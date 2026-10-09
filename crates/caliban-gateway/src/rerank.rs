@@ -8,6 +8,7 @@
 
 use crate::embeddings::mask_texts;
 use crate::error::Dialect;
+use crate::metering::Metered;
 use crate::pipeline::{Outcome, caliban_headers, finish, resolve};
 use crate::{ApiError, Gateway, auth, limits, telemetry};
 use axum::body::Bytes;
@@ -109,9 +110,11 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
             r
         })
         .collect();
-    let prompt_tokens = raw.pointer("/usage/total_tokens").or_else(|| raw.pointer("/usage/prompt_tokens")).and_then(Value::as_u64).unwrap_or(est);
+    let reported = raw.pointer("/usage/total_tokens").or_else(|| raw.pointer("/usage/prompt_tokens")).and_then(Value::as_u64);
+    let prompt_tokens = reported.unwrap_or(est);
     let usage = Usage { prompt_tokens, ..Usage::default() };
-    telemetry::record_usage(&us, usage);
+    let usage = if reported.is_some() { Metered::provider(usage) } else { Metered::estimated(usage) };
+    telemetry::record_usage(&us, usage.usage);
     let outcome = Outcome {
         request_id,
         tenant_id: tenant.id.to_string(),
@@ -125,9 +128,10 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
         span,
         est_prompt_tokens: est,
         route: None,
+        client_usage: true,
     };
     let model_id = outcome.model.id.to_string();
-    finish(&gw, &outcome, usage, 0, settlement, 0).await;
+    finish(&gw, &outcome, usage, 0, settlement).await;
     let mut resp = axum::Json(json!({ "model": model_id, "results": results, "usage": { "total_tokens": prompt_tokens } })).into_response();
     caliban_headers(resp.headers_mut(), &outcome);
     Ok(resp)

@@ -165,7 +165,11 @@ impl OpenAiToAnthropicStream {
 /// Accumulates usage across Anthropic stream events (`message_start` carries input and cache
 /// tokens, `message_delta` the cumulative output tokens).
 #[derive(Debug, Default, Clone)]
-pub struct AnthropicUsage(Map<String, Value>);
+pub struct AnthropicUsage {
+    fields: Map<String, Value>,
+    started: bool,
+    finished: bool,
+}
 
 impl AnthropicUsage {
     pub fn observe(&mut self, ev: &Value) {
@@ -175,16 +179,31 @@ impl AnthropicUsage {
             _ => None,
         };
         if let Some(Value::Object(u)) = u {
+            match ev.get("type").and_then(Value::as_str) {
+                Some("message_start") => self.started = true,
+                _ => self.finished = true,
+            }
             for (k, v) in u {
-                if v.is_number() {
-                    self.0.insert(k.clone(), v.clone());
+                // Numbers, and the `cache_creation` per-TTL breakdown object.
+                if v.is_number() || v.is_object() {
+                    self.fields.insert(k.clone(), v.clone());
                 }
             }
         }
     }
 
     pub fn usage(&self) -> Usage {
-        Usage::from_anthropic_usage(&Value::Object(self.0.clone()))
+        Usage::from_anthropic_usage(&Value::Object(self.fields.clone()))
+    }
+
+    /// `message_start` usage was seen: input and cache tokens are the provider's.
+    pub fn has_input(&self) -> bool {
+        self.started
+    }
+
+    /// `message_delta` usage was seen: output tokens are final.
+    pub fn is_complete(&self) -> bool {
+        self.finished
     }
 }
 
@@ -338,7 +357,7 @@ mod tests {
         evs.extend(s.push(&chunk(json!({"tool_calls": [{"index": 0, "function": {"arguments": "1}"}}]}), None)));
         evs.extend(s.push(&chunk(json!({}), Some("tool_calls"))));
         evs.extend(s.push(&json!({"id": "c1", "choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 4}})));
-        evs.extend(s.finish(Usage { prompt_tokens: 9, completion_tokens: 4, cached_prompt_tokens: 0 }));
+        evs.extend(s.finish(Usage { prompt_tokens: 9, completion_tokens: 4, ..Usage::default() }));
         assert_eq!(
             types(&evs),
             [
@@ -399,6 +418,20 @@ mod tests {
         assert_eq!(chunks[6]["usage"]["completion_tokens"], 20);
         assert_eq!(chunks[0]["model"], "claude-x");
         assert!(s.is_done());
-        assert_eq!(s.usage(), Usage { prompt_tokens: 15, completion_tokens: 20, cached_prompt_tokens: 3 });
+        assert_eq!(s.usage(), Usage { prompt_tokens: 15, completion_tokens: 20, cached_prompt_tokens: 3, ..Usage::default() });
+    }
+
+    #[test]
+    fn stream_usage_tracks_start_delta_and_cache_writes() {
+        let mut u = AnthropicUsage::default();
+        assert!(!u.has_input() && !u.is_complete());
+        u.observe(&json!({"type": "message_start", "message": {"usage": {"input_tokens": 4, "cache_read_input_tokens": 10, "cache_creation_input_tokens": 30,
+            "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 30}, "output_tokens": 1}}}));
+        assert!(u.has_input() && !u.is_complete(), "input known, output not final");
+        u.observe(&json!({"type": "message_delta", "usage": {"output_tokens": 9}}));
+        assert!(u.is_complete());
+        assert_eq!(u.usage(), Usage { prompt_tokens: 44, completion_tokens: 9, cached_prompt_tokens: 10, cache_write_tokens: 30, cache_write_1h_tokens: 30 });
+        // Translated for an OpenAI client, the cache writes survive.
+        assert_eq!(Usage::from_openai(&json!({"usage": openai_usage(u.usage())})), Some(u.usage()));
     }
 }

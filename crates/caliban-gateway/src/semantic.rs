@@ -586,7 +586,7 @@ pub(crate) async fn respond(
     let saved = m.payload.prompt_tokens + m.payload.completion_tokens;
     if !stream {
         let body = render_cached(&body, rh.as_ref(), is_native, outcome.dialect);
-        finish(&gw, &outcome, Usage::default(), saved, settlement, 0).await;
+        finish(&gw, &outcome, crate::metering::Metered::hit(Usage::default()), saved, settlement).await;
         return json_response(&outcome, body, Some(0.0));
     }
     let v: Value = serde_json::from_slice(&body).unwrap_or_default();

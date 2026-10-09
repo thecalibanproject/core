@@ -12,6 +12,7 @@
 
 use crate::error::Dialect;
 use crate::route_embed::{self, RouteMeta};
+use crate::metering::{self, Metered};
 use crate::{ApiError, Gateway, auth, limits, quirks, semantic, stream, telemetry};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -49,6 +50,10 @@ pub(crate) struct Outcome {
     pub est_prompt_tokens: u64,
     /// Routing facts for `x-caliban-intent` and metering (chat only).
     pub route: Option<RouteMeta>,
+    /// The client asked for usage in streams (OpenAI `stream_options.include_usage: true`; always
+    /// for Anthropic clients, whose events carry usage). Usage is requested upstream regardless,
+    /// and stripped from what the client receives when this is false.
+    pub client_usage: bool,
 }
 
 /// Entry point for both chat dialects.
@@ -94,6 +99,7 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
     if req.messages.is_empty() {
         return Err(CalibanError::InvalidRequest("messages must not be empty".into()).into());
     }
+    let client_usage = dialect == Dialect::Anthropic || metering::client_wants_stream_usage(&req.extra);
     let native_opts = NativeOptions { anthropic_version: header_str(headers, "anthropic-version"), anthropic_beta: header_str(headers, "anthropic-beta") };
     let ext = req.ext();
     let pii_mode = ext.pii.unwrap_or_else(|| snap.pii_mode_for(&tenant));
@@ -238,6 +244,7 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
             span: span.clone(),
             est_prompt_tokens: est_prompt,
             route: Some(route_meta.clone()),
+            client_usage,
         };
 
         if let Some(k) = &key {
@@ -247,7 +254,7 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
             if let Some(hit) = hit {
                 let outcome = Outcome { cache: CacheStatus::Hit, cache_tier: Some(CacheTier::Exact), ..outcome };
                 let body = render_cached(&hit.body, rh.as_ref(), is_native, dialect);
-                finish(&gw, &outcome, Usage::default(), hit.prompt_tokens + hit.completion_tokens, settlement, 0).await;
+                finish(&gw, &outcome, Metered::hit(Usage::default()), hit.prompt_tokens + hit.completion_tokens, settlement).await;
                 return Ok(json_response(&outcome, body, Some(0.0)));
             }
         }
@@ -276,7 +283,10 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
                 let cache_bytes = |v: &Value| (key.is_some() || sem.is_some()).then(|| Bytes::from(serde_json::to_vec(v).unwrap_or_default()));
                 let (client_body, cache_body, usage) = if is_native {
                     set_model(&mut v, &model);
-                    let usage = Usage::from_anthropic_usage(v.get("usage").unwrap_or(&Value::Null));
+                    let usage = match v.get("usage").filter(|u| u.is_object()) {
+                        Some(u) => Metered::provider(Usage::from_anthropic_usage(u)),
+                        None => metering::json_estimate(est_prompt, &v),
+                    };
                     let cache_body = cache_bytes(&v);
                     if let Some(r) = &rh {
                         rehydrate_anthropic(&mut v, r);
@@ -287,7 +297,7 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
                         quirks::normalize_message(&mut v);
                     }
                     set_model(&mut v, &model);
-                    let usage = Usage::from_openai(&v).unwrap_or_default();
+                    let usage = Usage::from_openai(&v).map_or_else(|| metering::json_estimate(est_prompt, &v), Metered::provider);
                     let cache_body = cache_bytes(&v);
                     if let Some(r) = &rh {
                         rehydrate_message(&mut v, r);
@@ -299,22 +309,22 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
                     (client, cache_body, usage)
                 };
                 if let (Some(s), Some(b)) = (sem, &cache_body) {
-                    s.complete(b.clone(), usage);
+                    s.complete(b.clone(), usage.usage);
                 }
                 if let (Some(k), Some(cache_body)) = (key, cache_body) {
                     gw.cache
                         .put(k, CachedResponse {
                             body: cache_body,
                             model: model.id.to_string(),
-                            prompt_tokens: usage.prompt_tokens,
-                            completion_tokens: usage.completion_tokens,
+                            prompt_tokens: usage.usage.prompt_tokens,
+                            completion_tokens: usage.usage.completion_tokens,
                         })
                         .await;
                 }
-                telemetry::record_usage(&us, usage);
+                telemetry::record_usage(&us, usage.usage);
                 drop(us);
-                let cost = cost_usd(usage.prompt_tokens, usage.completion_tokens, model.price_in_per_mtok, model.price_out_per_mtok);
-                finish(&gw, &outcome, usage, 0, settlement, 0).await;
+                let cost = metering::model_cost(&model, usage.usage);
+                finish(&gw, &outcome, usage, 0, settlement).await;
                 return Ok(json_response(&outcome, client_body, cost));
             }
             Ok(ProviderResponse::Stream(upstream)) => {
@@ -502,33 +512,36 @@ pub(crate) fn json_response(o: &Outcome, body: Bytes, cost: Option<f64>) -> Resp
     resp
 }
 
-/// Completes a request: usage event, quota settlement, span attributes. `streamed_bytes`
-/// estimates output when a stream ended without usage (e.g. the client disconnected).
-pub(crate) async fn finish(gw: &Gateway, o: &Outcome, usage: Usage, tokens_saved: u64, settlement: Settlement, streamed_bytes: u64) {
-    // A replayed (cached) stream shows the client the original usage, but nothing was consumed.
-    let (usage, tokens_saved) = if o.cache == CacheStatus::Hit && tokens_saved == 0 {
-        (Usage::default(), usage.prompt_tokens + usage.completion_tokens)
+/// Completes a request: usage event, quota settlement, span attributes. On a gateway cache hit
+/// nothing was consumed: `m.usage` (the cached answer's usage, as replayed streams report it)
+/// only becomes `tokens_saved` when `tokens_saved` is 0.
+pub(crate) async fn finish(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: u64, settlement: Settlement) {
+    let m = if o.cache == CacheStatus::Hit {
+        let saved = if tokens_saved == 0 { m.usage.prompt_tokens + m.usage.completion_tokens } else { tokens_saved };
+        record(gw, o, Metered::hit(Usage::default()), saved).await;
+        settlement.settle(Amount { tokens: 0, usd: 0.0 }).await;
+        Metered::hit(Usage::default())
     } else {
-        (usage, tokens_saved)
+        if m.source == Some(caliban_meter::UsageSource::Estimated) {
+            tracing::info!(request_id = %o.request_id, model = %o.model.id, prompt_tokens = m.usage.prompt_tokens,
+                completion_tokens = m.usage.completion_tokens, "usage estimated (no complete provider usage report)");
+        }
+        metering::warn_once_if_unpriced_cache(gw, &o.model, m.usage);
+        record(gw, o, m, tokens_saved).await;
+        let usd = metering::model_cost(&o.model, m.usage).unwrap_or(0.0);
+        settlement.settle(Amount { tokens: m.usage.prompt_tokens + m.usage.completion_tokens, usd }).await;
+        m
     };
-    record(gw, o, usage, tokens_saved).await;
-    let (tokens, usd) = if o.cache == CacheStatus::Hit {
-        (0, 0.0)
-    } else {
-        let reported = usage.prompt_tokens + usage.completion_tokens;
-        let tokens = if reported > 0 { reported } else { o.est_prompt_tokens + streamed_bytes.div_ceil(4) };
-        (tokens, cost_usd(usage.prompt_tokens, usage.completion_tokens, o.model.price_in_per_mtok, o.model.price_out_per_mtok).unwrap_or(0.0))
-    };
-    settlement.settle(Amount { tokens, usd }).await;
     let s = &o.span;
     s.record("caliban.cache", o.cache.as_str());
     s.record("caliban.pii.entities", o.pii_entities);
     s.record("gen_ai.response.model", o.model.id.as_str());
-    telemetry::record_usage(s, usage);
+    telemetry::record_usage(s, m.usage);
 }
 
-pub(crate) async fn record(gw: &Gateway, o: &Outcome, usage: Usage, tokens_saved: u64) {
-    let cost = cost_usd(usage.prompt_tokens, usage.completion_tokens, o.model.price_in_per_mtok, o.model.price_out_per_mtok);
+pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: u64) {
+    let usage = m.usage;
+    let cost = metering::model_cost(&o.model, usage);
     let auto = o.route.as_ref().filter(|r| r.auto);
     let event = UsageEvent {
         request_id: o.request_id.to_string(),
@@ -538,9 +551,12 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, usage: Usage, tokens_saved
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        cache_write_1h_tokens: usage.cache_write_1h_tokens,
         tokens_saved,
         cache: o.cache,
         cache_tier: o.cache_tier,
+        usage_source: m.source,
         pii_entities: o.pii_entities,
         cost_usd: cost,
         latency_ms: u64::try_from(o.started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -549,7 +565,7 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, usage: Usage, tokens_saved
         intent_confidence: o.route.as_ref().map(|r| r.confidence),
         route_stage: o.route.as_ref().map(|r| r.stage.to_owned()),
         routed_model_cost_usd: auto.and(cost),
-        flat_price_usd: auto.and_then(|r| cost_usd(usage.prompt_tokens, usage.completion_tokens, r.flat_price.0, r.flat_price.1)),
+        flat_price_usd: auto.and_then(|r| metering::flat_cost(r.flat_price, usage)),
     };
     gw.usage.record(event).await;
 }

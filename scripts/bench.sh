@@ -68,8 +68,6 @@ cargo test -p caliban --test isolation -- --test-threads=4 2>&1 | tee "$WORK/iso
 echo "== usage accuracy (cargo test -p caliban --test usage_accuracy)"
 USAGE_STATUS=pass
 USAGE_REPORT="$PWD/$OUT/usage.md" cargo test -p caliban --test usage_accuracy 2>&1 | tee "$WORK/usage.txt" || USAGE_STATUS=fail
-# Known gaps are #[ignore]d tests: run them to record whether they still fail.
-cargo test -p caliban --test usage_accuracy -- --ignored >"$WORK/gaps.txt" 2>&1 || true
 
 {
   echo "# P0 measurement report"
@@ -86,9 +84,7 @@ cargo test -p caliban --test usage_accuracy -- --ignored >"$WORK/gaps.txt" 2>&1 
   echo
   [[ -f "$OUT/usage.md" ]] && cat "$OUT/usage.md"
   echo
-  echo "Known gaps (ignored tests; \"FAILED\" means the gap is still open):"
-  echo
-  grep -E '^test .* \.\.\. ' "$WORK/gaps.txt" | sed -E 's/^test (.*) \.\.\. (.*)$/- `\1`: \2/' || true
+  grep -E '^test .* \.\.\. ' "$WORK/usage.txt" | sed -E 's/^test (.*) \.\.\. (.*)$/- `\1`: \2/' || true
 } > "$OUT/REPORT.md"
 echo "wrote $OUT/REPORT.md"
 [[ $ISO_STATUS == pass && $USAGE_STATUS == pass ]]

@@ -8,6 +8,11 @@
 //!   tenant cannot probe another's cached prefixes through timing.
 //! - `<think>` tags: when a server returns reasoning inline in `content`, it is moved to
 //!   `reasoning_content` so clients see the same shape as with a reasoning parser.
+//! - Stream usage: every stream asks for `stream_options.include_usage` (metering needs the
+//!   provider's usage even when the client did not ask for it). Models whose server rejects the
+//!   field are marked `capabilities.rejects_stream_options`; the field is removed for them, and
+//!   their streams are metered from an estimate (`usage_source: "estimated"`). The Anthropic
+//!   adapter drops the field itself (Anthropic streams always carry usage).
 
 use caliban_config::{ModelEntry, ProviderConfig, Reasoning, ReasoningControl};
 use caliban_types::ProviderKind;
@@ -43,6 +48,9 @@ pub fn shape_request(body: &mut Value, model: &ModelEntry, provider: &ProviderCo
     }
     if provider.cache_salt {
         obj.insert("cache_salt".into(), Value::String(tenant_salt.to_owned()));
+    }
+    if model.capabilities.rejects_stream_options {
+        obj.remove("stream_options");
     }
     // OpenAI's current models reject the legacy `max_tokens` (it arrives from Anthropic clients
     // and older SDKs); open-model servers keep it, since not all accept the new name.
@@ -185,6 +193,9 @@ mod tests {
             context_window: None,
             price_in_per_mtok: None,
             price_out_per_mtok: None,
+            price_cache_read_per_mtok: None,
+            price_cache_write_per_mtok: None,
+            price_cache_write_1h_per_mtok: None,
         }
     }
 
@@ -225,6 +236,17 @@ mod tests {
         p.kind = ProviderKind::Openai;
         shape_request(&mut body, &model(ReasoningControl::None), &p, None, "s");
         assert_eq!(body, json!({"max_completion_tokens": 100}));
+    }
+
+    #[test]
+    fn stream_options_are_removed_for_servers_that_reject_them() {
+        let mut body = json!({"stream": true, "stream_options": {"include_usage": true}});
+        let mut m = model(ReasoningControl::None);
+        shape_request(&mut body, &m, &provider(false), None, "s");
+        assert_eq!(body["stream_options"]["include_usage"], true, "kept by default");
+        m.capabilities.rejects_stream_options = true;
+        shape_request(&mut body, &m, &provider(false), None, "s");
+        assert!(body.get("stream_options").is_none());
     }
 
     #[test]

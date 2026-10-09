@@ -637,6 +637,10 @@ async fn usage(State(cp): State<Cp>, Query(q): Query<UsageQuery>) -> Json<Value>
         "requests": all.len(),
         "prompt_tokens": all.iter().map(|e| e.prompt_tokens).sum::<u64>(),
         "completion_tokens": all.iter().map(|e| e.completion_tokens).sum::<u64>(),
+        "cached_prompt_tokens": all.iter().map(|e| e.cached_prompt_tokens).sum::<u64>(),
+        "cache_write_tokens": all.iter().map(|e| e.cache_write_tokens).sum::<u64>(),
+        // Requests whose tokens are a gateway estimate (disconnects, streams without usage).
+        "estimated_requests": all.iter().filter(|e| e.usage_source == Some(caliban_meter::UsageSource::Estimated)).count(),
         "cache_hits": all.iter().filter(|e| e.cache == caliban_types::CacheStatus::Hit).count(),
         "semantic_cache_hits": all.iter().filter(|e| e.cache_tier == Some(caliban_types::CacheTier::Semantic)).count(),
         "tokens_saved": all.iter().map(|e| e.tokens_saved + e.cached_prompt_tokens).sum::<u64>(),

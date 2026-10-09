@@ -97,10 +97,17 @@ impl ChatRequest {
         req.caliban = None;
         req.model = upstream_model.to_owned();
         if req.stream {
-            // Ask for usage in the final chunk so metering is exact.
-            req.extra
-                .entry("stream_options")
-                .or_insert_with(|| serde_json::json!({ "include_usage": true }));
+            // Always ask for usage in the final chunk so metering is exact, also when the client
+            // turned it off (`include_usage: false`) or did not ask: the provider bills the request
+            // either way. The gateway strips the usage chunk for clients that did not ask for it.
+            // Other `stream_options` keys the client set are kept.
+            let so = req.extra.entry("stream_options").or_insert_with(|| serde_json::json!({}));
+            match so.as_object_mut() {
+                Some(o) => {
+                    o.insert("include_usage".into(), Value::Bool(true));
+                }
+                None => *so = serde_json::json!({ "include_usage": true }),
+            }
         }
         serde_json::to_value(req).unwrap_or(Value::Null)
     }
@@ -218,6 +225,11 @@ impl ChatRequest {
 }
 
 /// Token usage as reported by the upstream (OpenAI shape).
+///
+/// `prompt_tokens` counts every prompt token the provider processed. Of those,
+/// `cached_prompt_tokens` were read from the provider's prompt cache and `cache_write_tokens`
+/// were written to it (Anthropic `cache_creation_input_tokens`; `cache_write_1h_tokens` is the
+/// part written with the 1-hour TTL). The rest is uncached input.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Usage {
     #[serde(default)]
@@ -226,6 +238,10 @@ pub struct Usage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub cached_prompt_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cache_write_1h_tokens: u64,
 }
 
 impl Usage {
@@ -235,26 +251,41 @@ impl Usage {
         if u.is_null() {
             return None;
         }
+        let details = |k: &str| u.pointer(&format!("/prompt_tokens_details/{k}")).and_then(Value::as_u64).unwrap_or(0);
         Some(Usage {
             prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
             completion_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
-            cached_prompt_tokens: u
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            cached_prompt_tokens: details("cached_tokens"),
+            // Not part of OpenAI's schema: set when an Anthropic upstream is translated to the
+            // OpenAI shape (see `anthropic::openai_usage`), so cache writes survive translation.
+            cache_write_tokens: details("cache_write_tokens"),
+            cache_write_1h_tokens: details("cache_write_1h_tokens"),
         })
     }
 
     /// Extracts usage from an Anthropic `usage` object. Anthropic's `input_tokens` excludes cache
-    /// reads and writes, so they are added back to get the full prompt size.
+    /// reads and writes, so they are added back to get the full prompt size. Cache writes are
+    /// `cache_creation_input_tokens`; `cache_creation.ephemeral_1h_input_tokens` (when reported)
+    /// is the part written with the 1-hour TTL, priced higher than the default 5-minute TTL.
     pub fn from_anthropic_usage(u: &Value) -> Self {
         let g = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
         let cached = g("cache_read_input_tokens");
+        let breakdown = |k: &str| u.get("cache_creation").and_then(|c| c.get(k)).and_then(Value::as_u64);
+        let (w5, w1h) = (breakdown("ephemeral_5m_input_tokens"), breakdown("ephemeral_1h_input_tokens"));
+        // The total is normally reported; fall back to the per-TTL breakdown when it is not.
+        let written = u.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or_else(|| w5.unwrap_or(0) + w1h.unwrap_or(0));
         Usage {
-            prompt_tokens: g("input_tokens") + cached + g("cache_creation_input_tokens"),
+            prompt_tokens: g("input_tokens") + cached + written,
             completion_tokens: g("output_tokens"),
             cached_prompt_tokens: cached,
+            cache_write_tokens: written,
+            cache_write_1h_tokens: w1h.unwrap_or(0).min(written),
         }
+    }
+
+    /// Prompt tokens that were neither read from nor written to the provider's prompt cache.
+    pub fn uncached_prompt_tokens(&self) -> u64 {
+        self.prompt_tokens.saturating_sub(self.cached_prompt_tokens).saturating_sub(self.cache_write_tokens)
     }
 }
 
@@ -309,7 +340,47 @@ mod tests {
     #[test]
     fn anthropic_usage_adds_cache_tokens() {
         let u = Usage::from_anthropic_usage(&serde_json::json!({"input_tokens": 10, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5, "output_tokens": 7}));
-        assert_eq!(u, Usage { prompt_tokens: 115, completion_tokens: 7, cached_prompt_tokens: 100 });
+        assert_eq!(u, Usage { prompt_tokens: 115, completion_tokens: 7, cached_prompt_tokens: 100, cache_write_tokens: 5, cache_write_1h_tokens: 0 });
+        assert_eq!(u.uncached_prompt_tokens(), 10);
+    }
+
+    #[test]
+    fn anthropic_usage_splits_cache_write_ttls() {
+        let u = Usage::from_anthropic_usage(&serde_json::json!({"input_tokens": 3, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 50, "output_tokens": 2,
+            "cache_creation": {"ephemeral_5m_input_tokens": 20, "ephemeral_1h_input_tokens": 30}}));
+        assert_eq!((u.prompt_tokens, u.cache_write_tokens, u.cache_write_1h_tokens), (53, 50, 30));
+        // Breakdown only (no total): the total is the sum.
+        let u = Usage::from_anthropic_usage(&serde_json::json!({"input_tokens": 1, "cache_creation": {"ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 6}}));
+        assert_eq!((u.prompt_tokens, u.cache_write_tokens, u.cache_write_1h_tokens), (11, 10, 6));
+    }
+
+    #[test]
+    fn stream_usage_is_always_requested_upstream() {
+        for (so, extra) in [
+            (None, None),
+            (Some(serde_json::json!({"include_usage": false})), None),
+            (Some(serde_json::json!({"include_usage": false, "continuous_usage_stats": true})), Some("continuous_usage_stats")),
+            (Some(serde_json::json!(null)), None),
+        ] {
+            let mut r = req(r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"x"}]}"#);
+            if let Some(so) = so {
+                r.extra.insert("stream_options".into(), so);
+            }
+            let up = r.to_openai_upstream("u");
+            assert_eq!(up["stream_options"]["include_usage"], true);
+            if let Some(k) = extra {
+                assert_eq!(up["stream_options"][k], true, "other stream_options keys are kept");
+            }
+        }
+        let up = req(r#"{"model":"m","messages":[{"role":"user","content":"x"}]}"#).to_openai_upstream("u");
+        assert!(up.get("stream_options").is_none(), "non-streaming requests are unchanged");
+    }
+
+    #[test]
+    fn openai_usage_reads_translated_cache_writes() {
+        let u = Usage::from_openai(&serde_json::json!({"usage": {"prompt_tokens": 20, "completion_tokens": 1,
+            "prompt_tokens_details": {"cached_tokens": 5, "cache_write_tokens": 10, "cache_write_1h_tokens": 4}}})).unwrap();
+        assert_eq!(u, Usage { prompt_tokens: 20, completion_tokens: 1, cached_prompt_tokens: 5, cache_write_tokens: 10, cache_write_1h_tokens: 4 });
     }
 
     #[test]

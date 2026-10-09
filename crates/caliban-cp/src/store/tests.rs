@@ -39,6 +39,9 @@ upstream_model = "gpt-5-mini"
 trust_tier = "t2_contracted"
 price_in_per_mtok = 0.25
 price_out_per_mtok = 2.0
+price_cache_read_per_mtok = 0.1
+price_cache_write_per_mtok = 0.3
+price_cache_write_1h_per_mtok = 0.5
 
 [[tenants]]
 id = "acme"
@@ -619,6 +622,42 @@ async fn postgres_backend_matches_memory_and_persists() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn postgres_usage_events_carry_cache_tier_and_usage_source() {
+    let Some(pg) = pg_backend().await else { return };
+    pg.migrate().await.unwrap();
+    let mut e: caliban_meter::UsageEvent = serde_json::from_value(json!({
+        "request_id": "req_1", "tenant_id": "acme", "model": "ext/gpt", "intent": "chat", "prompt_tokens": 160,
+        "completion_tokens": 5, "cached_prompt_tokens": 100, "cache_write_tokens": 50, "cache_write_1h_tokens": 30,
+        "tokens_saved": 0, "cache": "miss", "usage_source": "provider", "pii_entities": 1, "cost_usd": 0.00039,
+        "latency_ms": 12, "ts": "2026-10-09T12:00:00Z", "requested_model": "caliban/auto", "intent_confidence": 0.9,
+        "route_stage": "knn", "routed_model_cost_usd": 0.00039, "flat_price_usd": 0.0005
+    }))
+    .unwrap();
+    let mut hit = e.clone();
+    hit.request_id = "req_2".into();
+    hit.cache = caliban_types::CacheStatus::Hit;
+    hit.cache_tier = Some(caliban_types::CacheTier::Semantic);
+    hit.usage_source = None;
+    assert_eq!(pg.insert_usage_events(&[e.clone(), hit]).await.unwrap(), 2);
+    e.prompt_tokens = 1;
+    assert_eq!(pg.insert_usage_events(&[e]).await.unwrap(), 0, "idempotent on request_id");
+    type Row = (String, Option<String>, Option<String>, i64, i64, i64);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT request_id, cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens, prompt_tokens FROM usage_event ORDER BY request_id",
+    )
+    .fetch_all(pg.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![
+        ("req_1".into(), None, Some("provider".into()), 50, 30, 160),
+        ("req_2".into(), Some("semantic".into()), None, 50, 30, 160),
+    ]);
+    // The CHECK constraints reject unknown values.
+    assert!(sqlx::query("UPDATE usage_event SET usage_source = 'guess' WHERE request_id = 'req_1'").execute(pg.pool()).await.is_err());
+    assert!(sqlx::query("UPDATE usage_event SET cache_tier = 'other' WHERE request_id = 'req_1'").execute(pg.pool()).await.is_err());
 }
 
 #[tokio::test]

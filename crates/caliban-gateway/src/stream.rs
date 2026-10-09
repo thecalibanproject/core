@@ -11,6 +11,7 @@
 //! disconnects (dropping the upstream stream cancels the provider request).
 
 use crate::error::Dialect;
+use crate::metering;
 use crate::pipeline::{Outcome, caliban_headers, finish};
 use crate::quirks::{self, ThinkSplitter};
 use crate::semantic::StreamCapture;
@@ -237,6 +238,7 @@ pub(crate) fn openai_shaped(
         let mut last_chunk_id = Value::Null;
         let mut streamed = 0u64;
         let (mut ended, mut client_gone) = (false, false);
+        let (mut usage_seen, mut errored) = (false, false);
         'outer: while let Some(item) = upstream.next().await {
             let bytes = match item {
                 Ok(b) => b,
@@ -247,6 +249,7 @@ pub(crate) fn openai_shaped(
                         c.abandon();
                     }
                     ended = true;
+                    errored = true;
                     break;
                 }
             };
@@ -262,6 +265,7 @@ pub(crate) fn openai_shaped(
                         Ok(mut v) => {
                             if let Some(u) = Usage::from_openai(&v) {
                                 usage = u;
+                                usage_seen = true;
                             }
                             if let Some(m) = v.get("model").and_then(Value::as_str) {
                                 upstream_span.record("gen_ai.response.model", m);
@@ -273,11 +277,13 @@ pub(crate) fn openai_shaped(
                             if let Some(c) = capture.as_mut() {
                                 c.openai_chunk(&v);
                             }
+                            // Usage is always requested upstream; a client that did not ask gets none.
+                            let usage_only = !outcome.client_usage && metering::strip_usage(&mut v);
                             if transform {
                                 transform_chunk(&mut v, &mut choices, rehydrator.as_ref(), think);
                             }
                             streamed += delta_bytes(&v);
-                            enc.chunk(&v)
+                            if usage_only { String::new() } else { enc.chunk(&v) }
                         }
                         Err(_) => enc.raw(&data),
                     }
@@ -306,12 +312,16 @@ pub(crate) fn openai_shaped(
         }
         drop(tx);
         drop(upstream);
-        telemetry::record_usage(&upstream_span, usage);
+        // Provider usage when the stream ran to completion with a usage report; otherwise
+        // estimated (client disconnect, upstream error, no usage sent).
+        let complete = usage_seen && !client_gone && !errored;
+        let metered = metering::stream_end(usage_seen.then_some(usage), complete, outcome.est_prompt_tokens, streamed);
+        telemetry::record_usage(&upstream_span, metered.usage);
         drop(upstream_span);
         if let Some(c) = capture {
             c.finish(usage);
         }
-        finish(&gw, &outcome, usage, 0, settlement, streamed).await;
+        finish(&gw, &outcome, metered, 0, settlement).await;
     };
     tokio::spawn(task.instrument(span));
     resp
@@ -429,13 +439,16 @@ pub(crate) fn native_anthropic(
         }
         drop(tx);
         drop(upstream);
+        // `message_start` gives the provider's input and cache tokens, `message_delta` the final
+        // output tokens; without the latter (disconnect, error) output is estimated.
+        let metered = metering::stream_end(usage.has_input().then(|| usage.usage()), usage.is_complete(), outcome.est_prompt_tokens, streamed);
         let usage = usage.usage();
-        telemetry::record_usage(&upstream_span, usage);
+        telemetry::record_usage(&upstream_span, metered.usage);
         drop(upstream_span);
         if let Some(c) = capture {
             c.finish(usage);
         }
-        finish(&gw, &outcome, usage, 0, settlement, streamed).await;
+        finish(&gw, &outcome, metered, 0, settlement).await;
     };
     tokio::spawn(task.instrument(span));
     resp

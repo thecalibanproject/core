@@ -8,7 +8,7 @@ The P0 exit criteria (reference architecture, section 8) are: **under 3 ms p50 o
 |---|---|
 | Under 3 ms p50 overhead | **Pass** for every non-streaming path (chat, PII regex tier, cache hit, native Anthropic, usage WAL) at concurrency 1, 16 and 64: worst p50 0.75 ms. **Pass** for streams at concurrency 1 and 16 (worst p50 1.17 ms total, 0.49 ms TTFB) and for paced streams at every level (TTFB p50 at most 0.57 ms). **Fail** for unpaced streams at concurrency 64: p50 4.1 ms (PII off) and 5.4 ms (PII on) in the full run, 2.9 ms in the quietest A/B round. See [Streaming at concurrency 64](#streaming-at-concurrency-64). The NER tier (model inference) is outside the 3 ms budget and is reported separately. |
 | Isolation audit passes | **Pass**: 9 of 9 properties, through the real binary. No cross-tenant leak found. One property (datasources) is only partly testable today because the data plane does not consume datasources yet. |
-| Usage within 1% of provider bills | **Tokens: pass, exact** on every path (71 requests, 4390 prompt, 1074 completion and 2432 cached tokens, zero difference). **Cost: pass at catalogue list prices, fail against real provider pricing when prompt caching is involved** (+33% over the run; up to +104% on Anthropic cache reads, and an undercharge on cache writes). One metering bug: streams whose client sets `include_usage: false` are metered as 0 tokens. |
+| Usage within 1% of provider bills | **Pass** after the metering fixes (`fix/metering`): tokens and cost equal the provider's bill on every path, prompt-cache pricing included (81 requests, +0.00%; before the fixes the same workload was metered +21.8% above the bill, and the first measurement +33.0%). Streams whose client sets `include_usage: false` are metered from the provider's usage (were 0 tokens); client disconnects are metered as flagged estimates (were 0). See [Usage accuracy](#usage-accuracy). |
 
 ## Run
 
@@ -69,7 +69,7 @@ Reading the table:
 
 - A difference of quantiles is not a quantile of differences, so tails can come out negative (a slow direct sample) and `max` is a single-sample comparison. p50 and p90 are the stable numbers.
 - The cache-hit "overhead" is near zero because the mock answers in about 30 microseconds; against a real upstream a hit saves the whole model call. The gateway's own cache-hit path costs about 40 microseconds end to end at concurrency 1.
-- The usage WAL costs about 15 microseconds per request at concurrency 1 and 0.25 ms at 64 (the JSONL sink opens, appends and closes the file for every event, inline before the response is returned).
+- The usage WAL costs about 15 microseconds per request at concurrency 1 and 0.25 ms at 64 (the JSONL sink opens, appends and closes the file for every event, inline before the response is returned). Fixed on `fix/metering` with a background writer; see [Usage WAL](#usage-wal).
 
 ### NER tier (L1 model; outside the 3 ms budget)
 
@@ -157,40 +157,64 @@ No isolation bug was found. Notes for later phases:
 
 ## Usage accuracy
 
-`apps/caliban/tests/usage_accuracy.rs`: one sequential request at a time, each usage event paired with the bill the mock recorded for that request (the event's request id must match the response). Tokens must match exactly; cost must equal the bill at the gateway's catalogue prices.
+`apps/caliban/tests/usage_accuracy.rs`: one sequential request at a time, each usage event paired with the bill the mock recorded for that request (the event's request id must match the response). Tokens must match exactly, and cost must equal the provider's bill with its prompt-cache pricing.
 
-| Path | Requests | Prompt (billed / metered) | Completion | Cached prompt | Cost at list price (expected / metered) | Provider cost with cache pricing | Metered vs provider |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| OpenAI client, OpenAI-compatible upstream, JSON | 6 | 178 / 178 | 103 / 103 | 0 / 0 | 0.000384 / 0.000384 | 0.000384 | +0.0% |
-| OpenAI client, OpenAI-compatible upstream, stream | 6 | 180 / 180 | 103 / 103 | 124 / 124 | 0.000386 / 0.000386 | 0.000324 | +19.1% |
-| OpenAI client, Anthropic upstream (translated), JSON | 6 | 179 / 179 | 103 / 103 | 0 / 0 | 0.002082 / 0.002082 | 0.002082 | +0.0% |
-| OpenAI client, Anthropic upstream (translated), stream | 6 | 179 / 179 | 103 / 103 | 0 / 0 | 0.002082 / 0.002082 | 0.002082 | +0.0% |
-| Anthropic client, OpenAI-compatible upstream (translated), JSON | 6 | 179 / 179 | 103 / 103 | 124 / 124 | 0.000385 / 0.000385 | 0.000323 | +19.2% |
-| Anthropic client, OpenAI-compatible upstream (translated), stream | 6 | 179 / 179 | 103 / 103 | 124 / 124 | 0.000385 / 0.000385 | 0.000323 | +19.2% |
-| Anthropic client, Anthropic upstream (native), JSON | 6 | 178 / 178 | 103 / 103 | 0 / 0 | 0.002079 / 0.002079 | 0.002079 | +0.0% |
-| Anthropic client, Anthropic upstream (native), stream | 6 | 180 / 180 | 103 / 103 | 0 / 0 | 0.002085 / 0.002085 | 0.002085 | +0.0% |
-| `caliban/auto` with fallback (first candidate 500s) | 6 | 179 / 179 | 103 / 103 | 124 / 124 | 0.000385 / 0.000385 | 0.000323 | +19.2% |
-| Anthropic native with `cache_control` (write, then reads) | 8 | 2624 / 2624 | 72 / 72 | 1860 / 1860 | 0.008952 / 0.008952 | 0.004395 | +103.7% |
-| OpenAI-compatible, provider prefix-cache hits | 6 | 138 / 138 | 66 / 66 | 76 / 76 | 0.000270 / 0.000270 | 0.000232 | +16.4% |
-| Gateway exact cache (1 miss, then hits) | 3 (2 hits) | 17 / 17 | 9 / 9 | 0 / 0 | 0.000035 / 0.000035 | 0.000035 | +0.0% |
-| **Total** | 71 | 4390 / 4390 | 1074 / 1074 | 2432 / 2432 | 0.019510 / 0.019510 | 0.014667 | +33.0% |
+### First measurement (`652fc17`)
 
-(PII prompts are counted after pseudonymisation, so prompt sizes vary by a token or two between runs. Several OpenAI-compatible rows show cached tokens because the same prompt was sent on an earlier path and the mock's prefix cache, keyed by credential, served it.)
+Tokens were exact on every path (71 requests). Cost was exact at catalogue list prices, but list prices are not what a provider charges once prompt caching is involved: the gateway priced every prompt token at `price_in_per_mtok`, so the run was metered **+33.0%** above the provider bill (+103.7% on the Anthropic cache-read rows, +19% on the OpenAI-compatible prefix-cache rows; a cache-write request alone was metered 19% below its bill). Two metering bugs: streams whose client set `include_usage: false` were metered as **0 tokens** (the provider billed them), and so were clients that disconnected mid-stream. Both, and the cache pricing, failed the 1% criterion.
 
-What this shows:
+### After the metering fixes (`fix/metering`)
 
-- **Tokens are exact everywhere**: both dialects, streams, translation in both directions, native passthrough with cache reads and writes, provider prefix-cache hits, fallbacks (billed once; the 500 is not billed), PII. Anthropic's `input_tokens` excludes cache tokens; the gateway adds `cache_read_input_tokens` and `cache_creation_input_tokens` back, which matches the provider's total.
-- **Cache hits** are metered as zero tokens and zero cost with `tokens_saved` set; the provider is not called, so nothing is billed.
-- **Cost at list prices is exact**, but it is not what a provider charges once prompt caching is involved. `cost_usd` prices every prompt token at `price_in_per_mtok`; providers charge cache reads at a discount (Anthropic 0.1x; OpenAI 0.5x on older models and less on newer ones; the comparison above uses 0.5x) and Anthropic cache writes at 1.25x. Over this run the metered cost is 33% above the provider bill (104% on the Anthropic cache rows), and a cache-write request alone is metered 19% below its bill. **This fails the 1% criterion whenever prompt caching is in play.** Fix: add cache-read and cache-write prices to the model catalogue, carry `cache_creation_input_tokens` in `UsageEvent`, and price the three classes separately. Tracked by the ignored test `cost_matches_provider_bill_with_prompt_caching`.
+Date: 2026-10-09, same machine. The workload now also covers `include_usage: false` streams and Anthropic cache writes with the 1-hour TTL (81 requests). The test catalogue carries the providers' cache prices (Anthropic reads 0.1x, 5-minute writes 1.25x, 1-hour writes 2x the input price; OpenAI-compatible cached input 0.5x). "Metered before" is what the gateway metered before the fixes for the same billed tokens (list price, and 0 for opt-out streams).
+
+| Path | Requests | Prompt (billed / metered) | Completion | Cache reads | Cache writes | Provider bill | Metered before | Before vs bill | Metered now | Now vs bill |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| OpenAI client, OpenAI-compatible upstream, JSON | 6 | 180 / 180 | 103 / 103 | 0 / 0 | 0 / 0 | 0.000386 | 0.000386 | +0.0% | 0.000386 | +0.00% |
+| OpenAI client, OpenAI-compatible upstream, stream | 6 | 180 / 180 | 103 / 103 | 156 / 156 | 0 / 0 | 0.000308 | 0.000386 | +25.3% | 0.000308 | +0.00% |
+| OpenAI client, OpenAI-compatible upstream, stream, `include_usage: false` | 6 | 192 / 192 | 109 / 109 | 0 / 0 | 0 / 0 | 0.000410 | 0.000000 | -100.0% | 0.000410 | +0.00% |
+| OpenAI client, Anthropic upstream (translated), JSON | 6 | 180 / 180 | 103 / 103 | 0 / 0 | 0 / 0 | 0.002085 | 0.002085 | +0.0% | 0.002085 | +0.00% |
+| OpenAI client, Anthropic upstream (translated), stream | 6 | 180 / 180 | 103 / 103 | 0 / 0 | 0 / 0 | 0.002085 | 0.002085 | +0.0% | 0.002085 | +0.00% |
+| Anthropic client, OpenAI-compatible upstream (translated), JSON | 6 | 180 / 180 | 103 / 103 | 156 / 156 | 0 / 0 | 0.000308 | 0.000386 | +25.3% | 0.000308 | +0.00% |
+| Anthropic client, OpenAI-compatible upstream (translated), stream | 6 | 180 / 180 | 103 / 103 | 156 / 156 | 0 / 0 | 0.000308 | 0.000386 | +25.3% | 0.000308 | +0.00% |
+| Anthropic client, Anthropic upstream (native), JSON | 6 | 180 / 180 | 103 / 103 | 0 / 0 | 0 / 0 | 0.002085 | 0.002085 | +0.0% | 0.002085 | +0.00% |
+| Anthropic client, Anthropic upstream (native), stream | 6 | 180 / 180 | 103 / 103 | 0 / 0 | 0 / 0 | 0.002085 | 0.002085 | +0.0% | 0.002085 | +0.00% |
+| `caliban/auto` with fallback (first candidate 500s) | 6 | 180 / 180 | 103 / 103 | 156 / 156 | 0 / 0 | 0.000308 | 0.000386 | +25.3% | 0.000308 | +0.00% |
+| Anthropic native with `cache_control` (write, then reads) | 8 | 2624 / 2624 | 72 / 72 | 1860 / 1860 | 620 / 620 | 0.004395 | 0.008952 | +103.7% | 0.004395 | +0.00% |
+| Anthropic native with `cache_control`, 1-hour TTL (write, then read) | 4 | 1356 / 1356 | 32 / 32 | 640 / 640 | 640 / 640 | 0.004740 | 0.004548 | -4.1% | 0.004740 | +0.00% |
+| OpenAI-compatible, provider prefix-cache hits | 6 | 138 / 138 | 66 / 66 | 76 / 76 | 0 / 0 | 0.000232 | 0.000270 | +16.4% | 0.000232 | +0.00% |
+| Gateway exact cache (1 miss, then hits) | 3 (2 hits) | 17 / 17 | 9 / 9 | 0 / 0 | 0 / 0 | 0.000035 | 0.000035 | +0.0% | 0.000035 | +0.00% |
+| **Total** | 81 | 5947 / 5947 | 1215 / 1215 | 3200 / 3200 | 1260 / 1260 | 0.019770 | 0.024075 | **+21.8%** | 0.019770 | **+0.00%** |
+
+(PII prompts are counted after pseudonymisation, so prompt sizes vary by a token or two between runs. Several OpenAI-compatible rows show cache reads because the same prompt was sent on an earlier path and the mock's prefix cache, keyed by credential, served it. The 1-hour row is metered below its bill before the fix because writes cost 2x and reads 0.1x; the 5-minute row's single write is hidden by its three reads.)
+
+**Verdict: pass.** Tokens and cost match the provider's bill exactly on every path, every request carries `usage_source: "provider"`, and the per-request cost difference is below 1e-12 USD. What changed:
+
+- **Opt-out streams.** Streams always ask the upstream for usage (`stream_options.include_usage: true`, other `stream_options` keys kept). For an OpenAI client that did not ask for usage, the usage-only final chunk is dropped and `usage` (including OpenAI's per-chunk `"usage": null`) is removed, so the client sees what it asked for. Models whose server rejects `stream_options` are marked `capabilities.rejects_stream_options`: the field is not sent and their streams are metered from an estimate (flagged). Anthropic native streams already captured `message_start` and `message_delta` usage; that is now tested for both complete and interrupted streams.
+- **Cache pricing.** The catalogue takes `price_cache_read_per_mtok`, `price_cache_write_per_mtok` and `price_cache_write_1h_per_mtok`. One cost function prices uncached input, cache reads, cache writes (1-hour writes separately) and output; `cost_usd`, `x-caliban-cost-usd`, quota settlement, `routed_model_cost_usd` and `flat_price_usd` all use it. Unset cache prices fall back to the input price (the previous behaviour), with a startup warning for priced OpenAI and Anthropic models and a once-per-model warning when a provider reports cache tokens for an unpriced model. Usage events gain `cache_write_tokens` and `cache_write_1h_tokens`.
+- **Disconnects.** A stream that ends without a complete usage report (client disconnect, upstream error, no usage sent) is metered with the best numbers available and marked `usage_source: "estimated"`: the provider's prompt tokens when it already reported them (Anthropic `message_start`), otherwise the prompt estimate, plus completion tokens estimated from the output streamed so far. `client_disconnect_is_metered_as_an_estimate` disconnects after the first chunk: the provider billed 81 + 48 tokens, the gateway metered 79 + 1 (estimated). The provider bills the whole generation it produced before noticing the cancellation, so an estimate after a disconnect is a floor, not a bill; such events are flagged rather than claimed exact.
 
 ### Estimation paths
 
-No estimation is used when the upstream reports usage, which is every path above. The gateway estimates in two places, and only for quota, never for the usage event:
+The gateway estimates in three places, and every estimated usage event says so (`usage_source: "estimated"`):
 
-- **Quota reservation** before the call: prompt estimate at about 4 bytes per token plus per-message, image and tool overhead (`ChatRequest::estimate_prompt_tokens`), plus `max_tokens` or 1024. Settlement replaces it with the reported usage.
-- **Settlement of a stream that ended without usage** (client disconnect, upstream that sends none): prompt estimate plus streamed bytes divided by 4.
+- **Quota reservation** before the call: prompt estimate at about 4 bytes per token plus per-message, image and tool overhead (`ChatRequest::estimate_prompt_tokens`), plus `max_tokens` or 1024. Settlement replaces it with the metered usage.
+- **Streams without a complete usage report** (above): disconnects, upstream errors, and models with `rejects_stream_options`.
+- **Responses without a usage object** (non-streaming chat, embeddings, rerank from an upstream that reports none): the prompt estimate plus output bytes divided by 4. Before, a non-streaming response without usage was metered as 0 tokens.
 
-**Bug: streams with `stream_options.include_usage: false` are metered as 0 tokens.** The gateway adds `include_usage: true` upstream only when the client did not set `stream_options`; a client that sets it to `false` turns usage off upstream as well, so the provider bills the request while the usage event says 0 prompt and 0 completion tokens (quota settlement uses the estimate above). The same applies to a client that disconnects mid-stream: the event records 0 tokens, while the provider bills what it generated. Fix: always request usage upstream, strip the usage-only chunk for clients that opted out, and record the estimate in the usage event (flagged as estimated) when no usage arrives. Tracked by the ignored test `stream_without_client_usage_is_still_metered`.
+### Usage WAL
+
+The JSONL sink opened, appended and closed the file for every event, inline before the response was returned (about 15 microseconds per request at concurrency 1 and 0.25 ms at 64). It is now a background writer: the request enqueues the event on a bounded queue (16,384 by default) and returns; the writer keeps the file open, appends in batches (flushing whenever the queue runs empty, at 256 KiB, and on graceful shutdown), and runs file I/O on the blocking pool. `fdatasync` is `off` by default as before (graceful shutdown always syncs) or after every batch with `CALIBAN_USAGE_WAL_FSYNC=batch`. A full queue makes a request wait at most 20 ms, then the event is dropped and counted; `/healthz` reports `usage_wal` counters (written, dropped, write errors, backpressure waits, queue depth). The format is unchanged and old lines still parse (`read_wal` test with a pre-fix line).
+
+Overhead re-measured with the release build, `caliban-bench --only chat` (4000 requests per side, 2 interleaved rounds), on a loaded machine (load average about 40 from parallel builds, so absolute numbers are inflated and noisy; compare rows of the same run):
+
+| Scenario | p50 overhead c=1 | c=16 | c=64 |
+|---|---:|---:|---:|
+| chat, WAL off | 0.119 | 0.282 | 0.916 |
+| chat, WAL on | 0.129 | 0.224 | 0.788 |
+| WAL on minus off, this run | +0.010 | -0.058 | -0.128 |
+| WAL on minus off, first measurement (open per event) | +0.017 | +0.087 | +0.248 |
+
+With the background writer the WAL's cost is within run-to-run noise at every concurrency.
 
 ## Caveats
 
@@ -207,6 +231,6 @@ scripts/bench.sh                               # report in bench/results/REPORT.
 CALIBAN_PII_NER_DIR=… scripts/bench.sh         # with the NER rows (builds --features ner)
 QUICK=1 scripts/bench.sh                       # smoke check of the suite
 cargo test -p caliban --test isolation         # isolation audit only
-cargo test -p caliban --test usage_accuracy    # usage accuracy only (add -- --ignored for the known gaps)
+cargo test -p caliban --test usage_accuracy    # usage accuracy only
 cargo build --profile profiling -p caliban     # symbols for `sample` or flamegraphs
 ```

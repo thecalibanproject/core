@@ -4,8 +4,10 @@
 //! with prompt caching, provider-side prefix caching, exact-cache hits, fallbacks and PII.
 //!
 //! P0 exit criterion: "Usage matches provider bills within 1%". Token counts must match exactly
-//! (no estimation is involved when the upstream reports usage). Cost is checked against the
-//! gateway's own catalogue prices; two known gaps are `#[ignore]`d tests below.
+//! (no estimation is involved when the upstream reports usage, also for streams whose client did
+//! not ask for usage). Cost must equal the provider's bill with prompt-cache pricing: the test
+//! catalogue carries the cache prices the mock "provider" charges (Anthropic reads 0.1x, 5-minute
+//! writes 1.25x, 1-hour writes 2x the input price; OpenAI-compatible cached input 0.5x).
 //!
 //! Set `USAGE_REPORT=path.md` to write the per-path table (scripts/bench.sh does).
 
@@ -19,6 +21,12 @@ use std::time::Duration;
 
 const PRICES: [(&str, f64, f64); 3] = [("oa/m", 1.0, 2.0), ("anth/m", 3.0, 15.0), ("oa/fail", 1.0, 2.0)];
 
+/// Prompt-cache price multipliers of the mock providers (of the input price).
+const ANTHROPIC_READ: f64 = 0.1;
+const ANTHROPIC_WRITE_5M: f64 = 1.25;
+const ANTHROPIC_WRITE_1H: f64 = 2.0;
+const OPENAI_CACHED: f64 = 0.5;
+
 fn price(model: &str) -> (f64, f64) {
     PRICES.iter().find(|p| p.0 == model).map(|p| (p.1, p.2)).expect("priced model")
 }
@@ -28,7 +36,13 @@ fn config(base: &str, hash: &str) -> String {
         .iter()
         .map(|(id, p, up)| {
             let (i, o) = price(id);
-            format!("[[models]]\nid = \"{id}\"\nprovider = \"{p}\"\nupstream_model = \"{up}\"\ntrust_tier = \"t2_contracted\"\nprice_in_per_mtok = {i}\nprice_out_per_mtok = {o}\n\n")
+            // The catalogue's cache prices are the providers' (see the constants above).
+            let cache = if *p == "anth" {
+                format!("price_cache_read_per_mtok = {}\nprice_cache_write_per_mtok = {}\nprice_cache_write_1h_per_mtok = {}\n", i * ANTHROPIC_READ, i * ANTHROPIC_WRITE_5M, i * ANTHROPIC_WRITE_1H)
+            } else {
+                format!("price_cache_read_per_mtok = {}\n", i * OPENAI_CACHED)
+            };
+            format!("[[models]]\nid = \"{id}\"\nprovider = \"{p}\"\nupstream_model = \"{up}\"\ntrust_tier = \"t2_contracted\"\nprice_in_per_mtok = {i}\nprice_out_per_mtok = {o}\n{cache}\n")
         })
         .collect();
     format!(
@@ -72,7 +86,11 @@ struct Env {
 }
 
 async fn setup() -> Env {
-    let mock = Mock::start("127.0.0.1:0", MockConfig { chunk_chars: 3, ..Default::default() }).await.unwrap();
+    setup_with(MockConfig { chunk_chars: 3, ..Default::default() }).await
+}
+
+async fn setup_with(mock_cfg: MockConfig) -> Env {
+    let mock = Mock::start("127.0.0.1:0", mock_cfg).await.unwrap();
     let (key, hash) = new_key("acct");
     let launch = Launch {
         config: config(&mock.base_url(), &hash),
@@ -107,29 +125,48 @@ impl Sample {
     fn billed_cached(&self) -> u64 {
         self.bills.iter().map(|b| b.cache_read_tokens).sum()
     }
+    fn billed_writes(&self) -> u64 {
+        self.bills.iter().map(|b| b.cache_creation_tokens).sum()
+    }
+    fn billed_writes_1h(&self) -> u64 {
+        self.bills.iter().map(|b| b.cache_creation_1h_tokens).sum()
+    }
     fn metered(&self, k: &str) -> u64 {
         self.event[k].as_u64().unwrap_or(0)
     }
-    /// The gateway's list-price cost for the billed tokens (what the event should say).
-    fn expected_list_cost(&self) -> f64 {
+    /// What the gateway metered before the metering fixes (the "before" column of the report):
+    /// every billed token at the list price (no cache pricing), and 0 for streams whose client
+    /// set `include_usage: false`.
+    fn before_cost(&self) -> f64 {
+        if self.bills.is_empty() || self.label.contains("include_usage: false") {
+            return 0.0;
+        }
         let (i, o) = price(self.event["model"].as_str().unwrap());
         (self.billed_prompt() as f64 * i + self.billed_completion() as f64 * o) / 1e6
     }
-    /// What a provider would actually charge, with its prompt-cache pricing: Anthropic cache
-    /// reads at 0.1x and writes at 1.25x the input price; OpenAI cached input at 0.5x.
+    /// What the provider charges, with its prompt-cache pricing: Anthropic cache reads at 0.1x,
+    /// 5-minute writes at 1.25x and 1-hour writes at 2x the input price; OpenAI cached input at
+    /// 0.5x. The usage event's `cost_usd` must equal this.
     fn provider_cost(&self) -> f64 {
         let (i, o) = price(self.event["model"].as_str().unwrap());
         self.bills
             .iter()
             .map(|b| {
                 let input = if b.anthropic {
-                    b.input_tokens as f64 * i + b.cache_read_tokens as f64 * 0.1 * i + b.cache_creation_tokens as f64 * 1.25 * i
+                    let w5 = b.cache_creation_tokens - b.cache_creation_1h_tokens;
+                    b.input_tokens as f64 * i
+                        + b.cache_read_tokens as f64 * ANTHROPIC_READ * i
+                        + w5 as f64 * ANTHROPIC_WRITE_5M * i
+                        + b.cache_creation_1h_tokens as f64 * ANTHROPIC_WRITE_1H * i
                 } else {
-                    (b.input_tokens - b.cache_read_tokens) as f64 * i + b.cache_read_tokens as f64 * 0.5 * i
+                    (b.input_tokens - b.cache_read_tokens) as f64 * i + b.cache_read_tokens as f64 * OPENAI_CACHED * i
                 };
                 (input + b.output_tokens as f64 * o) / 1e6
             })
             .sum()
+    }
+    fn metered_cost(&self) -> f64 {
+        self.event["cost_usd"].as_f64().unwrap_or(0.0)
     }
 }
 
@@ -180,6 +217,14 @@ async fn run_workload(e: &Env) -> Vec<Sample> {
         let tag = format!("{p} [{i}]");
         out.push(e.sample("OpenAI client, OpenAI-compatible upstream, JSON", Api::OpenAi, json!({"model": "oa/m", "messages": msgs(&tag)})).await);
         out.push(e.sample("OpenAI client, OpenAI-compatible upstream, stream", Api::OpenAi, json!({"model": "oa/m", "stream": true, "messages": msgs(&tag)})).await);
+        out.push(
+            e.sample(
+                "OpenAI client, OpenAI-compatible upstream, stream, include_usage: false",
+                Api::OpenAi,
+                json!({"model": "oa/m", "stream": true, "stream_options": {"include_usage": false}, "messages": msgs(&format!("{tag} opt-out"))}),
+            )
+            .await,
+        );
         out.push(e.sample("OpenAI client, Anthropic upstream (translated), JSON", Api::OpenAi, json!({"model": "anth/m", "messages": msgs(&tag)})).await);
         out.push(
             e.sample("OpenAI client, Anthropic upstream (translated), stream", Api::OpenAi, json!({"model": "anth/m", "stream": true, "messages": msgs(&tag)})).await,
@@ -217,6 +262,13 @@ async fn run_workload(e: &Env) -> Vec<Sample> {
         out.push(e.sample("Anthropic native with cache_control (cache write, then reads)", Api::Anthropic, body.clone()).await);
         out.push(e.sample("Anthropic native with cache_control (cache write, then reads)", Api::Anthropic, body).await);
     }
+    // The same with the 1-hour TTL (written at 2x, read at 0.1x).
+    let system_1h = json!([{"type": "text", "text": "You are the treasury assistant. ".repeat(40), "cache_control": {"type": "ephemeral", "ttl": "1h"}}]);
+    for stream in [false, true] {
+        let body = json!({"model": "anth/m", "max_tokens": 128, "stream": stream, "system": system_1h, "messages": msgs(&format!("Which invoices are overdue? stream={stream}"))});
+        out.push(e.sample("Anthropic native with cache_control, 1-hour TTL (write, then read)", Api::Anthropic, body.clone()).await);
+        out.push(e.sample("Anthropic native with cache_control, 1-hour TTL (write, then read)", Api::Anthropic, body).await);
+    }
     // Provider-side prefix cache on the OpenAI-compatible upstream (repeats report cached_tokens).
     for stream in [false, true] {
         let body = json!({"model": "oa/m", "stream": stream, "messages": msgs(&format!("Repeated long prompt for the prefix cache. stream={stream}"))});
@@ -242,10 +294,32 @@ fn report(samples: &[Sample]) -> String {
         mc: u64,
         bk: u64,
         mk: u64,
-        cost_expected: f64,
+        bw: u64,
+        mw: u64,
+        cost_list: f64,
         cost_metered: f64,
         cost_provider: f64,
         hits: usize,
+    }
+    impl Agg {
+        fn add(&mut self, a: &Agg) {
+            self.n += a.n;
+            self.bp += a.bp;
+            self.mp += a.mp;
+            self.bc += a.bc;
+            self.mc += a.mc;
+            self.bk += a.bk;
+            self.mk += a.mk;
+            self.bw += a.bw;
+            self.mw += a.mw;
+            self.cost_list += a.cost_list;
+            self.cost_metered += a.cost_metered;
+            self.cost_provider += a.cost_provider;
+            self.hits += a.hits;
+        }
+        fn pct(x: f64, base: f64) -> f64 {
+            if base > 0.0 { (x - base) / base * 100.0 } else { 0.0 }
+        }
     }
     let mut by: BTreeMap<&str, Agg> = BTreeMap::new();
     let mut order = Vec::new();
@@ -261,21 +335,24 @@ fn report(samples: &[Sample]) -> String {
         a.mc += s.metered("completion_tokens");
         a.bk += s.billed_cached();
         a.mk += s.metered("cached_prompt_tokens");
-        a.cost_expected += s.expected_list_cost();
-        a.cost_metered += s.event["cost_usd"].as_f64().unwrap_or(0.0);
+        a.bw += s.billed_writes();
+        a.mw += s.metered("cache_write_tokens");
+        a.cost_list += s.before_cost();
+        a.cost_metered += s.metered_cost();
         a.cost_provider += s.provider_cost();
         a.hits += usize::from(s.event["cache"] == "hit");
     }
     let mut o = String::new();
-    let _ = writeln!(o, "| Path | Requests | Prompt tokens (billed / metered) | Completion (billed / metered) | Cached prompt (billed / metered) | Cost, list price (expected / metered) | Provider cost with cache pricing | Metered vs provider |");
-    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|---:|");
+    let _ = writeln!(
+        o,
+        "| Path | Requests | Prompt (billed / metered) | Completion (billed / metered) | Cache reads (billed / metered) | Cache writes (billed / metered) | Provider bill | Metered before | Before vs bill | Metered now | Now vs bill |"
+    );
+    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     let mut total = Agg::default();
-    for l in order {
-        let a = &by[l];
-        let diff = if a.cost_provider > 0.0 { (a.cost_metered - a.cost_provider) / a.cost_provider * 100.0 } else { 0.0 };
+    let row = |o: &mut String, label: &str, a: &Agg| {
         let _ = writeln!(
             o,
-            "| {l} | {}{} | {} / {} | {} / {} | {} / {} | {:.6} / {:.6} | {:.6} | {diff:+.1}% |",
+            "| {label} | {}{} | {} / {} | {} / {} | {} / {} | {} / {} | {:.6} | {:.6} | {:+.1}% | {:.6} | {:+.2}% |",
             a.n,
             if a.hits > 0 { format!(" ({} cache hits)", a.hits) } else { String::new() },
             a.bp,
@@ -284,33 +361,32 @@ fn report(samples: &[Sample]) -> String {
             a.mc,
             a.bk,
             a.mk,
-            a.cost_expected,
+            a.bw,
+            a.mw,
+            a.cost_provider,
+            a.cost_list,
+            Agg::pct(a.cost_list, a.cost_provider),
             a.cost_metered,
-            a.cost_provider
+            Agg::pct(a.cost_metered, a.cost_provider),
         );
-        total.n += a.n;
-        total.bp += a.bp;
-        total.mp += a.mp;
-        total.bc += a.bc;
-        total.mc += a.mc;
-        total.bk += a.bk;
-        total.mk += a.mk;
-        total.cost_expected += a.cost_expected;
-        total.cost_metered += a.cost_metered;
-        total.cost_provider += a.cost_provider;
+    };
+    for l in order {
+        row(&mut o, l, &by[l]);
+        total.add(&by[l]);
     }
-    let diff = (total.cost_metered - total.cost_provider) / total.cost_provider * 100.0;
-    let _ = writeln!(
-        o,
-        "| **Total** | {} | {} / {} | {} / {} | {} / {} | {:.6} / {:.6} | {:.6} | {diff:+.1}% |",
-        total.n, total.bp, total.mp, total.bc, total.mc, total.bk, total.mk, total.cost_expected, total.cost_metered, total.cost_provider
-    );
+    row(&mut o, "**Total**", &total);
     o
 }
 
-/// Every request: metered prompt, completion and cached tokens equal the bill exactly, and the
-/// metered cost equals the bill at the gateway's catalogue prices. Cache hits are metered as
-/// zero tokens and zero cost (the provider was not called). Fallbacks bill once.
+fn assert_cost_matches(s: &Sample) {
+    let (metered, bill) = (s.metered_cost(), s.provider_cost());
+    assert!((metered - bill).abs() <= 1e-12 + bill * 1e-9, "{}: metered {metered} vs provider bill {bill}", s.label);
+}
+
+/// Every request: metered prompt, completion, cache-read and cache-write tokens equal the bill
+/// exactly, the usage comes from the provider, and the metered cost equals the provider's bill
+/// with its prompt-cache pricing. Cache hits are metered as zero tokens and zero cost (the
+/// provider was not called). Fallbacks bill once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metered_usage_matches_provider_bills() {
     let e = setup().await;
@@ -332,46 +408,112 @@ async fn metered_usage_matches_provider_bills() {
         assert_eq!(s.metered("prompt_tokens"), s.billed_prompt(), "{l}: prompt tokens");
         assert_eq!(s.metered("completion_tokens"), s.billed_completion(), "{l}: completion tokens");
         assert_eq!(s.metered("cached_prompt_tokens"), s.billed_cached(), "{l}: cached prompt tokens");
-        let cost = s.event["cost_usd"].as_f64().expect("priced model has a cost");
-        assert!((cost - s.expected_list_cost()).abs() < 1e-12, "{l}: cost {cost} vs {}", s.expected_list_cost());
+        assert_eq!(s.metered("cache_write_tokens"), s.billed_writes(), "{l}: cache-write tokens");
+        assert_eq!(s.metered("cache_write_1h_tokens"), s.billed_writes_1h(), "{l}: 1-hour cache-write tokens");
+        assert_eq!(s.event["usage_source"], "provider", "{l}: usage from the provider, not estimated");
+        assert!(s.event["cost_usd"].is_number(), "{l}: priced model has a cost");
+        assert_cost_matches(s);
     }
+    let (metered, bill): (f64, f64) = samples.iter().fold((0.0, 0.0), |(m, b), s| (m + s.metered_cost(), b + s.provider_cost()));
+    assert!((metered - bill).abs() / bill < 0.01, "total: metered {metered} vs provider bill {bill}");
     // The workload must actually exercise the cache paths.
     assert!(samples.iter().any(|s| s.billed_cached() > 0 && !s.bills[0].anthropic), "OpenAI-side cached tokens exercised");
     assert!(samples.iter().any(|s| s.bills.first().is_some_and(|b| b.cache_creation_tokens > 0)), "Anthropic cache writes exercised");
+    assert!(samples.iter().any(|s| s.bills.first().is_some_and(|b| b.cache_creation_1h_tokens > 0)), "Anthropic 1-hour cache writes exercised");
     assert!(samples.iter().any(|s| s.event["cache"] == "hit"), "gateway cache hits exercised");
 }
 
-/// KNOWN GAP: cost ignores provider prompt-cache pricing. The gateway prices every prompt token
-/// at `price_in_per_mtok`, but providers charge cache reads at a discount (Anthropic 0.1x, OpenAI
-/// 0.5x or less) and Anthropic cache writes at 1.25x. With prompt caching in play the metered
-/// cost overstates the bill well beyond 1%. Fix: add cached-read and cache-write prices to the
-/// catalogue and carry `cache_creation_input_tokens` in the usage event.
+/// Cost follows the provider's prompt-cache pricing (formerly a known gap: every prompt token was
+/// priced at the input price, +104% on Anthropic cache reads and under on cache writes): a cache
+/// write, then reads, for both TTLs and both transports, each within 1% of the bill (exact here).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known gap: cost does not apply provider prompt-cache pricing (bench/RESULTS.md)"]
 async fn cost_matches_provider_bill_with_prompt_caching() {
     let e = setup().await;
-    let system = json!([{"type": "text", "text": "Long shared instructions. ".repeat(60), "cache_control": {"type": "ephemeral"}}]);
-    for i in 0..4 {
-        let body = json!({"model": "anth/m", "max_tokens": 64, "system": system, "messages": msgs("same question")});
-        let s = e.sample("anthropic cached", Api::Anthropic, body).await;
-        let metered = s.event["cost_usd"].as_f64().unwrap();
-        let bill = s.provider_cost();
-        assert!((metered - bill).abs() / bill <= 0.01, "request {i}: metered {metered} vs provider {bill}");
+    for ttl in [None, Some("1h")] {
+        let mut cc = json!({"type": "ephemeral"});
+        if let Some(t) = ttl {
+            cc["ttl"] = json!(t);
+        }
+        let system = json!([{"type": "text", "text": format!("Long shared instructions {ttl:?}. ").repeat(60), "cache_control": cc}]);
+        for (i, stream) in [false, false, true, true].into_iter().enumerate() {
+            let body = json!({"model": "anth/m", "max_tokens": 64, "stream": stream, "system": system, "messages": msgs("same question")});
+            let s = e.sample("anthropic cached", Api::Anthropic, body).await;
+            let b = s.bills[0];
+            if i == 0 {
+                assert!(b.cache_creation_tokens > 0 && (ttl.is_none() || b.cache_creation_1h_tokens == b.cache_creation_tokens), "{ttl:?}: first request writes");
+            } else {
+                assert!(b.cache_read_tokens > 0, "{ttl:?}: later requests read");
+            }
+            let (metered, bill) = (s.metered_cost(), s.provider_cost());
+            assert!((metered - bill).abs() / bill <= 0.01, "{ttl:?} request {i}: metered {metered} vs provider {bill}");
+            assert_cost_matches(&s);
+        }
     }
 }
 
-/// KNOWN GAP: a streaming client that sets `stream_options.include_usage = false` turns usage off
-/// upstream too (the gateway only adds `include_usage` when the client did not set it), so the
-/// provider bills the request but the usage event records 0 tokens. The quota settlement falls
-/// back to an estimate (prompt estimate + streamed bytes / 4), the usage event does not. Fix:
-/// always request usage upstream and drop the usage-only chunk for clients that opted out.
+/// Streams whose client did not ask for usage (`include_usage: false`, or no `stream_options`)
+/// are metered from the provider's usage (formerly a known gap: 0 tokens), and the client still
+/// gets no usage chunk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known gap: streams with include_usage=false are metered as 0 tokens (bench/RESULTS.md)"]
 async fn stream_without_client_usage_is_still_metered() {
     let e = setup().await;
-    let body = json!({"model": "oa/m", "stream": true, "stream_options": {"include_usage": false}, "messages": msgs("count me")});
-    let s = e.sample("opt-out stream", Api::OpenAi, body).await;
-    assert_eq!(s.bills.len(), 1);
-    assert_eq!(s.metered("prompt_tokens"), s.billed_prompt(), "prompt tokens of an opt-out stream");
-    assert_eq!(s.metered("completion_tokens"), s.billed_completion(), "completion tokens of an opt-out stream");
+    for (i, extra) in [json!({"stream_options": {"include_usage": false}}), json!({})].into_iter().enumerate() {
+        let mut body = json!({"model": "oa/m", "stream": true, "messages": msgs(&format!("count me {i}"))});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let wal_before = e.gw.wal_events().len();
+        let r = e.gw.chat(&e.key, &body).await;
+        assert!(r.status.is_success());
+        assert!(!r.text.contains("\"usage\""), "case {i}: the client did not ask for usage: {}", r.text);
+        assert!(r.text.trim_end().ends_with("data: [DONE]"));
+        let mut events = Vec::new();
+        for _ in 0..200 {
+            events = e.gw.wal_events();
+            if events.len() > wal_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let ev = events.last().unwrap();
+        let bill = e.mock.log().last().unwrap().bill.unwrap();
+        assert_eq!(ev["prompt_tokens"], bill.total_prompt_tokens(), "case {i}: prompt tokens of an opt-out stream");
+        assert_eq!(ev["completion_tokens"], bill.output_tokens, "case {i}: completion tokens of an opt-out stream");
+        assert_eq!(ev["usage_source"], "provider");
+    }
+}
+
+/// A client that disconnects mid-stream is metered from an estimate (`usage_source:
+/// "estimated"`): the prompt estimate plus the output streamed so far. The provider bills the
+/// whole generation it produced (the mock finishes its response), so the estimate is a floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_disconnect_is_metered_as_an_estimate() {
+    let e = setup_with(MockConfig { chunk_chars: 2, chunk_delay: Duration::from_millis(5), ..Default::default() }).await;
+    let text = "Write a long answer about the quarterly close, the accruals, the reconciliations and the audit. ".repeat(3);
+    let body = json!({"model": "oa/m", "stream": true, "messages": msgs(&text)});
+    let wal_before = e.gw.wal_events().len();
+    let mut resp = caliban_bench::harness::client()
+        .post(format!("{}/v1/chat/completions", e.gw.dp))
+        .bearer_auth(&e.key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let first = resp.chunk().await.unwrap().expect("a first chunk");
+    assert!(!first.is_empty());
+    drop(resp);
+    let mut events = Vec::new();
+    for _ in 0..300 {
+        events = e.gw.wal_events();
+        if events.len() > wal_before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let ev = events.last().expect("a usage event for the disconnected stream");
+    assert_eq!(ev["usage_source"], "estimated");
+    let bill = e.mock.log().last().unwrap().bill.unwrap();
+    let (prompt, completion) = (ev["prompt_tokens"].as_u64().unwrap(), ev["completion_tokens"].as_u64().unwrap());
+    assert!(prompt > 0, "prompt estimate, not 0");
+    assert!(completion > 0 && completion < bill.output_tokens, "estimated output {completion} is below the {} billed", bill.output_tokens);
+    println!("disconnect: billed {} + {}, metered (estimated) {prompt} + {completion}", bill.total_prompt_tokens(), bill.output_tokens);
 }

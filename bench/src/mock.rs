@@ -95,6 +95,8 @@ pub struct Bill {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// The part of `cache_creation_tokens` written with the 1-hour TTL (`cache_control.ttl = "1h"`).
+    pub cache_creation_1h_tokens: u64,
 }
 
 impl Bill {
@@ -338,6 +340,7 @@ async fn chat(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
             output_tokens: completion,
             cache_read_tokens: cached,
             cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         rec.log.push(Entry {
             path: "/v1/chat/completions".into(),
@@ -429,6 +432,7 @@ async fn messages(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
     let total = prompt_tokens(&body);
     let output = completion_tokens(&text);
     let cacheable = anthropic_cacheable_tokens(&body).min(total);
+    let one_hour = anthropic_last_breakpoint_ttl(&body).as_deref() == Some("1h");
     let (mut read, mut created) = (0, 0);
     if s.cfg.record {
         let mut rec = s.rec.lock();
@@ -446,6 +450,7 @@ async fn messages(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
             output_tokens: output,
             cache_read_tokens: read,
             cache_creation_tokens: created,
+            cache_creation_1h_tokens: if one_hour { created } else { 0 },
         };
         rec.log.push(Entry {
             path: "/v1/messages".into(),
@@ -456,6 +461,9 @@ async fn messages(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
         });
     }
     let input = total - read - created;
+    let created_1h = if one_hour { created } else { 0 };
+    let usage = json!({"input_tokens": input, "cache_read_input_tokens": read, "cache_creation_input_tokens": created,
+        "cache_creation": {"ephemeral_5m_input_tokens": created - created_1h, "ephemeral_1h_input_tokens": created_1h}});
     wait(&s.cfg).await;
     if stream {
         let ev = |e: Value| {
@@ -468,7 +476,7 @@ async fn messages(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
             ev(
                 json!({"type": "message_start", "message": {"id": "msg_mock", "type": "message", "role": "assistant", "model": model, "content": [],
                       "stop_reason": null, "stop_sequence": null,
-                      "usage": {"input_tokens": input, "cache_read_input_tokens": read, "cache_creation_input_tokens": created, "output_tokens": 1}}}),
+                      "usage": with_output(&usage, 1)}}),
             ),
             ev(
                 json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
@@ -485,8 +493,37 @@ async fn messages(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
     json_resp(&json!({
         "id": "msg_mock", "type": "message", "role": "assistant", "model": model,
         "content": [{"type": "text", "text": text}], "stop_reason": "end_turn", "stop_sequence": null,
-        "usage": {"input_tokens": input, "cache_read_input_tokens": read, "cache_creation_input_tokens": created, "output_tokens": output}
+        "usage": with_output(&usage, output)
     }))
+}
+
+fn with_output(usage: &Value, output: u64) -> Value {
+    let mut u = usage.clone();
+    u["output_tokens"] = json!(output);
+    u
+}
+
+/// The `ttl` of the last `cache_control` breakpoint (system, then messages), if any.
+fn anthropic_last_breakpoint_ttl(body: &Value) -> Option<String> {
+    let mut ttl = None;
+    let mut visit = |v: &Value| {
+        let parts: Vec<&Value> = match v {
+            Value::Array(a) => a.iter().collect(),
+            other => vec![other],
+        };
+        for p in parts {
+            if let Some(cc) = p.get("cache_control") {
+                ttl = Some(cc.get("ttl").and_then(Value::as_str).unwrap_or("5m").to_owned());
+            }
+        }
+    };
+    if let Some(sys) = body.get("system") {
+        visit(sys);
+    }
+    for m in body.get("messages").and_then(Value::as_array).into_iter().flatten() {
+        visit(&m["content"]);
+    }
+    ttl
 }
 
 async fn embeddings(State(s): St, headers: HeaderMap, body: Bytes) -> Response {

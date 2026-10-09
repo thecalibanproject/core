@@ -14,6 +14,9 @@ mod embeddings;
 mod error;
 mod limits;
 mod messages;
+mod metering;
+#[cfg(test)]
+mod metering_tests;
 mod pipeline;
 pub mod purge;
 mod quirks;
@@ -71,11 +74,14 @@ pub struct Gateway {
     /// Derives per-tenant PII surrogate keys (HKDF over `CALIBAN_KEK`, tenant id as info), so all
     /// routers of a deployment produce the same surrogates; random per process without a KEK.
     pub pii_keys: SurrogateKeys,
+    /// Models already warned about (cache tokens reported, no cache prices); once per process.
+    cache_price_warned: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Gateway {
     pub fn new(config: ConfigHandle, usage: Arc<dyn UsageSink>) -> Self {
         let c = config.load().config.cache.clone();
+        metering::warn_missing_cache_prices_at_startup(&config.load());
         let providers = Arc::new(Providers::default());
         let embedder = Arc::new(embedder::ProviderEmbedder::new(
             config.clone(),
@@ -96,6 +102,7 @@ impl Gateway {
             quota: Arc::new(InMemoryQuota::new()),
             salt_key: salt_key(),
             pii_keys: pii_keys(),
+            cache_price_warned: Default::default(),
         }
     }
 
@@ -228,6 +235,11 @@ pub fn app(gw: Arc<Gateway>) -> Router {
 
 async fn health(axum::extract::State(gw): axum::extract::State<Arc<Gateway>>) -> axum::Json<serde_json::Value> {
     let snap = gw.config.load();
-    // A degraded quota store does not fail the probe: limits are then enforced locally.
-    axum::Json(serde_json::json!({ "status": "ok", "mode": "router", "config_version": snap.version, "quota": gw.quota.status() }))
+    // A degraded quota store does not fail the probe: limits are then enforced locally. Neither
+    // do usage WAL drops; they are reported under `usage_wal` (absent without a WAL).
+    let mut body = serde_json::json!({ "status": "ok", "mode": "router", "config_version": snap.version, "quota": gw.quota.status() });
+    if let Some(wal) = gw.usage.status() {
+        body["usage_wal"] = wal;
+    }
+    axum::Json(body)
 }

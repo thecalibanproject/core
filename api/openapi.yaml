@@ -1111,6 +1111,7 @@ components:
         reasoning: { type: string, enum: [none, always, hybrid], default: none }
         reasoning_control: { type: string, enum: [none, enable_thinking, reasoning_effort], default: none }
         inline_think_tags: { type: boolean, default: false, description: 'Server returns <think>…</think> in content; Caliban moves it to reasoning_content.' }
+        rejects_stream_options: { type: boolean, default: false, description: 'The server rejects `stream_options`. Caliban then does not request usage on streams, and meters them from an estimate (`usage_source: estimated`). Leave false for servers that accept it (vLLM, SGLang, OpenAI).' }
     ModelCreate:
       type: object
       required: [id, provider, upstream_model, trust_tier]
@@ -1126,6 +1127,9 @@ components:
         context_window: { type: [integer, 'null'] }
         price_in_per_mtok: { type: [number, 'null'] }
         price_out_per_mtok: { type: [number, 'null'] }
+        price_cache_read_per_mtok: { type: [number, 'null'], minimum: 0, description: 'USD per million prompt tokens read from the provider prompt cache (OpenAI `cached_tokens`, Anthropic `cache_read_input_tokens`). Null: `price_in_per_mtok`.' }
+        price_cache_write_per_mtok: { type: [number, 'null'], minimum: 0, description: 'USD per million prompt tokens written to the provider prompt cache (Anthropic `cache_creation_input_tokens`, 5-minute TTL). Null: `price_in_per_mtok`.' }
+        price_cache_write_1h_per_mtok: { type: [number, 'null'], minimum: 0, description: 'USD per million tokens written with the Anthropic 1-hour TTL (`cache_creation.ephemeral_1h_input_tokens`). Null: `price_cache_write_per_mtok`.' }
     Model:
       type: object
       required: [id, provider_id, upstream_model, trust_tier, kind, capabilities]
@@ -1142,6 +1146,9 @@ components:
         context_window: { type: [integer, 'null'] }
         price_in_per_mtok: { type: [number, 'null'] }
         price_out_per_mtok: { type: [number, 'null'] }
+        price_cache_read_per_mtok: { type: [number, 'null'], minimum: 0, description: 'USD per million prompt tokens read from the provider prompt cache (OpenAI `cached_tokens`, Anthropic `cache_read_input_tokens`). Null: `price_in_per_mtok`.' }
+        price_cache_write_per_mtok: { type: [number, 'null'], minimum: 0, description: 'USD per million prompt tokens written to the provider prompt cache (Anthropic `cache_creation_input_tokens`, 5-minute TTL). Null: `price_in_per_mtok`.' }
+        price_cache_write_1h_per_mtok: { type: [number, 'null'], minimum: 0, description: 'USD per million tokens written with the Anthropic 1-hour TTL (`cache_creation.ephemeral_1h_input_tokens`). Null: `price_cache_write_per_mtok`.' }
     SharedProvider:
       type: object
       required: [id, kind, base_url, trust_tier, cache_salt, has_api_key, tenants]
@@ -1241,20 +1248,23 @@ components:
         model: { type: string }
         prompt_tokens: { type: integer }
         completion_tokens: { type: integer }
-        cached_prompt_tokens: { type: integer }
+        cached_prompt_tokens: { type: integer, description: 'Part of prompt_tokens read from the provider prompt cache.' }
+        cache_write_tokens: { type: integer, description: 'Part of prompt_tokens written to the provider prompt cache (Anthropic `cache_creation_input_tokens`). Omitted when 0.' }
+        cache_write_1h_tokens: { type: integer, description: 'Part of cache_write_tokens written with the Anthropic 1-hour TTL. Omitted when 0.' }
+        usage_source: { type: string, enum: [provider, estimated], description: '`provider`: the token counts are the provider''s usage report. `estimated`: no complete report arrived (the client disconnected mid-stream, the upstream stream failed or ended without usage, or the model has `rejects_stream_options`), so the gateway estimated them: prompt tokens from the provider''s partial report when one arrived (Anthropic `message_start`), else from the request; completion tokens from the output streamed so far, about 4 bytes per token. After a disconnect the provider may bill more than the estimate. Absent on cache hits (nothing consumed) and on events written before this field existed.' }
         tokens_saved: { type: integer, description: 'Tokens not sent upstream thanks to Caliban: on a cache hit of either tier, the cached answer''s prompt plus completion tokens' }
         intent: { type: string }
         cache: { type: string, enum: [hit, miss, bypass] }
         cache_tier: { type: string, enum: [exact, semantic], description: 'Only on hits: which cache tier answered.' }
         pii_entities: { type: integer }
-        cost_usd: { type: [number, 'null'] }
+        cost_usd: { type: [number, 'null'], description: 'Uncached prompt tokens at price_in_per_mtok, cache reads at price_cache_read_per_mtok, cache writes at price_cache_write_per_mtok (1-hour writes at price_cache_write_1h_per_mtok), completion at price_out_per_mtok. Unset cache prices fall back to the input price. Null when the model has no input or output price.' }
         latency_ms: { type: integer }
         ts: { type: string, format: date-time }
         requested_model: { type: string, description: 'Model the client asked for (`caliban/auto` or a pinned id). Chat requests only; absent otherwise.' }
         intent_confidence: { type: number, description: 'Confidence of the intent decision, 0..1. Chat requests only.' }
         route_stage: { type: string, enum: [rules, knn, keyword], description: 'Stage that decided the intent. Chat requests only.' }
-        routed_model_cost_usd: { type: number, description: '`caliban/auto` only: real cost of the routed model for this request (its prices times reported usage). Absent when the model has no price.' }
-        flat_price_usd: { type: number, description: '`caliban/auto` only: flat auto price for the same tokens (`[routing] auto_price_*`). Margin = flat_price_usd - routed_model_cost_usd. 0 on a cache hit of either tier (no tokens consumed; whether hits should charge the flat price for `tokens_saved` is an open pricing decision).' }
+        routed_model_cost_usd: { type: number, description: '`caliban/auto` only: real cost of the routed model for this request (the same number and cost function as `cost_usd`, prompt-cache prices included). Absent when the model has no price.' }
+        flat_price_usd: { type: number, description: '`caliban/auto` only: flat auto price for the same tokens (`[routing] auto_price_*`), through the same cost function as `cost_usd`; the flat price has no cache prices, so cache reads and writes count at its input price. Margin = flat_price_usd - routed_model_cost_usd. 0 on a cache hit of either tier (no tokens consumed; whether hits should charge the flat price for `tokens_saved` is an open pricing decision).' }
     UsageReport:
       type: object
       required: [events, totals]
@@ -1266,6 +1276,9 @@ components:
             requests: { type: integer }
             prompt_tokens: { type: integer }
             completion_tokens: { type: integer }
+            cached_prompt_tokens: { type: integer, description: 'Prompt tokens read from provider prompt caches' }
+            cache_write_tokens: { type: integer, description: 'Prompt tokens written to provider prompt caches' }
+            estimated_requests: { type: integer, description: 'Events with `usage_source: estimated`' }
             cache_hits: { type: integer, description: 'Hits of both tiers.' }
             semantic_cache_hits: { type: integer }
             tokens_saved: { type: integer }

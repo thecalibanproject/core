@@ -112,6 +112,20 @@ provider = "openai"
 upstream_model = "gpt-5-mini"
 trust_tier = "t2_contracted"
 licence = "proprietary"
+# Prices in USD per million tokens. Placeholders: copy the values from the provider's current
+# price list (they are not shipped here). Without input and output prices, `cost_usd` is null.
+# Providers with prompt caching (OpenAI, Anthropic) bill cached tokens differently, so set the
+# cache prices too; unset, cache reads and writes are metered at the input price and the gateway
+# logs a startup warning. Cost = uncached input + cache reads + cache writes + output.
+# price_in_per_mtok = <input>
+# price_out_per_mtok = <output>
+# price_cache_read_per_mtok = <cached input>     # OpenAI cached_tokens, Anthropic cache reads
+# price_cache_write_per_mtok = <cache write>     # Anthropic cache writes (5-minute TTL)
+# price_cache_write_1h_per_mtok = <cache write>  # Anthropic cache writes with the 1-hour TTL
+# Streams always ask the upstream for usage (`stream_options.include_usage`). For a server that
+# rejects `stream_options`, set this; its streams are then metered from an estimate:
+# [models.capabilities]
+# rejects_stream_options = true
 
 # ─────────────── Tenants ───────────────
 [[tenants]]

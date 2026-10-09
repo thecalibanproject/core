@@ -22,6 +22,8 @@ fn model_json(cp: &Cp, m: &ModelEntry) -> Value {
         "upstream_model": m.upstream_model, "kind": m.kind, "family": m.family, "capabilities": m.capabilities,
         "trust_tier": m.trust_tier, "licence": m.licence, "context_window": m.context_window,
         "price_in_per_mtok": m.price_in_per_mtok, "price_out_per_mtok": m.price_out_per_mtok,
+        "price_cache_read_per_mtok": m.price_cache_read_per_mtok, "price_cache_write_per_mtok": m.price_cache_write_per_mtok,
+        "price_cache_write_1h_per_mtok": m.price_cache_write_1h_per_mtok,
     })
 }
 
@@ -225,6 +227,9 @@ pub(crate) fn suggest(p: &ProviderConfig, upstream: &str, context_window: Option
         context_window,
         price_in_per_mtok: Some(0.0),
         price_out_per_mtok: Some(0.0),
+        price_cache_read_per_mtok: None,
+        price_cache_write_per_mtok: None,
+        price_cache_write_1h_per_mtok: None,
     }
 }
 

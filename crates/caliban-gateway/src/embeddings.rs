@@ -5,6 +5,7 @@
 //! identical texts embed differently.
 
 use crate::error::Dialect;
+use crate::metering::Metered;
 use crate::pipeline::{Outcome, caliban_headers, finish, resolve};
 use crate::{ApiError, Gateway, auth, limits, telemetry};
 use axum::body::Bytes;
@@ -77,8 +78,12 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
         }
     };
     out["model"] = Value::String(model.id.to_string());
-    let usage = Usage { prompt_tokens: out.pointer("/usage/prompt_tokens").and_then(Value::as_u64).unwrap_or(0), ..Usage::default() };
-    telemetry::record_usage(&us, usage);
+    // The provider's count; the request estimate when the upstream reports none.
+    let usage = match out.pointer("/usage/prompt_tokens").and_then(Value::as_u64) {
+        Some(n) => Metered::provider(Usage { prompt_tokens: n, ..Usage::default() }),
+        None => Metered::estimated(Usage { prompt_tokens: est, ..Usage::default() }),
+    };
+    telemetry::record_usage(&us, usage.usage);
     let outcome = Outcome {
         request_id,
         tenant_id: tenant.id.to_string(),
@@ -92,8 +97,9 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
         span,
         est_prompt_tokens: est,
         route: None,
+        client_usage: true,
     };
-    finish(&gw, &outcome, usage, 0, settlement, 0).await;
+    finish(&gw, &outcome, usage, 0, settlement).await;
     let mut resp = axum::Json(out).into_response();
     caliban_headers(resp.headers_mut(), &outcome);
     Ok(resp)

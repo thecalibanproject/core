@@ -3,23 +3,33 @@
 use crate::Usage;
 use serde_json::{Value, json};
 
-/// Anthropic `usage` from IR usage. Anthropic's `input_tokens` excludes cache reads.
+/// Anthropic `usage` from IR usage. Anthropic's `input_tokens` excludes cache reads and writes.
 pub fn anthropic_usage(u: Usage) -> Value {
     json!({
-        "input_tokens": u.prompt_tokens.saturating_sub(u.cached_prompt_tokens),
+        "input_tokens": u.uncached_prompt_tokens(),
         "output_tokens": u.completion_tokens,
         "cache_read_input_tokens": u.cached_prompt_tokens,
-        "cache_creation_input_tokens": 0,
+        "cache_creation_input_tokens": u.cache_write_tokens,
     })
 }
 
-/// OpenAI `usage` from IR usage.
+/// OpenAI `usage` from IR usage. Cache writes (an Anthropic upstream translated for an OpenAI
+/// client) are reported as `prompt_tokens_details.cache_write_tokens` (and
+/// `cache_write_1h_tokens` for the 1-hour TTL), only when non-zero; OpenAI SDKs ignore the extra
+/// keys, and the gateway meters cache writes from them.
 pub fn openai_usage(u: Usage) -> Value {
+    let mut details = json!({ "cached_tokens": u.cached_prompt_tokens });
+    if u.cache_write_tokens > 0 {
+        details["cache_write_tokens"] = json!(u.cache_write_tokens);
+    }
+    if u.cache_write_1h_tokens > 0 {
+        details["cache_write_1h_tokens"] = json!(u.cache_write_1h_tokens);
+    }
     json!({
         "prompt_tokens": u.prompt_tokens,
         "completion_tokens": u.completion_tokens,
         "total_tokens": u.prompt_tokens + u.completion_tokens,
-        "prompt_tokens_details": { "cached_tokens": u.cached_prompt_tokens },
+        "prompt_tokens_details": details,
     })
 }
 

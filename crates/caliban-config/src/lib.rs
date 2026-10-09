@@ -637,6 +637,38 @@ pub struct ModelEntry {
     pub context_window: Option<u32>,
     pub price_in_per_mtok: Option<f64>,
     pub price_out_per_mtok: Option<f64>,
+    /// Price of prompt tokens read from the provider's prompt cache (OpenAI `cached_tokens`,
+    /// Anthropic `cache_read_input_tokens`). Unset: `price_in_per_mtok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_cache_read_per_mtok: Option<f64>,
+    /// Price of prompt tokens written to the provider's prompt cache (Anthropic
+    /// `cache_creation_input_tokens`, default 5-minute TTL). Unset: `price_in_per_mtok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_cache_write_per_mtok: Option<f64>,
+    /// Price of cache writes with Anthropic's 1-hour TTL (`cache_creation.ephemeral_1h_input_tokens`).
+    /// Unset: `price_cache_write_per_mtok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_cache_write_1h_per_mtok: Option<f64>,
+}
+
+impl ModelEntry {
+    /// True when any prompt-cache price is configured.
+    pub fn has_cache_prices(&self) -> bool {
+        self.price_cache_read_per_mtok.is_some() || self.price_cache_write_per_mtok.is_some() || self.price_cache_write_1h_per_mtok.is_some()
+    }
+
+    fn validate_prices(&self) -> Result<(), ConfigError> {
+        for (what, v) in [
+            ("price_cache_read_per_mtok", self.price_cache_read_per_mtok),
+            ("price_cache_write_per_mtok", self.price_cache_write_per_mtok),
+            ("price_cache_write_1h_per_mtok", self.price_cache_write_1h_per_mtok),
+        ] {
+            if v.is_some_and(|p| !p.is_finite() || p < 0.0) {
+                return Err(ConfigError::Invalid(format!("model {}: {what} must be a non-negative number", self.id)));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -711,6 +743,11 @@ pub struct Capabilities {
     /// Caliban moves it to `reasoning_content`.
     #[serde(default)]
     pub inline_think_tags: bool,
+    /// The server rejects `stream_options` (some older OpenAI-compatible servers and proxies).
+    /// Caliban then does not ask for usage on streams, and meters them from an estimate
+    /// (`usage_source: "estimated"`). Omitted from the rendered snapshot when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rejects_stream_options: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -808,6 +845,9 @@ impl Config {
         let models: HashMap<&ModelId, &ModelEntry> = self.models.iter().map(|m| (&m.id, m)).collect();
         if models.len() != self.models.len() {
             return Err(ConfigError::Invalid("duplicate model id".into()));
+        }
+        for m in &self.models {
+            m.validate_prices()?;
         }
         let mut shared_ids = std::collections::HashSet::new();
         for p in &self.providers {
@@ -1160,5 +1200,29 @@ mod tests {
         for bad in ["store = \"redis\"", "valkey_key_prefix = \"a{b}\"", "valkey_key_prefix = \"\"", "valkey_timeout_ms = 0", "valkey_timeout_ms = 5000"] {
             assert!(Config::from_toml_str(&format!("{SHARED}\n[limits]\n{bad}\n")).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn cache_prices_parse_validate_and_are_omitted_when_unset() {
+        let model = |extra: &str| {
+            format!("[[models]]\nid = \"ext/m\"\nprovider = \"vllm-qwen\"\nupstream_model = \"m\"\ntrust_tier = \"t2_contracted\"\nprice_in_per_mtok = 3.0\nprice_out_per_mtok = 15.0\n{extra}\n")
+        };
+        let cfg = Config::from_toml_str(&format!(
+            "{SHARED}\n{}",
+            model("price_cache_read_per_mtok = 0.3\nprice_cache_write_per_mtok = 3.75\nprice_cache_write_1h_per_mtok = 6.0\n[models.capabilities]\nrejects_stream_options = true")
+        ))
+        .unwrap();
+        let m = cfg.models.iter().find(|m| m.id.as_str() == "ext/m").unwrap();
+        assert_eq!((m.price_cache_read_per_mtok, m.price_cache_write_per_mtok, m.price_cache_write_1h_per_mtok), (Some(0.3), Some(3.75), Some(6.0)));
+        assert!(m.has_cache_prices() && m.capabilities.rejects_stream_options);
+        for bad in ["price_cache_read_per_mtok = -0.1", "price_cache_write_per_mtok = nan", "price_cache_write_1h_per_mtok = -1.0"] {
+            assert!(Config::from_toml_str(&format!("{SHARED}\n{}", model(bad))).is_err(), "{bad}");
+        }
+        // Unset fields stay out of the rendered snapshot, so routers that predate them still parse it.
+        let cfg = Config::from_toml_str(&format!("{SHARED}\n{}", model(""))).unwrap();
+        let m = cfg.models.iter().find(|m| m.id.as_str() == "ext/m").unwrap();
+        let v = serde_json::to_value(m).unwrap();
+        assert!(v.get("price_cache_read_per_mtok").is_none() && v["capabilities"].get("rejects_stream_options").is_none(), "{v}");
+        assert!(!m.has_cache_prices());
     }
 }

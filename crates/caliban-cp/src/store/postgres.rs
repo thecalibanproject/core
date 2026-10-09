@@ -30,6 +30,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (4, "pii_surrogate_scope", include_str!("../../../../migrations/0004_pii_surrogate_scope.sql")),
     (5, "usage_routing", include_str!("../../../../migrations/0005_usage_routing.sql")),
     (6, "tenant_semantic_cache", include_str!("../../../../migrations/0006_tenant_semantic_cache.sql")),
+    (7, "usage_cache_tier", include_str!("../../../../migrations/0007_usage_cache_tier.sql")),
 ];
 
 /// Advisory lock keys ("calibn" + n).
@@ -109,6 +110,52 @@ impl PgBackend {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Appends usage events to `usage_event` (idempotent on `request_id`, so a shipper can retry
+    /// a batch). Not called by the data plane yet: routers keep events in their WAL and ring
+    /// until usage shipping lands; this is the column mapping it will use.
+    pub async fn insert_usage_events(&self, events: &[caliban_meter::UsageEvent]) -> Result<u64, StoreError> {
+        let mut inserted = 0;
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        for e in events {
+            let r = sqlx::query(
+                "INSERT INTO usage_event (request_id, tenant_id, model, intent, prompt_tokens, completion_tokens,
+                                          cached_prompt_tokens, tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts,
+                                          requested_model, intent_confidence, route_stage, routed_model_cost_usd, flat_price_usd,
+                                          cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                 ON CONFLICT (request_id) DO NOTHING",
+            )
+            .bind(&e.request_id)
+            .bind(&e.tenant_id)
+            .bind(&e.model)
+            .bind(&e.intent)
+            .bind(i64_of(e.prompt_tokens))
+            .bind(i64_of(e.completion_tokens))
+            .bind(i64_of(e.cached_prompt_tokens))
+            .bind(i64_of(e.tokens_saved))
+            .bind(e.cache.as_str())
+            .bind(i32::try_from(e.pii_entities).unwrap_or(i32::MAX))
+            .bind(e.cost_usd)
+            .bind(i64_of(e.latency_ms))
+            .bind(e.ts)
+            .bind(&e.requested_model)
+            .bind(e.intent_confidence)
+            .bind(&e.route_stage)
+            .bind(e.routed_model_cost_usd)
+            .bind(e.flat_price_usd)
+            .bind(e.cache_tier.map(|t| t.as_str()))
+            .bind(e.usage_source.map(caliban_meter::UsageSource::as_str))
+            .bind(i64_of(e.cache_write_tokens))
+            .bind(i64_of(e.cache_write_1h_tokens))
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+            inserted += r.rows_affected();
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(inserted)
     }
 
     /// Applies pending migrations; refuses to start if an applied migration was edited.
@@ -405,8 +452,9 @@ async fn insert_model(c: &mut PgConnection, m: &ModelEntry) -> Result<(), StoreE
         c,
         sqlx::query(
             "INSERT INTO model (id, provider_id, upstream_model, kind, family, capabilities, trust_tier, licence,
-                                context_window, price_in_per_mtok, price_out_per_mtok)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                                context_window, price_in_per_mtok, price_out_per_mtok,
+                                price_cache_read_per_mtok, price_cache_write_per_mtok, price_cache_write_1h_per_mtok)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(m.id.to_string())
         .bind(m.provider.to_string())
@@ -418,7 +466,10 @@ async fn insert_model(c: &mut PgConnection, m: &ModelEntry) -> Result<(), StoreE
         .bind(&m.licence)
         .bind(m.context_window.map(|n| i32::try_from(n).unwrap_or(i32::MAX)))
         .bind(m.price_in_per_mtok)
-        .bind(m.price_out_per_mtok),
+        .bind(m.price_out_per_mtok)
+        .bind(m.price_cache_read_per_mtok)
+        .bind(m.price_cache_write_per_mtok)
+        .bind(m.price_cache_write_1h_per_mtok),
     )
     .await
 }
@@ -651,7 +702,8 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     for r in rows(
         c,
         "SELECT id, provider_id, upstream_model, kind, family, capabilities, trust_tier, licence, context_window,
-                price_in_per_mtok, price_out_per_mtok
+                price_in_per_mtok, price_out_per_mtok,
+                price_cache_read_per_mtok, price_cache_write_per_mtok, price_cache_write_1h_per_mtok
          FROM model ORDER BY ord",
     )
     .await?
@@ -668,6 +720,9 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             context_window: get::<Option<i32>>(&r, "context_window")?.and_then(|n| u32::try_from(n).ok()),
             price_in_per_mtok: get(&r, "price_in_per_mtok")?,
             price_out_per_mtok: get(&r, "price_out_per_mtok")?,
+            price_cache_read_per_mtok: get(&r, "price_cache_read_per_mtok")?,
+            price_cache_write_per_mtok: get(&r, "price_cache_write_per_mtok")?,
+            price_cache_write_1h_per_mtok: get(&r, "price_cache_write_1h_per_mtok")?,
         });
     }
 

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use caliban_config::signing::{SnapshotSigner, SnapshotVerifier, generate_signing_key};
 use caliban_config::{Config, ConfigHandle, Snapshot};
-use caliban_meter::{JsonlSink, RecentUsage, Tee, UsageSink};
+use caliban_meter::{FsyncPolicy, JsonlSink, RecentUsage, Tee, UsageSink, WalOptions};
 use clap::{Parser, Subcommand};
 use rand::RngCore;
 use std::path::PathBuf;
@@ -26,6 +26,14 @@ struct Cli {
     /// Append usage events to this JSONL file (write-ahead log for billing).
     #[arg(long, env = "CALIBAN_USAGE_WAL", global = true)]
     usage_wal: Option<String>,
+    /// When the usage WAL calls fdatasync: `off` (default; the OS writes back, graceful shutdown
+    /// syncs) or `batch` (after every written batch).
+    #[arg(long, env = "CALIBAN_USAGE_WAL_FSYNC", default_value = "off", global = true)]
+    usage_wal_fsync: FsyncPolicy,
+    /// Usage events the WAL queue holds before requests wait (up to 20 ms) or the event is dropped
+    /// and counted in /healthz.
+    #[arg(long, env = "CALIBAN_USAGE_WAL_QUEUE", default_value_t = 16_384, global = true)]
+    usage_wal_queue: usize,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -106,10 +114,16 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
+    // The usage WAL: written by a background task, flushed on graceful shutdown.
+    let wal: Option<Arc<JsonlSink>> = cli.usage_wal.as_ref().map(|path| {
+        let opts = WalOptions { queue: cli.usage_wal_queue.max(1), fsync: cli.usage_wal_fsync, ..WalOptions::default() };
+        tracing::info!(path = %path, fsync = opts.fsync.as_str(), queue = opts.queue, "usage WAL enabled");
+        Arc::new(JsonlSink::with_options(path, opts))
+    });
     let usage_sinks = |recent: &RecentUsage| -> Arc<dyn UsageSink> {
         let mut sinks: Vec<Arc<dyn UsageSink>> = vec![Arc::new(recent.clone())];
-        if let Some(path) = &cli.usage_wal {
-            sinks.push(Arc::new(JsonlSink::new(path)));
+        if let Some(w) = &wal {
+            sinks.push(Arc::clone(w) as Arc<dyn UsageSink>);
         }
         Arc::new(Tee(sinks))
     };
@@ -129,7 +143,9 @@ async fn main() -> Result<()> {
         let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default()))?);
         spawn_router_warmup(&gw);
         gw.spawn_tenant_purge(PURGE_EVERY);
-        return serve("router", listen.clone(), caliban_gateway::app(gw)).await;
+        let res = serve("router", listen.clone(), caliban_gateway::app(gw)).await;
+        flush_wal(wal.as_deref()).await;
+        return res;
     }
 
     let cfg = Config::from_file(&cli.config).with_context(|| format!("loading {}", cli.config))?;
@@ -147,7 +163,7 @@ async fn main() -> Result<()> {
     let router_addr = cfg.server.router_addr.clone();
     let router_task = move || serve("router", router_addr.clone(), caliban_gateway::app(Arc::clone(&gw)));
 
-    match cli.cmd {
+    let res = match cli.cmd {
         Cmd::Router(_) => {
             purge_gw.spawn_tenant_purge(PURGE_EVERY);
             router_task().await
@@ -164,6 +180,16 @@ async fn main() -> Result<()> {
             tokio::try_join!(router_task(), cp).map(|_| ())
         }
         Cmd::CheckConfig | Cmd::Keygen | Cmd::GenKek | Cmd::GenSigningKey | Cmd::Healthcheck { .. } => unreachable!(),
+    };
+    flush_wal(wal.as_deref()).await;
+    res
+}
+
+/// Graceful shutdown of the usage WAL: everything recorded so far is written and synced, and
+/// streams that finish shortly after the server stopped accepting are still recorded.
+async fn flush_wal(wal: Option<&JsonlSink>) {
+    if let Some(w) = wal {
+        w.shutdown(Duration::from_secs(2)).await;
     }
 }
 
