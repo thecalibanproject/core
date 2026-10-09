@@ -721,6 +721,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
@@ -766,6 +767,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

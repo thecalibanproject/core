@@ -9,7 +9,10 @@
 mod secret;
 pub mod signing;
 
-pub use secret::{Secret, SecretRef, open, process_kek, seal};
+pub use secret::{
+    Dek, KEK_ENV, KEK_PREVIOUS_ENV, Keyring, Secret, SecretRef, TenantSealed, WrappedDek, kek_id, open, process_kek,
+    process_keyring, seal,
+};
 
 use arc_swap::ArcSwap;
 use caliban_types::{
