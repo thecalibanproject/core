@@ -79,6 +79,9 @@ pub struct Tenant {
     pub pii_surrogate_scope: PiiSurrogateScope,
     /// T2 semantic cache for this tenant (`off` by default; also needs `[cache.semantic] enabled`).
     pub semantic_cache: SemanticCacheMode,
+    /// Fraction of the flat `caliban/auto` price billed for a cache hit, in 0..=1. `None`: the
+    /// deployment's `[routing] auto_cache_hit_fraction` (default 0.20).
+    pub auto_cache_hit_fraction: Option<f64>,
     pub created_at: DateTime<Utc>,
     pub status: TenantStatus,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -204,6 +207,7 @@ impl State {
                 pii_default: t.pii_mode.unwrap_or(base.pii.default_mode),
                 pii_surrogate_scope: t.pii_surrogate_scope,
                 semantic_cache: t.semantic_cache,
+                auto_cache_hit_fraction: t.auto_cache_hit_fraction,
                 created_at: now,
                 status: TenantStatus::Active,
                 deleted_at: None,
@@ -293,8 +297,17 @@ impl NodeRecord {
 }
 
 /// `TenantConfig` fields the store models explicitly; anything else is kept in `settings`.
-const TENANT_FIELDS: &[&str] =
-    &["id", "name", "pii_mode", "pii_surrogate_scope", "semantic_cache", "api_key_hashes", "providers", "routes"];
+const TENANT_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "pii_mode",
+    "pii_surrogate_scope",
+    "semantic_cache",
+    "auto_cache_hit_fraction",
+    "api_key_hashes",
+    "providers",
+    "routes",
+];
 
 fn tenant_settings(t: &TenantConfig) -> Map<String, Value> {
     match serde_json::to_value(t) {
@@ -358,6 +371,9 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
             obj.insert("pii_mode".into(), json!(t.pii_default));
             obj.insert("pii_surrogate_scope".into(), json!(t.pii_surrogate_scope));
             obj.insert("semantic_cache".into(), json!(t.semantic_cache));
+            if let Some(f) = t.auto_cache_hit_fraction {
+                obj.insert("auto_cache_hit_fraction".into(), json!(f));
+            }
             obj.insert(
                 "api_key_hashes".into(),
                 json!(
@@ -420,6 +436,8 @@ pub enum Mutation {
         pii_default: Option<PiiMode>,
         pii_surrogate_scope: Option<PiiSurrogateScope>,
         semantic_cache: Option<SemanticCacheMode>,
+        /// `Some(None)` clears the override (back to the deployment value).
+        auto_cache_hit_fraction: Option<Option<f64>>,
     },
     CreateProviderKey(ProviderKeyRecord),
     DeleteProviderKey {
@@ -548,24 +566,32 @@ impl Mutation {
             detail,
         };
         match self {
-            Mutation::CreateTenant(t) => d(
-                Some(&t.id),
-                "tenant.create",
-                &t.id,
-                json!({"name": t.name, "pii_default": t.pii_default, "pii_surrogate_scope": t.pii_surrogate_scope, "semantic_cache": t.semantic_cache}),
-            ),
-            Mutation::UpdateTenant { id, pii_default, pii_surrogate_scope, semantic_cache } => {
+            Mutation::CreateTenant(t) => {
+                let mut detail = json!({"name": t.name, "pii_default": t.pii_default, "pii_surrogate_scope": t.pii_surrogate_scope, "semantic_cache": t.semantic_cache});
+                if let Some(f) = t.auto_cache_hit_fraction {
+                    detail["auto_cache_hit_fraction"] = json!(f);
+                }
+                d(Some(&t.id), "tenant.create", &t.id, detail)
+            }
+            Mutation::UpdateTenant {
+                id,
+                pii_default,
+                pii_surrogate_scope,
+                semantic_cache,
+                auto_cache_hit_fraction,
+            } => {
                 let t = before.tenant(id);
-                d(
-                    Some(id),
-                    "tenant.update",
-                    id,
-                    json!({
-                        "pii_default": {"from": t.map(|t| t.pii_default), "to": pii_default},
-                        "pii_surrogate_scope": {"from": t.map(|t| t.pii_surrogate_scope), "to": pii_surrogate_scope},
-                        "semantic_cache": {"from": t.map(|t| t.semantic_cache), "to": semantic_cache},
-                    }),
-                )
+                let mut detail = json!({
+                    "pii_default": {"from": t.map(|t| t.pii_default), "to": pii_default},
+                    "pii_surrogate_scope": {"from": t.map(|t| t.pii_surrogate_scope), "to": pii_surrogate_scope},
+                    "semantic_cache": {"from": t.map(|t| t.semantic_cache), "to": semantic_cache},
+                });
+                // Only when changed: `to: null` here means "cleared", not "kept".
+                if let Some(to) = auto_cache_hit_fraction {
+                    detail["auto_cache_hit_fraction"] =
+                        json!({"from": t.and_then(|t| t.auto_cache_hit_fraction), "to": to});
+                }
+                d(Some(id), "tenant.update", id, detail)
             }
             Mutation::CreateApiKey(k) => {
                 d(Some(&k.tenant_id), "api_key.create", &k.id, json!({"name": k.name, "prefix": k.prefix}))

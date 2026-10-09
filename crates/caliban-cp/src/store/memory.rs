@@ -81,6 +81,7 @@ fn need_tenant(st: &State, id: &str) -> Result<(), StoreError> {
 pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
     match m {
         Mutation::CreateTenant(t) => {
+            check_fraction(t.auto_cache_hit_fraction)?;
             match st.tenant_record(&t.id) {
                 Some(x) if x.is_active() => {
                     return Err(StoreError::Conflict(format!("tenant '{}' already exists", t.id)));
@@ -119,7 +120,7 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 n.deleted_at = Some(*at);
             }
         }
-        Mutation::UpdateTenant { id, pii_default, pii_surrogate_scope, semantic_cache } => {
+        Mutation::UpdateTenant { id, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction } => {
             let t = st
                 .tenants
                 .iter_mut()
@@ -133,6 +134,10 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             }
             if let Some(s) = semantic_cache {
                 t.semantic_cache = *s;
+            }
+            if let Some(f) = auto_cache_hit_fraction {
+                check_fraction(*f)?;
+                t.auto_cache_hit_fraction = *f;
             }
         }
         Mutation::CreateApiKey(k) => {
@@ -328,4 +333,15 @@ fn rekey(st: &mut State, r: &super::Rekey) -> Result<(), StoreError> {
         ds.connection = c.next.clone();
     }
     Ok(())
+}
+
+/// Range check before any backend write (the Postgres CHECK constraint would otherwise surface as
+/// a backend error rather than an invalid request).
+fn check_fraction(f: Option<f64>) -> Result<(), StoreError> {
+    match f {
+        Some(f) if !f.is_finite() || !(0.0..=1.0).contains(&f) => {
+            Err(StoreError::Invalid(format!("auto_cache_hit_fraction must be in 0..=1, got {f}")))
+        }
+        _ => Ok(()),
+    }
 }

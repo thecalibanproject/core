@@ -88,6 +88,7 @@ fn tenant(id: &str) -> Tenant {
         pii_default: PiiMode::Off,
         pii_surrogate_scope: PiiSurrogateScope::Tenant,
         semantic_cache: SemanticCacheMode::Off,
+        auto_cache_hit_fraction: None,
         created_at: ts(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -183,6 +184,7 @@ async fn suite(s: &Store) {
         pii_default: None,
         pii_surrogate_scope: Some(PiiSurrogateScope::Session),
         semantic_cache: None,
+        auto_cache_hit_fraction: None,
     };
     s.apply(A, to_session).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
@@ -197,6 +199,7 @@ async fn suite(s: &Store) {
         pii_default: None,
         pii_surrogate_scope: None,
         semantic_cache: Some(SemanticCacheMode::On),
+        auto_cache_hit_fraction: None,
     };
     s.apply(A, on).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
@@ -208,11 +211,47 @@ async fn suite(s: &Store) {
     let snap = s.config.load();
     assert_eq!(snap.tenant(&"globex".into()).unwrap().semantic_cache, SemanticCacheMode::On);
     assert_eq!(snap.tenant(&"acme".into()).unwrap().semantic_cache, SemanticCacheMode::Off);
+    // Cache-hit billing: a per-tenant fraction of the flat auto price, shipped in the snapshot,
+    // audited with from/to, validated (0..=1), and cleared back to the deployment value.
+    let fraction = |f: Option<Option<f64>>| Mutation::UpdateTenant {
+        id: "globex".into(),
+        pii_default: None,
+        pii_surrogate_scope: None,
+        semantic_cache: None,
+        auto_cache_hit_fraction: f,
+    };
+    s.apply(A, fraction(Some(Some(0.1)))).await.unwrap();
+    assert_eq!(s.state().tenant("globex").unwrap().auto_cache_hit_fraction, Some(0.1));
+    assert_eq!(s.state().tenant("globex").unwrap().semantic_cache, SemanticCacheMode::On, "other settings kept");
+    let snap = s.config.load();
+    assert!((snap.auto_cache_hit_fraction_for(snap.tenant(&"globex".into()).unwrap()) - 0.1).abs() < f64::EPSILON);
+    assert!(
+        (snap.auto_cache_hit_fraction_for(snap.tenant(&"acme".into()).unwrap())
+            - caliban_config::DEFAULT_AUTO_CACHE_HIT_FRACTION)
+            .abs()
+            < f64::EPSILON
+    );
+    let a = s.audit(1).await.unwrap().pop().unwrap();
+    assert_eq!(a.detail["auto_cache_hit_fraction"], json!({"from": null, "to": 0.1}));
+    assert!(matches!(s.apply(A, fraction(Some(Some(1.5)))).await.unwrap_err(), StoreError::Invalid(_)));
+    s.apply(A, fraction(None)).await.unwrap();
+    assert_eq!(s.state().tenant("globex").unwrap().auto_cache_hit_fraction, Some(0.1), "absent keeps the value");
+    assert!(s.audit(1).await.unwrap().pop().unwrap().detail.get("auto_cache_hit_fraction").is_none());
+    s.apply(A, fraction(Some(Some(0.15)))).await.unwrap();
+    s.apply(A, fraction(Some(None))).await.unwrap();
+    assert_eq!(s.state().tenant("globex").unwrap().auto_cache_hit_fraction, None, "cleared");
+    assert_eq!(
+        s.audit(1).await.unwrap().pop().unwrap().detail["auto_cache_hit_fraction"],
+        json!({"from": 0.15, "to": null})
+    );
+    assert!(s.config.load().tenant(&"globex".into()).unwrap().auto_cache_hit_fraction.is_none());
+    s.apply(A, fraction(Some(Some(0.125)))).await.unwrap();
     let ghost = Mutation::UpdateTenant {
         id: "nobody".into(),
         pii_default: Some(PiiMode::Mask),
         pii_surrogate_scope: None,
         semantic_cache: None,
+        auto_cache_hit_fraction: None,
     };
     assert_eq!(s.apply(A, ghost).await.unwrap_err(), StoreError::NotFound("tenant".into()));
     let key = ApiKeyRecord {
@@ -1008,6 +1047,9 @@ async fn postgres_usage_events_carry_cache_tier_and_usage_source() {
     hit.cache = caliban_types::CacheStatus::Hit;
     hit.cache_tier = Some(caliban_types::CacheTier::Semantic);
     hit.usage_source = None;
+    hit.billed_usd = Some(0.0001);
+    hit.saved_usd = Some(0.0004);
+    e.billed_usd = Some(0.0005);
     assert_eq!(pg.insert_usage_events(&[e.clone(), hit]).await.unwrap(), 2);
     e.prompt_tokens = 1;
     assert_eq!(pg.insert_usage_events(&[e]).await.unwrap(), 0, "idempotent on request_id");
@@ -1025,6 +1067,12 @@ async fn postgres_usage_events_carry_cache_tier_and_usage_source() {
             ("req_2".into(), Some("semantic".into()), None, 50, 30, 160),
         ]
     );
+    let billing: Vec<(Option<f64>, Option<f64>)> =
+        sqlx::query_as("SELECT billed_usd, saved_usd FROM usage_event ORDER BY request_id")
+            .fetch_all(pg.pool())
+            .await
+            .unwrap();
+    assert_eq!(billing, vec![(Some(0.0005), None), (Some(0.0001), Some(0.0004))]);
     // The CHECK constraints reject unknown values.
     assert!(
         sqlx::query("UPDATE usage_event SET usage_source = 'guess' WHERE request_id = 'req_1'")

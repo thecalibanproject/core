@@ -35,6 +35,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (6, "tenant_semantic_cache", include_str!("../../../../migrations/0006_tenant_semantic_cache.sql")),
     (7, "usage_cache_tier", include_str!("../../../../migrations/0007_usage_cache_tier.sql")),
     (8, "tenant_data_keys", include_str!("../../../../migrations/0008_tenant_data_keys.sql")),
+    (10, "cache_hit_billing", include_str!("../../../../migrations/0010_cache_hit_billing.sql")),
 ];
 
 /// Advisory lock keys ("calibn" + n).
@@ -160,8 +161,8 @@ impl PgBackend {
                 "INSERT INTO usage_event (request_id, tenant_id, model, intent, prompt_tokens, completion_tokens,
                                           cached_prompt_tokens, tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts,
                                           requested_model, intent_confidence, route_stage, routed_model_cost_usd, flat_price_usd,
-                                          cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                                          cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens, billed_usd, saved_usd)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
                  ON CONFLICT (request_id) DO NOTHING",
             )
             .bind(&e.request_id)
@@ -186,6 +187,8 @@ impl PgBackend {
             .bind(e.usage_source.map(caliban_meter::UsageSource::as_str))
             .bind(i64_of(e.cache_write_tokens))
             .bind(i64_of(e.cache_write_1h_tokens))
+            .bind(e.billed_usd)
+            .bind(e.saved_usd)
             .execute(&mut *tx)
             .await
             .map_err(db)?;
@@ -350,14 +353,16 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
         Mutation::DeleteTenant { id, at } => delete_tenant(c, id, *at).await,
         Mutation::UpdateTenant { id, .. } => {
             let t = next.tenant(id).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
-            let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3, semantic_cache = $4 WHERE id = $1 AND status = 'active'";
+            let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3, semantic_cache = $4, auto_cache_hit_fraction = $5
+                     WHERE id = $1 AND status = 'active'";
             exec(
                 c,
                 sqlx::query(q)
                     .bind(id)
                     .bind(enum_str(&t.pii_default))
                     .bind(t.pii_surrogate_scope.as_str())
-                    .bind(t.semantic_cache.as_str()),
+                    .bind(t.semantic_cache.as_str())
+                    .bind(t.auto_cache_hit_fraction),
             )
             .await
         }
@@ -517,8 +522,9 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
     exec(
         c,
         sqlx::query(
-            "INSERT INTO tenant (id, name, region, pii_default, pii_surrogate_scope, semantic_cache, settings, created_at, status, deleted_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            "INSERT INTO tenant (id, name, region, pii_default, pii_surrogate_scope, semantic_cache, settings, created_at, status, deleted_at,
+                                 auto_cache_hit_fraction)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(&t.id)
         .bind(&t.name)
@@ -529,7 +535,8 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         .bind(Json(Value::Object(t.settings.clone())))
         .bind(t.created_at)
         .bind(t.status.as_str())
-        .bind(t.deleted_at),
+        .bind(t.deleted_at)
+        .bind(t.auto_cache_hit_fraction),
     )
     .await
 }
@@ -784,7 +791,7 @@ async fn rows(c: &mut PgConnection, sql: &'static str) -> Result<Vec<PgRow>, Sto
 async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     let mut st = State::default();
 
-    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
         st.tenants.push(Tenant {
             id: get(&r, "id")?,
             name: get(&r, "name")?,
@@ -792,6 +799,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             pii_default: parse_enum(get(&r, "pii_default")?)?,
             pii_surrogate_scope: parse_enum(get(&r, "pii_surrogate_scope")?)?,
             semantic_cache: parse_enum(get(&r, "semantic_cache")?)?,
+            auto_cache_hit_fraction: get(&r, "auto_cache_hit_fraction")?,
             created_at: get(&r, "created_at")?,
             status: match get::<String>(&r, "status")?.as_str() {
                 "deleted" => TenantStatus::Deleted,

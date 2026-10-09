@@ -326,6 +326,7 @@ struct TenantCreate {
     pii_default: Option<PiiMode>,
     pii_surrogate_scope: Option<PiiSurrogateScope>,
     semantic_cache: Option<SemanticCacheMode>,
+    auto_cache_hit_fraction: Option<f64>,
 }
 
 async fn create_tenant(State(cp): State<Cp>, Json(body): Json<TenantCreate>) -> ApiResult<(StatusCode, Json<Tenant>)> {
@@ -340,6 +341,7 @@ async fn create_tenant(State(cp): State<Cp>, Json(body): Json<TenantCreate>) -> 
         pii_default: body.pii_default.unwrap_or(cp.store.base().pii.default_mode),
         pii_surrogate_scope: body.pii_surrogate_scope.unwrap_or_default(),
         semantic_cache: body.semantic_cache.unwrap_or_default(),
+        auto_cache_hit_fraction: body.auto_cache_hit_fraction,
         created_at: now_micros(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -359,10 +361,22 @@ struct TenantUpdate {
     pii_default: Option<PiiMode>,
     pii_surrogate_scope: Option<PiiSurrogateScope>,
     semantic_cache: Option<SemanticCacheMode>,
+    /// Absent: kept. `null`: cleared (the deployment value applies). A number in 0..=1: set.
+    #[serde(default, deserialize_with = "present")]
+    auto_cache_hit_fraction: Option<Option<f64>>,
 }
 
-/// Changes a tenant's PII and cache settings (absent fields are kept). Audited; routers pick it up
-/// with the next snapshot.
+/// Tells an explicit `null` (`Some(None)`) from an absent field (`None`, with `#[serde(default)]`).
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// Changes a tenant's PII, cache and cache-hit billing settings (absent fields are kept). Audited;
+/// routers pick it up with the next snapshot.
 async fn update_tenant(
     State(cp): State<Cp>,
     Path(tenant_id): Path<String>,
@@ -373,6 +387,7 @@ async fn update_tenant(
         pii_default: body.pii_default,
         pii_surrogate_scope: body.pii_surrogate_scope,
         semantic_cache: body.semantic_cache,
+        auto_cache_hit_fraction: body.auto_cache_hit_fraction,
     };
     let st = cp.store.apply(ADMIN_ACTOR, m).await?;
     st.tenant(&tenant_id).cloned().map(Json).ok_or_else(|| not_found("tenant"))
@@ -726,6 +741,8 @@ struct UsageQuery {
 async fn usage(State(cp): State<Cp>, Query(q): Query<UsageQuery>) -> Json<Value> {
     let events = cp.store.usage.snapshot(q.tenant_id.as_deref(), q.limit.unwrap_or(100).min(1000));
     let all = cp.store.usage.snapshot(q.tenant_id.as_deref(), usize::MAX);
+    let auto = all.iter().filter(|e| e.requested_model.as_deref() == Some("caliban/auto"));
+    let priced = all.iter().filter(|e| e.margin_usd().is_some());
     let totals = json!({
         "requests": all.len(),
         "prompt_tokens": all.iter().map(|e| e.prompt_tokens).sum::<u64>(),
@@ -735,14 +752,20 @@ async fn usage(State(cp): State<Cp>, Query(q): Query<UsageQuery>) -> Json<Value>
         // Requests whose tokens are a gateway estimate (disconnects, streams without usage).
         "estimated_requests": all.iter().filter(|e| e.usage_source == Some(caliban_meter::UsageSource::Estimated)).count(),
         "cache_hits": all.iter().filter(|e| e.cache == caliban_types::CacheStatus::Hit).count(),
+        // What cache hits of both tiers saved customers (see `UsageEvent::saved_usd`).
+        "saved_usd": all.iter().filter_map(|e| e.saved_usd).sum::<f64>(),
         "semantic_cache_hits": all.iter().filter(|e| e.cache_tier == Some(caliban_types::CacheTier::Semantic)).count(),
         "tokens_saved": all.iter().map(|e| e.tokens_saved + e.cached_prompt_tokens).sum::<u64>(),
         "cost_usd": all.iter().filter_map(|e| e.cost_usd).sum::<f64>(),
-        // caliban/auto: flat price billed vs the routed models' real cost, over events with both.
-        "auto_requests": all.iter().filter(|e| e.requested_model.as_deref() == Some("caliban/auto")).count(),
-        "flat_price_usd": all.iter().filter(|e| e.margin_usd().is_some()).filter_map(|e| e.flat_price_usd).sum::<f64>(),
-        "routed_model_cost_usd": all.iter().filter(|e| e.margin_usd().is_some()).filter_map(|e| e.routed_model_cost_usd).sum::<f64>(),
-        "margin_usd": all.iter().filter_map(caliban_meter::UsageEvent::margin_usd).sum::<f64>(),
+        // caliban/auto: the full flat price and what was billed (discounted on cache hits) vs the
+        // routed models' real cost, over events with both prices.
+        "auto_requests": auto.clone().count(),
+        "auto_cache_hits": auto.clone().filter(|e| e.cache == caliban_types::CacheStatus::Hit).count(),
+        "flat_price_usd": priced.clone().filter_map(|e| e.flat_price_usd).sum::<f64>(),
+        "billed_usd": priced.clone().filter_map(caliban_meter::UsageEvent::auto_billed_usd).sum::<f64>(),
+        "auto_saved_usd": priced.clone().filter_map(|e| e.saved_usd).sum::<f64>(),
+        "routed_model_cost_usd": priced.clone().filter_map(|e| e.routed_model_cost_usd).sum::<f64>(),
+        "margin_usd": priced.filter_map(caliban_meter::UsageEvent::margin_usd).sum::<f64>(),
     });
     Json(json!({ "events": events, "totals": totals }))
 }
@@ -883,6 +906,93 @@ mod tests {
         let (s, _) =
             call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"semantic_cache": "maybe"})), true).await;
         assert!(s.is_client_error());
+    }
+
+    #[tokio::test]
+    async fn auto_cache_hit_fraction_is_a_per_tenant_override() {
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        let (s, t) = call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert!(t["auto_cache_hit_fraction"].is_null(), "unset: the deployment value applies");
+        let body = json!({"name": "Initech", "auto_cache_hit_fraction": 0.15});
+        let (s, t) = call(&app, "POST", "/api/v1/tenants", Some(body), true).await;
+        assert_eq!((s, t["auto_cache_hit_fraction"].as_f64()), (StatusCode::CREATED, Some(0.15)));
+
+        let patch = |v: Value| call(&app, "PATCH", "/api/v1/tenants/globex", Some(v), true);
+        let (s, t) = patch(json!({"auto_cache_hit_fraction": 0.1})).await;
+        assert_eq!((s, t["auto_cache_hit_fraction"].as_f64()), (StatusCode::OK, Some(0.1)), "{t}");
+        let snap = c.store.config.load();
+        assert_eq!(snap.tenant(&"globex".into()).unwrap().auto_cache_hit_fraction, Some(0.1));
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=1", None, true).await;
+        assert_eq!(a["entries"][0]["detail"]["auto_cache_hit_fraction"], json!({"from": null, "to": 0.1}));
+        // Absent keeps it; other settings do not touch it.
+        let (_, t) = patch(json!({"semantic_cache": "on"})).await;
+        assert_eq!(t["auto_cache_hit_fraction"].as_f64(), Some(0.1));
+        // Out of range is rejected and nothing changes.
+        for bad in [json!(1.5), json!(-0.1), json!("20%")] {
+            let (s, e) = patch(json!({"auto_cache_hit_fraction": bad})).await;
+            assert!(s.is_client_error(), "{bad}: {s} {e}");
+        }
+        assert_eq!(c.store.state().tenant("globex").unwrap().auto_cache_hit_fraction, Some(0.1));
+        // null clears the override.
+        let (s, t) = patch(json!({"auto_cache_hit_fraction": null})).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(t["auto_cache_hit_fraction"].is_null());
+        assert!(c.store.config.load().tenant(&"globex".into()).unwrap().auto_cache_hit_fraction.is_none());
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=1", None, true).await;
+        assert_eq!(a["entries"][0]["detail"]["auto_cache_hit_fraction"], json!({"from": 0.1, "to": null}));
+    }
+
+    #[tokio::test]
+    async fn usage_totals_show_auto_billing_and_cache_savings() {
+        use caliban_meter::{UsageEvent, UsageSink};
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        let ev = |id: &str, extra: Value| -> UsageEvent {
+            let mut v = json!({
+                "request_id": id, "tenant_id": "acme", "model": "ext/gpt", "intent": "chat", "prompt_tokens": 0,
+                "completion_tokens": 0, "cached_prompt_tokens": 0, "tokens_saved": 0, "cache": "miss",
+                "pii_entities": 0, "cost_usd": 0.0, "latency_ms": 1, "ts": "2026-10-09T12:00:00Z"
+            });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        };
+        let auto = |extra: Value| {
+            let mut v = json!({"requested_model": "caliban/auto"});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        for e in [
+            // An auto miss: billed the full flat price.
+            ev("r1", auto(json!({"routed_model_cost_usd": 0.4, "flat_price_usd": 1.0, "billed_usd": 1.0}))),
+            // An auto hit at 20%: routed cost 0, the saving is the other 80%.
+            ev(
+                "r2",
+                auto(json!({"cache": "hit", "cache_tier": "exact", "routed_model_cost_usd": 0.0,
+                            "flat_price_usd": 1.0, "billed_usd": 0.2, "saved_usd": 0.8})),
+            ),
+            // An auto event written before cache-hit billing: billed the flat price.
+            ev("r3", auto(json!({"routed_model_cost_usd": 0.1, "flat_price_usd": 0.5}))),
+            // A pinned-model hit: the avoided model cost.
+            ev("r4", json!({"requested_model": "ext/gpt", "cache": "hit", "cache_tier": "semantic", "saved_usd": 0.3})),
+        ] {
+            c.store.usage.record(e).await;
+        }
+        let (s, u) = call(&app, "GET", "/api/v1/usage", None, true).await;
+        assert_eq!(s, StatusCode::OK);
+        let t = &u["totals"];
+        let close = |k: &str, want: f64| {
+            assert!((t[k].as_f64().unwrap() - want).abs() < 1e-12, "{k}: {} vs {want}", t[k]);
+        };
+        assert_eq!((t["auto_requests"].as_u64(), t["auto_cache_hits"].as_u64()), (Some(3), Some(1)));
+        assert_eq!(t["cache_hits"], 2);
+        close("flat_price_usd", 2.5);
+        close("billed_usd", 1.0 + 0.2 + 0.5);
+        close("routed_model_cost_usd", 0.5);
+        close("margin_usd", 1.7 - 0.5);
+        close("auto_saved_usd", 0.8);
+        close("saved_usd", 0.8 + 0.3);
     }
 
     #[tokio::test]
