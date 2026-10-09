@@ -438,12 +438,18 @@ fn load_ner(_dir: &str) -> Result<(caliban_pii::PiiEngine, caliban_gateway::pii_
     )
 }
 
-/// `CALIBAN_TCP_NODELAY=1` sets `TCP_NODELAY` on accepted connections (default off). On
-/// loopback it made streaming slower in the P0 bench (Nagle coalesced small frames); over a real
-/// network it can save a delayed-ACK wait per token frame. Measure before turning it on; see
-/// `bench/RESULTS.md`.
+/// `TCP_NODELAY` on accepted connections: on unless `CALIBAN_TCP_NODELAY` is `0`, `false` or
+/// `off`. With Nagle on, Linux holds a stream's first SSE frame until the client's delayed ACK
+/// of the headers (24 ms per stream at real model pacing, up to 50 ms; see
+/// `bench/RESULTS-aws-2026-10.md`). On macOS loopback Nagle coalesced small frames instead and
+/// `TCP_NODELAY` cost about 5 ms p50 at concurrency 64 in the stress bench, but production
+/// runs on Linux.
 fn tcp_nodelay() -> bool {
-    std::env::var("CALIBAN_TCP_NODELAY").is_ok_and(|v| matches!(v.trim(), "1" | "true"))
+    nodelay_from(std::env::var("CALIBAN_TCP_NODELAY").ok().as_deref())
+}
+
+fn nodelay_from(v: Option<&str>) -> bool {
+    !v.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
 }
 
 async fn serve(name: &'static str, addr: String, app: axum::Router) -> Result<()> {
@@ -473,4 +479,17 @@ async fn shutdown() {
     let term = std::future::pending::<()>();
     tokio::select! { () = ctrl_c => {}, () = term => {} }
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod nodelay_tests {
+    #[test]
+    fn tcp_nodelay_is_on_unless_turned_off() {
+        for v in [None, Some("1"), Some("true"), Some(""), Some("yes")] {
+            assert!(super::nodelay_from(v), "{v:?}");
+        }
+        for v in ["0", "false", "OFF", " no "] {
+            assert!(!super::nodelay_from(Some(v)), "{v}");
+        }
+    }
 }

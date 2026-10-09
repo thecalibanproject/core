@@ -645,9 +645,9 @@ pub(crate) async fn respond(
     };
     let upstream = futures::stream::iter([Ok(Bytes::from(sse))]).boxed();
     if is_native {
-        stream::native_anthropic(gw, outcome, upstream, rh, settlement, Span::none(), None)
+        stream::native_anthropic(gw, outcome, upstream, rh, settlement, Span::none(), None).await
     } else {
-        stream::openai_shaped(gw, outcome, upstream, rh, false, settlement, Span::none(), None)
+        stream::openai_shaped(gw, outcome, upstream, rh, false, settlement, Span::none(), None).await
     }
 }
 

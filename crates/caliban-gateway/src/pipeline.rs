@@ -369,10 +369,10 @@ async fn run(
             Ok(ProviderResponse::Stream(upstream)) => {
                 let capture = sem.map(semantic::Semantic::into_capture);
                 return Ok(if is_native {
-                    stream::native_anthropic(gw, outcome, upstream, rh, settlement, us, capture)
+                    stream::native_anthropic(gw, outcome, upstream, rh, settlement, us, capture).await
                 } else {
                     let think = model.capabilities.inline_think_tags;
-                    stream::openai_shaped(gw, outcome, upstream, rh, think, settlement, us, capture)
+                    stream::openai_shaped(gw, outcome, upstream, rh, think, settlement, us, capture).await
                 });
             }
             Err(e) => {

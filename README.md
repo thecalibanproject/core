@@ -277,7 +277,7 @@ exemplars = { "legal.review" = ["review this NDA clause for risky terms", "check
 | `CALIBAN_PII_NER_QUEUE` | data plane | Requests that may wait for a PII worker (default 128) |
 | `CALIBAN_PII_NER_QUEUE_WAIT_MS` | data plane | How long a request waits for a queue slot when the queue is full (default 0) |
 | `CALIBAN_PII_NER_OVERFLOW` | data plane | `reject` (default: 503, fail closed) or `degrade` (regex tier only); see [PII NER model](#pii-ner-model-ner-feature) |
-| `CALIBAN_TCP_NODELAY` | all | `1` sets `TCP_NODELAY` on accepted connections (default off). Set it on Linux: with Nagle on, a stream's first frame can wait about 40 ms for the client's delayed ACK (`bench/RESULTS-aws-2026-10.md`) |
+| `CALIBAN_TCP_NODELAY` | all | `TCP_NODELAY` on accepted connections, on by default; `0`, `false` or `off` turns it off. On Linux, with Nagle on, a stream's first frame waits for the client's delayed ACK (24 ms per stream at real model pacing, up to 50 ms; `bench/RESULTS-aws-2026-10.md`). Streams also hold their headers back until the first frame is ready (at most 250 ms), so headers and first token leave in one write either way. On macOS loopback it cost about 5 ms p50 at concurrency 64 in the stress bench (Nagle coalesced the frames there); production is Linux |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | Turns on OTLP/HTTP trace export (off when unset). `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME` and `OTEL_SDK_DISABLED` are honoured |
 
 Split-mode variables are listed under [Split mode](#split-mode).

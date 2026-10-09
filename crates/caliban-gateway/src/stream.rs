@@ -76,13 +76,35 @@ fn write_sse_event(out: &mut BytesMut, ev: &Value) {
     out.extend_from_slice(b"\n\n");
 }
 
-fn sse_response(o: &Outcome, rx: mpsc::Receiver<Result<Bytes, std::io::Error>>) -> Response {
-    let mut resp = Response::new(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)));
-    *resp.status_mut() = StatusCode::OK;
-    let h = resp.headers_mut();
+/// How long a stream's response headers wait for its first frame. Sent together, headers and
+/// first frame leave in one write, so with Nagle on (`CALIBAN_TCP_NODELAY=0`) the first token
+/// cannot wait for the client's delayed ACK of a headers-only segment. An upstream that is slower
+/// than this to send its first event gets its headers first, as before.
+const FIRST_FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Headers of a streamed response, set before the stream task takes the outcome.
+fn sse_headers(o: &Outcome) -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    caliban_headers(h, o);
+    caliban_headers(&mut h, o);
+    h
+}
+
+/// The streamed response, returned once its first frame is ready (or after [`FIRST_FRAME_WAIT`]).
+async fn sse_response(
+    headers: axum::http::HeaderMap,
+    mut rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+) -> Response {
+    let first = tokio::time::timeout(FIRST_FRAME_WAIT, rx.recv()).await.ok().flatten();
+    let rest = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = match first {
+        Some(f) => Body::from_stream(futures::stream::once(std::future::ready(f)).chain(rest)),
+        None => Body::from_stream(rest),
+    };
+    let mut resp = Response::new(body);
+    *resp.status_mut() = StatusCode::OK;
+    *resp.headers_mut() = headers;
     resp
 }
 
@@ -285,7 +307,7 @@ fn tail(
 }
 
 #[allow(clippy::too_many_arguments)] // one call site per path; a params struct would only move the list
-pub(crate) fn openai_shaped(
+pub(crate) async fn openai_shaped(
     gw: Arc<Gateway>,
     outcome: Outcome,
     mut upstream: Upstream,
@@ -296,7 +318,7 @@ pub(crate) fn openai_shaped(
     mut capture: Option<StreamCapture>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let resp = sse_response(&outcome, rx);
+    let headers = sse_headers(&outcome);
     let model_id = outcome.model.id.to_string();
     let transform = rehydrator.is_some() || think;
     let span = outcome.span.clone();
@@ -504,7 +526,7 @@ pub(crate) fn openai_shaped(
         finish(&gw, &outcome, metered, 0, settlement).await;
     };
     tokio::spawn(task.instrument(span));
-    resp
+    sse_response(headers, rx).await
 }
 
 /// Per-block rehydration state for native Anthropic streams.
@@ -514,7 +536,7 @@ struct BlockState {
     rehydrator: StreamingRehydrator,
 }
 
-pub(crate) fn native_anthropic(
+pub(crate) async fn native_anthropic(
     gw: Arc<Gateway>,
     outcome: Outcome,
     mut upstream: Upstream,
@@ -524,7 +546,7 @@ pub(crate) fn native_anthropic(
     mut capture: Option<StreamCapture>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let resp = sse_response(&outcome, rx);
+    let headers = sse_headers(&outcome);
     let model_id = outcome.model.id.to_string();
     let span = outcome.span.clone();
     settlement.set_in_flight(true);
@@ -669,7 +691,7 @@ pub(crate) fn native_anthropic(
         finish(&gw, &outcome, metered, 0, settlement).await;
     };
     tokio::spawn(task.instrument(span));
-    resp
+    sse_response(headers, rx).await
 }
 
 #[cfg(test)]
@@ -863,6 +885,7 @@ trust_tier = "t2_contracted"
                 Span::none(),
                 None,
             )
+            .await
         } else {
             openai_shaped(
                 Arc::clone(&gw),
@@ -874,6 +897,7 @@ trust_tier = "t2_contracted"
                 Span::none(),
                 None,
             )
+            .await
         };
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         // The usage event is recorded after the body ends.
@@ -888,6 +912,46 @@ trust_tier = "t2_contracted"
         FORCE_GENERAL.with(|f| f.set(false));
         let ev = ev.expect("usage event recorded");
         (String::from_utf8(body.to_vec()).unwrap(), (ev.prompt_tokens, ev.completion_tokens, ev.cached_prompt_tokens))
+    }
+
+    /// The response is handed to hyper only once the first frame is ready, so headers and first
+    /// frame leave in one write; a slow upstream gets its headers after `FIRST_FRAME_WAIT`.
+    #[tokio::test]
+    async fn headers_wait_for_the_first_frame() {
+        use axum::body::HttpBody as _;
+        for (delay_ms, ready) in [(30u64, true), (400, false)] {
+            let (gw, _) = gateway();
+            let first = Bytes::from(format!("data: {}\n\ndata: [DONE]\n\n", OPENAI[1]));
+            let upstream: Upstream = futures::stream::once(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                Ok(first)
+            })
+            .boxed();
+            let started = Instant::now();
+            let resp = openai_shaped(
+                Arc::clone(&gw),
+                outcome(&gw, Dialect::OpenAi, false),
+                upstream,
+                None,
+                false,
+                Settlement::none(),
+                Span::none(),
+                None,
+            )
+            .await;
+            let waited = started.elapsed();
+            let mut body = resp.into_body();
+            let polled = futures::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::pin::Pin::new(&mut body).poll_frame(cx).is_ready())
+            })
+            .await;
+            assert_eq!(polled, ready, "first frame ready with the headers (upstream delay {delay_ms} ms)");
+            if ready {
+                assert!(waited >= std::time::Duration::from_millis(delay_ms), "{waited:?}");
+            } else {
+                assert!(waited < std::time::Duration::from_millis(delay_ms), "{waited:?}");
+            }
+        }
     }
 
     #[tokio::test]
