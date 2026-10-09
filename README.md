@@ -1,137 +1,277 @@
-# caliban/core
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/thecalibanproject/website/main/public/brand/logo-white.svg">
+  <img alt="Caliban" src="https://raw.githubusercontent.com/thecalibanproject/website/main/public/brand/logo.svg" width="200">
+</picture>
 
-Rust workspace for Caliban: one binary, `caliban`, runs the **data plane** (OpenAI-compatible gateway, `:8080`), the **control plane** (admin API + web console, `:8081`), or both (`standalone`, the on-prem default).
+# Caliban Core
 
-Design: [`../docs/architecture/caliban-reference-architecture.md`](../docs/architecture/caliban-reference-architecture.md). Conventions: [`../docs/architecture/repos-and-conventions.md`](../docs/architecture/repos-and-conventions.md).
+The Rust workspace behind Caliban: one binary, `caliban`, that runs the gateway data plane, the control plane, or both.
+
+[Docs](https://github.com/thecalibanproject/docs) · [Deploy](https://github.com/thecalibanproject/deploy) · [Web console](https://github.com/thecalibanproject/web) · [TypeScript SDK](https://github.com/thecalibanproject/sdk-typescript) · [Python SDK](https://github.com/thecalibanproject/sdk-python) · [ML](https://github.com/thecalibanproject/ml)
+
+## What this is
+
+Caliban is a sovereign AI gateway: one OpenAI- and Anthropic-compatible endpoint for a whole company. Requests are authenticated per tenant, screened for PII (and pseudonymised before anything reaches an outside provider), routed by intent to an allowed model, cached, metered and rate-limited. Upstream access is BYOK only: each tenant brings its own provider keys or uses on-prem open-weight models, and keys are never pooled. A deployment can run entirely on-prem with zero egress.
+
+This repo is the server. It holds the `caliban` binary, the crates it is built from, and the contracts the other repos depend on (the OpenAPI spec, the node schema, the config format and the Postgres migrations). Container images, compose stacks and the Helm chart live in [deploy](https://github.com/thecalibanproject/deploy); the admin console lives in [web](https://github.com/thecalibanproject/web).
+
+**Status:** in active development with design partners. Nothing is published to a package or image registry; build from source. [Status and roadmap](#status-and-roadmap) lists what is done and what is not.
+
+Design: [reference architecture](https://github.com/thecalibanproject/docs/blob/main/architecture/caliban-reference-architecture.md). Conventions: [repos and conventions](https://github.com/thecalibanproject/docs/blob/main/architecture/repos-and-conventions.md).
+
+## Architecture
+
+### Planes and ports
+
+| Command | Runs | Default address |
+|---|---|---|
+| `caliban router` | Data plane: the OpenAI- and Anthropic-compatible API | `0.0.0.0:8080` (`[server] router_addr`) |
+| `caliban control-plane` | Control plane: admin API and web console | `0.0.0.0:8081` (`[server] control_plane_addr`) |
+| `caliban standalone` | Both in one process (the on-prem default) | both of the above |
+
+Data-plane endpoints (`:8080`, tenant `cal_…` key as bearer token):
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat Completions, streaming included |
+| `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic Messages, streaming included |
+| `POST /v1/embeddings` | Embeddings |
+| `POST /v1/rerank` | Reranking |
+| `GET /v1/models` | Models this tenant can use |
+| `GET /healthz` | Liveness and config version |
+
+The model id `caliban/auto` lets Caliban choose: the request is classified into an intent and routed through the tenant's ordered candidates for that intent. Naming a catalogue model id pins the model, subject to the tenant's policy.
+
+Control-plane endpoints (`:8081`) live under `/api/v1/*` and are specified in [`api/openapi.yaml`](api/openapi.yaml): tenants, tenant API keys, BYOK provider keys, routes, the model catalogue and shared providers (with health checks and model discovery), datasources and introspection, the ontology review queue, nodes, usage, the audit log, health, and signed snapshots for split-mode routers. When a built console is available (`CALIBAN_WEB_DIR` or `[server] web_dir`), it is served at `/`.
+
+### Request pipeline
+
+One pipeline serves both API shapes. OpenAI and Anthropic requests are decoded into a canonical IR (unknown fields pass through), then:
+
+1. **Auth and limits.** Tenant API key lookup (keys are stored as SHA-256 hashes). GCRA request rate per tenant and per key; token and USD budgets with reservation and settlement. Exceeding a limit returns `429` with `retry-after`.
+2. **PII.** L0: regexes with validators (Luhn, IBAN, SSN), tenant dictionaries, and credential detection (a prompt carrying credentials is refused). L1, optional (`ner` feature): an in-process multilingual NER model. Each tenant's `pii_mode` is `off`, `mask` or `reversible`. In `reversible` mode, values are replaced with realistic surrogates (valid Luhn and IBAN numbers) before an external model sees them, and the response, streams included, is rehydrated with a hold-back buffer. Sovereign (`t0_sovereign`) models receive the raw text.
+3. **Routing.** Rules and policy (pinned model, trust tier, licence), then intent classification (a placeholder keyword classifier today), then the tenant's ordered candidates with fallbacks.
+4. **Cache.** Exact cache over a canonical request hash, keyed by tenant, ACL and datasource epoch.
+5. **Upstream.** BYOK calls to OpenAI-compatible servers (OpenAI, vLLM, SGLang, llama.cpp, Ollama, TEI) or to Anthropic, either as native passthrough (`cache_control` kept) or translated. `security.egress = "deny_by_default"` limits calls to declared `base_url`s. Shared vLLM and SGLang pools can receive a per-tenant `cache_salt` for prefix-cache isolation.
+6. **Metering and tracing.** Usage events with cost go to an in-memory ring and, optionally, a JSONL write-ahead log. OpenTelemetry GenAI spans are exported only when configured, and prompt and response content is never recorded.
+
+### Workspace layout
+
+The binary is in `apps/caliban`; everything else is in `crates/`.
+
+| Crate | Status | Role |
+|---|---|---|
+| `caliban-types` | Done | Ids, trust tiers, PII and cache modes, errors |
+| `caliban-config` | Done | TOML config to an indexed `Snapshot` behind `ArcSwap`; secret references (`env`, `file`, and `sealed` with AES-256-GCM under `CALIBAN_KEK`); Ed25519 snapshot signing |
+| `caliban-ir` | Done (OpenAI, Anthropic) | Canonical request IR, unknown-field passthrough, canonical hashing for cache keys, Anthropic Messages codecs (requests, responses, stream events), SSE parser |
+| `caliban-pii` | L0 done; L1 NER done behind `ner` | Regexes and validators, tenant dictionaries, in-process multilingual NER (ONNX, MIT-licensed weights, hash-verified artifact; see [`crates/caliban-pii/MODELS.md`](crates/caliban-pii/MODELS.md)), surrogates, vault, streaming rehydration |
+| `caliban-cache` | Exact cache done; semantic cache planned | Exact cache (moka) with tenant, ACL and datasource-epoch keys; semantic cache trait |
+| `caliban-route` | Rules and placeholder classifier done; kNN and ONNX classifier planned | Intent to ordered candidates, trust-tier constraints, fallbacks |
+| `caliban-providers` | OpenAI-compatible and Anthropic done; Bedrock and Vertex planned | BYOK upstream calls; Anthropic native passthrough or translation |
+| `caliban-meter` | Done; Valkey quota store stubbed | Usage events, cost, in-memory ring and JSONL WAL; GCRA rate limits (`governor`), token and USD budgets (in-memory) |
+| `caliban-ontology` | Compiler done; store and retrieval planned | Caliban Semantic Model (CSM) types and the **CQIR compiler**: typed queries lowered to a MongoDB aggregation pipeline (with lint) or to SQL for the CDC replica; a pure-function lane planner |
+| `caliban-connect` | MongoDB done; SQL and REST sources planned | Connector trait. MongoDB: read-only privilege check, stratified sampling into path statistics, reference discovery, ontology bootstrap (`proposed` elements), native-lane executor with an `explain` gate, epochs |
+| `caliban-replica` | v1 done | CDC replica: snapshot plus change streams to Arrow and Parquet, queried with DataFusion; the watermark is the last applied `clusterTime` |
+| `caliban-nodes` | Spec and budgets done; executor planned | Node (agent) spec validation (pinned tools, bounded cycles), hierarchical budget ledger |
+| `caliban-rag` | Fusion and budgeting done; index planned | Reciprocal rank fusion, token-budgeted context selection |
+| `caliban-mcp` | Pinning done; MCP client planned | Tool-manifest pinning against description poisoning |
+| `caliban-gateway` | Done | Data-plane HTTP app: the pipeline above, embeddings, rerank, rate limits, OTel tracing |
+| `caliban-cp` | Done | Control plane: admin API per `api/openapi.yaml`, in-memory and Postgres stores, hash-chained audit log, signed snapshots for split-mode routers, web console hosting |
+
+### Contracts owned here
+
+- [`api/openapi.yaml`](api/openapi.yaml): the HTTP contract used by [web](https://github.com/thecalibanproject/web), [sdk-typescript](https://github.com/thecalibanproject/sdk-typescript) and [sdk-python](https://github.com/thecalibanproject/sdk-python).
+- [`schemas/node.schema.json`](schemas/node.schema.json): the node spec, vendored by the SDKs and the web app.
+- [`config/caliban.example.toml`](config/caliban.example.toml): the config format, used by [deploy](https://github.com/thecalibanproject/deploy). [`config/open-models.example.toml`](config/open-models.example.toml) is a complete on-prem config with a catalogue of open-weight models.
+- [`migrations/`](migrations): the control plane's Postgres schema, embedded in the binary and applied at start-up. Applied migrations are checksummed in `caliban_schema_migrations`, and the binary refuses to start if one was edited: add a new `000N_*.sql` file and list it in `crates/caliban-cp/src/store/postgres.rs`. Tested against Postgres 17.
 
 ## Quick start
 
+Requirements: a stable Rust toolchain (selected by `rust-toolchain.toml`; edition 2024, `rust-version` 1.85), plus an OpenAI-compatible model server or a provider key to route to.
+
 ```sh
-cargo build
-export CALIBAN_ADMIN_TOKEN=dev-admin CALIBAN_KEK=$(./target/debug/caliban gen-kek)
-./target/debug/caliban keygen                  # prints a tenant key + the hash to put in the config
-CALIBAN_CONFIG=config/caliban.example.toml ./target/debug/caliban standalone
+cargo build -p caliban
+cp config/caliban.example.toml caliban.toml
+./target/debug/caliban keygen          # prints a cal_… tenant key and its hash
+```
+
+Edit `caliban.toml`: put the hash in `tenants.api_key_hashes`, and point the `local-llm` provider's `base_url` at your model server (or keep the `openai` BYOK provider and export `ACME_OPENAI_API_KEY`). Then:
+
+```sh
+export CALIBAN_CONFIG=caliban.toml CALIBAN_ADMIN_TOKEN=dev-admin
+export CALIBAN_KEK=$(./target/debug/caliban gen-kek)
+./target/debug/caliban check-config
+./target/debug/caliban standalone
 ```
 
 ```sh
-curl localhost:8080/v1/chat/completions -H "authorization: Bearer cal_…" -H 'content-type: application/json' \
+curl localhost:8080/v1/chat/completions \
+  -H "authorization: Bearer cal_…" -H 'content-type: application/json' \
   -d '{"model":"caliban/auto","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Any OpenAI SDK works: set `base_url=http://<host>:8080/v1` and use a `cal_…` key. Any Anthropic SDK works too: set `base_url=http://<host>:8080` and `api_key=cal_…` (`POST /v1/messages`, streaming included).
+Any OpenAI SDK works with `base_url=http://<host>:8080/v1` and a `cal_…` key. Any Anthropic SDK works with `base_url=http://<host>:8080` and `api_key=cal_…`.
 
-Rate limits and token budgets: `[limits]` (defaults) and `[limits.tenants.<id>]` (overrides) in the config; exceeding one returns `429` with `retry-after`. Tracing: OpenTelemetry GenAI spans are exported over OTLP/HTTP only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (off by default); prompt and response content is never recorded.
+The admin API listens on `:8081` with `CALIBAN_ADMIN_TOKEN` as bearer token. Without `CALIBAN_DATABASE_URL` the control plane uses an in-memory store seeded from the config file, so changes made through the API are lost on restart.
+
+For container images, compose and Kubernetes, see [deploy](https://github.com/thecalibanproject/deploy).
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `caliban standalone` | Data plane + control plane in one process |
-| `caliban router` / `caliban control-plane` | Run one plane only (router config from `$CALIBAN_CONFIG`) |
-| `caliban router --control-plane-url http://cp:8081` | Split mode: router config from signed control-plane snapshots (no config file) |
-| `caliban check-config` | Validate `$CALIBAN_CONFIG` |
-| `caliban keygen` / `caliban gen-kek` | New tenant API key (+ hash) / new base64 KEK |
-| `caliban gen-signing-key` | New Ed25519 snapshot signing key (CP) + its public key (routers) |
-| `caliban healthcheck --addr 127.0.0.1:8080` | Exit 0/1, for distroless container healthchecks |
+| `caliban standalone` | Data plane and control plane in one process |
+| `caliban router` | Data plane only, config from `$CALIBAN_CONFIG` |
+| `caliban router --control-plane-url http://cp:8081` | Split mode: config from signed control-plane snapshots, no config file |
+| `caliban control-plane` | Control plane only |
+| `caliban check-config` | Validate `$CALIBAN_CONFIG` and exit |
+| `caliban keygen` | New tenant API key and its hash |
+| `caliban gen-kek` | New base64 32-byte key-encryption key for `CALIBAN_KEK` |
+| `caliban gen-signing-key` | New Ed25519 snapshot signing key (control plane) and its public key (routers) |
+| `caliban healthcheck [--addr 127.0.0.1:8080] [--path /healthz]` | Exit 0 on a 2xx response, 1 otherwise; for container healthchecks in the shell-less image |
 
-## Layout
+Global flags: `--config` (`CALIBAN_CONFIG`, default `/etc/caliban/caliban.toml`) and `--usage-wal` (`CALIBAN_USAGE_WAL`: append usage events to a JSONL file).
 
-| Crate | Status | Role |
+## Configuration
+
+### Config file
+
+[`config/caliban.example.toml`](config/caliban.example.toml) is annotated. Its sections:
+
+- `[server]`: `router_addr`, `control_plane_addr`, `web_dir`.
+- `[security]`: `egress = "deny_by_default"` and `admin_token`.
+- `[cache]`: exact cache on or off, size and TTL.
+- `[pii]`: `default_mode` (`off`, `mask` or `reversible`).
+- `[limits]` and `[limits.tenants.<id>]`: `requests_per_minute`, `key_requests_per_minute`, `tokens_per_minute`, `tokens_per_day`, `usd_per_day`. Unset means unlimited.
+- `[[providers]]`: deployment-wide model servers shared by tenants (see `open-models.example.toml`).
+- `[[models]]`: the catalogue (provider, `upstream_model`, trust tier, licence, context window, prices, capabilities).
+- `[[tenants]]`, with `[[tenants.providers]]` (BYOK) and `[[tenants.routes]]` (intent to ordered models).
+
+Secrets are never written inline: use `{ env = "VAR" }`, `{ file = "/path" }`, or a value sealed under `CALIBAN_KEK`. Trust tiers run from `t0_sovereign` to `t3_public`.
+
+### Environment variables
+
+| Variable | Used by | Meaning |
 |---|---|---|
-| `caliban-types` | ✅ | Ids, trust tiers, PII/cache modes, errors |
-| `caliban-config` | ✅ | TOML config → indexed `Snapshot` behind `ArcSwap`; secret refs (`env`, `file`, `sealed` AES-256-GCM under `CALIBAN_KEK`) |
-| `caliban-ir` | ✅ OpenAI · ✅ Anthropic | Canonical request IR; unknown fields pass through; canonical hashing for cache keys; Anthropic Messages ⇄ IR codecs (requests, responses, stream events); SSE parser |
-| `caliban-pii` | ✅ L0 · ✅ L1 NER (`ner` feature) | Regex + validators (Luhn, IBAN, SSN), tenant dictionaries, **in-process multilingual NER** (ONNX, MIT-licensed model, hash-verified artifact; see `crates/caliban-pii/MODELS.md`), realistic surrogates (valid Luhn/IBAN), vault, streaming rehydration with hold-back |
-| `caliban-cache` | ✅ T1 · ⏳ T2 | Exact cache (moka), tenant + ACL + datasource-epoch keys; semantic cache trait |
-| `caliban-route` | ✅ rules + placeholder classifier · ⏳ kNN/ONNX | Intent → ordered candidates, trust-tier constraints, fallbacks |
-| `caliban-providers` | ✅ OpenAI-compatible · ✅ Anthropic · ⏳ Bedrock/Vertex | BYOK upstream calls; covers vLLM, SGLang, llama.cpp, Ollama; Anthropic native passthrough (`cache_control` kept) or translation |
-| `caliban-meter` | ✅ · ⏳ Valkey quotas | Usage events, cost, in-memory ring + JSONL WAL; quotas: GCRA request rate (`governor`), token/USD budgets with reservation + settlement (in-memory; Valkey store stubbed) |
-| `caliban-ontology` | ✅ compiler · ⏳ store/retrieval | CSM types + **CQIR compiler** → MongoDB pipeline (with lint) or SQL for the CDC replica |
-| `caliban-connect` | ✅ MongoDB · ⏳ SQL/REST sources | Connector trait; MongoDB connector: read-only privilege check, stratified sampling → path stats, reference discovery, ontology bootstrap (`proposed` elements), native-lane executor + `explain` gate, epochs |
-| `caliban-replica` | ✅ v1 | CDC replica: snapshot + change streams → Arrow → Parquet, queried with DataFusion; watermark = last applied clusterTime |
-| `caliban-nodes` | ✅ spec/budgets · ⏳ executor | Node spec validation (pinned tools, bounded cycles), hierarchical budget ledger |
-| `caliban-rag` | ✅ RRF/budget · ⏳ index | Rank fusion, token-budgeted context selection |
-| `caliban-mcp` | ✅ pinning · ⏳ rmcp | Tool-manifest pinning against description poisoning |
-| `caliban-gateway` | ✅ | Data-plane HTTP app: one pipeline for `/v1/chat/completions` and Anthropic `/v1/messages` (+ `count_tokens`), embeddings, rate limits, OTel GenAI tracing (`telemetry::init`) |
-| `caliban-cp` | ✅ memory + Postgres stores, audit chain, signed snapshots | Admin API per `api/openapi.yaml`; every mutation is one transaction + one hash-chained audit row; republishes the data-plane snapshot on change; serves signed snapshots to split-mode routers and the web console |
+| `CALIBAN_CONFIG` | all | Config file path (default `/etc/caliban/caliban.toml`) |
+| `CALIBAN_ADMIN_TOKEN` | control plane | Admin bearer token, unless `[security] admin_token` resolves it another way |
+| `CALIBAN_KEK` | all | Base64 32-byte key-encryption key: seals and opens BYOK keys, derives the cache-salt key |
+| `CALIBAN_DATABASE_URL` | control plane | Postgres store; unset means in-memory |
+| `CALIBAN_WEB_DIR` | control plane | Built web console (overrides `[server] web_dir`) |
+| `CALIBAN_USAGE_WAL` | data plane | JSONL usage log path |
+| `CALIBAN_LOG` | all | Log filter (default `info,tower_http=info`) |
+| `CALIBAN_PII_NER_DIR` | data plane | Verified NER artifact directory; needs a `ner` build |
+| `CALIBAN_PII_NER_SESSIONS` | data plane | Number of NER inference sessions |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | all | Turns on OTLP/HTTP trace export (off when unset). `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME` and `OTEL_SDK_DISABLED` are honoured |
 
-## Contracts owned here
-- `api/openapi.yaml`: the HTTP contract used by `web/`, `sdk-typescript/` and `sdk-python/`.
-- `schemas/node.schema.json`: node spec, vendored by the SDKs and the web app.
-- `config/caliban.example.toml`: config format, used by `deploy/`.
-- `migrations/`: Postgres schema for the control plane, embedded in the binary and applied at startup (checksummed in `caliban_schema_migrations`; never edit an applied file, add `000N_*.sql` and list it in `crates/caliban-cp/src/store/postgres.rs`). Tested against Postgres 17.
+Split-mode variables are listed under [Split mode](#split-mode).
 
-## Control-plane store and split mode
+### PII NER model (`ner` feature)
 
-**Store.** `CALIBAN_DATABASE_URL` set → Postgres; unset → in-memory (dev/demo; the log says which, and so does `GET /api/v1/health` → `store`).
-
-Precedence with Postgres: the config file seeds the database **once**, on the first start against an empty database (marker row `cp_meta.seeded_at`). From then on the database is the source of truth for tenants, API keys, BYOK credentials, shared providers, models, routes, datasources, nodes and ontology; `[[tenants]]`, `[[models]]` and `[[providers]]` in the file are ignored (logged at startup). Every other section of the file (`[server]`, `[security]`, `[cache]`, `[pii]`, `[limits]`, …) always comes from the control plane's file and is shipped to split-mode routers inside the snapshot. Without Postgres the file seeds memory at every start and runtime changes are lost.
-
-Every mutation is one transaction: apply → render + validate the data-plane config (an invalid result, e.g. deleting a model a route uses, rolls back with 409/422) → append an `audit_log` row (`hash = sha256(prev_hash ‖ canonical row)`, append-only trigger) → commit. `GET /api/v1/audit?limit=` (admin) returns the newest rows and `chain_verified`. BYOK keys are sealed (AES-256-GCM, `CALIBAN_KEK`) before they reach the store (`sealed_key`); `{env}`/`{file}` references from the file are stored as references. Several CP replicas can share one database: writes are serialized with an advisory lock and each replica reloads when the audit head moves (every 5 s, and on every snapshot request). The CP connects as the schema owner (or a `BYPASSRLS` role); RLS policies apply to tenant-scoped roles.
-
-**Split mode.** Routers run without a config file and poll the CP:
+The L1 detector is off by default, so the workspace builds without ONNX Runtime.
 
 ```sh
-./target/debug/caliban gen-signing-key            # prints CALIBAN_SNAPSHOT_SIGNING_KEY=… and CALIBAN_SNAPSHOT_PUBLIC_KEY=…
+cargo build -p caliban --features ner
+```
+
+Fetch and verify the model with [`scripts/fetch_pii_ner.py`](https://github.com/thecalibanproject/ml/blob/main/scripts/fetch_pii_ner.py) from the ml repo, then set `CALIBAN_PII_NER_DIR` to the artifact directory (and optionally `CALIBAN_PII_NER_SESSIONS`). If the variable is set and the artifact fails hash verification, or the binary was built without `ner`, Caliban refuses to start rather than run without the detector. The `ort` crate downloads a prebuilt ONNX Runtime at build time only; for air-gapped builds, set `ORT_LIB_LOCATION`. Model choice, licences and the open licence item are in [`crates/caliban-pii/MODELS.md`](crates/caliban-pii/MODELS.md).
+
+### Control-plane store
+
+`CALIBAN_DATABASE_URL` set means Postgres; unset means in-memory (for development and demos). The startup log says which, and so does `GET /api/v1/health` (field `store`).
+
+With Postgres, the config file seeds the database **once**, on the first start against an empty database (marker row `cp_meta.seeded_at`). From then on the database is the source of truth for tenants, API keys, BYOK credentials, shared providers, models, routes, datasources, nodes and the ontology: `[[tenants]]`, `[[models]]` and `[[providers]]` in the file are ignored (and the startup log says so). All other sections (`[server]`, `[security]`, `[cache]`, `[pii]`, `[limits]`, …) always come from the control plane's file and are shipped to split-mode routers inside the snapshot. Without Postgres, the file seeds memory at every start.
+
+Every mutation is one transaction: apply the change, render and validate the data-plane config (an invalid result, such as deleting a model a route uses, rolls back with 409 or 422), append an `audit_log` row (`hash = sha256(prev_hash ‖ canonical row)`, append-only trigger), commit. `GET /api/v1/audit?limit=` returns the newest rows and `chain_verified`. BYOK keys are sealed with AES-256-GCM under `CALIBAN_KEK` before they reach the store; `{env}` and `{file}` references from the file are stored as references.
+
+Several control-plane replicas can share one database. Writes are serialised with an advisory lock, and each replica reloads when the audit head moves (every 5 s, and on every snapshot request). The control plane connects as the schema owner (or a `BYPASSRLS` role); row-level security policies apply to tenant-scoped roles.
+
+### Split mode
+
+In split mode, routers run without a config file and poll the control plane for signed snapshots.
+
+```sh
+caliban gen-signing-key      # prints CALIBAN_SNAPSHOT_SIGNING_KEY=… and CALIBAN_SNAPSHOT_PUBLIC_KEY=…
+
 # control plane
-CALIBAN_DATABASE_URL=postgres://… CALIBAN_SNAPSHOT_SIGNING_KEY=… CALIBAN_ROUTER_TOKEN=… CALIBAN_KEK=… caliban control-plane
+CALIBAN_DATABASE_URL=postgres://… CALIBAN_SNAPSHOT_SIGNING_KEY=… CALIBAN_ROUTER_TOKEN=… CALIBAN_KEK=… \
+  caliban control-plane
+
 # each router (same CALIBAN_KEK, to open sealed BYOK keys)
 CALIBAN_SNAPSHOT_PUBLIC_KEY=… CALIBAN_ROUTER_TOKEN=… CALIBAN_KEK=… \
   caliban router --control-plane-url http://cp:8081 --snapshot-cache /var/lib/caliban/snapshot.json
 ```
 
-`GET /api/v1/snapshot` (router token, not the admin token) returns `{key_id, payload, signature}`: `payload` is base64 of `{version, issued_at_ms, config}` and is signed with Ed25519 (domain-separated). The ETag is the config digest; routers send `If-None-Match` and get 304 while nothing changed. The router verifies the signature, validates the config, refuses snapshots issued before the one it serves (anti-rollback), then swaps it in. **Fail-static:** on any error (CP down, bad signature, invalid config) it logs and keeps serving the last good snapshot; with `CALIBAN_SNAPSHOT_CACHE` the last good signed snapshot is persisted (0600, re-verified on load) so a router restarted while the CP is down still serves. Sealed secrets stay sealed in the snapshot; `{env}`/`{file}` secret references resolve on the router host. Upgrade routers before the CP when the config format gains fields.
+`GET /api/v1/snapshot` (router token, not the admin token) returns `{key_id, payload, signature}`. The payload is base64 of `{version, issued_at_ms, config}`, signed with Ed25519 (domain-separated). The ETag is the config digest, so a router sending `If-None-Match` gets `304` while nothing has changed. A router verifies the signature, validates the config, refuses snapshots issued before the one it serves (anti-rollback), then swaps the new one in.
 
-| Env var | Where | Meaning |
+**Fail-static.** On any error (control plane down, bad signature, invalid config) the router logs it and keeps serving its last good snapshot. With `CALIBAN_SNAPSHOT_CACHE`, that snapshot is persisted (mode 0600, re-verified on load), so a router restarted while the control plane is down still serves. Sealed secrets stay sealed inside the snapshot; `{env}` and `{file}` references resolve on the router host. When a release adds config fields, upgrade routers before the control plane.
+
+| Variable | Where | Meaning |
 |---|---|---|
-| `CALIBAN_DATABASE_URL` | CP | Postgres store (unset = in-memory) |
-| `CALIBAN_SNAPSHOT_SIGNING_KEY` | CP | base64 32-byte Ed25519 seed (`caliban gen-signing-key`) |
-| `CALIBAN_ROUTER_TOKEN` | CP + routers | Bearer token for `GET /api/v1/snapshot` |
-| `CALIBAN_SNAPSHOT_PUBLIC_KEY` | routers | base64 public key; comma-separated list for rotation |
+| `CALIBAN_SNAPSHOT_SIGNING_KEY` | control plane | Base64 32-byte Ed25519 seed (`caliban gen-signing-key`) |
+| `CALIBAN_ROUTER_TOKEN` | control plane and routers | Bearer token for `GET /api/v1/snapshot` |
+| `CALIBAN_SNAPSHOT_PUBLIC_KEY` | routers | Base64 public key; a comma-separated list allows rotation |
 | `CALIBAN_CONTROL_PLANE_URL` | routers | Same as `--control-plane-url` |
 | `CALIBAN_SNAPSHOT_POLL_SECS` | routers | Poll interval, default 10 (±20% jitter) |
 | `CALIBAN_SNAPSHOT_CACHE` | routers | Path for the last good signed snapshot |
 | `CALIBAN_ROUTER_ADDR` | routers | Listen address in split mode, default `0.0.0.0:8080` |
 
-Known gaps: usage events stay on each router (WAL / its own ring); the CP's `/usage` only sees its own process in split mode. No per-tenant DEKs yet (`tenant_dek` is unused). Delete endpoints for tenants/keys/datasources/nodes are still missing.
-
-## Tests
+## Testing
 
 ```sh
-cargo test                 # unit tests in every crate
+cargo test                   # unit tests in every crate; Docker-backed tests skip themselves
 cargo clippy --all-targets
-./scripts/smoke.sh         # end-to-end: real binary + mock upstream (PII, streaming, cache, BYOK, Anthropic API, 429s, CP→DP)
-./scripts/split-smoke.sh   # split mode: Postgres (Docker) + CP + router processes; pickup, fail-static, cache restart
-# Postgres store parity tests (same suite as the memory store; skipped without the env var):
+./scripts/smoke.sh           # end to end: real binary + mock upstream
+./scripts/split-smoke.sh     # split mode: Postgres (Docker) + control-plane + router processes
+./scripts/mongo-it.sh        # MongoDB connector + CDC replica against a real replica set (Docker)
+
+# Postgres store parity tests (the memory store's suite, run against Postgres):
 docker run -d --rm -p 55432:5432 -e POSTGRES_PASSWORD=x --name caliban-pg-test postgres:17-alpine
 CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres cargo test -p caliban-cp
-./scripts/mongo-it.sh      # MongoDB connector + CDC replica against a real replica set (Docker)
 ```
 
-### MongoDB integration test
+- **`scripts/smoke.sh`** runs `caliban standalone` against `scripts/mock_upstream.py`. It checks that PII never reaches an external model, responses and streams are rehydrated, sovereign models get raw text, the exact cache hits, credentials in prompts are blocked, the Anthropic Messages API works (translated and native passthrough), rate limits return `429` with `retry-after`, and keys and BYOK credentials created through the control plane work on the data plane. Needs `python3`, `curl` and `shasum`. With `CALIBAN_PII_NER_DIR` set, it builds with `ner` and adds name-protection checks.
+- **`scripts/split-smoke.sh`** checks that the control plane seeds Postgres and signs snapshots; that a router with no config file picks up a tenant, key and BYOK credential created on the control plane within the poll interval; that the audit chain verifies; that killing the control plane leaves the router serving; that a router restarted while the control plane is down serves from its snapshot cache; and that a restarted control plane keeps its state. Needs Docker, `python3` and `curl`. Set `SPLIT_DATABASE_URL` to use an existing database.
+- **`scripts/mongo-it.sh`** starts `mongo:8` as a single-node replica set with auth (container `caliban-mongo-test`, port 27018), runs `cargo test -p caliban-replica --test mongo_it -- --nocapture`, then removes the container. The test ([`crates/caliban-replica/tests/mongo_it.rs`](crates/caliban-replica/tests/mongo_it.rs)) seeds `orders` (embedded `lines`, `customerId` references) and `customers`, creates a read-only user, and checks that:
+  1. `verify_read_only` accepts the `read`-role user and refuses the admin user, and the replica set is detected;
+  2. introspection and `bootstrap::propose` find `Order`, `OrderLine` (embedded), `Customer`, the attribute bindings, and `Order.customer_id->Customer`;
+  3. the reference CQIR query, compiled with `plan` and `mongo::lower`, passes the `explain` gate (IXSCAN on `createdAt_1`; a COLLSCAN query is rejected under a strict policy) and runs natively with a row cap;
+  4. after a replica snapshot, `sql::lower` output on DataFusion returns **the same rows as the native lane** for three query shapes;
+  5. inserts, updates (`$set`, and `$push` into the embedded array) and deletes flow through the change stream, the replica converges to the native answer, and the watermark advances.
 
-`scripts/mongo-it.sh` starts `mongo:8` as a single-node replica set with auth (container
-`caliban-mongo-test`, port 27018, keyfile generated in the container), creates an admin user, runs
-`cargo test -p caliban-replica --test mongo_it -- --nocapture`, and removes the container. The
-test (`crates/caliban-replica/tests/mongo_it.rs`) seeds `orders` (embedded `lines`, `customerId`
-references) and `customers` to match the ontology compiler fixture, creates a read-only user, and checks:
+  Knobs: `CALIBAN_MONGO_IMAGE` (for example `mongo:7`), `CALIBAN_MONGO_TEST_PORT`, `CALIBAN_MONGO_CONTAINER`, and `KEEP=1` to keep the container. Without `CALIBAN_MONGO_TEST_URI` the test prints a skip message and passes, so plain `cargo test` needs no Docker.
 
-1. `verify_read_only` accepts the `read`-role user and refuses the admin user; replica set detected.
-2. Introspection + `bootstrap::propose`: `Order`, `OrderLine` (embedded), `Customer`, the
-   fixture's attribute bindings, and `Order.customer_id->Customer` (100% overlap).
-3. The reference CQIR compiled with `plan` + `mongo::lower`: `explain` gate (IXSCAN on
-   `createdAt_1`; a COLLSCAN query is rejected under a strict policy) and native execution with a row cap.
-4. Replica snapshot, then `sql::lower` output on DataFusion: **both lanes return the same rows**
-   for three query shapes (child grain + reference join + policy, same-element child filter, root grain by dimension).
-5. Insert, update (`$set` and `$push` into the embedded array) and delete through the change stream:
-   the replica converges to the native answer and the watermark advances.
+## Status and roadmap
 
-Knobs: `CALIBAN_MONGO_IMAGE=mongo:7`, `CALIBAN_MONGO_TEST_PORT`, `KEEP=1` (keep the container).
-Without `CALIBAN_MONGO_TEST_URI` the test prints a skip message and passes, so plain `cargo test` needs no Docker.
+Known gaps:
 
-## Next (in order)
-1. ~~Postgres store; signed snapshots for split deployments~~ ✅. Left: per-tenant DEKs (`tenant_dek`), OIDC actors in the audit log, usage shipping from routers to the CP, push (long-poll) instead of polling, delete endpoints.
-2. ~~MongoDB connector~~ ✅ (`caliban-connect::mongo`). Left: wire `introspect`/`propose` into `caliban-cp`'s introspection job; `$jsonSchema`-declared types; map attributes and scalar-array attributes; per-shard sampling.
-3. CDC replica ✅ v1 (`caliban-replica`), immutable per-flush file generations (queries never see a file being replaced). Planner ✅ as a pure function (`caliban_ontology::compile::planner`); left: wiring it to `explain_gate` + `lag_secs` in a query service; delta Parquet + compaction instead of whole-table rewrites; resume from the manifest after restart (today: re-snapshot); parallel `_id`-range snapshot; arrays nested in arrays.
-4. L1 PII NER ✅: build with `cargo build -p caliban --features ner`, fetch the model with `ml/scripts/fetch_pii_ner.py`, set `CALIBAN_PII_NER_DIR` (optional `CALIBAN_PII_NER_SESSIONS`). The binary refuses to start if the variable is set but the artifact fails hash verification. `CALIBAN_PII_NER_DIR=… ./scripts/smoke.sh` adds name-protection checks. Left: tenant-scoped surrogates so pseudonymized requests can hit the cache; licence sign-off on the model's CC-BY-SA fine-tuning text (MODELS.md).
-5. ~~Anthropic `/v1/messages`, quotas, OTel GenAI spans~~ ✅. Left: Valkey quota store for multi-router deployments, tokenizer-based estimates, rate-limit headers on successful responses, tool-call argument rehydration in streams, `Idempotency-Key`.
+- Usage events stay on each router (its WAL and in-memory ring); in split mode, the control plane's `/usage` only sees its own process.
+- No per-tenant data-encryption keys yet (`tenant_dek` is unused): BYOK keys are sealed directly under `CALIBAN_KEK`.
+- Delete endpoints for tenants, API keys, datasources and nodes are missing.
+- Quotas are in-memory per process; the Valkey store for multi-router deployments is stubbed.
+- No Prometheus metrics endpoint yet.
+
+Next, in order:
+
+1. Control plane: per-tenant DEKs, OIDC actors in the audit log, usage shipping from routers to the control plane, push (long-poll) instead of polling, delete endpoints.
+2. MongoDB connector: wire `introspect` and `propose` into the control plane's introspection job; `$jsonSchema`-declared types; map and scalar-array attributes; per-shard sampling.
+3. CDC replica and planner: connect the planner to the `explain` gate and replica lag in a query service; delta Parquet with compaction instead of whole-table rewrites; resume from the manifest after a restart (today it re-snapshots); parallel `_id`-range snapshots; arrays nested in arrays.
+4. PII: tenant-scoped surrogates so pseudonymised requests can hit the cache; licence sign-off on the NER model's fine-tuning data (see `MODELS.md`).
+5. Gateway: Valkey quota store, tokenizer-based estimates, rate-limit headers on successful responses, tool-call argument rehydration in streams, `Idempotency-Key`, the semantic cache, and the embedding kNN and ONNX intent classifiers.
+
+## Related repositories
+
+| Repo | What it holds |
+|---|---|
+| [docs](https://github.com/thecalibanproject/docs) | Reference architecture and research notes |
+| [deploy](https://github.com/thecalibanproject/deploy) | Container image build, compose stack, Helm chart, air-gapped bundles, open-model serving |
+| [web](https://github.com/thecalibanproject/web) | Admin console, served by the control plane |
+| [sdk-typescript](https://github.com/thecalibanproject/sdk-typescript) | TypeScript SDK (Apache-2.0) |
+| [sdk-python](https://github.com/thecalibanproject/sdk-python) | Python SDK (Apache-2.0) |
+| [ml](https://github.com/thecalibanproject/ml) | Offline training, evaluation and ONNX export for the in-process models (embedder, intent heads, PII NER) |
+
+## Licence
+
+Copyright 2026 Elie Sfeir. All rights reserved.
+
+This repository is proprietary and source-available. It is public for reference and evaluation only and is not open source. No right to use, copy, modify or distribute it is granted except under a written agreement with the copyright holder. See [LICENSE](LICENSE). For licensing, contact [elie@internalizable.dev](mailto:elie@internalizable.dev).

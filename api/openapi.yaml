@@ -967,7 +967,7 @@ components:
         label: { type: string }
         provider_id: { type: string, description: 'Provider id referenced by the model catalogue (e.g. local-llm, openai). Defaults to the slugified label.' }
         base_url: { type: string }
-        api_key: { type: string, description: 'Write-only. Encrypted with the tenant DEK. Optional for keyless local endpoints.' }
+        api_key: { type: string, description: 'Write-only. Sealed under CALIBAN_KEK. Optional for keyless local endpoints.' }
         trust_tier: { $ref: '#/components/schemas/TrustTier' }
         cache_salt: { type: boolean, default: false, description: 'Send a per-tenant cache_salt (vLLM prefix-cache isolation)' }
 
