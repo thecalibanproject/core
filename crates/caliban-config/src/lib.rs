@@ -424,12 +424,112 @@ pub enum EgressPolicy {
     Open,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     #[serde(default)]
     pub egress: EgressPolicy,
+    /// Bootstrap admin token (`CALIBAN_ADMIN_TOKEN`). With SSO configured it is the break-glass
+    /// credential: every use is logged and audited as `break_glass`.
     pub admin_token: Option<SecretRef>,
+    /// `false` turns the bootstrap token off once SSO works (the control plane then ignores it).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub break_glass: bool,
+    /// `[security.oidc]`: single sign-on for the web console and the admin API against the
+    /// customer's own identity provider. Control plane only: never sent to routers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<OidcConfig>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self { egress: EgressPolicy::default(), admin_token: None, break_glass: true, oidc: None }
+    }
+}
+
+/// `[security.oidc]`: OpenID Connect against the customer's identity provider (Keycloak,
+/// Microsoft Entra ID, Okta, ADFS, Authentik, Dex, ...). The control plane is a confidential
+/// client using the authorization code flow with PKCE and keeps sessions server-side. Nothing but
+/// `issuer` (discovery, JWKS, token endpoint) is ever contacted.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OidcConfig {
+    /// Exactly as the provider reports it in `.well-known/openid-configuration` (`iss`).
+    pub issuer: String,
+    pub client_id: String,
+    /// `{ env = "..." }`, `{ file = "..." }` or `{ sealed = "..." }`. Absent: public client (PKCE
+    /// only), for providers that allow it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<SecretRef>,
+    /// The console's public callback URL, registered at the provider:
+    /// `https://<console host>/auth/callback`. Its origin is the console origin (CSRF checks), and
+    /// an `https` URL makes session cookies `Secure` with the `__Host-` prefix.
+    pub redirect_url: String,
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// Claim holding the user's groups (dotted path for nested claims, e.g.
+    /// `realm_access.roles`). Groups map to roles through `role_mappings` and stored bindings.
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
+    /// Audience required in access tokens sent as `Authorization: Bearer` to the admin API (CI,
+    /// scripts). Absent: only browser sessions and the break-glass token are accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_audience: Option<String>,
+    /// Absolute session lifetime.
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_secs: u64,
+    /// A session unused for this long ends.
+    #[serde(default = "default_session_idle")]
+    pub session_idle_secs: u64,
+    /// Tolerance for `exp`, `nbf` and `iat`.
+    #[serde(default = "default_clock_skew")]
+    pub clock_skew_secs: u64,
+    /// How long the provider's signing keys are cached. An unknown key id refetches sooner.
+    #[serde(default = "default_jwks_cache")]
+    pub jwks_cache_secs: u64,
+    /// PEM bundle of extra CA certificates for the provider (internal PKI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
+    /// Where the provider sends the browser after logout. Default: the console root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_logout_redirect_url: Option<String>,
+    /// Group to role mappings (`[[security.oidc.role_mappings]]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub role_mappings: Vec<RoleMapping>,
+}
+
+/// Grants `role` to members of `group`. Tenant roles (`tenant_admin`, `developer`, `viewer`,
+/// `billing`) need `tenant`; deployment roles (`owner`, `admin`, `auditor`) must not have one.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoleMapping {
+    pub group: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".into(), "profile".into(), "email".into()]
+}
+fn default_groups_claim() -> String {
+    "groups".into()
+}
+fn default_session_ttl() -> u64 {
+    8 * 3600
+}
+fn default_session_idle() -> u64 {
+    3600
+}
+fn default_clock_skew() -> u64 {
+    60
+}
+fn default_jwks_cache() -> u64 {
+    3600
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
