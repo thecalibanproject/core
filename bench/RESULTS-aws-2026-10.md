@@ -334,6 +334,8 @@ With the default grey band (0.03), probes between 0.92 and 0.95 are answered fre
 5. **NER on arm64**: 77 ms per inference on Graviton4. Profile ORT on aarch64 before recommending Graviton for NER-heavy tenants, and make the `ner` build work on AL2023 (static libstdc++ from a newer GCC, or document the container build).
 6. **Bench**: make the mock's reply independent of the prompt length (or send the surrogate form on the direct side), so that paced PII totals become comparable; see the caveat below.
 
+Done in core since this run: `CALIBAN_TCP_NODELAY` defaults to on, and streamed responses hold their headers until the first frame is ready (at most 250 ms), so both leave in one write (1); `config/open-models.example.toml` ships the `[routing]` values above as an opt-in block (3); `min_threshold` defaults to 0.93, the semantic cache partitions on ordered slots (currency codes, units and languages included), capitalised names and modifier classes, which separates the three false hits above, and `[cache.semantic] query_prefix` exists, off by default (4); the bench mock pads or cuts replies to a fixed length (6). Not re-measured on AWS yet.
+
 ## Testbed fixes
 
 Found by this run and fixed in the deploy repo:
