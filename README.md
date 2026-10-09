@@ -70,7 +70,7 @@ One pipeline serves both API shapes. OpenAI and Anthropic requests are decoded i
 
 ### Workspace layout
 
-The binary is in `apps/caliban`; everything else is in `crates/`.
+The binary is in `apps/caliban`; everything else is in `crates/`, except the P0 measurement suite (mock upstream, load generator, process harness), which is in `bench/` (crate `caliban-bench`).
 
 | Crate | Status | Role |
 |---|---|---|
@@ -239,6 +239,11 @@ cargo clippy --all-targets
 ./scripts/smoke.sh           # end to end: real binary + mock upstream
 ./scripts/split-smoke.sh     # split mode: Postgres (Docker) + control-plane + router processes
 ./scripts/mongo-it.sh        # MongoDB connector + CDC replica against a real replica set (Docker)
+./scripts/bench.sh           # P0 measurement suite: overhead benchmark, isolation audit, usage accuracy
+
+# The isolation audit and usage-accuracy check alone (also part of plain `cargo test`):
+cargo test -p caliban --test isolation
+cargo test -p caliban --test usage_accuracy
 
 # Postgres store parity tests (the memory store's suite, run against Postgres):
 docker run -d --rm -p 55432:5432 -e POSTGRES_PASSWORD=x --name caliban-pg-test postgres:17-alpine
@@ -247,6 +252,9 @@ CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres cargo t
 
 - **`scripts/smoke.sh`** runs `caliban standalone` against `scripts/mock_upstream.py`. It checks that PII never reaches an external model, responses and streams are rehydrated, sovereign models get raw text, the exact cache hits, credentials in prompts are blocked, the Anthropic Messages API works (translated and native passthrough), rate limits return `429` with `retry-after`, keys and BYOK credentials created through the control plane work on the data plane, and a revoked key or a deleted tenant's key gets `401`. Needs `python3`, `curl` and `shasum`. With `CALIBAN_PII_NER_DIR` set, it builds with `ner` and adds name-protection checks.
 - **`scripts/split-smoke.sh`** checks that the control plane seeds Postgres and signs snapshots; that a router with no config file picks up a tenant, key and BYOK credential created on the control plane within the poll interval; that the audit chain verifies; that killing the control plane leaves the router serving; that a router restarted while the control plane is down serves from its snapshot cache; that a restarted control plane keeps its state; and that a key revoked and a tenant deleted on the control plane get `401` from the router after its next poll. Needs Docker, `python3` and `curl`. Set `SPLIT_DATABASE_URL` to use an existing database.
+- **`scripts/bench.sh`** measures the P0 exit criteria (reference architecture section 8) and writes `bench/results/REPORT.md`; the latest numbers and their caveats are in [`bench/RESULTS.md`](bench/RESULTS.md). It builds release binaries, starts the Rust mock upstream (`bench/`, binary `mock-upstream`: OpenAI Chat Completions and Anthropic Messages, streaming and not, fixed latency, deterministic usage) and `caliban standalone` with a generated config, then measures latency through the gateway and direct to the mock at concurrency 1, 16 and 64 with the `caliban-bench` load generator (HDR histograms, warm-up, interleaved rounds). Scenarios: non-streaming and streaming chat (time to first byte and total) with PII off and on (regex tier), the exact-cache hit path, native Anthropic passthrough, streams paced like a real model, the usage WAL, and the NER tier when `CALIBAN_PII_NER_DIR` is set (a `ner` build is made for it; otherwise those rows are reported as skipped). Overhead is reported as gateway minus direct at p50, p90, p99 and max. Knobs: `QUICK=1`, `BENCH_CONCURRENCY`, `BENCH_REQUESTS`, `BENCH_WARMUP`, `BENCH_PACED_REQUESTS`, `BENCH_OUT`. Needs only cargo. For profiling, `cargo build --profile profiling -p caliban` keeps symbols.
+- **`apps/caliban/tests/isolation.rs`** runs the real binary against the mock with two tenants and a shared pool, and proves that a tenant key cannot list or use another tenant's models, routes, BYOK credentials or restricted shared pools (also under interleaved concurrent load); that exact-cache entries seeded by one tenant miss for the other on an identical prompt; that the per-tenant `cache_salt` differs across tenants, is stable per tenant and across restarts with the same `CALIBAN_KEK`, and that the mock's salted prefix cache gives the other tenant no `cached_tokens` signal; that usage events (WAL and `/api/v1/usage`) are attributed only to the caller; that PII surrogates differ per tenant and one tenant's surrogate is never rehydrated to another tenant's original; that revoked keys and a deleted tenant's keys get `401` on every data-plane endpoint; and that every admin route rejects tenant keys.
+- **`apps/caliban/tests/usage_accuracy.rs`** sends a varied sequential workload (both dialects, streams, translation both ways, native Anthropic with `cache_control`, provider prefix-cache hits, exact-cache hits, fallbacks, PII) and pairs each usage event with the mock's bill for that request: prompt, completion and cached tokens must match exactly, and cost must match at catalogue prices. Two `#[ignore]`d tests track known gaps (cost does not apply prompt-cache pricing; streams with `include_usage: false` are metered as 0 tokens); run them with `-- --ignored`.
 - **`scripts/mongo-it.sh`** starts `mongo:8` as a single-node replica set with auth (container `caliban-mongo-test`, port 27018), runs `cargo test -p caliban-replica --test mongo_it -- --nocapture`, then removes the container. The test ([`crates/caliban-replica/tests/mongo_it.rs`](crates/caliban-replica/tests/mongo_it.rs)) seeds `orders` (embedded `lines`, `customerId` references) and `customers`, creates a read-only user, and checks that:
   1. `verify_read_only` accepts the `read`-role user and refuses the admin user, and the replica set is detected;
   2. introspection and `bootstrap::propose` find `Order`, `OrderLine` (embedded), `Customer`, the attribute bindings, and `Order.customer_id->Customer`;

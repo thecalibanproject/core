@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/caliban"]
+members = ["crates/*", "apps/caliban", "bench"]
 
 [workspace.package]
 version = "0.1.0"
@@ -71,3 +71,9 @@ todo = "warn"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Release build with symbols, for profilers (`cargo build --profile profiling`; see bench/RESULTS.md).
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
