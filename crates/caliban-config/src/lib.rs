@@ -1178,6 +1178,34 @@ mod tests {
         assert!(snap.models_for(acme).count() >= 2);
     }
 
+    /// The commented `[security.oidc]` block of the example, switched on, is valid as written.
+    #[test]
+    fn example_sso_block_parses() {
+        let mut on = false;
+        let text: String = EXAMPLE
+            .lines()
+            .map(|l| {
+                if l.starts_with("# [security.oidc]") {
+                    on = true;
+                }
+                // Settings and tables are switched on; prose comments stay comments.
+                let body = l.strip_prefix("# ").or(l.strip_prefix('#')).unwrap_or(l);
+                let setting = body.is_empty() || body.starts_with('[') || body.contains(" = ");
+                let out = if on && setting { body } else { l };
+                if l.starts_with("# tenant = ") {
+                    on = false;
+                }
+                format!("{out}\n")
+            })
+            .collect();
+        let cfg = Config::from_toml_str(&text).unwrap();
+        let oidc = cfg.security.oidc.expect("block switched on");
+        assert_eq!(oidc.client_secret, Some(SecretRef::Env { env: "CALIBAN_OIDC_CLIENT_SECRET".into() }));
+        assert_eq!(oidc.role_mappings.len(), 2);
+        assert_eq!(oidc.role_mappings[1].tenant.as_deref(), Some("acme"));
+        assert!(cfg.security.break_glass);
+    }
+
     const SHARED: &str = r#"
         [[providers]]
         id = "vllm-qwen"

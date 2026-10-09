@@ -13,8 +13,33 @@ web_dir = "/usr/share/caliban/web"
 [security]
 # deny_by_default: the data plane only calls base_urls declared under tenants.providers.
 egress = "deny_by_default"
-# Admin bearer token for the control plane API.
+# Bootstrap admin token for the control plane API and console. Once single sign-on works it is the
+# break-glass credential (owner rights, every use audited); `break_glass = false` turns it off.
 admin_token = { env = "CALIBAN_ADMIN_TOKEN" }
+# break_glass = true
+
+# Single sign-on against your own OpenID Connect provider (docs/sso.md). Nothing but the issuer is
+# contacted. Every field can also come from CALIBAN_OIDC_* environment variables.
+# [security.oidc]
+# issuer = "https://keycloak.example.internal/realms/caliban"   # exactly as discovery reports it
+# client_id = "caliban-console"
+# client_secret = { env = "CALIBAN_OIDC_CLIENT_SECRET" }
+# redirect_url = "https://caliban.example.internal/auth/callback"
+# scopes = ["openid", "profile", "email"]
+# groups_claim = "groups"            # dotted path for nested claims, e.g. "realm_access.roles"
+# api_audience = "caliban-api"       # also accept access tokens for this audience (CI, scripts)
+# session_ttl_secs = 28800
+# session_idle_secs = 3600
+#
+# Roles: owner, admin, auditor (deployment); tenant_admin, developer, viewer, billing (need tenant).
+# [[security.oidc.role_mappings]]
+# group = "caliban-owners"
+# role = "owner"
+#
+# [[security.oidc.role_mappings]]
+# group = "acme-developers"
+# role = "developer"
+# tenant = "acme"
 
 [cache]
 exact_enabled = true

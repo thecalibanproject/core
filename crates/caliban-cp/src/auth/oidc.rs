@@ -472,8 +472,13 @@ impl Oidc {
             }
         }
         let claims = self.validate(token, audience).await?;
-        // Keycloak marks ID tokens with `typ: ID`; they are not credentials for an API.
-        if claims.get("typ").and_then(Value::as_str).is_some_and(|t| t.eq_ignore_ascii_case("id")) {
+        // ID tokens are not credentials for an API. Keycloak marks them with `typ: ID`; when the
+        // API audience is the client id (Entra ID v2 tokens), an ID token has the same audience,
+        // so the marks only ID tokens carry (`nonce`, `at_hash`) are refused too.
+        let id_token = claims.get("typ").and_then(Value::as_str).is_some_and(|t| t.eq_ignore_ascii_case("id"))
+            || (audience == self.settings.client_id
+                && (claims.get("nonce").is_some() || claims.get("at_hash").is_some()));
+        if id_token {
             return Err(OidcError::token("token_type", "an ID token is not an access token"));
         }
         self.identity(&claims)

@@ -56,11 +56,11 @@ Every chat response carries these headers (all exposed to browsers through CORS)
 
 `x-caliban-cache` stays `hit` for both cache tiers, so SDKs and dashboards that count `hit | miss | bypass` keep working (the Python SDK's usage model and the console's filters only accept those three values); usage events add `cache_tier` the same way.
 
-Control-plane endpoints (`:8081`) live under `/api/v1/*` and are specified in [`api/openapi.yaml`](api/openapi.yaml): tenants, tenant API keys, BYOK provider keys, routes, the model catalogue and shared providers (with health checks and model discovery), datasources and introspection, the ontology review queue, nodes, usage, the audit log, health, and signed snapshots for split-mode routers. When a built console is available (`CALIBAN_WEB_DIR` or `[server] web_dir`), it is served at `/`.
+Control-plane endpoints (`:8081`) live under `/api/v1/*` and are specified in [`api/openapi.yaml`](api/openapi.yaml): tenants, tenant API keys, BYOK provider keys, routes, the model catalogue and shared providers (with health checks and model discovery), datasources and introspection, the ontology review queue, nodes, usage, the audit log, users and role bindings, health, and signed snapshots for split-mode routers. Login lives under `/auth/*` (see [Admin access](#admin-access-sso-and-roles)). When a built console is available (`CALIBAN_WEB_DIR` or `[server] web_dir`), it is served at `/`.
 
 `PATCH /api/v1/tenants/{tenantId}` changes a tenant's `pii_default`, `pii_surrogate_scope` and `semantic_cache` (audited as `tenant.update`; routers apply it with their next snapshot).
 
-Deletes (admin token):
+Deletes (each needs its permission, see [Admin access](#admin-access-sso-and-roles)):
 
 | Endpoint | Effect |
 |---|---|
@@ -172,7 +172,7 @@ curl localhost:8080/v1/chat/completions \
 
 Any OpenAI SDK works with `base_url=http://<host>:8080/v1` and a `cal_…` key. Any Anthropic SDK works with `base_url=http://<host>:8080` and `api_key=cal_…`.
 
-The admin API listens on `:8081` with `CALIBAN_ADMIN_TOKEN` as bearer token. Without `CALIBAN_DATABASE_URL` the control plane uses an in-memory store seeded from the config file, so changes made through the API are lost on restart.
+The admin API listens on `:8081`. Without single sign-on, `CALIBAN_ADMIN_TOKEN` is the bearer token (and the console's login); with it, people log in through the identity provider and the token becomes break-glass (see [Admin access](#admin-access-sso-and-roles)). Without `CALIBAN_DATABASE_URL` the control plane uses an in-memory store seeded from the config file, so changes made through the API are lost on restart.
 
 For container images, compose and Kubernetes, see [deploy](https://github.com/thecalibanproject/deploy).
 
@@ -201,7 +201,8 @@ Global flags: `--config` (`CALIBAN_CONFIG`, default `/etc/caliban/caliban.toml`)
 [`config/caliban.example.toml`](config/caliban.example.toml) is annotated. Its sections:
 
 - `[server]`: `router_addr`, `control_plane_addr`, `web_dir`.
-- `[security]`: `egress = "deny_by_default"` and `admin_token`.
+- `[security]`: `egress = "deny_by_default"`, `admin_token` (break-glass once SSO works) and `break_glass` (default `true`).
+- `[security.oidc]` and `[[security.oidc.role_mappings]]`: single sign-on and group to role mappings (see [Admin access](#admin-access-sso-and-roles)).
 - `[cache]`: exact cache on or off, size and TTL.
 - `[cache.semantic]`: `enabled`, `store` (`qdrant` or `memory`), `qdrant_url`, `qdrant_api_key`, `collection_prefix`, `embedding_model`, `threshold`, `min_threshold`, `grey_band`, `max_error_rate`, `verify_rate`, `verify_answer_similarity`, `max_temperature`, `ttl_secs`, `lookup_budget_ms`, `embed_timeout_ms`, `query_prefix` (an instruction prepended before embedding, off by default: Qwen3-Embedding with `"Instruct: Given a user question, retrieve questions that ask exactly the same thing\nQuery: "` gave 81% paraphrase hits at 5% false hits with `threshold = 0.91` in the AWS run; unless it equals `[routing] query_prefix`, a kNN-routed request then embeds its prompt twice) (see [Cache](#request-pipeline) above and the annotated example). Caliban talks to Qdrant's REST port (6333), not gRPC (6334). The store and its URL are read at start-up; the switches, thresholds and budgets follow the live snapshot (split-mode routers get them from the control plane).
 - `[pii]`: `default_mode` (`off`, `mask` or `reversible`).
@@ -280,7 +281,11 @@ exemplars = { "legal.review" = ["review this NDA clause for risky terms", "check
 | Variable | Used by | Meaning |
 |---|---|---|
 | `CALIBAN_CONFIG` | all | Config file path (default `/etc/caliban/caliban.toml`) |
-| `CALIBAN_ADMIN_TOKEN` | control plane | Admin bearer token, unless `[security] admin_token` resolves it another way |
+| `CALIBAN_ADMIN_TOKEN` | control plane | Bootstrap admin token (break-glass once SSO works), unless `[security] admin_token` resolves it another way. Optional when SSO is configured |
+| `CALIBAN_BREAK_GLASS` | control plane | `false` refuses the admin token (overrides `[security] break_glass`); needs SSO |
+| `CALIBAN_OIDC_ISSUER`, `CALIBAN_OIDC_CLIENT_ID`, `CALIBAN_OIDC_CLIENT_SECRET`, `CALIBAN_OIDC_REDIRECT_URL` | control plane | Single sign-on without a `[security.oidc]` section, or overrides of it |
+| `CALIBAN_OIDC_SCOPES`, `CALIBAN_OIDC_GROUPS_CLAIM`, `CALIBAN_OIDC_API_AUDIENCE`, `CALIBAN_OIDC_CA_FILE` | control plane | Same, optional fields |
+| `CALIBAN_OIDC_OWNER_GROUPS`, `CALIBAN_OIDC_ADMIN_GROUPS`, `CALIBAN_OIDC_AUDITOR_GROUPS` | control plane | IdP groups (comma separated) that get the deployment role |
 | `CALIBAN_KEK` | all | Current base64 32-byte key-encryption key: wraps the per-tenant data keys and seals shared provider keys, and derives the cache-salt key and the per-tenant PII surrogate keys. Rotating it changes every tenant's surrogates (only costs cache misses). See [Secrets and keys](#secrets-and-keys) |
 | `CALIBAN_KEK_PREVIOUS` | all | Retired KEKs (base64, comma separated), only used to open what is still wrapped or sealed under them during a [KEK rotation](#kek-rotation). Remove once `caliban keys status` shows they are no longer needed |
 | `CALIBAN_DATABASE_URL` | control plane | Postgres store; unset means in-memory |
@@ -380,6 +385,14 @@ Deletes keep what audit needs and drop secrets. A revoked API key keeps its row 
 
 Several control-plane replicas can share one database. Writes are serialised with an advisory lock, and each replica reloads when the audit head moves (every 5 s, and on every snapshot request). The control plane connects as the schema owner (or a `BYPASSRLS` role); row-level security policies apply to tenant-scoped roles.
 
+### Admin access (SSO and roles)
+
+The control plane logs people in through the customer's own OpenID Connect provider (Keycloak, Entra ID, Okta, ADFS, Authentik, Dex, ...) and contacts nothing else. It acts as the backend for the console: authorization code flow with PKCE, ID token validation (signature through a cached JWKS that follows key rotation, issuer, audience, nonce, expiry with clock skew), and a server-side session in an `HttpOnly`, `SameSite=Strict` cookie with absolute and idle expiry, revocation and CSRF tokens. Access tokens from the same issuer for `api_audience` work as bearer tokens for CI and scripts. The bootstrap token stays as break-glass (owner rights, every use audited when SSO is on, `break_glass = false` turns it off).
+
+Roles: `owner`, `admin` and `auditor` for the whole deployment; `tenant_admin`, `developer`, `viewer` and `billing` per tenant. They come from IdP groups (`[[security.oidc.role_mappings]]`) and from bindings to users or groups stored through `/api/v1/role-bindings`. Every admin route has an explicit permission and anything without one is refused; lists only show the tenants the caller may see. The audit actor is the user (`email <issuer#subject>`), and logins, logouts, failed logins and role changes are audited in the same hash chain.
+
+[docs/sso.md](docs/sso.md) has the full route to permission table, the configuration, and setup guides for Keycloak and Microsoft Entra ID. `scripts/sso-dex-smoke.sh` logs in against a throwaway Dex container.
+
 ### Secrets and keys
 
 ```text
@@ -458,7 +471,8 @@ cargo test -p caliban --test usage_accuracy
 docker run -d --rm -p 56379:6379 --name caliban-valkey-test valkey/valkey:9.1.2
 CALIBAN_TEST_VALKEY_URL=redis://127.0.0.1:56379 cargo test -p caliban-meter -- --nocapture quota:: idempotency::
 
-# Postgres store parity tests (the memory store's suite, run against Postgres):
+# Postgres store parity tests (the memory store's suite, run against Postgres), and SSO sessions
+# shared by two control-plane replicas:
 docker run -d --rm -p 55432:5432 -e POSTGRES_PASSWORD=x --name caliban-pg-test postgres:17-alpine
 CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres cargo test -p caliban-cp
 
@@ -499,6 +513,7 @@ Known gaps:
 - Revocation in split mode takes effect on the router's next snapshot poll (`CALIBAN_SNAPSHOT_POLL_SECS`, default 10 s), not instantly.
 - Quotas default to in-memory per router process; set `[limits] store = "valkey"` to share them. While Valkey is unreachable each router limits on its own (see [Shared quotas](#shared-quotas-valkey)), and changing `store` needs a router restart.
 - No Prometheus metrics endpoint yet.
+- SSO: roles come from token claims only (no userinfo or Microsoft Graph calls, so Entra group overage is not followed); no refresh tokens, back-channel logout or multiple issuers. Another control-plane replica sees a role binding change within its 5 s refresh.
 - Semantic cache: the starting threshold (0.95) is not calibrated per embedding model yet; some models place unrelated text close together (bge-small scored random-word prompts above 0.95), so calibrate on your traffic before switching tenants on. The verifier is an answer-embedding comparison, not an LLM judge (Krites-style judging of grey-zone pairs is next); thresholds are not yet per intent category (the note's category-aware caching), and there is no near-hit-as-hint tier (T2b). Datasource epochs and ACL fingerprints are not wired into T2 keys yet (no grounded answers reach it today). Entries are not encrypted per tenant. A deleted tenant's entries are purged only by routers running at the time (see [Tenant offboarding](#tenant-offboarding-semantic-cache)). No per-tenant entry quota. Internal embedding calls are not metered. The tenant error budget is per router, and concurrent stat updates to one entry are last-writer-wins. Hits replay instantly, which is a timing signal within a tenant (research note, open question 6).
 - Routing: Stage 2 (ONNX classifier) and Stage 3 (LLM fallback) are not built; kNN abstentions go straight to the keyword rules. The built-in kNN defaults (k 5, temperature 0.05, abstain below 0.5, no OOS gate) are not calibrated for any particular embedder until ml ships an `intent_head` calibration for it. Model health is not tracked on the data plane yet (the policy has a hook; every model counts as healthy). Router-profile centroids are ignored (clusters are matched by intent id). Tenant exemplars come from config only, not yet from the control plane. Artifact signatures (`manifest.json.minisig`) are not checked, only file hashes.
 - Usage events are not written to Postgres yet (see usage shipping below). Migration `0007` adds `cache_tier`, `usage_source`, `cache_write_tokens` and `cache_write_1h_tokens` to `usage_event` (next to the routing columns from `0005`) and the cache prices to `model`; `0010` adds `billed_usd` and `saved_usd` (and the tenant's `auto_cache_hit_fraction`); `PgBackend::insert_usage_events` is the column mapping usage shipping will use (idempotent on `request_id`), tested against Postgres but not called yet.
@@ -507,7 +522,7 @@ Known gaps:
 
 Next, in order:
 
-1. Control plane: OIDC actors in the audit log, usage shipping from routers to the control plane, push (long-poll) instead of polling (faster revocation in split mode).
+1. Control plane: usage shipping from routers to the control plane, push (long-poll) instead of polling (faster revocation in split mode), tenant admins granting roles on their own tenant.
 2. MongoDB connector: wire `introspect` and `propose` into the control plane's introspection job; `$jsonSchema`-declared types; map and scalar-array attributes; per-shard sampling.
 3. CDC replica and planner: connect the planner to the `explain` gate and replica lag in a query service; delta Parquet with compaction instead of whole-table rewrites; resume from the manifest after a restart (today it re-snapshots); parallel `_id`-range snapshots; arrays nested in arrays.
 4. PII: licence sign-off on the NER model's fine-tuning data (see `MODELS.md`); FF1 format-preserving encryption for structured IDs; coreference so a first name maps to the surrogate's first name.

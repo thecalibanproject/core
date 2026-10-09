@@ -552,6 +552,19 @@ async fn access_tokens_work_for_automation() {
         .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
 
+    // API audience = client id (Entra ID v2): an ID token has that audience too, and is refused.
+    let h = harness_with(TestKey::es256("k1"), |s| s.api_audience = Some(CLIENT_ID.into())).await;
+    let id_like = h.idp.access_token(&json!({"aud": CLIENT_ID, "nonce": "n"}));
+    let at = h.idp.access_token(&json!({"aud": CLIENT_ID}));
+    assert_eq!(
+        send(&h.app, "GET", "/api/v1/tenants", &[("authorization", &bearer(&id_like))], None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(&h.app, "GET", "/api/v1/tenants", &[("authorization", &bearer(&at))], None).await.status,
+        StatusCode::OK
+    );
+
     // Without api_audience, access tokens are not accepted at all.
     let h = harness_with(TestKey::es256("k1"), |s| s.api_audience = None).await;
     let t = h.idp.access_token(&json!({}));

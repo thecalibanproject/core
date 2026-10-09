@@ -14,6 +14,14 @@ info:
     `404`, never a second `204`, and write no audit row. Tenants, API keys, datasources and nodes
     are soft-deleted (rows kept for audit, never returned again by default); secrets they held
     are destroyed.
+
+    **Admin authentication (control plane).** One of: a console session (cookie from `/auth/callback`;
+    writes also send `X-CSRF-Token`), an OIDC access token from the configured issuer
+    (`Authorization: Bearer <JWT>`, when `api_audience` is configured), or the break-glass bootstrap
+    token (`Authorization: Bearer $CALIBAN_ADMIN_TOKEN`, owner rights, audited). Every admin route
+    checks one permission (see `core/docs/sso.md` for the route table): `401` means not
+    authenticated, `403` (`error.type` = `permission_error`) means the caller's roles do not allow it.
+    List endpoints return only the tenants the caller may see.
 servers:
   - url: http://localhost:8080
     description: Data plane
@@ -30,6 +38,7 @@ tags:
   - name: nodes
   - name: usage
   - name: system
+  - name: auth
 
 security:
   - bearer: []
@@ -782,6 +791,171 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AuditLog' }
 
+  /api/v1/roles:
+    get:
+      tags: [auth]
+      summary: The roles and the permissions each grants
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/RoleInfo' } }
+        '403': { $ref: '#/components/responses/Error' }
+
+  /api/v1/users:
+    get:
+      tags: [auth]
+      summary: Users known from the identity provider (created just in time)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/User' } }
+        '403': { $ref: '#/components/responses/Error' }
+
+  /api/v1/users/{userId}/sessions:
+    parameters:
+      - { name: userId, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [auth]
+      summary: Sign the user out everywhere (revokes every active session)
+      description: Audited as `user.sessions_revoke`.
+      responses:
+        '204': { description: Revoked }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/role-bindings:
+    get:
+      tags: [auth]
+      summary: Stored role bindings, and the group mappings from the config file
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleBindingList' }
+        '403': { $ref: '#/components/responses/Error' }
+    post:
+      tags: [auth]
+      summary: Grant a role to a user or an identity-provider group
+      description: |
+        Deployment roles (`owner`, `admin`, `auditor`) take no `tenant_id`; tenant roles (`tenant_admin`,
+        `developer`, `viewer`, `billing`) need one (`422` otherwise). Only an owner can grant `owner`
+        (`403`). A user subject must be a user id (`404` if unknown). Takes effect on the next request.
+        Audited as `role_binding.create`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RoleBindingCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleBinding' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/role-bindings/{bindingId}:
+    parameters:
+      - { name: bindingId, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [auth]
+      summary: Revoke a role binding
+      description: Only an owner can revoke an `owner` binding. Audited as `role_binding.delete`.
+      responses:
+        '204': { description: Revoked }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /auth/config:
+    get:
+      tags: [auth]
+      security: []
+      summary: How the console should offer login (public)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthConfig' }
+
+  /auth/login:
+    get:
+      tags: [auth]
+      security: []
+      summary: Start single sign-on (browser navigation)
+      description: |
+        Redirects (303) to the identity provider (authorization code flow with PKCE) and sets a short-lived
+        login cookie. On failure to reach the provider, redirects to `/#/login?error=idp_unavailable`.
+      parameters:
+        - name: return_to
+          in: query
+          required: false
+          description: Path on the console to come back to (same origin only), e.g. `/#/tenants`.
+          schema: { type: string }
+      responses:
+        '303': { description: To the identity provider }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /auth/callback:
+    get:
+      tags: [auth]
+      security: []
+      summary: Identity provider redirect target (browser navigation)
+      description: |
+        Validates the state, the login cookie and the ID token, creates the session cookie (HttpOnly,
+        SameSite=Strict) and redirects (303) to `return_to`. Failures redirect to
+        `/#/login?error=login_failed` (audited as `auth.login_failed`) or `/#/login?error=login_expired`.
+      parameters:
+        - { name: code, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+      responses:
+        '303': { description: To the console }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      security: [ { session: [] } ]
+      summary: End the console session
+      description: Needs `X-CSRF-Token`. Clears the cookie; audited as `auth.logout`.
+      responses:
+        '200':
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [end_session_url]
+                properties:
+                  end_session_url:
+                    type: [string, 'null']
+                    description: The provider's logout URL (RP-initiated logout), if it has one.
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+
+  /auth/me:
+    get:
+      tags: [auth]
+      security: [ { session: [] }, { bearer: [] } ]
+      summary: The authenticated caller, roles and effective permissions
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Error' }
+
   /api/v1/snapshot:
     get:
       tags: [system]
@@ -814,7 +988,16 @@ components:
     bearer:
       type: http
       scheme: bearer
-      description: Tenant API key (`cal_…`) on the data plane; admin token on the control plane.
+      description: |
+        Tenant API key (`cal_…`) on the data plane. On the control plane: an OIDC access token for the
+        configured `api_audience`, or the break-glass bootstrap token.
+    session:
+      type: apiKey
+      in: cookie
+      name: __Host-caliban_session
+      description: |
+        Console session from `/auth/callback` (`caliban_session` when the console is served over plain
+        http). Requests that change something also send the `X-CSRF-Token` header from `/auth/me`.
     apiKey:
       type: apiKey
       in: header
@@ -895,7 +1078,7 @@ components:
           required: [message, type]
           properties:
             message: { type: string }
-            type: { type: string, description: 'e.g. invalid_request_error, authentication_error, policy_violation, upstream_error, rate_limited' }
+            type: { type: string, description: 'e.g. invalid_request_error, authentication_error, permission_error, policy_violation, upstream_error, rate_limited' }
             code: { type: [string, 'null'], description: 'For rate_limited: the limit that was hit (e.g. tokens_per_minute).' }
 
     Health:
@@ -1341,8 +1524,8 @@ components:
         seq: { type: integer }
         ts: { type: string, format: date-time }
         tenant_id: { type: [string, 'null'] }
-        actor: { type: string, description: 'e.g. admin, system (seed)' }
-        action: { type: string, description: 'e.g. tenant.create, api_key.create, provider_key.delete, routes.set, store.seed' }
+        actor: { type: string, description: 'The user as `email <issuer#subject>`, `break_glass` (bootstrap token), `system`, or `anonymous` (failed logins)' }
+        action: { type: string, description: 'e.g. tenant.create, api_key.create, provider_key.delete, routes.set, store.seed, auth.login, auth.logout, auth.login_failed, auth.break_glass, role_binding.create' }
         target: { type: [string, 'null'] }
         detail: { type: object, additionalProperties: true }
         prev_hash: { type: [string, 'null'], description: 'Hex; null for the first row' }
@@ -1358,6 +1541,114 @@ components:
             seq: { type: integer }
             hash: { type: string }
         chain_verified: { type: boolean }
+
+    Role:
+      type: string
+      enum: [owner, admin, auditor, tenant_admin, developer, viewer, billing]
+    Permission:
+      type: string
+      enum: [tenants.create, catalog.read, catalog.write, providers.probe, audit.read, rbac.read, rbac.write,
+             tenant.read, tenant.write, tenant.delete, api_keys.read, api_keys.write, provider_keys.read,
+             provider_keys.write, routes.read, routes.write, datasources.read, datasources.write, ontology.read,
+             ontology.review, nodes.read, nodes.write, usage.read]
+    RoleInfo:
+      type: object
+      required: [role, scope, description, permissions]
+      properties:
+        role: { $ref: '#/components/schemas/Role' }
+        scope: { type: string, enum: [deployment, tenant] }
+        description: { type: string }
+        permissions: { type: array, items: { $ref: '#/components/schemas/Permission' } }
+    User:
+      type: object
+      required: [id, issuer, subject, created_at]
+      properties:
+        id: { type: string }
+        issuer: { type: string }
+        subject: { type: string }
+        email: { type: [string, 'null'] }
+        name: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        last_login_at: { type: [string, 'null'], format: date-time }
+        role_bindings: { type: array, items: { $ref: '#/components/schemas/RoleBinding' }, description: 'Bindings naming this user (GET /users only)' }
+        active_sessions: { type: integer, description: 'GET /users only' }
+    RoleBinding:
+      type: object
+      required: [id, subject_kind, subject, role, created_at, created_by]
+      properties:
+        id: { type: string }
+        subject_kind: { type: string, enum: [user, group] }
+        subject: { type: string, description: 'A user id, or a group name as the identity provider sends it' }
+        role: { $ref: '#/components/schemas/Role' }
+        tenant_id: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+    RoleBindingCreate:
+      type: object
+      required: [subject_kind, subject, role]
+      additionalProperties: false
+      properties:
+        subject_kind: { type: string, enum: [user, group] }
+        subject: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        tenant_id: { type: [string, 'null'] }
+    GroupMapping:
+      type: object
+      required: [group, role, source]
+      properties:
+        group: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        tenant_id: { type: [string, 'null'] }
+        source: { type: string, enum: [config] }
+    RoleBindingList:
+      type: object
+      required: [bindings, group_mappings]
+      properties:
+        bindings: { type: array, items: { $ref: '#/components/schemas/RoleBinding' } }
+        group_mappings: { type: array, items: { $ref: '#/components/schemas/GroupMapping' } }
+        groups_claim: { type: [string, 'null'] }
+    AuthConfig:
+      type: object
+      required: [sso_enabled, break_glass_enabled]
+      properties:
+        sso_enabled: { type: boolean }
+        break_glass_enabled: { type: boolean }
+        login_url: { type: [string, 'null'] }
+    Me:
+      type: object
+      required: [authenticated, method, actor, roles, permissions]
+      properties:
+        authenticated: { type: boolean }
+        method: { type: string, enum: [session, bearer, break_glass] }
+        actor: { type: string }
+        user: { oneOf: [ { $ref: '#/components/schemas/User' }, { type: 'null' } ] }
+        groups: { type: array, items: { type: string } }
+        roles:
+          type: array
+          items:
+            type: object
+            required: [role]
+            properties:
+              role: { $ref: '#/components/schemas/Role' }
+              tenant_id: { type: string }
+        permissions:
+          type: object
+          required: [deployment, tenants]
+          properties:
+            deployment:
+              type: array
+              description: Held deployment-wide; tenant-scoped ones here apply to every tenant.
+              items: { $ref: '#/components/schemas/Permission' }
+            tenants:
+              type: object
+              additionalProperties: { type: array, items: { $ref: '#/components/schemas/Permission' } }
+        csrf_token: { type: string, description: 'Sessions only: send as X-CSRF-Token on writes' }
+        session:
+          type: object
+          properties:
+            id: { type: string }
+            created_at: { type: string, format: date-time }
+            expires_at: { type: string, format: date-time }
 
     SignedSnapshot:
       type: object
