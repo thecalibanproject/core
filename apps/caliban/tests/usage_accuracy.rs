@@ -1,7 +1,9 @@
 //! Usage accuracy: the gateway's metered usage (the JSONL usage WAL) against the "provider bill"
 //! (the usage the mock upstream reported for every request it served), request by request,
 //! across both dialects, streams, translation in both directions, native Anthropic passthrough
-//! with prompt caching, provider-side prefix caching, exact-cache hits, fallbacks and PII.
+//! with prompt caching, provider-side prefix caching, exact-cache hits, fallbacks and PII. Cache
+//! hits are billed separately: `caliban/auto` hits at the tenant's fraction of the flat price,
+//! and every priced hit records what it saved.
 //!
 //! P0 exit criterion: "Usage matches provider bills within 1%". Token counts must match exactly
 //! (no estimation is involved when the upstream reports usage, also for streams whose client did
@@ -27,6 +29,12 @@ const ANTHROPIC_WRITE_5M: f64 = 1.25;
 const ANTHROPIC_WRITE_1H: f64 = 2.0;
 const OPENAI_CACHED: f64 = 0.5;
 
+/// Flat `caliban/auto` price (USD per million tokens, in and out) and the cache-hit fractions:
+/// the deployment's, and the test tenant's override (the one that applies).
+const AUTO_PRICE: (f64, f64) = (5.0, 10.0);
+const DEPLOYMENT_HIT_FRACTION: f64 = 0.25;
+const TENANT_HIT_FRACTION: f64 = 0.1;
+
 fn price(model: &str) -> (f64, f64) {
     PRICES.iter().find(|p| p.0 == model).map(|p| (p.1, p.2)).expect("priced model")
 }
@@ -47,6 +55,11 @@ fn config(base: &str, hash: &str) -> String {
         .collect();
     format!(
         r#"
+[routing]
+auto_price_in_per_mtok = {auto_in}
+auto_price_out_per_mtok = {auto_out}
+auto_cache_hit_fraction = {DEPLOYMENT_HIT_FRACTION}
+
 [cache]
 exact_enabled = true
 
@@ -55,6 +68,7 @@ exact_enabled = true
 id = "acct"
 name = "Accounting"
 pii_mode = "reversible"
+auto_cache_hit_fraction = {TENANT_HIT_FRACTION}
 api_key_hashes = ["{hash}"]
   [[tenants.providers]]
   id = "oa"
@@ -75,7 +89,14 @@ api_key_hashes = ["{hash}"]
   [[tenants.routes]]
   intent = "chat"
   models = ["oa/fail", "oa/m"]
-"#
+  # Except summaries: the exact cache only answers a request's first candidate, so caliban/auto
+  # cache hits need a route that does not fall back.
+  [[tenants.routes]]
+  intent = "summarize"
+  models = ["oa/m"]
+"#,
+        auto_in = AUTO_PRICE.0,
+        auto_out = AUTO_PRICE.1,
     )
 }
 
@@ -463,6 +484,7 @@ async fn metered_usage_matches_provider_bills() {
             assert!(s.bills.is_empty(), "{l}: a cache hit reached the provider");
             assert_eq!((s.metered("prompt_tokens"), s.metered("completion_tokens")), (0, 0), "{l}");
             assert!(s.metered("tokens_saved") > 0, "{l}: hits record tokens saved");
+            assert!(s.event["saved_usd"].as_f64().is_some_and(|v| v > 0.0), "{l}: priced hits record the saving");
             continue;
         }
         assert_eq!(s.bills.len(), 1, "{l}: billed exactly once (fallback included)");
@@ -601,4 +623,69 @@ async fn client_disconnect_is_metered_as_an_estimate() {
         bill.total_prompt_tokens(),
         bill.output_tokens
     );
+}
+
+fn f64_of(e: &Value, k: &str) -> f64 {
+    e[k].as_f64().unwrap_or_else(|| panic!("{k} missing in {e}"))
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-15 + b.abs() * 1e-9
+}
+
+/// `caliban/auto` exact-cache hits: the provider is not called; the event records the full flat
+/// price of the cached answer's tokens, the discounted billed amount (the tenant's fraction, which
+/// overrides the deployment's), the saving, and a routed model cost of 0. The miss before them
+/// bills the full flat price, and its cost still matches the provider's bill. A pinned model's
+/// hit records the model cost it avoided.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_cache_hits_are_billed_at_the_discounted_flat_price() {
+    let e = setup().await;
+    for api in [Api::OpenAi, Api::Anthropic] {
+        let mut body = json!({"model": "caliban/auto", "temperature": 0, "messages": msgs(&format!("Summarize the meeting notes in one line. {}", matches!(api, Api::Anthropic)))});
+        if matches!(api, Api::Anthropic) {
+            body["max_tokens"] = json!(64);
+        }
+        let miss = e.sample("caliban/auto, exact-cache miss", api, body.clone()).await;
+        assert_eq!(miss.event["cache"], "miss");
+        assert_eq!(miss.bills.len(), 1, "a miss is billed by the provider once");
+        assert_cost_matches(&miss);
+        let flat = f64_of(&miss.event, "flat_price_usd");
+        let want = (miss.billed_prompt() as f64 * AUTO_PRICE.0 + miss.billed_completion() as f64 * AUTO_PRICE.1) / 1e6;
+        assert!(close(flat, want), "flat price {flat} vs {want}");
+        assert!(close(f64_of(&miss.event, "billed_usd"), flat), "a miss bills the full flat price");
+        assert!(miss.event.get("saved_usd").is_none());
+
+        for _ in 0..2 {
+            let hit = e.sample("caliban/auto, exact-cache hit", api, body.clone()).await;
+            let ev = &hit.event;
+            assert!(hit.bills.is_empty(), "a hit never reaches the provider");
+            assert_eq!((ev["cache"].as_str(), ev["cache_tier"].as_str()), (Some("hit"), Some("exact")));
+            assert_eq!(ev["requested_model"], "caliban/auto");
+            assert_eq!((hit.metered("prompt_tokens"), hit.metered("completion_tokens")), (0, 0));
+            assert_eq!(hit.metered("tokens_saved"), miss.billed_prompt() + miss.billed_completion());
+            assert!(close(f64_of(ev, "cost_usd"), 0.0) && close(f64_of(ev, "routed_model_cost_usd"), 0.0));
+            assert!(close(f64_of(ev, "flat_price_usd"), flat), "full price recorded next to the bill");
+            assert!(close(f64_of(ev, "billed_usd"), flat * TENANT_HIT_FRACTION), "billed {}", ev["billed_usd"]);
+            assert!(close(f64_of(ev, "saved_usd"), flat * (1.0 - TENANT_HIT_FRACTION)));
+        }
+    }
+
+    // A pinned model: the hit costs the customer nothing at the provider and records the
+    // avoided cost (the miss's provider bill, which has no prompt-cache reads here).
+    let body =
+        json!({"model": "oa/m", "temperature": 0, "messages": msgs("Summarize the incident timeline in one line.")});
+    let miss = e.sample("pinned, exact-cache miss", Api::OpenAi, body.clone()).await;
+    assert_eq!(miss.billed_cached(), 0);
+    let hit = e.sample("pinned, exact-cache hit", Api::OpenAi, body).await;
+    assert!(hit.bills.is_empty());
+    assert!(
+        close(f64_of(&hit.event, "saved_usd"), miss.provider_cost()),
+        "{} vs {}",
+        hit.event["saved_usd"],
+        miss.provider_cost()
+    );
+    for k in ["flat_price_usd", "billed_usd", "routed_model_cost_usd"] {
+        assert!(hit.event.get(k).is_none(), "{k} is caliban/auto only");
+    }
 }
