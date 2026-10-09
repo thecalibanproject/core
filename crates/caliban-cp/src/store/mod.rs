@@ -27,6 +27,12 @@
 //! Tenant secrets (BYOK keys, datasource credentials) are sealed under the tenant's DEK, which is
 //! stored wrapped by a KEK ([`State::deks`]); see [`crate::keys`] for the hierarchy, the startup
 //! migration and KEK rotation.
+//!
+//! Identity (see [`crate::auth`]): users (created just in time from the identity provider) and
+//! role bindings are part of [`State`] and change through audited mutations like everything else.
+//! Sessions and pending logins are not in [`State`]: they are read per request straight from the
+//! backend. Creating a session (login) or revoking one (logout, an admin revoking a user's
+//! sessions) is still a [`Mutation`], so it is atomic with its audit row.
 
 pub mod audit;
 pub mod memory;
@@ -34,6 +40,7 @@ pub mod postgres;
 #[cfg(test)]
 mod tests;
 
+use crate::auth::rbac::Role;
 use audit::{AuditDraft, AuditEntry};
 use caliban_config::{
     Config, ConfigHandle, Keyring, ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider, Snapshot,
@@ -169,6 +176,87 @@ pub struct NodeRecord {
     pub deleted_at: Option<DateTime<Utc>>,
 }
 
+/// A person or service known from the identity provider, keyed by `(issuer, subject)`. Created
+/// just in time on the first login or the first access token.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UserRecord {
+    pub id: String,
+    pub issuer: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_login_at: Option<DateTime<Utc>>,
+}
+
+impl UserRecord {
+    /// Audit actor: `display <issuer#subject>`, where display is the email, else the name, else
+    /// the subject. The part in angle brackets is the stable identity.
+    pub fn actor(&self) -> String {
+        let display = self.email.as_deref().or(self.name.as_deref()).unwrap_or(&self.subject);
+        format!("{display} <{}#{}>", self.issuer, self.subject)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectKind {
+    /// `subject` is a [`UserRecord::id`].
+    User,
+    /// `subject` is an identity-provider group, as sent in the groups claim.
+    Group,
+}
+
+impl SubjectKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubjectKind::User => "user",
+            SubjectKind::Group => "group",
+        }
+    }
+}
+
+/// A role granted to a user or a group, deployment-wide (`tenant_id: None`) or for one tenant.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RoleBinding {
+    pub id: String,
+    pub subject_kind: SubjectKind,
+    pub subject: String,
+    pub role: Role,
+    pub tenant_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub created_by: String,
+}
+
+/// A server-side console session. The browser holds the token; only its SHA-256 is stored.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SessionRecord {
+    /// Public id (audit rows, revocation), unrelated to the token.
+    pub id: String,
+    #[serde(skip)]
+    pub token_sha256: String,
+    pub user_id: String,
+    /// The user's identity-provider groups at login.
+    pub groups: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// An authorization request in flight (between `/auth/login` and `/auth/callback`). Single use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingLogin {
+    pub state: String,
+    /// SHA-256 of the login cookie set on the browser that started the login.
+    pub binding_sha256: String,
+    pub nonce: String,
+    pub pkce_verifier: String,
+    pub return_to: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct State {
     /// Model catalogue.
@@ -189,6 +277,10 @@ pub struct State {
     pub ontologies: BTreeMap<String, Ontology>,
     /// Tenant → wrapped DEK. Created on the tenant's first secret, destroyed with the tenant.
     pub deks: BTreeMap<String, DekRecord>,
+    /// Users known from the identity provider (created just in time).
+    pub users: Vec<UserRecord>,
+    /// Roles granted through the API (group to role mappings from the config file are not here).
+    pub role_bindings: Vec<RoleBinding>,
     /// Sequence number of the last audit row; doubles as the state version.
     pub audit_head: u64,
 }
@@ -269,6 +361,14 @@ impl State {
 
     pub fn live_node(&self, tenant_id: &str, id: &str) -> Option<&NodeRecord> {
         self.nodes.iter().find(|n| n.tenant_id == tenant_id && n.id == id && n.is_live())
+    }
+
+    pub fn user(&self, id: &str) -> Option<&UserRecord> {
+        self.users.iter().find(|u| u.id == id)
+    }
+
+    pub fn user_by_subject(&self, issuer: &str, subject: &str) -> Option<&UserRecord> {
+        self.users.iter().find(|u| u.issuer == issuer && u.subject == subject)
     }
 }
 
@@ -487,6 +587,31 @@ pub enum Mutation {
     },
     /// Startup migration or KEK rotation, planned by [`crate::keys::plan`].
     Rekey(Rekey),
+    /// A successful login: creates the user (keyed by issuer and subject) or refreshes its email,
+    /// name and `last_login_at`, and stores the new session for that user.
+    Login {
+        user: UserRecord,
+        session: SessionRecord,
+    },
+    /// Revokes one active session of `user_id` (logout).
+    Logout {
+        session_id: String,
+        user_id: String,
+        at: DateTime<Utc>,
+    },
+    /// A user first seen through an access token. Conflict if `(issuer, subject)` is known.
+    CreateUser(UserRecord),
+    /// Revokes every active session of the user.
+    RevokeUserSessions {
+        user_id: String,
+        at: DateTime<Utc>,
+    },
+    CreateRoleBinding(RoleBinding),
+    DeleteRoleBinding {
+        id: String,
+    },
+    /// Changes nothing; only appends the audit row (failed logins, break-glass use).
+    Record(AuditDraft),
 }
 
 /// A batch of key changes. Every change names the value it replaces; if any of them changed in
@@ -619,6 +744,7 @@ impl Mutation {
                         "nodes_deleted": ids(before.nodes.iter().filter(|x| &x.tenant_id == id && x.is_live()).map(|x| &x.id).collect()),
                         // Crypto-shredding: everything sealed under this key is unreadable without it.
                         "tenant_key_destroyed": before.deks.get(id).map(|d| &d.wrapped.kek_id),
+                        "role_bindings_removed": ids(before.role_bindings.iter().filter(|b| b.tenant_id.as_ref() == Some(id)).map(|b| &b.id).collect()),
                     }),
                 )
             }
@@ -692,8 +818,55 @@ impl Mutation {
                 target: None,
                 detail: r.summary(),
             },
+            Mutation::Login { user, session } => {
+                let known = before.user_by_subject(&user.issuer, &user.subject);
+                d(
+                    None,
+                    "auth.login",
+                    known.map_or(&user.id, |u| &u.id),
+                    json!({"issuer": user.issuer, "subject": user.subject, "email": user.email, "name": user.name,
+                           "session": session.id, "groups": session.groups, "new_user": known.is_none()}),
+                )
+            }
+            Mutation::Logout { session_id, user_id, .. } => {
+                d(None, "auth.logout", user_id, json!({"session": session_id}))
+            }
+            Mutation::CreateUser(u) => d(
+                None,
+                "user.create",
+                &u.id,
+                json!({"issuer": u.issuer, "subject": u.subject, "email": u.email, "name": u.name}),
+            ),
+            Mutation::RevokeUserSessions { user_id, .. } => d(
+                None,
+                "user.sessions_revoke",
+                user_id,
+                json!({"email": before.user(user_id).and_then(|u| u.email.as_ref())}),
+            ),
+            Mutation::CreateRoleBinding(b) => {
+                d(b.tenant_id.as_deref(), "role_binding.create", &b.id, binding_detail(before, b))
+            }
+            Mutation::DeleteRoleBinding { id } => {
+                let b = before.role_bindings.iter().find(|b| &b.id == id);
+                d(
+                    b.and_then(|b| b.tenant_id.as_deref()),
+                    "role_binding.delete",
+                    id,
+                    b.map_or_else(|| json!({}), |b| binding_detail(before, b)),
+                )
+            }
+            Mutation::Record(draft) => draft.clone(),
         }
     }
+}
+
+/// What a role binding grants to whom (a user subject also shows the user's email).
+fn binding_detail(st: &State, b: &RoleBinding) -> Value {
+    let email = match b.subject_kind {
+        SubjectKind::User => st.user(&b.subject).and_then(|u| u.email.clone()),
+        SubjectKind::Group => None,
+    };
+    json!({"subject_kind": b.subject_kind, "subject": b.subject, "email": email, "role": b.role, "tenant_id": b.tenant_id})
 }
 
 /// Validation hook the backend runs inside the transaction, before the audit row and commit.
@@ -711,6 +884,21 @@ pub trait Backend: Send + Sync {
     async fn apply(&self, actor: &str, m: &Mutation, check: Check<'_>) -> Result<State, StoreError>;
     /// Newest `limit` audit rows, ascending by `seq`.
     async fn audit(&self, limit: usize) -> Result<Vec<AuditEntry>, StoreError>;
+
+    // Sessions and pending logins: per-request reads and housekeeping, not audited. Creating and
+    // revoking sessions goes through `apply` (`Login`, `Logout`, `RevokeUserSessions`).
+
+    /// The session whose token hashes to `token_sha256`, revoked or expired ones included.
+    async fn session(&self, token_sha256: &str) -> Result<Option<SessionRecord>, StoreError>;
+    /// Records activity (idle timeout).
+    async fn touch_session(&self, id: &str, at: DateTime<Utc>) -> Result<(), StoreError>;
+    /// Sessions of a user that are neither revoked nor expired at `now`.
+    async fn active_sessions(&self, user_id: &str, now: DateTime<Utc>) -> Result<Vec<SessionRecord>, StoreError>;
+    async fn put_login(&self, login: &PendingLogin) -> Result<(), StoreError>;
+    /// Removes and returns the pending login (single use), expired or not.
+    async fn take_login(&self, state: &str) -> Result<Option<PendingLogin>, StoreError>;
+    /// Deletes sessions and pending logins that expired before `now`. Returns how many.
+    async fn purge_auth(&self, now: DateTime<Utc>) -> Result<u64, StoreError>;
 }
 
 pub struct Store {
@@ -795,6 +983,30 @@ impl Store {
 
     pub async fn audit(&self, limit: usize) -> Result<Vec<AuditEntry>, StoreError> {
         self.backend.audit(limit).await
+    }
+
+    pub async fn session(&self, token_sha256: &str) -> Result<Option<SessionRecord>, StoreError> {
+        self.backend.session(token_sha256).await
+    }
+
+    pub async fn touch_session(&self, id: &str, at: DateTime<Utc>) -> Result<(), StoreError> {
+        self.backend.touch_session(id, at).await
+    }
+
+    pub async fn active_sessions(&self, user_id: &str, now: DateTime<Utc>) -> Result<Vec<SessionRecord>, StoreError> {
+        self.backend.active_sessions(user_id, now).await
+    }
+
+    pub async fn put_login(&self, login: &PendingLogin) -> Result<(), StoreError> {
+        self.backend.put_login(login).await
+    }
+
+    pub async fn take_login(&self, state: &str) -> Result<Option<PendingLogin>, StoreError> {
+        self.backend.take_login(state).await
+    }
+
+    pub async fn purge_auth(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
+        self.backend.purge_auth(now).await
     }
 
     /// Reloads from the backend if another control-plane replica committed changes.

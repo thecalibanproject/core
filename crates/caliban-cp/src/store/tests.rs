@@ -1,9 +1,10 @@
 //! Store parity: one behaviour suite, run against the memory backend and (when
 //! `CALIBAN_TEST_DATABASE_URL` is set) the Postgres backend; the final states must match.
 
-use super::audit::verify_chain;
+use super::audit::{AuditDraft, verify_chain};
 use super::postgres::{MIGRATIONS, PgBackend};
 use super::*;
+use crate::auth::rbac::Role;
 use caliban_config::{Keyring, seal};
 use chrono::TimeZone;
 use sqlx::AssertSqlSafe;
@@ -406,6 +407,7 @@ async fn suite(s: &Store) {
 
     tenant_keys(s).await;
     deletes(s).await;
+    identity(s).await;
 
     // ── concurrent writers: serialized, chain stays intact ──
     let writes = (0..8).map(|i| s.apply("ops", Mutation::CreateTenant(tenant(&format!("burst-{i}")))));
@@ -429,6 +431,13 @@ async fn suite(s: &Store) {
         "tenant_key.create",
         "keys.migrate",
         "keys.rotate",
+        "auth.login",
+        "auth.logout",
+        "auth.login_failed",
+        "user.create",
+        "user.sessions_revoke",
+        "role_binding.create",
+        "role_binding.delete",
     ] {
         assert!(actions.contains(&a), "{a} is audited");
     }
@@ -436,6 +445,209 @@ async fn suite(s: &Store) {
     assert!(!log_text.contains("sk-test") && !log_text.contains("hunter2"), "no secrets in the audit log");
     assert_eq!(s.audit(3).await.unwrap(), log[log.len() - 3..].to_vec());
     assert_eq!(s.config.load().version, format!("cp-{}", s.state().audit_head));
+}
+
+fn sha(t: &str) -> String {
+    crate::auth::sha256_hex(t)
+}
+
+fn far() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap()
+}
+
+fn user(id: &str, sub: &str) -> UserRecord {
+    UserRecord {
+        id: id.into(),
+        issuer: "https://idp.example.test/realms/caliban".into(),
+        subject: sub.into(),
+        email: Some(format!("{sub}@example.test")),
+        name: Some(sub.to_uppercase()),
+        created_at: ts(),
+        last_login_at: Some(ts()),
+    }
+}
+
+fn session(id: &str, token: &str, user_id: &str, expires_at: DateTime<Utc>) -> SessionRecord {
+    SessionRecord {
+        id: id.into(),
+        token_sha256: sha(token),
+        user_id: user_id.into(),
+        groups: vec!["caliban-devs".into()],
+        created_at: ts(),
+        expires_at,
+        last_seen_at: ts(),
+        revoked_at: None,
+    }
+}
+
+fn binding(id: &str, kind: SubjectKind, subject: &str, role: Role, tenant: Option<&str>) -> RoleBinding {
+    RoleBinding {
+        id: id.into(),
+        subject_kind: kind,
+        subject: subject.into(),
+        role,
+        tenant_id: tenant.map(str::to_owned),
+        created_at: ts(),
+        created_by: A.into(),
+    }
+}
+
+/// Users, role bindings, sessions and pending logins (run inside `suite`, so on both backends).
+async fn identity(s: &Store) {
+    let conflict = |e: StoreError| matches!(e, StoreError::Conflict(_));
+    let alice = user("usr_a", "alice");
+    let actor = alice.actor();
+    assert_eq!(actor, "alice@example.test <https://idp.example.test/realms/caliban#alice>");
+
+    // ── login: creates the user just in time, with the session ──
+    let login = |u: &UserRecord, s: SessionRecord| Mutation::Login { user: u.clone(), session: s };
+    s.apply(&actor, login(&alice, session("ses_1", "tok-1", "usr_a", far()))).await.unwrap();
+    assert_eq!(s.state().user("usr_a"), Some(&alice));
+    let got = s.session(&sha("tok-1")).await.unwrap().unwrap();
+    assert_eq!(
+        (got.user_id.as_str(), got.groups.clone(), got.revoked_at),
+        ("usr_a", vec!["caliban-devs".into()], None)
+    );
+    assert!(s.session(&sha("tok-nope")).await.unwrap().is_none());
+    let a = &s.audit(1).await.unwrap()[0];
+    assert_eq!(
+        (a.action.as_str(), a.actor.as_str(), a.target.as_deref()),
+        ("auth.login", actor.as_str(), Some("usr_a"))
+    );
+    assert_eq!(a.detail["new_user"], json!(true));
+    assert_eq!(a.detail["session"], json!("ses_1"));
+
+    // Next login of the same (issuer, subject): same user id, fresh profile, session bound to it.
+    let again = UserRecord {
+        id: "usr_proposed".into(),
+        email: Some("alice@new.example.test".into()),
+        last_login_at: Some(del_ts()),
+        ..alice.clone()
+    };
+    s.apply(&actor, login(&again, session("ses_2", "tok-2", "usr_proposed", far()))).await.unwrap();
+    let st = s.state();
+    assert_eq!(st.users.iter().filter(|u| u.subject == "alice").count(), 1);
+    let u = st.user("usr_a").unwrap();
+    assert_eq!(
+        (u.email.as_deref(), u.last_login_at, u.created_at),
+        (Some("alice@new.example.test"), Some(del_ts()), ts())
+    );
+    assert_eq!(s.session(&sha("tok-2")).await.unwrap().unwrap().user_id, "usr_a");
+    assert_eq!(s.audit(1).await.unwrap()[0].detail["new_user"], json!(false));
+    let head = s.state().audit_head;
+    assert!(conflict(s.apply(&actor, login(&alice, session("ses_3", "tok-1", "usr_a", far()))).await.unwrap_err()));
+    assert!(conflict(s.apply(&actor, login(&alice, session("ses_1", "tok-9", "usr_a", far()))).await.unwrap_err()));
+    assert_eq!(s.state().audit_head, head, "a failed login mutation writes nothing");
+    assert_eq!(s.active_sessions("usr_a", ts()).await.unwrap().len(), 2);
+
+    // ── logout: revokes that session only; repeat is a 404 ──
+    let logout = |sid: &str, uid: &str| Mutation::Logout { session_id: sid.into(), user_id: uid.into(), at: del_ts() };
+    assert_eq!(s.apply(&actor, logout("ses_1", "usr_other")).await.unwrap_err(), StoreError::NotFound("user".into()));
+    s.apply(&actor, logout("ses_1", "usr_a")).await.unwrap();
+    assert_eq!(s.session(&sha("tok-1")).await.unwrap().unwrap().revoked_at, Some(del_ts()));
+    assert_eq!(s.apply(&actor, logout("ses_1", "usr_a")).await.unwrap_err(), StoreError::NotFound("session".into()));
+    assert_eq!(
+        s.active_sessions("usr_a", ts()).await.unwrap().iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
+        ["ses_2"]
+    );
+
+    // ── users first seen through an access token ──
+    let ci = user("usr_ci", "ci-bot");
+    s.apply(&ci.actor(), Mutation::CreateUser(ci.clone())).await.unwrap();
+    assert!(conflict(s.apply(&ci.actor(), Mutation::CreateUser(ci.clone())).await.unwrap_err()));
+    assert!(conflict(
+        s.apply(A, Mutation::CreateUser(UserRecord { id: "usr_x".into(), ..ci.clone() })).await.unwrap_err()
+    ));
+
+    // ── role bindings ──
+    let create = |b: RoleBinding| Mutation::CreateRoleBinding(b);
+    s.apply(A, create(binding("rb_1", SubjectKind::User, "usr_a", Role::Owner, None))).await.unwrap();
+    s.apply(A, create(binding("rb_2", SubjectKind::Group, "acme-devs", Role::Developer, Some("acme")))).await.unwrap();
+    s.apply(A, create(binding("rb_3", SubjectKind::User, "usr_ci", Role::Viewer, Some("acme")))).await.unwrap();
+    let invalid = |e: StoreError| matches!(e, StoreError::Invalid(_));
+    assert!(invalid(
+        s.apply(A, create(binding("rb_x", SubjectKind::Group, "g", Role::Developer, None))).await.unwrap_err()
+    ));
+    assert!(invalid(
+        s.apply(A, create(binding("rb_x", SubjectKind::Group, "g", Role::Admin, Some("acme")))).await.unwrap_err()
+    ));
+    assert!(invalid(
+        s.apply(A, create(binding("rb_x", SubjectKind::Group, " ", Role::Admin, None))).await.unwrap_err()
+    ));
+    assert_eq!(
+        s.apply(A, create(binding("rb_x", SubjectKind::Group, "g", Role::Viewer, Some("nobody")))).await.unwrap_err(),
+        StoreError::NotFound("tenant".into())
+    );
+    assert_eq!(
+        s.apply(A, create(binding("rb_x", SubjectKind::User, "usr_nope", Role::Admin, None))).await.unwrap_err(),
+        StoreError::NotFound("user".into())
+    );
+    assert!(conflict(
+        s.apply(A, create(binding("rb_x", SubjectKind::User, "usr_a", Role::Owner, None))).await.unwrap_err()
+    ));
+    assert!(conflict(
+        s.apply(A, create(binding("rb_1", SubjectKind::Group, "g", Role::Admin, None))).await.unwrap_err()
+    ));
+    let a = &s.audit(1).await.unwrap()[0];
+    assert_eq!((a.action.as_str(), a.tenant_id.as_deref()), ("role_binding.create", Some("acme")));
+    assert_eq!(
+        a.detail,
+        json!({"subject_kind": "user", "subject": "usr_ci", "email": "ci-bot@example.test", "role": "viewer", "tenant_id": "acme"})
+    );
+    s.apply(A, Mutation::DeleteRoleBinding { id: "rb_1".into() }).await.unwrap();
+    assert_eq!(s.audit(1).await.unwrap()[0].detail["role"], json!("owner"));
+    assert_eq!(
+        s.apply(A, Mutation::DeleteRoleBinding { id: "rb_1".into() }).await.unwrap_err(),
+        StoreError::NotFound("role binding".into())
+    );
+    assert_eq!(s.state().role_bindings.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["rb_2", "rb_3"]);
+
+    // ── sign a user out everywhere ──
+    s.apply(&ci.actor(), login(&ci, session("ses_ci", "tok-ci", "usr_ci", del_ts()))).await.unwrap();
+    s.apply(A, Mutation::RevokeUserSessions { user_id: "usr_a".into(), at: del_ts() }).await.unwrap();
+    assert!(s.active_sessions("usr_a", ts()).await.unwrap().is_empty());
+    assert_eq!(s.active_sessions("usr_ci", ts()).await.unwrap().len(), 1, "other users keep theirs");
+    assert_eq!(
+        s.apply(A, Mutation::RevokeUserSessions { user_id: "usr_nope".into(), at: del_ts() }).await.unwrap_err(),
+        StoreError::NotFound("user".into())
+    );
+
+    // ── activity and expiry ──
+    s.touch_session("ses_ci", del_ts()).await.unwrap();
+    assert_eq!(s.session(&sha("tok-ci")).await.unwrap().unwrap().last_seen_at, del_ts());
+    assert!(s.active_sessions("usr_ci", del_ts()).await.unwrap().is_empty(), "expired at del_ts");
+
+    // ── pending logins: single use ──
+    let pending = PendingLogin {
+        state: "st-1".into(),
+        binding_sha256: sha("bind"),
+        nonce: "n".into(),
+        pkce_verifier: "v".into(),
+        return_to: "/#/tenants".into(),
+        created_at: ts(),
+        expires_at: del_ts(),
+    };
+    s.put_login(&pending).await.unwrap();
+    assert!(conflict(s.put_login(&pending).await.unwrap_err()));
+    s.put_login(&PendingLogin { state: "st-2".into(), expires_at: far(), ..pending.clone() }).await.unwrap();
+    assert_eq!(s.take_login("st-1").await.unwrap(), Some(pending.clone()));
+    assert_eq!(s.take_login("st-1").await.unwrap(), None, "used once");
+
+    // ── purge: expired sessions and logins go, live ones stay ──
+    let after = del_ts() + chrono::Duration::seconds(1);
+    assert_eq!(s.purge_auth(after).await.unwrap(), 1, "ses_ci");
+    assert!(s.session(&sha("tok-ci")).await.unwrap().is_none());
+    assert!(s.session(&sha("tok-2")).await.unwrap().is_some(), "revoked but not expired: kept until expiry");
+    assert_eq!(s.purge_auth(far() + chrono::Duration::seconds(1)).await.unwrap(), 3, "ses_1, ses_2, st-2");
+    assert_eq!(s.take_login("st-2").await.unwrap(), None);
+
+    // ── audit-only records ──
+    let st = s.state();
+    let draft =
+        AuditDraft { tenant_id: None, action: "auth.login_failed", target: None, detail: json!({"reason": "nonce"}) };
+    s.apply("anonymous", Mutation::Record(draft)).await.unwrap();
+    assert_eq!(s.state().audit_head, st.audit_head + 1);
+    assert_eq!(normalize(&State { audit_head: st.audit_head, ..State::clone(&s.state()) }), normalize(&st));
 }
 
 /// Revoke and delete semantics (run inside `suite`, so on both backends).
@@ -561,6 +773,16 @@ async fn deletes(s: &Store) {
     s.apply(A, Mutation::CreateNode(node("node_d", "doomed", "triage"))).await.unwrap();
     s.apply(A, Mutation::ProposeOntology { tenant_id: "doomed".into(), elements: vec![element("e_d")] }).await.unwrap();
     assert!(s.config.load().tenant(&"doomed".into()).is_some());
+    let rb = RoleBinding {
+        id: "rb_doomed".into(),
+        subject_kind: SubjectKind::Group,
+        subject: "doomed-devs".into(),
+        role: Role::Developer,
+        tenant_id: Some("doomed".into()),
+        created_at: ts(),
+        created_by: A.into(),
+    };
+    s.apply(A, Mutation::CreateRoleBinding(rb)).await.unwrap();
 
     let del_tenant = |id: &str| Mutation::DeleteTenant { id: id.into(), at: del_ts() };
     assert_eq!(s.apply(A, del_tenant("nobody")).await.unwrap_err(), not_found("tenant"));
@@ -576,6 +798,7 @@ async fn deletes(s: &Store) {
     let ds = st.datasources.iter().find(|d| d.id == "ds_d").unwrap();
     assert_eq!((ds.deleted_at, &ds.connection), (Some(del_ts()), &json!({})));
     assert_eq!(st.nodes.iter().find(|n| n.id == "node_d").unwrap().deleted_at, Some(del_ts()));
+    assert!(st.role_bindings.iter().all(|b| b.id != "rb_doomed"), "the tenant's role bindings go with it");
     // Gone from the data plane: no tenant, no key.
     let snap = s.config.load();
     assert!(snap.tenant(&"doomed".into()).is_none());
@@ -587,7 +810,8 @@ async fn deletes(s: &Store) {
     assert_eq!(
         a.detail,
         json!({"api_keys_revoked": ["key_d1"], "provider_keys_destroyed": ["openai"], "routes_removed": ["default"],
-               "datasources_deleted": ["ds_d"], "nodes_deleted": ["node_d"], "tenant_key_destroyed": ring().current_id()})
+               "datasources_deleted": ["ds_d"], "nodes_deleted": ["node_d"], "tenant_key_destroyed": ring().current_id(),
+               "role_bindings_removed": ["rb_doomed"]})
     );
     // Everything tenant-scoped now 404s; the id cannot be reused; a repeat delete is 404.
     assert_eq!(s.apply(A, del_tenant("doomed")).await.unwrap_err(), not_found("tenant"));
@@ -784,6 +1008,8 @@ fn normalize(st: &State) -> Value {
         "datasources": st.datasources.iter().map(|d| json!([d, crate::keys::count_sealed(&d.connection)])).collect::<Vec<_>>(),
         "nodes": st.nodes,
         "ontologies": st.ontologies,
+        "users": st.users,
+        "role_bindings": st.role_bindings,
         "audit_head": st.audit_head,
     });
     strip(&mut v);
@@ -942,7 +1168,7 @@ async fn postgres_backend_matches_memory_and_persists() {
     );
     assert_eq!(
         scalar("SELECT count(*) FROM audit_log WHERE tenant_id = 'doomed'").await,
-        9,
+        10,
         "audit rows of a deleted tenant are kept"
     );
     assert!(sqlx::query("UPDATE api_key SET revoked_at = NULL WHERE id = 'key_g1'").execute(&pool).await.is_err());
@@ -954,6 +1180,25 @@ async fn postgres_backend_matches_memory_and_persists() {
     );
     assert!(sqlx::query("UPDATE datasource SET deleted_at = NULL WHERE id = 'ds_1'").execute(&pool).await.is_err());
     assert!(sqlx::query("UPDATE node SET deleted_at = NULL WHERE id = 'node_2'").execute(&pool).await.is_err());
+    // Identity at rest: one user per (issuer, subject), bindings scoped by role, no session left
+    // after the purge, and pending logins consumed.
+    assert_eq!(scalar("SELECT count(*) FROM app_user").await, 2);
+    assert!(
+        sqlx::query("INSERT INTO app_user (id, issuer, subject, created_at) VALUES ('usr_dup', 'https://idp.example.test/realms/caliban', 'alice', now())")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    for (role, tenant) in [("owner", "'globex'"), ("viewer", "NULL"), ("root", "NULL")] {
+        let q = format!(
+            "INSERT INTO role_binding (id, subject_kind, subject, role, tenant_id, created_at, created_by) VALUES ('rb_bad', 'group', 'g', '{role}', {tenant}, now(), 'x')"
+        );
+        assert!(sqlx::query(AssertSqlSafe(q)).execute(&pool).await.is_err(), "{role} with tenant {tenant}");
+    }
+    assert_eq!(scalar("SELECT count(*) FROM role_binding WHERE tenant_id = 'doomed'").await, 0);
+    assert_eq!(scalar("SELECT count(*) FROM auth_session").await, 0);
+    assert_eq!(scalar("SELECT count(*) FROM auth_login").await, 0);
+
     // Live datasource names stay unique per tenant at the database level too.
     assert!(
         sqlx::query("INSERT INTO datasource (id, tenant_id, kind, name, connection) VALUES ('ds_dup', 'globex', 'mongodb', 'sales', '{}')")

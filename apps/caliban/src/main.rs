@@ -237,11 +237,33 @@ async fn control_plane(
     recent: &RecentUsage,
     mode: &'static str,
 ) -> Result<impl std::future::Future<Output = Result<()>>> {
-    let admin_token = match &cfg.security.admin_token {
-        Some(r) => r.resolve().context("resolving admin token")?.expose().to_owned(),
-        None => {
-            std::env::var("CALIBAN_ADMIN_TOKEN").context("CALIBAN_ADMIN_TOKEN is required for the control plane")?
+    let oidc = control_plane_sso(cfg)?;
+    let break_glass = match std::env::var("CALIBAN_BREAK_GLASS").ok().filter(|v| !v.trim().is_empty()) {
+        Some(v) => v.trim().parse::<bool>().context("CALIBAN_BREAK_GLASS must be true or false")?,
+        None => cfg.security.break_glass,
+    };
+    if !break_glass && oidc.is_none() {
+        anyhow::bail!("security.break_glass = false needs single sign-on ([security.oidc]): nobody could log in");
+    }
+    let token = match &cfg.security.admin_token {
+        Some(r) => r.resolve().context("resolving admin token").map(|s| s.expose().to_owned()),
+        None => std::env::var("CALIBAN_ADMIN_TOKEN").context("CALIBAN_ADMIN_TOKEN is required for the control plane"),
+    };
+    let admin_token = match (break_glass, token, oidc.is_some()) {
+        (false, _, _) => {
+            tracing::info!("break-glass admin token disabled (security.break_glass = false)");
+            String::new()
         }
+        (true, Ok(t), true) => {
+            tracing::info!("admin token accepted as break-glass: every use is logged and audited");
+            t
+        }
+        (true, Ok(t), false) => t,
+        (true, Err(e), true) => {
+            tracing::warn!(error = %e, "no admin token: break-glass access is off, SSO is the only way in");
+            String::new()
+        }
+        (true, Err(e), false) => return Err(e),
     };
     let store = match std::env::var("CALIBAN_DATABASE_URL").ok().filter(|u| !u.trim().is_empty()) {
         Some(url) => {
@@ -287,14 +309,19 @@ async fn control_plane(
             "split mode needs both CALIBAN_SNAPSHOT_SIGNING_KEY and CALIBAN_ROUTER_TOKEN; /api/v1/snapshot is disabled"
         ),
     }
+    let sso = oidc.is_some();
     let cp = Arc::new(
         caliban_cp::ControlPlane::new(store, admin_token, mode)
             .with_snapshots(signer, router_token)
-            .with_keyring(keyring),
+            .with_keyring(keyring)
+            .with_oidc(oidc),
     );
     if postgres {
         // Picks up writes made through other control-plane replicas.
         caliban_cp::spawn_refresh(Arc::clone(&cp), Duration::from_secs(5));
+    }
+    if sso {
+        caliban_cp::auth::spawn_purge(Arc::clone(&cp), Duration::from_secs(600));
     }
     let web_dir = std::env::var("CALIBAN_WEB_DIR").ok().or_else(|| cfg.server.web_dir.clone());
     let web_dir = web_dir.filter(|d| std::path::Path::new(d).join("index.html").exists());
@@ -302,6 +329,34 @@ async fn control_plane(
         tracing::warn!("web console not found (set CALIBAN_WEB_DIR); serving API only");
     }
     Ok(serve("control-plane", cfg.server.control_plane_addr.clone(), caliban_cp::app(cp, web_dir.as_deref())))
+}
+
+/// Single sign-on from `[security.oidc]` and the `CALIBAN_OIDC_*` environment overrides.
+fn control_plane_sso(cfg: &Config) -> Result<Option<caliban_cp::auth::oidc::Oidc>> {
+    use caliban_cp::auth::oidc::{Oidc, OidcSettings, config_with_env};
+    let Some(c) = config_with_env(cfg.security.oidc.as_ref(), |k| std::env::var(k).ok()).map_err(anyhow::Error::msg)?
+    else {
+        tracing::info!("single sign-on not configured: the admin token is the only way in (token mode)");
+        return Ok(None);
+    };
+    if let Some(r) = &c.client_secret {
+        r.resolve().context("resolving security.oidc.client_secret")?;
+    }
+    let settings = OidcSettings::from_config(&c).map_err(anyhow::Error::msg)?;
+    if !c.issuer.starts_with("https://") {
+        tracing::warn!(issuer = %c.issuer, "OIDC issuer is not https: tokens and keys travel in clear");
+    }
+    if !settings.secure_cookies() {
+        tracing::warn!("security.oidc.redirect_url is not https: session cookies are not Secure (development only)");
+    }
+    tracing::info!(
+        issuer = %settings.issuer,
+        client_id = %settings.client_id,
+        bearer_tokens = settings.api_audience.is_some(),
+        group_mappings = settings.role_mappings.len(),
+        "single sign-on enabled"
+    );
+    Ok(Some(Oidc::new(settings).map_err(anyhow::Error::msg)?))
 }
 
 /// `caliban keys status|rotate` against the Postgres store (the in-memory store is rebuilt from the

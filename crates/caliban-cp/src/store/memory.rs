@@ -1,13 +1,23 @@
 //! In-memory backend (dev/demo): state and audit chain live in the process.
 
 use super::audit::{AuditEntry, now_micros};
-use super::{Backend, Check, Mutation, State, StoreError};
+use super::{Backend, Check, Mutation, PendingLogin, SessionRecord, State, StoreError, SubjectKind};
 use caliban_ontology::Ontology;
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 pub struct MemoryBackend {
     inner: Mutex<(State, Vec<AuditEntry>)>,
+    /// Sessions (by id) and pending logins (by state). Locked after `inner`, never before.
+    auth: Mutex<AuthTables>,
+}
+
+#[derive(Default)]
+struct AuthTables {
+    sessions: BTreeMap<String, SessionRecord>,
+    logins: BTreeMap<String, PendingLogin>,
 }
 
 impl MemoryBackend {
@@ -15,7 +25,7 @@ impl MemoryBackend {
     pub fn seeded(mut seed: State) -> Self {
         let entry = AuditEntry::next(None, "system", &seed_draft(&seed), now_micros());
         seed.audit_head = entry.seq;
-        Self { inner: Mutex::new((seed, vec![entry])) }
+        Self { inner: Mutex::new((seed, vec![entry])), auth: Mutex::default() }
     }
 
     pub fn state(&self) -> State {
@@ -59,6 +69,7 @@ impl Backend for MemoryBackend {
         let draft = m.audit(&st);
         apply_to(&mut st, m)?;
         check(&st).map_err(StoreError::Invalid)?;
+        apply_sessions(&mut self.auth.lock(), m, &st)?;
         let entry = AuditEntry::next(log.last(), actor, &draft, now_micros());
         st.audit_head = entry.seq;
         log.push(entry);
@@ -70,6 +81,84 @@ impl Backend for MemoryBackend {
         let g = self.inner.lock();
         Ok(g.1[g.1.len().saturating_sub(limit)..].to_vec())
     }
+
+    async fn session(&self, token_sha256: &str) -> Result<Option<SessionRecord>, StoreError> {
+        Ok(self.auth.lock().sessions.values().find(|s| s.token_sha256 == token_sha256).cloned())
+    }
+
+    async fn touch_session(&self, id: &str, at: DateTime<Utc>) -> Result<(), StoreError> {
+        if let Some(s) = self.auth.lock().sessions.get_mut(id) {
+            s.last_seen_at = at;
+        }
+        Ok(())
+    }
+
+    async fn active_sessions(&self, user_id: &str, now: DateTime<Utc>) -> Result<Vec<SessionRecord>, StoreError> {
+        let mut v: Vec<SessionRecord> = self
+            .auth
+            .lock()
+            .sessions
+            .values()
+            .filter(|s| s.user_id == user_id && s.revoked_at.is_none() && s.expires_at > now)
+            .cloned()
+            .collect();
+        v.sort_by_key(|s| s.created_at);
+        Ok(v)
+    }
+
+    async fn put_login(&self, login: &PendingLogin) -> Result<(), StoreError> {
+        let mut a = self.auth.lock();
+        if a.logins.contains_key(&login.state) {
+            return Err(StoreError::Conflict("login state already exists".into()));
+        }
+        a.logins.insert(login.state.clone(), login.clone());
+        Ok(())
+    }
+
+    async fn take_login(&self, state: &str) -> Result<Option<PendingLogin>, StoreError> {
+        Ok(self.auth.lock().logins.remove(state))
+    }
+
+    async fn purge_auth(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
+        let mut a = self.auth.lock();
+        let before = a.sessions.len() + a.logins.len();
+        a.sessions.retain(|_, s| s.expires_at >= now);
+        a.logins.retain(|_, l| l.expires_at >= now);
+        Ok((before - a.sessions.len() - a.logins.len()) as u64)
+    }
+}
+
+/// The session side of `Login`, `Logout` and `RevokeUserSessions` (sessions are not in
+/// [`State`]). `st` is the state after [`apply_to`]. `postgres.rs` matches it.
+fn apply_sessions(a: &mut AuthTables, m: &Mutation, st: &State) -> Result<(), StoreError> {
+    match m {
+        Mutation::Login { user, session } => {
+            let owner = st
+                .user_by_subject(&user.issuer, &user.subject)
+                .ok_or_else(|| StoreError::Backend("login user not applied".into()))?;
+            if a.sessions.contains_key(&session.id)
+                || a.sessions.values().any(|s| s.token_sha256 == session.token_sha256)
+            {
+                return Err(StoreError::Conflict("session already exists".into()));
+            }
+            a.sessions.insert(session.id.clone(), SessionRecord { user_id: owner.id.clone(), ..session.clone() });
+        }
+        Mutation::Logout { session_id, user_id, at } => {
+            let s = a
+                .sessions
+                .get_mut(session_id)
+                .filter(|s| &s.user_id == user_id && s.revoked_at.is_none())
+                .ok_or_else(|| StoreError::NotFound("session".into()))?;
+            s.revoked_at = Some(*at);
+        }
+        Mutation::RevokeUserSessions { user_id, at } => {
+            for s in a.sessions.values_mut().filter(|s| &s.user_id == user_id && s.revoked_at.is_none()) {
+                s.revoked_at = Some(*at);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn need_tenant(st: &State, id: &str) -> Result<(), StoreError> {
@@ -119,6 +208,7 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             for n in st.nodes.iter_mut().filter(|n| &n.tenant_id == id && n.is_live()) {
                 n.deleted_at = Some(*at);
             }
+            st.role_bindings.retain(|b| b.tenant_id.as_ref() != Some(id));
         }
         Mutation::UpdateTenant { id, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction } => {
             let t = st
@@ -295,6 +385,69 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             st.deks.insert(tenant_id.clone(), dek.clone());
         }
         Mutation::Rekey(r) => rekey(st, r)?,
+        Mutation::Login { user, .. } => {
+            match st.users.iter_mut().find(|u| u.issuer == user.issuer && u.subject == user.subject) {
+                Some(u) => {
+                    u.email.clone_from(&user.email);
+                    u.name.clone_from(&user.name);
+                    u.last_login_at = user.last_login_at;
+                }
+                None => {
+                    if st.users.iter().any(|u| u.id == user.id) {
+                        return Err(StoreError::Conflict("user id already exists".into()));
+                    }
+                    st.users.push(user.clone());
+                }
+            }
+        }
+        Mutation::Logout { user_id, .. } | Mutation::RevokeUserSessions { user_id, .. } => {
+            if st.user(user_id).is_none() {
+                return Err(StoreError::NotFound("user".into()));
+            }
+        }
+        Mutation::CreateUser(user) => {
+            if st.user_by_subject(&user.issuer, &user.subject).is_some() || st.user(&user.id).is_some() {
+                return Err(StoreError::Conflict("user already exists".into()));
+            }
+            st.users.push(user.clone());
+        }
+        Mutation::CreateRoleBinding(b) => {
+            if b.role.is_tenant_role() != b.tenant_id.is_some() {
+                return Err(StoreError::Invalid(if b.role.is_tenant_role() {
+                    format!("role '{}' is a tenant role: tenant_id is required", b.role.as_str())
+                } else {
+                    format!("role '{}' is deployment-wide: tenant_id must be empty", b.role.as_str())
+                }));
+            }
+            if let Some(t) = &b.tenant_id {
+                need_tenant(st, t)?;
+            }
+            if b.subject.trim().is_empty() {
+                return Err(StoreError::Invalid("subject must not be empty".into()));
+            }
+            if b.subject_kind == SubjectKind::User && st.user(&b.subject).is_none() {
+                return Err(StoreError::NotFound("user".into()));
+            }
+            if st.role_bindings.iter().any(|x| {
+                x.id == b.id
+                    || (x.subject_kind == b.subject_kind
+                        && x.subject == b.subject
+                        && x.role == b.role
+                        && x.tenant_id == b.tenant_id)
+            }) {
+                return Err(StoreError::Conflict("this role binding already exists".into()));
+            }
+            st.role_bindings.push(b.clone());
+        }
+        Mutation::DeleteRoleBinding { id } => {
+            let pos = st
+                .role_bindings
+                .iter()
+                .position(|b| &b.id == id)
+                .ok_or_else(|| StoreError::NotFound("role binding".into()))?;
+            st.role_bindings.remove(pos);
+        }
+        Mutation::Record(_) => {}
     }
     Ok(())
 }

@@ -5,10 +5,11 @@
 //! (`GET <base_url>/models`) to add what it serves to the catalogue. Every change republishes the
 //! data-plane snapshot.
 
+use crate::auth::Principal;
 use crate::store::Mutation;
-use crate::{ADMIN_ACTOR, ApiError, ApiResult, Cp, bad, not_found, still_referenced};
+use crate::{ApiError, ApiResult, Cp, bad, not_found, still_referenced};
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use caliban_config::{
     Capabilities, ModelEntry, ModelKind, ProviderConfig, Reasoning, ReasoningControl, SharedProvider,
@@ -47,14 +48,19 @@ pub(crate) async fn list_models(State(cp): State<Cp>) -> Json<Value> {
 
 pub(crate) async fn create_model(
     State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
     Json(m): Json<ModelEntry>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    cp.store.apply(ADMIN_ACTOR, Mutation::CreateModel(m.clone())).await?;
+    cp.store.apply(&p.actor, Mutation::CreateModel(m.clone())).await?;
     Ok((StatusCode::CREATED, Json(model_json(&cp, &m))))
 }
 
-pub(crate) async fn delete_model(State(cp): State<Cp>, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    cp.store.apply(ADMIN_ACTOR, Mutation::DeleteModel(id)).await.map_err(|e| still_referenced(e, "model"))?;
+pub(crate) async fn delete_model(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    cp.store.apply(&p.actor, Mutation::DeleteModel(id)).await.map_err(|e| still_referenced(e, "model"))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -101,6 +107,7 @@ pub(crate) struct SharedProviderCreate {
 
 pub(crate) async fn create_provider(
     State(cp): State<Cp>,
+    Extension(principal): Extension<Principal>,
     Json(b): Json<SharedProviderCreate>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     if b.id.trim().is_empty() || b.base_url.trim().is_empty() {
@@ -122,15 +129,16 @@ pub(crate) async fn create_provider(
         },
         tenants: b.tenants.into_iter().map(Into::into).collect(),
     };
-    cp.store.apply(ADMIN_ACTOR, Mutation::CreateSharedProvider(sp.clone())).await?;
+    cp.store.apply(&principal.actor, Mutation::CreateSharedProvider(sp.clone())).await?;
     Ok((StatusCode::CREATED, Json(serde_json::to_value(view(&sp)).unwrap_or_default())))
 }
 
-pub(crate) async fn delete_provider(State(cp): State<Cp>, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    cp.store
-        .apply(ADMIN_ACTOR, Mutation::DeleteSharedProvider(id))
-        .await
-        .map_err(|e| still_referenced(e, "provider"))?;
+pub(crate) async fn delete_provider(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    cp.store.apply(&p.actor, Mutation::DeleteSharedProvider(id)).await.map_err(|e| still_referenced(e, "provider"))?;
     Ok(StatusCode::NO_CONTENT)
 }
 

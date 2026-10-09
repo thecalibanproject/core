@@ -8,9 +8,10 @@
 
 use super::audit::{AuditDraft, AuditEntry, now_micros};
 use super::{
-    ApiKeyRecord, Backend, Check, DatasourceRecord, DekRecord, Mutation, NodeRecord, ProviderKeyRecord, Rekey, State,
-    StoreError, StoredSecret, Tenant, TenantStatus,
+    ApiKeyRecord, Backend, Check, DatasourceRecord, DekRecord, Mutation, NodeRecord, PendingLogin, ProviderKeyRecord,
+    Rekey, RoleBinding, SessionRecord, State, StoreError, StoredSecret, SubjectKind, Tenant, TenantStatus, UserRecord,
 };
+use crate::auth::rbac::Role;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use caliban_config::{ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider, WrappedDek};
@@ -25,6 +26,12 @@ use sqlx::types::Json;
 use sqlx::{Postgres, Row};
 use std::time::Duration;
 
+macro_rules! session_columns {
+    () => {
+        "SELECT id, token_sha256, user_id, groups, created_at, expires_at, last_seen_at, revoked_at FROM auth_session"
+    };
+}
+
 /// `(version, name, sql)`; applied in order, each recorded in `caliban_schema_migrations`.
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "init", include_str!("../../../../migrations/0001_init.sql")),
@@ -35,6 +42,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (6, "tenant_semantic_cache", include_str!("../../../../migrations/0006_tenant_semantic_cache.sql")),
     (7, "usage_cache_tier", include_str!("../../../../migrations/0007_usage_cache_tier.sql")),
     (8, "tenant_data_keys", include_str!("../../../../migrations/0008_tenant_data_keys.sql")),
+    (9, "sso_rbac", include_str!("../../../../migrations/0009_sso_rbac.sql")),
     (10, "cache_hit_billing", include_str!("../../../../migrations/0010_cache_hit_billing.sql")),
 ];
 
@@ -336,6 +344,113 @@ impl Backend for PgBackend {
         out.reverse();
         Ok(out)
     }
+
+    async fn session(&self, token_sha256: &str) -> Result<Option<SessionRecord>, StoreError> {
+        let r = sqlx::query(concat!(session_columns!(), " WHERE token_sha256 = $1"))
+            .bind(token_sha256)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        r.as_ref().map(session_row).transpose()
+    }
+
+    async fn touch_session(&self, id: &str, at: DateTime<Utc>) -> Result<(), StoreError> {
+        sqlx::query("UPDATE auth_session SET last_seen_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(at)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    async fn active_sessions(&self, user_id: &str, now: DateTime<Utc>) -> Result<Vec<SessionRecord>, StoreError> {
+        let rows = sqlx::query(concat!(
+            session_columns!(),
+            " WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > $2 ORDER BY created_at"
+        ))
+        .bind(user_id)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter().map(session_row).collect()
+    }
+
+    async fn put_login(&self, l: &PendingLogin) -> Result<(), StoreError> {
+        let r = sqlx::query(
+            "INSERT INTO auth_login (state, binding_sha256, nonce, pkce_verifier, return_to, created_at, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (state) DO NOTHING",
+        )
+        .bind(&l.state)
+        .bind(&l.binding_sha256)
+        .bind(&l.nonce)
+        .bind(&l.pkce_verifier)
+        .bind(&l.return_to)
+        .bind(l.created_at)
+        .bind(l.expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        if r.rows_affected() == 0 {
+            return Err(StoreError::Conflict("login state already exists".into()));
+        }
+        Ok(())
+    }
+
+    async fn take_login(&self, state: &str) -> Result<Option<PendingLogin>, StoreError> {
+        let r = sqlx::query(
+            "DELETE FROM auth_login WHERE state = $1
+             RETURNING state, binding_sha256, nonce, pkce_verifier, return_to, created_at, expires_at",
+        )
+        .bind(state)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        r.map(|r| {
+            Ok(PendingLogin {
+                state: get(&r, "state")?,
+                binding_sha256: get(&r, "binding_sha256")?,
+                nonce: get(&r, "nonce")?,
+                pkce_verifier: get(&r, "pkce_verifier")?,
+                return_to: get(&r, "return_to")?,
+                created_at: get(&r, "created_at")?,
+                expires_at: get(&r, "expires_at")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn purge_auth(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let a = sqlx::query("DELETE FROM auth_session WHERE expires_at < $1")
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        let b = sqlx::query("DELETE FROM auth_login WHERE expires_at < $1")
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        tx.commit().await.map_err(db)?;
+        Ok(a + b)
+    }
+}
+
+fn session_row(r: &PgRow) -> Result<SessionRecord, StoreError> {
+    Ok(SessionRecord {
+        id: get(r, "id")?,
+        token_sha256: get(r, "token_sha256")?,
+        user_id: get(r, "user_id")?,
+        groups: parse(get::<Json<Value>>(r, "groups")?.0)?,
+        created_at: get(r, "created_at")?,
+        expires_at: get(r, "expires_at")?,
+        last_seen_at: get(r, "last_seen_at")?,
+        revoked_at: get(r, "revoked_at")?,
+    })
 }
 
 // ───────────────────────────── writes ─────────────────────────────
@@ -416,7 +531,110 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
         }
         Mutation::CreateDek { tenant_id, dek } => insert_dek(c, tenant_id, dek).await,
         Mutation::Rekey(r) => rekey(c, r).await,
+        Mutation::Login { user, session } => login(c, user, session).await,
+        Mutation::Logout { session_id, user_id, at } => {
+            let r = sqlx::query(
+                "UPDATE auth_session SET revoked_at = $3 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(at)
+            .execute(&mut *c)
+            .await
+            .map_err(db)?;
+            if r.rows_affected() == 0 { Err(StoreError::NotFound("session".into())) } else { Ok(()) }
+        }
+        Mutation::CreateUser(u) => insert_user(c, u).await,
+        Mutation::RevokeUserSessions { user_id, at } => {
+            let q = "UPDATE auth_session SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL";
+            exec(c, sqlx::query(q).bind(user_id).bind(at)).await
+        }
+        Mutation::CreateRoleBinding(b) => insert_role_binding(c, b).await,
+        Mutation::DeleteRoleBinding { id } => {
+            exec(c, sqlx::query("DELETE FROM role_binding WHERE id = $1").bind(id)).await
+        }
+        Mutation::Record(_) => Ok(()),
     }
+}
+
+async fn insert_user(c: &mut PgConnection, u: &UserRecord) -> Result<(), StoreError> {
+    exec(
+        c,
+        sqlx::query(
+            "INSERT INTO app_user (id, issuer, subject, email, name, created_at, last_login_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&u.id)
+        .bind(&u.issuer)
+        .bind(&u.subject)
+        .bind(&u.email)
+        .bind(&u.name)
+        .bind(u.created_at)
+        .bind(u.last_login_at),
+    )
+    .await
+}
+
+/// Upserts the user by (issuer, subject), keeping its id and `created_at` (as `memory::apply_to`
+/// does), then stores the session for whichever id the user has.
+async fn login(c: &mut PgConnection, u: &UserRecord, s: &SessionRecord) -> Result<(), StoreError> {
+    exec(
+        c,
+        sqlx::query(
+            "INSERT INTO app_user (id, issuer, subject, email, name, created_at, last_login_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (issuer, subject) DO UPDATE
+                 SET email = EXCLUDED.email, name = EXCLUDED.name, last_login_at = EXCLUDED.last_login_at",
+        )
+        .bind(&u.id)
+        .bind(&u.issuer)
+        .bind(&u.subject)
+        .bind(&u.email)
+        .bind(&u.name)
+        .bind(u.created_at)
+        .bind(u.last_login_at),
+    )
+    .await?;
+    let groups = serde_json::to_value(&s.groups).map_err(|e| StoreError::Backend(e.to_string()))?;
+    let r = sqlx::query(
+        "INSERT INTO auth_session (id, token_sha256, user_id, groups, created_at, expires_at, last_seen_at, revoked_at)
+         SELECT $1, $2, id, $3, $4, $5, $6, $7 FROM app_user WHERE issuer = $8 AND subject = $9
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&s.id)
+    .bind(&s.token_sha256)
+    .bind(Json(groups))
+    .bind(s.created_at)
+    .bind(s.expires_at)
+    .bind(s.last_seen_at)
+    .bind(s.revoked_at)
+    .bind(&u.issuer)
+    .bind(&u.subject)
+    .execute(&mut *c)
+    .await
+    .map_err(db)?;
+    if r.rows_affected() == 0 {
+        return Err(StoreError::Conflict("session already exists".into()));
+    }
+    Ok(())
+}
+
+async fn insert_role_binding(c: &mut PgConnection, b: &RoleBinding) -> Result<(), StoreError> {
+    exec(
+        c,
+        sqlx::query(
+            "INSERT INTO role_binding (id, subject_kind, subject, role, tenant_id, created_at, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&b.id)
+        .bind(b.subject_kind.as_str())
+        .bind(&b.subject)
+        .bind(b.role.as_str())
+        .bind(&b.tenant_id)
+        .bind(b.created_at)
+        .bind(&b.created_by),
+    )
+    .await
 }
 
 async fn insert_dek(c: &mut PgConnection, tenant: &str, d: &DekRecord) -> Result<(), StoreError> {
@@ -505,6 +723,7 @@ async fn delete_tenant(c: &mut PgConnection, id: &str, at: DateTime<Utc>) -> Res
     exec(c, tenant_at("UPDATE node SET deleted_at = $2 WHERE tenant_id = $1 AND deleted_at IS NULL")).await?;
     let tenant = |sql: &'static str| sqlx::query(sql).bind(id);
     exec(c, tenant("DELETE FROM route WHERE tenant_id = $1")).await?;
+    exec(c, tenant("DELETE FROM role_binding WHERE tenant_id = $1")).await?;
     // BYOK: drop the sealed ciphertext with its rows, and the tenant's wrapped DEK
     // (crypto-shredding: nothing sealed under it opens again).
     exec(c, tenant("DELETE FROM provider_credential WHERE tenant_id = $1")).await?;
@@ -971,6 +1190,37 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
                 created_at: get(&r, "created_at")?,
             },
         );
+    }
+
+    for r in
+        rows(c, "SELECT id, issuer, subject, email, name, created_at, last_login_at FROM app_user ORDER BY ord").await?
+    {
+        st.users.push(UserRecord {
+            id: get(&r, "id")?,
+            issuer: get(&r, "issuer")?,
+            subject: get(&r, "subject")?,
+            email: get(&r, "email")?,
+            name: get(&r, "name")?,
+            created_at: get(&r, "created_at")?,
+            last_login_at: get(&r, "last_login_at")?,
+        });
+    }
+
+    for r in rows(
+        c,
+        "SELECT id, subject_kind, subject, role, tenant_id, created_at, created_by FROM role_binding ORDER BY ord",
+    )
+    .await?
+    {
+        st.role_bindings.push(RoleBinding {
+            id: get(&r, "id")?,
+            subject_kind: parse_enum::<SubjectKind>(get(&r, "subject_kind")?)?,
+            subject: get(&r, "subject")?,
+            role: parse_enum::<Role>(get(&r, "role")?)?,
+            tenant_id: get(&r, "tenant_id")?,
+            created_at: get(&r, "created_at")?,
+            created_by: get(&r, "created_by")?,
+        });
     }
 
     st.audit_head = audit_head(c).await?;

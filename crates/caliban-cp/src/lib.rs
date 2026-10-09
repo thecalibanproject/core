@@ -1,17 +1,21 @@
 //! Control plane (`caliban control-plane`, :8081): admin API under `/api/v1` and the web console.
 //!
-//! Admin auth is a bootstrap bearer token (`CALIBAN_ADMIN_TOKEN`). TODO: OIDC + RBAC.
+//! Admin auth ([`auth`]): OIDC single sign-on (console sessions and bearer access tokens) with
+//! role-based access on every route, and the bootstrap token (`CALIBAN_ADMIN_TOKEN`) as break-glass.
 //! Every mutation goes through [`store::Store::apply`] (one transaction + one hash-chained audit
 //! row). Split deployments: routers poll `GET /api/v1/snapshot` (router token, not the admin
 //! token) for an Ed25519-signed config snapshot.
 
+pub mod auth;
 pub mod keys;
 mod models;
 pub mod store;
 
-use axum::extract::{Path, Query, Request, State};
+use auth::Principal;
+use auth::rbac::Perm;
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::middleware::{self, Next};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -34,12 +38,12 @@ use store::{
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
-/// Audit actor for requests authenticated with the bootstrap admin token.
-pub(crate) const ADMIN_ACTOR: &str = "admin";
-
 pub struct ControlPlane {
     pub store: Store,
-    admin_token: String,
+    /// Break-glass bootstrap token; `None` when disabled.
+    admin_token: Option<String>,
+    /// Single sign-on; `None` = token mode (the bootstrap token is the only way in).
+    oidc: Option<Arc<auth::oidc::Oidc>>,
     mode: &'static str,
     signer: Option<SnapshotSigner>,
     router_token: Option<String>,
@@ -57,8 +61,34 @@ struct Exported {
 }
 
 impl ControlPlane {
+    /// `admin_token` is the bootstrap (break-glass) token; empty disables it.
     pub fn new(store: Store, admin_token: String, mode: &'static str) -> Self {
-        Self { store, admin_token, mode, signer: None, router_token: None, exported: Mutex::new(None), keyring: None }
+        Self {
+            store,
+            admin_token: Some(admin_token).filter(|t| !t.is_empty()),
+            oidc: None,
+            mode,
+            signer: None,
+            router_token: None,
+            exported: Mutex::new(None),
+            keyring: None,
+        }
+    }
+
+    /// Enables OIDC single sign-on.
+    #[must_use]
+    pub fn with_oidc(mut self, oidc: Option<auth::oidc::Oidc>) -> Self {
+        self.oidc = oidc.map(Arc::new);
+        self
+    }
+
+    /// `false` refuses the bootstrap token (`security.break_glass = false`).
+    #[must_use]
+    pub fn with_break_glass(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.admin_token = None;
+        }
+        self
     }
 
     /// Enables storing tenant and shared secrets (sealed under keys from this keyring).
@@ -114,9 +144,12 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let kind = match self.0 {
             StatusCode::UNAUTHORIZED => "authentication_error",
+            StatusCode::FORBIDDEN => "permission_error",
             StatusCode::NOT_FOUND => "not_found",
             StatusCode::CONFLICT => "conflict",
-            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY | StatusCode::PAYLOAD_TOO_LARGE => {
+                "invalid_request_error"
+            }
             StatusCode::SERVICE_UNAVAILABLE => "unavailable",
             _ => "internal_error",
         };
@@ -180,12 +213,18 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/nodes", get(list_nodes).post(create_node))
         .route("/usage", get(usage))
         .route("/audit", get(audit))
-        .route_layer(middleware::from_fn_with_state(Arc::clone(&cp), require_admin))
+        .route("/roles", get(auth::admin::roles))
+        .route("/users", get(auth::admin::list_users))
+        .route("/users/{id}/sessions", delete(auth::admin::revoke_sessions))
+        .route("/role-bindings", get(auth::admin::list_bindings).post(auth::admin::create_binding))
+        .route("/role-bindings/{id}", delete(auth::admin::delete_binding))
+        // Authentication and the route's permission (auth::rbac::ROUTES; no entry = denied).
+        .route_layer(middleware::from_fn_with_state(Arc::clone(&cp), auth::authorize))
         // Router token, not the admin token: a compromised router cannot administer.
         .route("/snapshot", get(snapshot))
         .route("/health", get(health));
 
-    let mut app = Router::new().nest("/api/v1", api);
+    let mut app = Router::new().nest("/api/v1", api).merge(auth::handlers::routes());
     if let Some(dir) = web_dir {
         // SPA: unknown paths fall back to index.html for client-side routing.
         let index = format!("{dir}/index.html");
@@ -200,18 +239,7 @@ fn bearer_is(headers: &HeaderMap, expected: &str) -> bool {
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .is_some_and(|t| constant_time_eq(t.trim().as_bytes(), expected.as_bytes()))
-}
-
-async fn require_admin(State(cp): State<Cp>, req: Request, next: Next) -> Response {
-    if !bearer_is(req.headers(), &cp.admin_token) {
-        return ApiError(StatusCode::UNAUTHORIZED, "invalid admin token".into()).into_response();
-    }
-    next.run(req).await
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+            .is_some_and(|t| auth::constant_time_eq(t.trim().as_bytes(), expected.as_bytes()))
 }
 
 async fn health(State(cp): State<Cp>) -> Json<Value> {
@@ -244,8 +272,10 @@ async fn snapshot(State(cp): State<Cp>, headers: HeaderMap) -> Response {
     }
     let snap = cp.store.config.load();
     let mut config = snap.config.clone();
-    // Routers never need the admin credential reference.
+    // Routers never need the admin credential reference or the SSO settings.
     config.security.admin_token = None;
+    config.security.oidc = None;
+    config.security.break_glass = true;
     let digest = config_digest(&config);
     let etag = format!("\"{}\"", &digest[..32]);
     let not_modified = headers
@@ -315,8 +345,21 @@ struct TenantList {
 }
 
 /// Active tenants; `?include_deleted=true` adds tombstones (`status: deleted`).
-async fn list_tenants(State(cp): State<Cp>, Query(q): Query<TenantList>) -> Json<Vec<Tenant>> {
-    Json(cp.store.state().tenants.iter().filter(|t| q.include_deleted || t.is_active()).cloned().collect())
+async fn list_tenants(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Query(q): Query<TenantList>,
+) -> Json<Vec<Tenant>> {
+    let visible = p.visible(Perm::TenantRead);
+    Json(
+        cp.store
+            .state()
+            .tenants
+            .iter()
+            .filter(|t| (q.include_deleted || t.is_active()) && visible.contains(&t.id))
+            .cloned()
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -329,7 +372,11 @@ struct TenantCreate {
     auto_cache_hit_fraction: Option<f64>,
 }
 
-async fn create_tenant(State(cp): State<Cp>, Json(body): Json<TenantCreate>) -> ApiResult<(StatusCode, Json<Tenant>)> {
+async fn create_tenant(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Json(body): Json<TenantCreate>,
+) -> ApiResult<(StatusCode, Json<Tenant>)> {
     let id = slug(&body.name);
     if id.is_empty() {
         return Err(bad("name must contain letters or digits"));
@@ -347,7 +394,7 @@ async fn create_tenant(State(cp): State<Cp>, Json(body): Json<TenantCreate>) -> 
         deleted_at: None,
         settings: serde_json::Map::new(),
     };
-    cp.store.apply(ADMIN_ACTOR, Mutation::CreateTenant(t.clone())).await?;
+    cp.store.apply(&p.actor, Mutation::CreateTenant(t.clone())).await?;
     Ok((StatusCode::CREATED, Json(t)))
 }
 
@@ -379,6 +426,7 @@ where
 /// routers pick it up with the next snapshot.
 async fn update_tenant(
     State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
     Path(tenant_id): Path<String>,
     Json(body): Json<TenantUpdate>,
 ) -> ApiResult<Json<Tenant>> {
@@ -389,15 +437,19 @@ async fn update_tenant(
         semantic_cache: body.semantic_cache,
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
     };
-    let st = cp.store.apply(ADMIN_ACTOR, m).await?;
+    let st = cp.store.apply(&p.actor, m).await?;
     st.tenant(&tenant_id).cloned().map(Json).ok_or_else(|| not_found("tenant"))
 }
 
 /// Tombstones the tenant: revokes its API keys, destroys its BYOK credentials, removes its routes
 /// and soft-deletes its datasources and nodes, in one audited transaction. The tenant leaves the
 /// data-plane snapshot. A repeat delete is a 404, like every other delete.
-async fn delete_tenant(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiResult<StatusCode> {
-    cp.store.apply(ADMIN_ACTOR, Mutation::DeleteTenant { id: tenant_id, at: now_micros() }).await?;
+async fn delete_tenant(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path(tenant_id): Path<String>,
+) -> ApiResult<StatusCode> {
+    cp.store.apply(&p.actor, Mutation::DeleteTenant { id: tenant_id, at: now_micros() }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -432,9 +484,10 @@ async fn list_api_keys(
 /// snapshot (standalone: immediately; split mode: on the router's next snapshot poll).
 async fn revoke_api_key(
     State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
     Path((tenant_id, key_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    cp.store.apply(ADMIN_ACTOR, Mutation::RevokeApiKey { tenant_id, id: key_id, at: now_micros() }).await?;
+    cp.store.apply(&p.actor, Mutation::RevokeApiKey { tenant_id, id: key_id, at: now_micros() }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -445,6 +498,7 @@ struct ApiKeyCreate {
 
 async fn create_api_key(
     State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
     Path(tenant_id): Path<String>,
     body: Option<Json<ApiKeyCreate>>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
@@ -458,7 +512,7 @@ async fn create_api_key(
         created_at: now_micros(),
         revoked_at: None,
     };
-    cp.store.apply(ADMIN_ACTOR, Mutation::CreateApiKey(rec.clone())).await?;
+    cp.store.apply(&p.actor, Mutation::CreateApiKey(rec.clone())).await?;
     let mut v = serde_json::to_value(&rec).unwrap_or_default();
     v["key"] = Value::String(key);
     Ok((StatusCode::CREATED, Json(v)))
@@ -493,6 +547,7 @@ struct ProviderKeyCreate {
 
 async fn create_provider_key(
     State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
     Path(tenant_id): Path<String>,
     Json(body): Json<ProviderKeyCreate>,
 ) -> ApiResult<(StatusCode, Json<ProviderKeyRecord>)> {
@@ -506,7 +561,7 @@ async fn create_provider_key(
     let (secret, last4) = match body.api_key.as_deref().filter(|k| !k.is_empty()) {
         Some(k) => {
             let keyring = cp.keyring("provider keys")?;
-            let dek = keys::tenant_dek(&cp.store, keyring, &tenant_id, ADMIN_ACTOR).await?;
+            let dek = keys::tenant_dek(&cp.store, keyring, &tenant_id, &p.actor).await?;
             let last4: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
             (Some(StoredSecret::TenantDek(dek.seal(&tenant_id, k))), Some(last4))
         }
@@ -524,18 +579,19 @@ async fn create_provider_key(
         created_at: now_micros(),
         secret,
     };
-    cp.store.apply(ADMIN_ACTOR, Mutation::CreateProviderKey(rec.clone())).await?;
+    cp.store.apply(&p.actor, Mutation::CreateProviderKey(rec.clone())).await?;
     Ok((StatusCode::CREATED, Json(rec)))
 }
 
 async fn delete_provider_key(
     State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
     Path((tenant_id, key_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     // The sealed ciphertext is dropped with the row. Copies in backups stay sealed under the
     // tenant DEK, which is destroyed with the tenant (see `keys`).
     cp.store
-        .apply(ADMIN_ACTOR, Mutation::DeleteProviderKey { tenant_id, id: key_id })
+        .apply(&p.actor, Mutation::DeleteProviderKey { tenant_id, id: key_id })
         .await
         .map_err(|e| still_referenced(e, "provider key"))?;
     Ok(StatusCode::NO_CONTENT)
@@ -554,11 +610,12 @@ struct RoutesPut {
 /// Replaces the tenant's routes. Rejected (422) if a route names a model the tenant cannot reach.
 async fn put_routes(
     State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
     Path(tenant_id): Path<String>,
     Json(body): Json<RoutesPut>,
 ) -> ApiResult<Json<Vec<RouteConfig>>> {
     let st =
-        cp.store.apply(ADMIN_ACTOR, Mutation::SetRoutes { tenant_id: tenant_id.clone(), routes: body.routes }).await?;
+        cp.store.apply(&p.actor, Mutation::SetRoutes { tenant_id: tenant_id.clone(), routes: body.routes }).await?;
     Ok(Json(st.routes.get(&tenant_id).cloned().unwrap_or_default()))
 }
 
@@ -569,12 +626,18 @@ struct TenantFilter {
     tenant_id: Option<String>,
 }
 
-async fn list_datasources(State(cp): State<Cp>, Query(f): Query<TenantFilter>) -> Json<Vec<DatasourceRecord>> {
+async fn list_datasources(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Query(f): Query<TenantFilter>,
+) -> Json<Vec<DatasourceRecord>> {
     let st = cp.store.state();
+    let visible = p.visible(Perm::DatasourcesRead);
     Json(
         st.datasources
             .iter()
             .filter(|d| d.is_live() && f.tenant_id.as_ref().is_none_or(|t| &d.tenant_id == t))
+            .filter(|d| visible.contains(&d.tenant_id))
             .cloned()
             .collect(),
     )
@@ -604,6 +667,7 @@ const DATASOURCE_KINDS: &[&str] = &[
 
 async fn create_datasource(
     State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
     Json(body): Json<DatasourceCreate>,
 ) -> ApiResult<(StatusCode, Json<DatasourceRecord>)> {
     if !DATASOURCE_KINDS.contains(&body.kind.as_str()) {
@@ -615,7 +679,7 @@ async fn create_datasource(
     // tenant's DEK like BYOK keys; `{env}`/`{file}` references are kept as references.
     let connection = if keys::needs_sealing(&body.connection) {
         let keyring = cp.keyring("datasource credentials")?;
-        let dek = keys::tenant_dek(&cp.store, keyring, &body.tenant_id, ADMIN_ACTOR).await?;
+        let dek = keys::tenant_dek(&cp.store, keyring, &body.tenant_id, &p.actor).await?;
         keys::seal_connection(&body.connection, &body.tenant_id, &dek)
     } else {
         body.connection
@@ -630,23 +694,28 @@ async fn create_datasource(
         connection,
         deleted_at: None,
     };
-    cp.store.apply(ADMIN_ACTOR, Mutation::CreateDatasource(rec.clone())).await?;
+    cp.store.apply(&p.actor, Mutation::CreateDatasource(rec.clone())).await?;
     Ok((StatusCode::CREATED, Json(rec)))
 }
 
 /// Soft delete scoped to the tenant: the row is kept for audit, its stored connection is wiped.
 async fn delete_datasource(
     State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
     Path((tenant_id, id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    cp.store.apply(ADMIN_ACTOR, Mutation::DeleteDatasource { tenant_id, id, at: now_micros() }).await?;
+    cp.store.apply(&p.actor, Mutation::DeleteDatasource { tenant_id, id, at: now_micros() }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn introspect_datasource(State(cp): State<Cp>, Path(id): Path<String>) -> ApiResult<(StatusCode, Json<Value>)> {
+async fn introspect_datasource(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
     // TODO: run the bootstrap job (introspect → profile → mine query log → LLM proposals) via
     // caliban-connect, writing `proposed` ontology elements (Mutation::ProposeOntology).
-    cp.store.apply(ADMIN_ACTOR, Mutation::SetDatasourceStatus { id, status: "introspecting".into() }).await?;
+    cp.store.apply(&p.actor, Mutation::SetDatasourceStatus { id, status: "introspecting".into() }).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "job_id": new_id("job") }))))
 }
 
@@ -671,14 +740,19 @@ struct Review {
     note: Option<String>,
 }
 
-async fn review_element(State(cp): State<Cp>, Path(id): Path<String>, Json(r): Json<Review>) -> ApiResult<Json<Value>> {
+async fn review_element(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path(id): Path<String>,
+    Json(r): Json<Review>,
+) -> ApiResult<Json<Value>> {
     let status = match r.decision.as_str() {
         "approve" => Status::Approved,
         "reject" => Status::Rejected,
         _ => return Err(bad("decision must be 'approve' or 'reject'")),
     };
     // Any reviewed change publishes a new ontology version (cache keys include it).
-    let st = cp.store.apply(ADMIN_ACTOR, Mutation::ReviewOntologyElement { id: id.clone(), status }).await?;
+    let st = cp.store.apply(&p.actor, Mutation::ReviewOntologyElement { id: id.clone(), status }).await?;
     st.ontologies
         .values()
         .find_map(|o| o.elements.iter().find(|e| e.id == id))
@@ -688,20 +762,30 @@ async fn review_element(State(cp): State<Cp>, Path(id): Path<String>, Json(r): J
 
 // ───────────────────────────── nodes & usage ─────────────────────────────
 
-async fn list_nodes(State(cp): State<Cp>, Query(f): Query<TenantFilter>) -> Json<Vec<NodeRecord>> {
+async fn list_nodes(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Query(f): Query<TenantFilter>,
+) -> Json<Vec<NodeRecord>> {
     let st = cp.store.state();
+    let visible = p.visible(Perm::NodesRead);
     Json(
         st.nodes
             .iter()
             .filter(|n| n.is_live() && f.tenant_id.as_ref().is_none_or(|t| &n.tenant_id == t))
+            .filter(|n| visible.contains(&n.tenant_id))
             .cloned()
             .collect(),
     )
 }
 
 /// Soft-deletes one node version, scoped to the tenant. Its version number is not reused.
-async fn delete_node(State(cp): State<Cp>, Path((tenant_id, id)): Path<(String, String)>) -> ApiResult<StatusCode> {
-    cp.store.apply(ADMIN_ACTOR, Mutation::DeleteNode { tenant_id, id, at: now_micros() }).await?;
+async fn delete_node(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path((tenant_id, id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    cp.store.apply(&p.actor, Mutation::DeleteNode { tenant_id, id, at: now_micros() }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -712,7 +796,11 @@ struct NodeCreate {
     spec: Value,
 }
 
-async fn create_node(State(cp): State<Cp>, Json(body): Json<NodeCreate>) -> ApiResult<(StatusCode, Json<NodeRecord>)> {
+async fn create_node(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Json(body): Json<NodeCreate>,
+) -> ApiResult<(StatusCode, Json<NodeRecord>)> {
     ensure_tenant(&cp, &body.tenant_id)?;
     let spec: NodeSpec = serde_json::from_value(body.spec.clone())
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid node spec: {e}")))?;
@@ -727,7 +815,7 @@ async fn create_node(State(cp): State<Cp>, Json(body): Json<NodeCreate>) -> ApiR
         created_at: now_micros(),
         deleted_at: None,
     };
-    let st = cp.store.apply(ADMIN_ACTOR, Mutation::CreateNode(rec)).await?;
+    let st = cp.store.apply(&p.actor, Mutation::CreateNode(rec)).await?;
     let created = st.nodes.iter().find(|n| n.id == id).cloned().ok_or_else(|| not_found("node"))?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -738,9 +826,12 @@ struct UsageQuery {
     limit: Option<usize>,
 }
 
-async fn usage(State(cp): State<Cp>, Query(q): Query<UsageQuery>) -> Json<Value> {
-    let events = cp.store.usage.snapshot(q.tenant_id.as_deref(), q.limit.unwrap_or(100).min(1000));
-    let all = cp.store.usage.snapshot(q.tenant_id.as_deref(), usize::MAX);
+/// Usage events (newest first) and totals; without `tenant_id`, over the tenants the caller sees.
+async fn usage(State(cp): State<Cp>, Extension(p): Extension<Principal>, Query(q): Query<UsageQuery>) -> Json<Value> {
+    let visible = p.visible(Perm::UsageRead);
+    let mut all = cp.store.usage.snapshot(q.tenant_id.as_deref(), usize::MAX);
+    all.retain(|e| visible.contains(&e.tenant_id));
+    let events: Vec<_> = all.iter().take(q.limit.unwrap_or(100).min(1000)).cloned().collect();
     let auto = all.iter().filter(|e| e.requested_model.as_deref() == Some("caliban/auto"));
     let priced = all.iter().filter(|e| e.margin_usd().is_some());
     let totals = json!({
@@ -774,6 +865,7 @@ async fn usage(State(cp): State<Cp>, Query(q): Query<UsageQuery>) -> Json<Value>
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::Request;
     use caliban_config::signing::{SnapshotVerifier, generate_signing_key};
     use caliban_config::{Config, ConfigHandle, Snapshot};
     use caliban_meter::RecentUsage;
@@ -1079,7 +1171,7 @@ mod tests {
         let e = &a["entries"][0];
         assert_eq!(
             (&e["action"], &e["actor"], &e["tenant_id"], &e["target"]),
-            (&json!("api_key.revoke"), &json!("admin"), &json!("globex"), &json!(id))
+            (&json!("api_key.revoke"), &json!("break_glass"), &json!("globex"), &json!(id))
         );
         assert_eq!(e["detail"], json!({"name": "ci", "prefix": &key[..8]}));
         assert!(!a.to_string().contains(&key[8..]));
@@ -1133,7 +1225,7 @@ mod tests {
         let (_, a) = call(&app, "GET", "/api/v1/audit?limit=20", None, true).await;
         assert_eq!(a["chain_verified"], true);
         let del = a["entries"].as_array().unwrap().iter().find(|e| e["action"] == "tenant.delete").unwrap();
-        assert_eq!((&del["actor"], &del["target"]), (&json!("admin"), &json!("acme")));
+        assert_eq!((&del["actor"], &del["target"]), (&json!("break_glass"), &json!("acme")));
         assert_eq!(del["detail"]["datasources_deleted"], json!([ds_id]));
         // The tenant's earlier audit rows are still there.
         assert!(

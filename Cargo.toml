@@ -42,6 +42,8 @@ clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
+# JWT validation (OIDC ID tokens, admin API access tokens). Pure-Rust crypto backend.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 memchr = "2"
 moka = { version = "0.12", features = ["future"] }
 parking_lot = "0.12"
@@ -59,6 +61,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "fs", "cors", "request-id", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 zeroize = "1"
 

@@ -20,6 +20,7 @@ parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 hex.workspace = true
+jsonwebtoken.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -27,13 +28,19 @@ sha2.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "chrono", "json"] }
 thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
+# Test-only signing keys for the in-process mock OIDC provider.
+p256 = { version = "0.13", features = ["pkcs8", "arithmetic"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rsa = "0.9"
 tower.workspace = true
 
 [lints]
