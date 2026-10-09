@@ -125,10 +125,7 @@ pub async fn run(
         tasks.push(tokio::spawn(async move {
             let mut s = Stats::empty();
             let mut first_err: Option<String> = None;
-            while remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-                .is_ok()
-            {
+            while take_one(&remaining) {
                 match one(&client, &target).await {
                     Ok((total, ttfb)) => {
                         let _ = s.total.record(total.as_nanos() as u64);
@@ -174,4 +171,16 @@ pub fn ms(h: &Histogram<u64>, q: f64) -> f64 {
         h.value_at_quantile(q)
     };
     ns as f64 / 1e6
+}
+
+/// Claims one request from the shared budget; false once it is exhausted.
+fn take_one(remaining: &AtomicUsize) -> bool {
+    let mut n = remaining.load(Ordering::Acquire);
+    while n > 0 {
+        match remaining.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(cur) => n = cur,
+        }
+    }
+    false
 }
