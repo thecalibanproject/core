@@ -49,14 +49,37 @@ enabled = false
 store = "qdrant"
 qdrant_url = "http://qdrant:6333"
 embedding_model = "local/qwen3-embedding-0.6b"
-threshold = 0.95
-min_threshold = 0.90
+threshold = 0.95       # 47% of paraphrases, 8% false hits on the adversarial AWS set
+min_threshold = 0.93   # below 0.93 the false-hit rate doubles (16% at 0.92, 21% at 0.90)
 max_error_rate = 0.02
 ttl_secs = 86400
 lookup_budget_ms = 50
+# Optional instruction for the cache embedder (Qwen3-Embedding expects one for queries). Measured
+# on the AWS set: 81% of paraphrases hit at 5% false hits with threshold 0.91. Off by default:
+# entries embedded with and without it do not mix (purge or let them expire when switching), and
+# because it differs from [routing] query_prefix every request then embeds twice (about 5 ms each
+# on a GPU). See bench/RESULTS-aws-2026-10.md.
+# query_prefix = "Instruct: Given a user question, retrieve questions that ask exactly the same thing\nQuery: "
 
 [pii]
 default_mode = "reversible"
+
+# caliban/auto stage-1 kNN on the shared TEI pool. Opt-in: uncomment once the embeddings pool
+# (compose profile embeddings, or cpu) is running; without it the kNN index cannot be built and
+# routing falls back to the keyword rules with an error in the refresh report. Values measured
+# with Qwen3-Embedding-0.6B on the built-in exemplar set (bench/RESULTS-aws-2026-10.md): the query
+# instruction raises leave-one-out top-1 from 0.838 to 0.948. Exemplars get the same prefix.
+# [routing]
+# embedding_model = "local/qwen3-embedding-0.6b"
+# query_prefix = "Instruct: Given a user request, identify the type of task it asks for\nQuery: "
+# budget_ms = 25
+# k = 5
+# temperature = 0.1
+# abstain_threshold = 0.6   # 5% abstain, accepted precision 0.970
+# # Out-of-scope gate: only valid together with query_prefix (without it in-scope and OOS scores
+# # overlap). It rests on just 10 OOS examples (4 of 10 rejected, 1.4% of in-scope); calibrate it
+# # with ml's knn-eval on a larger out-of-scope set before relying on it.
+# oos_threshold = 0.64
 
 # ═════════════════════ Shared model servers (on-prem pools) ═════════════════════
 # Host names match the docker-compose service names; in Kubernetes, the Helm `modelPools`

@@ -42,6 +42,7 @@ fn key(tenant: &str, prompt: &str) -> SemanticKey {
         prompt,
         surrogates: &[],
         pii_mode: PiiMode::Reversible,
+        embed_prefix: "",
     })
 }
 

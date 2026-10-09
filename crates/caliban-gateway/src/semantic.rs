@@ -212,7 +212,13 @@ pub(crate) fn prepare(gw: &Gateway, snap: &Snapshot, tenant: &TenantConfig, i: I
         prompt: &prompt,
         surrogates: &surrogates,
         pii_mode: i.pii_mode,
+        embed_prefix: cfg.query_prefix.as_deref().unwrap_or_default(),
     });
+    // The text that is embedded: the prompt, after the optional instruction.
+    let embed_text = match cfg.query_prefix.as_deref() {
+        Some(p) if !p.is_empty() => format!("{p}{prompt}"),
+        _ => prompt,
+    };
     Some(Semantic {
         cache: Arc::clone(cache),
         embedder: Arc::clone(&gw.embedder),
@@ -223,7 +229,7 @@ pub(crate) fn prepare(gw: &Gateway, snap: &Snapshot, tenant: &TenantConfig, i: I
         model_id: i.model.id.to_string(),
         think: !i.is_native && i.model.capabilities.inline_think_tags,
         key,
-        emb: Emb::Idle(prompt),
+        emb: Emb::Idle(embed_text),
         probe: None,
     })
 }

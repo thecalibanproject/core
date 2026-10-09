@@ -513,6 +513,15 @@ pub struct SemanticCacheConfig {
     /// slower embedding is kept for the insert after the upstream answers).
     #[serde(default = "default_sem_embed_timeout")]
     pub embed_timeout_ms: u64,
+    /// Instruction prepended to the prompt before it is embedded for the cache (off by default).
+    /// Qwen3-Embedding expects one for queries: with
+    /// `"Instruct: Given a user question, retrieve questions that ask exactly the same thing\nQuery: "`
+    /// the AWS run measured 81% paraphrase hits at 5% false hits with `threshold = 0.91`
+    /// (`bench/RESULTS-aws-2026-10.md`). Entries embedded with another prefix are never compared
+    /// (the prefix is part of the key). Unless it equals `[routing] query_prefix`, a request that
+    /// is routed by kNN and looked up here embeds its prompt twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_prefix: Option<String>,
 }
 
 impl Default for SemanticCacheConfig {
@@ -534,6 +543,7 @@ impl Default for SemanticCacheConfig {
             ttl_secs: default_sem_ttl(),
             lookup_budget_ms: default_sem_budget(),
             embed_timeout_ms: default_sem_embed_timeout(),
+            query_prefix: None,
         }
     }
 }
@@ -612,7 +622,7 @@ fn default_sem_threshold() -> f32 {
     0.95
 }
 fn default_sem_min_threshold() -> f32 {
-    0.90
+    0.93
 }
 fn default_sem_grey_band() -> f32 {
     0.03
@@ -1104,6 +1114,38 @@ mod tests {
         let t = &snap.config.tenants[0];
         assert!(snap.models_for(t).any(|m| m.kind == ModelKind::Embedding));
         assert!(snap.models_for(t).any(|m| m.capabilities.reasoning_control != ReasoningControl::None));
+        assert_eq!(snap.config.cache.semantic.min_threshold, 0.93);
+    }
+
+    /// The opt-in blocks of the open-models example (`[routing]` and the cache `query_prefix`)
+    /// are valid once uncommented, with the calibrated values.
+    #[test]
+    fn open_models_example_opt_in_blocks_are_valid() {
+        let src = include_str!("../../../config/open-models.example.toml");
+        let mut out = String::new();
+        let mut in_routing = false;
+        for line in src.lines() {
+            if line.starts_with("# [routing]") {
+                in_routing = true;
+            } else if in_routing && !line.starts_with('#') {
+                in_routing = false;
+            }
+            let uncomment = (in_routing && !line.starts_with("# #")) || line.starts_with("# query_prefix = ");
+            out.push_str(if uncomment { &line[2..] } else { line });
+            out.push('\n');
+        }
+        let cfg = Config::from_toml_str(&out).unwrap();
+        let r = &cfg.routing;
+        assert_eq!(r.embedding_model.as_ref().map(ModelId::as_str), Some("local/qwen3-embedding-0.6b"));
+        assert_eq!(
+            r.query_prefix.as_deref(),
+            Some("Instruct: Given a user request, identify the type of task it asks for\nQuery: ")
+        );
+        assert_eq!(
+            (r.k, r.temperature, r.abstain_threshold, r.oos_threshold),
+            (Some(5), Some(0.1), Some(0.6), Some(0.64))
+        );
+        assert!(cfg.cache.semantic.query_prefix.as_deref().is_some_and(|p| p.ends_with("\nQuery: ")));
     }
 
     #[test]
@@ -1131,7 +1173,7 @@ mod tests {
         assert!(!c.enabled);
         assert_eq!(
             (c.threshold, c.min_threshold, c.lookup_budget_ms, c.store),
-            (0.95, 0.90, 50, SemanticStoreKind::Qdrant)
+            (0.95, 0.93, 50, SemanticStoreKind::Qdrant)
         );
         let on = |extra: &str| format!("{SHARED}\n[cache.semantic]\nenabled = true\n{extra}");
         let cfg = Config::from_toml_str(&on("embedding_model = \"local/b\"\nstore = \"memory\"")).unwrap();

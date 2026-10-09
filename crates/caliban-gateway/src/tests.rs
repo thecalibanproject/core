@@ -1083,7 +1083,7 @@ api_key_hashes = ["{limited}"]
         wait_entries(&s.store, 1).await;
         let calls = upstream_calls(&s.log);
 
-        let (status, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q("what is the capital of france")).await;
+        let (status, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q("what is the capital of France")).await;
         assert_eq!(status, StatusCode::OK, "{out}");
         assert_eq!(h["x-caliban-cache"], "hit", "SDKs keep seeing hit | miss | bypass");
         assert_eq!(h["x-caliban-cache-tier"], "semantic");
@@ -1394,18 +1394,18 @@ api_key_hashes = ["{limited}"]
         let s = setup(Opts { verify_rate: 1.0, ..Default::default() }).await;
         {
             let mut o = s.embedder.overrides.lock().unwrap();
-            o.insert("first prompt".into(), at(1.0, 10));
-            o.insert("second prompt".into(), at(0.97, 1));
-            o.insert("You said: first prompt".into(), at(1.0, 5));
-            o.insert("You said: second prompt".into(), at(0.0, 6)); // orthogonal: a different answer
+            o.insert("one prompt".into(), at(1.0, 10));
+            o.insert("another prompt".into(), at(0.97, 1));
+            o.insert("You said: one prompt".into(), at(1.0, 5));
+            o.insert("You said: another prompt".into(), at(0.0, 6)); // orthogonal: a different answer
         }
-        call(&s.app, "/v1/chat/completions", BEARER, q("first prompt")).await;
+        call(&s.app, "/v1/chat/completions", BEARER, q("one prompt")).await;
         wait_entries(&s.store, 1).await;
         let first = s.store.entries()[0].1.clone();
         // 0.97 >= 0.95 would hit; verify_rate = 1 explores instead and finds a different answer.
-        let (_, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q("second prompt")).await;
+        let (_, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q("another prompt")).await;
         assert_eq!(h["x-caliban-cache"], "miss");
-        assert_eq!(reply_text(&out), "You said: second prompt");
+        assert_eq!(reply_text(&out), "You said: another prompt");
         wait_entries(&s.store, 2).await;
         settle().await;
         let p = s.store.entries().into_iter().find(|(_, id, _)| *id == first).unwrap().2;
@@ -1745,6 +1745,36 @@ api_key_hashes = ["{acme}"]
         assert_eq!(env.store.len(), 1, "T2 stored the answer under the prompt vector");
         let times = env.seen.lock().unwrap().iter().filter(|t| t.as_str() == prompt).count();
         assert_eq!(times, 1, "one upstream embedding for routing and T2 together");
+    }
+
+    /// `[routing] query_prefix` is applied on the gateway path (exemplars and prompts), and
+    /// `[cache.semantic] query_prefix` to what T2 embeds: two different texts, two embeddings.
+    #[tokio::test]
+    async fn routing_and_cache_query_prefixes_are_applied() {
+        let env = setup(&format!(
+            "query_prefix = \"Instruct: route\\nQuery: \"\n{WITH_T2}query_prefix = \"Instruct: same\\nQuery: \"\n"
+        ))
+        .await;
+        assert!(
+            env.seen.lock().unwrap().iter().all(|t| t.starts_with("Instruct: route\nQuery: ")),
+            "exemplars embedded with the routing prefix"
+        );
+        let prompt = "please translate the quarterly roadmap memo into german";
+        let body =
+            json!({"model": "caliban/auto", "temperature": 0.2, "messages": [{"role": "user", "content": prompt}]});
+        let (status, h, _) = call(&env.app, "/v1/chat/completions", BEARER, body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(h["x-caliban-intent"].to_str().unwrap().contains(";stage=knn"));
+        for _ in 0..200 {
+            if !env.store.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let seen = env.seen.lock().unwrap().clone();
+        assert!(seen.contains(&format!("Instruct: route\nQuery: {prompt}")), "routing embedded the prefixed prompt");
+        assert!(seen.contains(&format!("Instruct: same\nQuery: {prompt}")), "T2 embedded its own prefix");
+        assert!(!seen.iter().any(|t| t == prompt), "the raw prompt is never embedded");
     }
 
     /// Both cache tiers meter a `caliban/auto` hit the same way: no tokens, zero routed cost and

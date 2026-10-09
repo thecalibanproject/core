@@ -62,6 +62,7 @@ async fn seed(gw: &Gateway, tenants: &[&str]) {
             prompt: "what is our refund policy?",
             surrogates: &[],
             pii_mode: PiiMode::Reversible,
+            embed_prefix: "",
         });
         for (model, v) in [("emb", vec![0.6f32, 0.8]), ("emb-old", vec![1.0, 0.0, 0.0])] {
             let e = NewEntry {

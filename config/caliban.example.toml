@@ -37,7 +37,7 @@ exact_ttl_secs = 3600
 # embedding_model = "local/qwen3-embedding-0.6b"  # the same model as [routing] embedding_model
 #                                  # lets one embedding per request serve both
 # threshold = 0.95                 # starting per-entry cosine threshold
-# min_threshold = 0.90             # learned thresholds never go below
+# min_threshold = 0.93             # learned thresholds never go below
 # grey_band = 0.03                 # just below the threshold: answer fresh, verify, learn
 # max_error_rate = 0.02            # error budget: tighten a tenant's thresholds above this
 # verify_rate = 0.05               # share of would-be hits answered fresh to measure errors
@@ -46,6 +46,9 @@ exact_ttl_secs = 3600
 # ttl_secs = 86400
 # lookup_budget_ms = 50            # embed + search; slower means a miss
 # embed_timeout_ms = 2000
+# query_prefix = "..."             # optional instruction prepended before embedding (off by
+#                                  # default); see open-models.example.toml. Costs a second
+#                                  # embedding when it differs from [routing] query_prefix.
 
 [pii]
 # Default for tenants that don't override it: off | mask | reversible
@@ -71,6 +74,8 @@ default_mode = "reversible"
 # [routing]
 # embedding_model = "local/bge-small"       # catalogue model with kind = "embedding"
 # embedder_artifact = "bge-small@1.0.0"     # ml embedder artifact; a calibration must require the same
+# query_prefix = "query: "                  # prepended to prompts and exemplars (E5: "query: ";
+#                                           # Qwen3-Embedding: see open-models.example.toml)
 # budget_ms = 25                            # embed + kNN; over budget = keyword rules
 # calibration_dir = "/opt/caliban/artifacts/intent_head/knn-default/1.0.0"
 # profile_dir = "/opt/caliban/artifacts/router_profile/core/1.0.0"

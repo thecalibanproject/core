@@ -64,7 +64,7 @@ pub struct ThresholdPolicy {
 
 impl Default for ThresholdPolicy {
     fn default() -> Self {
-        Self { threshold: 0.95, min_threshold: 0.90, grey_band: 0.03, max_error_rate: 0.02, verify_rate: 0.05 }
+        Self { threshold: 0.95, min_threshold: 0.93, grey_band: 0.03, max_error_rate: 0.02, verify_rate: 0.05 }
     }
 }
 

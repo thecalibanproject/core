@@ -6,7 +6,13 @@
 //! - a hash of the whole protected request **except the last user message**: system prompt,
 //!   earlier turns, sampling and output parameters, so different system prompts, histories or
 //!   temperatures never share answers (MeanCache's context chains, arXiv 2403.02694);
-//! - the numeric tokens of the last user message ("Q3 2025" never matches "Q3 2026");
+//! - the guard [`Signature`] of the last user message ([`guard`]): its slots in order (numbers,
+//!   dates and IDs, currency codes, units, languages, codes and capitalised names: "Q3 2025" never
+//!   matches "Q3 2026", "USD to EUR" never matches "EUR to USD", "into Spanish" never matches
+//!   "into Italian") and its modifier classes ("briefly" never matches "in detail", "enable"
+//!   never matches "disable", a negation never matches its absence);
+//! - the instruction prefix the prompt was embedded with (`[cache.semantic] query_prefix`), so
+//!   vectors from different instructions are never compared;
 //! - the set of PII surrogates in the request (tenant-scoped surrogates are deterministic, so
 //!   the same people and accounts give the same set; a cached answer about someone else is never
 //!   served, and every surrogate in a hit is restorable with the hitting request's vault);
@@ -15,10 +21,12 @@
 //! What is embedded: the last user message in surrogate form. Within a partition the nearest
 //! entries are judged by the per-entry threshold policy in [`policy`].
 
+pub mod guard;
 pub mod policy;
 pub mod qdrant;
 pub mod store;
 
+pub use guard::{Signature, signature};
 pub use policy::{Decision, EntryStats, ThresholdPolicy, VerifyKind};
 pub use qdrant::QdrantStore;
 pub use store::{Candidate, EntryPayload, MemoryStore, ResponseShape, SearchQuery, StoreError, VectorStore};
@@ -48,6 +56,8 @@ pub struct KeyParts<'a> {
     /// PII surrogates present in the request (any order).
     pub surrogates: &'a [&'a str],
     pub pii_mode: PiiMode,
+    /// Instruction prepended to `prompt` before embedding (`""` when none).
+    pub embed_prefix: &'a str,
 }
 
 /// Derived identifiers of one request's T2 key.
@@ -67,17 +77,22 @@ impl SemanticKey {
     pub fn new(p: &KeyParts<'_>) -> Self {
         let route = format!("{}|{}", p.model, p.shape.as_str());
         let mut h = blake3::Hasher::new();
-        h.update(b"caliban/t2/v1\0");
+        // v2: ordered guard slots and modifier classes (v1 hashed sorted numeric tokens only).
+        h.update(b"caliban/t2/v2\0");
         h.update(p.tenant.as_str().as_bytes());
         h.update(&[0]);
         h.update(route.as_bytes());
         h.update(&[0]);
         h.update(p.context_hash.as_bytes());
-        for s in numeric_slots(p.prompt) {
+        h.update(&(p.embed_prefix.len() as u64).to_le_bytes());
+        h.update(p.embed_prefix.as_bytes());
+        let sig = guard::signature(p.prompt);
+        for s in &sig.slots {
             h.update(s.as_bytes());
             h.update(&[0]);
         }
         h.update(&[1]);
+        h.update(&sig.modifiers.to_le_bytes());
         let mut surrogates: Vec<String> = p.surrogates.iter().map(|s| s.to_lowercase()).collect();
         surrogates.sort_unstable();
         surrogates.dedup();
@@ -102,18 +117,6 @@ impl SemanticKey {
             point_id: uuid::Uuid::from_bytes(b).to_string(),
         }
     }
-}
-
-/// Lower-cased alphanumeric tokens that contain a digit, sorted: numbers, dates, versions, IDs.
-pub fn numeric_slots(text: &str) -> Vec<String> {
-    let mut v: Vec<String> = text
-        .split(|c: char| !c.is_alphanumeric() && c != '.' && c != ',')
-        .map(|t| t.trim_matches(|c| c == '.' || c == ','))
-        .filter(|t| t.chars().any(|c| c.is_ascii_digit()))
-        .map(str::to_lowercase)
-        .collect();
-    v.sort_unstable();
-    v
 }
 
 /// `{prefix}_{model}_{dim}`, with characters outside `[a-z0-9_-]` replaced by `_`.
@@ -335,6 +338,7 @@ mod tests {
             prompt,
             surrogates: &[],
             pii_mode: PiiMode::Reversible,
+            embed_prefix: "",
         })
     }
 
@@ -378,6 +382,7 @@ mod tests {
                 prompt: "email them",
                 surrogates: s,
                 pii_mode: PiiMode::Reversible,
+                embed_prefix: "",
             })
             .partition
         };
@@ -386,10 +391,35 @@ mod tests {
     }
 
     #[test]
-    fn numeric_slots_keep_numbers_dates_and_ids() {
-        assert_eq!(numeric_slots("Revenue for Q3 2025, region EMEA-2 (v1.2)."), ["2", "2025", "q3", "v1.2"]);
-        assert!(numeric_slots("what is the capital of france").is_empty());
-        assert_eq!(numeric_slots("1,000 or 1000"), vec!["1,000", "1000"]);
+    fn partition_separates_the_aws_false_hits_and_keeps_paraphrases() {
+        let p = |prompt: &str| key("a", prompt, b"sys").partition;
+        // The three false hits of the AWS run (bench/RESULTS-aws-2026-10.md).
+        assert_ne!(p("Translate 'good morning' into Spanish."), p("Translate 'good morning' into Italian."));
+        assert_ne!(p("Convert 100 USD to EUR."), p("Convert 100 EUR to USD."));
+        assert_ne!(p("Explain the CAP theorem briefly."), p("Explain the CAP theorem in detail."));
+        // Paraphrases still share a partition (the threshold decides).
+        assert_eq!(p("Translate 'good morning' into Spanish."), p("How do you say 'good morning' in Spanish?"));
+        assert_eq!(p("Convert 100 USD to EUR."), p("How much is 100 USD in EUR?"));
+        assert_eq!(p("Explain the CAP theorem briefly."), p("Give me a brief explanation of the CAP theorem."));
+    }
+
+    #[test]
+    fn embedding_prefix_is_part_of_the_partition() {
+        let t: TenantId = "a".into();
+        let with = |prefix: &str| {
+            SemanticKey::new(&KeyParts {
+                tenant: &t,
+                model: "m",
+                shape: ResponseShape::Openai,
+                context_hash: blake3::hash(b"x"),
+                prompt: "hi",
+                surrogates: &[],
+                pii_mode: PiiMode::Reversible,
+                embed_prefix: prefix,
+            })
+            .partition
+        };
+        assert_ne!(with(""), with("Instruct: same question\nQuery: "));
     }
 
     #[test]
