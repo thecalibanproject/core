@@ -449,6 +449,9 @@ CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres cargo t
 docker run -d --rm -p 56333:6333 --name caliban-qdrant-test qdrant/qdrant:v1.19.1-unprivileged
 CALIBAN_TEST_QDRANT_URL=http://127.0.0.1:56333 cargo test -p caliban-cache --test qdrant -- --nocapture
 CALIBAN_TEST_QDRANT_URL=http://127.0.0.1:56333 cargo test --release -p caliban-gateway semantic_miss_latency -- --nocapture
+# Routing latency report; CALIBAN_TEST_PERF=1 also enforces the 25 ms kNN p99 budget (plain
+# `cargo test` only prints it, so a loaded machine does not fail the run):
+CALIBAN_TEST_PERF=1 cargo test --release -p caliban-gateway knn_latency -- --nocapture
 ```
 
 - **Valkey quota tests** ([`crates/caliban-meter/src/quota/store_tests.rs`](crates/caliban-meter/src/quota/store_tests.rs)) run one behavioural suite against the in-memory store and, with `CALIBAN_TEST_VALKEY_URL`, against Valkey. The Valkey-only tests check that 400 concurrent calls through two store instances never exceed a rate or a day budget, that reserve and settle from two instances leave the server counters at exactly the actual usage, that idle keys expire, that a cut connection (a TCP proxy in front of Valkey) falls back to local limits and recovers with the shared state intact, and print the added latency. Without the variable they print a skip message and pass.
