@@ -758,12 +758,19 @@ mod tests {
         let text = "Please draft a short follow-up note to our customer about the renewal. Their contact is \
                     jane.doe@acme.com and the card on file is 4111 1111 1111 1111. Keep it friendly and under one \
                     hundred words, and mention that the invoice is attached.";
-        let n = 2000;
-        let started = std::time::Instant::now();
-        for _ in 0..n {
-            std::hint::black_box(signature(std::hint::black_box(text)));
-        }
-        let per = started.elapsed() / n;
+        // Best of several batches, so a loaded machine does not fail the test.
+        let n = 200;
+        let per = (0..10)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                for _ in 0..n {
+                    std::hint::black_box(signature(std::hint::black_box(text)));
+                }
+                started.elapsed() / n
+            })
+            .min()
+            .unwrap_or_default();
+        eprintln!("guard signature: {per:?} per prompt (best of 10 batches)");
         // Typically a few microseconds in release builds; generous for debug builds and CI.
         assert!(per < std::time::Duration::from_millis(1), "{per:?} per signature");
     }
