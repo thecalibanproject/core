@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: Clippy and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # rust-toolchain.toml pins the stable channel; install it explicitly.
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Default features: no ONNX Runtime. Postgres and MongoDB tests return early without
+      # CALIBAN_TEST_DATABASE_URL / CALIBAN_MONGO_TEST_URI; the NER test needs `--features ner`.
+      - run: cargo test --workspace
+
+  postgres:
+    name: Postgres store parity
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: caliban
+          POSTGRES_PASSWORD: caliban
+          POSTGRES_DB: caliban_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U caliban -d caliban_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      CALIBAN_TEST_DATABASE_URL: postgres://caliban:caliban@localhost:5432/caliban_test
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p caliban-cp store::tests::postgres
+
+  ner:
+    name: Build with NER (ONNX Runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      # ort downloads a prebuilt ONNX Runtime at build time.
+      - run: cargo build -p caliban --features ner
