@@ -11,6 +11,7 @@ use axum::routing::post;
 use caliban_config::{Config, ConfigHandle, Snapshot};
 use caliban_meter::RecentUsage;
 use caliban_meter::quota::InMemoryQuota;
+use caliban_pii::{EntityType, SurrogateKeys, Vault};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
@@ -118,6 +119,11 @@ fn hash(k: &str) -> String {
 }
 
 async fn setup() -> (Router, Log, Arc<InMemoryQuota>) {
+    setup_with_keys(None).await
+}
+
+/// `keys`: the PII surrogate keyring, as derived from a deployment's `CALIBAN_KEK`.
+async fn setup_with_keys(keys: Option<SurrogateKeys>) -> (Router, Log, Arc<InMemoryQuota>) {
     let (base, log) = mock_upstream().await;
     let key_file = std::env::temp_dir().join(format!("caliban-gw-test-anthropic-{}", std::process::id()));
     std::fs::write(&key_file, "sk-ant-test").unwrap();
@@ -165,6 +171,27 @@ api_key_hashes = ["{acme}"]
   trust_tier = "t0_sovereign"
 
 [[tenants]]
+id = "globex"
+name = "Globex"
+api_key_hashes = ["{globex}"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t2_contracted"
+
+[[tenants]]
+id = "solo"
+name = "Solo"
+pii_surrogate_scope = "session"
+api_key_hashes = ["{solo}"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t2_contracted"
+
+[[tenants]]
 id = "limited"
 name = "Limited"
 api_key_hashes = ["{limited}"]
@@ -191,13 +218,18 @@ requests_per_minute = 1
 tokens_per_day = 2000
 "#,
         acme = hash("cal_acme"),
+        globex = hash("cal_globex"),
+        solo = hash("cal_solo"),
         limited = hash("cal_limited"),
         budget = hash("cal_budget"),
         key = key_file.display(),
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     let quota = Arc::new(InMemoryQuota::new());
-    let gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(RecentUsage::default())).with_quota(quota.clone());
+    let mut gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(RecentUsage::default())).with_quota(quota.clone());
+    if let Some(k) = keys {
+        gw.pii_keys = k;
+    }
     (app(Arc::new(gw)), log, quota)
 }
 
@@ -501,4 +533,191 @@ async fn genai_spans_carry_attributes_but_never_content() {
     assert!(has("upstream", "caliban.native", "true"));
     assert!(has("pii", "caliban.pii.entities", "1"));
     assert!(has("route", "caliban.route.candidates", "1"));
+}
+
+// ───────────────────────── PII surrogate scopes and the exact cache ─────────────────────────
+
+const GLOBEX: (&str, &str) = ("authorization", "Bearer cal_globex");
+const SOLO: (&str, &str) = ("authorization", "Bearer cal_solo");
+const TEST_KEK: [u8; 32] = *b"caliban-test-kek-32-bytes-long!!";
+
+fn chat_body(text: &str) -> Value {
+    json!({"model": "ext/mock", "temperature": 0, "messages": [{"role": "user", "content": text}]})
+}
+
+fn upstream_calls(log: &Log) -> usize {
+    log.0.lock().unwrap().len()
+}
+
+fn reply_text(out: &str) -> String {
+    let v: Value = serde_json::from_str(out).unwrap();
+    v["choices"][0]["message"]["content"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn tenant_scope_repeated_pii_prompt_hits_the_cache() {
+    let (app, log, _) = setup().await;
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, chat_body(PII)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(h["x-caliban-cache"], "miss");
+    assert_eq!(reply_text(&out), format!("You said: {PII}"));
+    let first = last_user_text(&log.last().2);
+    assert!(!first.contains(EMAIL), "{first}");
+    let calls = upstream_calls(&log);
+
+    // Same PII, same tenant, new request: same surrogates, so the same protected body.
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, chat_body(PII)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(h["x-caliban-cache"], "hit");
+    assert_eq!(upstream_calls(&log), calls, "served from cache");
+    assert_eq!(reply_text(&out), format!("You said: {PII}"), "cached answer rehydrated with this request's vault");
+
+    // Same value inside a different prompt: same surrogate upstream.
+    call(&app, "/v1/chat/completions", BEARER, chat_body(&format!("Is {EMAIL} still valid?"))).await;
+    let surrogate = first.strip_prefix("Email ").and_then(|r| r.strip_suffix(" about the plan")).unwrap();
+    assert!(last_user_text(&log.last().2).contains(surrogate));
+
+    // Anthropic clients: the OpenAI-shaped entry is translated and rehydrated on a hit.
+    let body = json!({"model": "ext/mock", "max_tokens": 100, "temperature": 0, "messages": [{"role": "user", "content": PII}]});
+    let (_, h, _) = call(&app, "/v1/messages", ANTH, body.clone()).await;
+    assert_eq!(h["x-caliban-cache"], "miss", "max_tokens makes it another upstream body");
+    let (status, h, out) = call(&app, "/v1/messages", ANTH, body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(h["x-caliban-cache"], "hit");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["content"][0]["text"], format!("You said: {PII}"));
+}
+
+#[tokio::test]
+async fn tenant_scope_cache_never_crosses_tenants() {
+    let (app, log, _) = setup().await;
+    let (_, h, _) = call(&app, "/v1/chat/completions", BEARER, chat_body(PII)).await;
+    assert_eq!(h["x-caliban-cache"], "miss");
+    let acme_sent = last_user_text(&log.last().2);
+    let calls = upstream_calls(&log);
+
+    let (status, h, out) = call(&app, "/v1/chat/completions", GLOBEX, chat_body(PII)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(h["x-caliban-cache"], "miss", "another tenant never sees acme's entry");
+    assert_eq!(upstream_calls(&log), calls + 1);
+    let globex_sent = last_user_text(&log.last().2);
+    assert!(!globex_sent.contains(EMAIL));
+    assert_ne!(globex_sent, acme_sent, "different tenants, different surrogates");
+    assert_eq!(reply_text(&out), format!("You said: {PII}"));
+
+    let (_, h, _) = call(&app, "/v1/chat/completions", GLOBEX, chat_body(PII)).await;
+    assert_eq!(h["x-caliban-cache"], "hit");
+}
+
+#[tokio::test]
+async fn session_scope_gives_fresh_surrogates_and_bypasses_the_cache() {
+    let (app, log, _) = setup().await;
+    let (_, h, out) = call(&app, "/v1/chat/completions", SOLO, chat_body(PII)).await;
+    assert_eq!(h["x-caliban-cache"], "bypass");
+    assert_eq!(reply_text(&out), format!("You said: {PII}"));
+    let first = last_user_text(&log.last().2);
+    let (_, h, out) = call(&app, "/v1/chat/completions", SOLO, chat_body(PII)).await;
+    assert_eq!(h["x-caliban-cache"], "bypass");
+    assert_eq!(reply_text(&out), format!("You said: {PII}"));
+    let second = last_user_text(&log.last().2);
+    assert!(!first.contains(EMAIL) && !second.contains(EMAIL));
+    assert_ne!(first, second, "a new surrogate per request");
+
+    // Without PII, session-scope tenants still use the cache.
+    call(&app, "/v1/chat/completions", SOLO, chat_body("hello there")).await;
+    let (_, h, _) = call(&app, "/v1/chat/completions", SOLO, chat_body("hello there")).await;
+    assert_eq!(h["x-caliban-cache"], "hit");
+
+    // Streaming rehydration with per-request surrogates.
+    let body = json!({"model": "ext/mock", "stream": true, "messages": [{"role": "user", "content": PII}]});
+    let (status, _, out) = call(&app, "/v1/chat/completions", SOLO, body).await;
+    assert_eq!(status, StatusCode::OK);
+    let text: String = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(text, format!("You said: {PII}"));
+}
+
+#[tokio::test]
+async fn tenant_scope_streaming_is_rehydrated() {
+    let (app, log, _) = setup().await;
+    let body = json!({"model": "ext/mock", "stream": true, "messages": [{"role": "user", "content": PII}]});
+    let (status, _, out) = call(&app, "/v1/chat/completions", BEARER, body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = |out: &str| -> String {
+        out.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(text(&out), format!("You said: {PII}"));
+    let first = last_user_text(&log.last().2);
+    let (_, _, out) = call(&app, "/v1/chat/completions", BEARER, body).await;
+    assert_eq!(text(&out), format!("You said: {PII}"));
+    assert_eq!(last_user_text(&log.last().2), first, "stable surrogate across streamed requests");
+}
+
+/// Split mode: two routers that share only `CALIBAN_KEK` send byte-identical protected requests.
+#[tokio::test]
+async fn routers_sharing_the_kek_send_identical_surrogates() {
+    let (a, log_a, _) = setup_with_keys(Some(SurrogateKeys::from_kek(&TEST_KEK))).await;
+    let (b, log_b, _) = setup_with_keys(Some(SurrogateKeys::from_kek(&TEST_KEK))).await;
+    call(&a, "/v1/chat/completions", BEARER, chat_body(PII)).await;
+    call(&b, "/v1/chat/completions", BEARER, chat_body(PII)).await;
+    let (sa, sb) = (log_a.last().2, log_b.last().2);
+    assert!(!sa.to_string().contains(EMAIL));
+    assert_eq!(sa, sb);
+    let (c, log_c, _) = setup_with_keys(Some(SurrogateKeys::from_kek(&[1; 32]))).await;
+    call(&c, "/v1/chat/completions", BEARER, chat_body(PII)).await;
+    assert_ne!(last_user_text(&log_c.last().2), last_user_text(&sa), "another KEK, other surrogates");
+}
+
+/// Two different values that share a surrogate in one tenant (small formats make this possible
+/// across requests) produce the same protected request, so the second hits the first's cache
+/// entry. The entry is stored pseudonymised and rehydrated with the second request's own vault,
+/// so the second caller never sees the first caller's value.
+#[tokio::test]
+async fn cache_hit_after_a_cross_request_collision_never_leaks_the_other_value() {
+    let keys = SurrogateKeys::from_kek(&TEST_KEK);
+    let acme = keys.tenant_key("acme");
+    let surrogate = |ip: &str| Vault::new(&acme).surrogate_for(&EntityType::IpAddress, ip);
+    // 762 possible IP surrogates: a colliding pair turns up within a few dozen addresses.
+    let mut seen = std::collections::HashMap::new();
+    let (ip1, ip2) = (0..=255u32)
+        .flat_map(|x| (1..=254u32).map(move |y| format!("10.9.{x}.{y}")))
+        .find_map(|ip| seen.insert(surrogate(&ip), ip.clone()).map(|prev| (prev, ip)))
+        .expect("collision in a 762-address pool");
+
+    let (app, log, _) = setup_with_keys(Some(keys)).await;
+    let (_, h, out) = call(&app, "/v1/chat/completions", BEARER, chat_body(&format!("ping {ip1} now"))).await;
+    assert_eq!(h["x-caliban-cache"], "miss");
+    assert_eq!(reply_text(&out), format!("You said: ping {ip1} now"));
+    assert_eq!(last_user_text(&log.last().2), format!("ping {} now", surrogate(&ip1)));
+
+    let (_, h, out) = call(&app, "/v1/chat/completions", BEARER, chat_body(&format!("ping {ip2} now"))).await;
+    assert_eq!(h["x-caliban-cache"], "hit", "byte-identical protected request");
+    let text = reply_text(&out);
+    assert_eq!(text, format!("You said: ping {ip2} now"));
+    assert!(!text.contains(&ip1), "{text}");
+}
+
+#[tokio::test]
+async fn native_anthropic_cache_hit_is_rehydrated() {
+    let (app, log, _) = setup().await;
+    let body = json!({"model": "anth/claude", "max_tokens": 50, "temperature": 0, "messages": [{"role": "user", "content": PII}]});
+    let (_, h, out) = call(&app, "/v1/messages", ANTH, body.clone()).await;
+    assert_eq!(h["x-caliban-cache"], "miss", "{out}");
+    assert_eq!(log.last().0, "messages");
+    let calls = upstream_calls(&log);
+    let (status, h, out) = call(&app, "/v1/messages", ANTH, body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(h["x-caliban-cache"], "hit");
+    assert_eq!(upstream_calls(&log), calls);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["content"][0]["text"], format!("You said: {PII}"));
+    assert_eq!(v["model"], "anth/claude");
 }

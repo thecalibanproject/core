@@ -168,7 +168,7 @@ fn engine_round_trip_with_names() {
     assert_eq!(Rehydrator::new(&p.vault).rehydrate(&sent), original);
 
     // Tenant scope: identical requests → identical protected text (exact-cache friendly).
-    let key = tenant_scope_key(b"server-secret-for-tests-only-32b!", "tenant-a");
+    let key = tenant_scope_key(b"server-secret-for-tests-only-32b", "tenant-a");
     let (mut r1, mut r2) = (chat(original), chat(original));
     engine.protect(&mut r1, PiiMode::Reversible, &key).unwrap();
     engine.protect(&mut r2, PiiMode::Reversible, &key).unwrap();

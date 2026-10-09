@@ -44,6 +44,8 @@ The model id `caliban/auto` lets Caliban choose: the request is classified into 
 
 Control-plane endpoints (`:8081`) live under `/api/v1/*` and are specified in [`api/openapi.yaml`](api/openapi.yaml): tenants, tenant API keys, BYOK provider keys, routes, the model catalogue and shared providers (with health checks and model discovery), datasources and introspection, the ontology review queue, nodes, usage, the audit log, health, and signed snapshots for split-mode routers. When a built console is available (`CALIBAN_WEB_DIR` or `[server] web_dir`), it is served at `/`.
 
+`PATCH /api/v1/tenants/{tenantId}` changes a tenant's `pii_default` and `pii_surrogate_scope` (audited as `tenant.update`; routers apply it with their next snapshot).
+
 Deletes (admin token):
 
 | Endpoint | Effect |
@@ -63,8 +65,14 @@ One pipeline serves both API shapes. OpenAI and Anthropic requests are decoded i
 
 1. **Auth and limits.** Tenant API key lookup (keys are stored as SHA-256 hashes). GCRA request rate per tenant and per key; token and USD budgets with reservation and settlement. Exceeding a limit returns `429` with `retry-after`.
 2. **PII.** L0: regexes with validators (Luhn, IBAN, SSN), tenant dictionaries, and credential detection (a prompt carrying credentials is refused). L1, optional (`ner` feature): an in-process multilingual NER model. Each tenant's `pii_mode` is `off`, `mask` or `reversible`. In `reversible` mode, values are replaced with realistic surrogates (valid Luhn and IBAN numbers) before an external model sees them, and the response, streams included, is rehydrated with a hold-back buffer. Sovereign (`t0_sovereign`) models receive the raw text.
+
+   Surrogates are a keyed HMAC-SHA256 of (entity type, normalised value). Each tenant's `pii_surrogate_scope` picks the key:
+   - `tenant` (default): a per-tenant key, HKDF-SHA256 over `CALIBAN_KEK` with the tenant id as info. The same value in the same tenant always gets the same surrogate, so a repeated PII prompt is byte-identical after protection and can hit the exact cache. Every router that shares `CALIBAN_KEK` derives the same keys. The cost: the upstream can link sessions of one tenant through their surrogates (linkable, not identifiable).
+   - `session`: a random key per request. Nothing links two requests, and requests carrying PII bypass the exact cache.
+
+   Surrogates never cross tenants. No surrogate-to-original table is stored: each request's reverse map is built from the values seen in that request, and only those values are restored in the response (any other surrogate, for example in a cached answer, is left as it is). Within a request, two values never share a surrogate (deterministic re-draw, then a typed placeholder). Across requests, small formats such as names can collide; that never breaks rehydration. Derivation, formats and collision probabilities are documented in [`crates/caliban-pii/src/surrogate.rs`](crates/caliban-pii/src/surrogate.rs). Without `CALIBAN_KEK`, the key comes from a random per-process secret, so surrogates are stable within one process only.
 3. **Routing.** Rules and policy (pinned model, trust tier, licence), then intent classification (a placeholder keyword classifier today), then the tenant's ordered candidates with fallbacks.
-4. **Cache.** Exact cache over a canonical request hash, keyed by tenant, ACL and datasource epoch.
+4. **Cache.** Exact cache over the protected upstream body (never raw PII sent outside), keyed by tenant, ACL and datasource epoch. Entries are stored pseudonymised and rehydrated with the vault of the request that hits them.
 5. **Upstream.** BYOK calls to OpenAI-compatible servers (OpenAI, vLLM, SGLang, llama.cpp, Ollama, TEI) or to Anthropic, either as native passthrough (`cache_control` kept) or translated. `security.egress = "deny_by_default"` limits calls to declared `base_url`s. Shared vLLM and SGLang pools can receive a per-tenant `cache_salt` for prefix-cache isolation.
 6. **Metering and tracing.** Usage events with cost go to an in-memory ring and, optionally, a JSONL write-ahead log. OpenTelemetry GenAI spans are exported only when configured, and prompt and response content is never recorded.
 
@@ -158,7 +166,7 @@ Global flags: `--config` (`CALIBAN_CONFIG`, default `/etc/caliban/caliban.toml`)
 - `[limits]` and `[limits.tenants.<id>]`: `requests_per_minute`, `key_requests_per_minute`, `tokens_per_minute`, `tokens_per_day`, `usd_per_day`. Unset means unlimited.
 - `[[providers]]`: deployment-wide model servers shared by tenants (see `open-models.example.toml`).
 - `[[models]]`: the catalogue (provider, `upstream_model`, trust tier, licence, context window, prices, capabilities).
-- `[[tenants]]`, with `[[tenants.providers]]` (BYOK) and `[[tenants.routes]]` (intent to ordered models).
+- `[[tenants]]`, with `pii_mode`, `pii_surrogate_scope` (`tenant` or `session`), `[[tenants.providers]]` (BYOK) and `[[tenants.routes]]` (intent to ordered models).
 
 Secrets are never written inline: use `{ env = "VAR" }`, `{ file = "/path" }`, or a value sealed under `CALIBAN_KEK`. Trust tiers run from `t0_sovereign` to `t3_public`.
 
@@ -168,7 +176,7 @@ Secrets are never written inline: use `{ env = "VAR" }`, `{ file = "/path" }`, o
 |---|---|---|
 | `CALIBAN_CONFIG` | all | Config file path (default `/etc/caliban/caliban.toml`) |
 | `CALIBAN_ADMIN_TOKEN` | control plane | Admin bearer token, unless `[security] admin_token` resolves it another way |
-| `CALIBAN_KEK` | all | Base64 32-byte key-encryption key: seals and opens BYOK keys, derives the cache-salt key |
+| `CALIBAN_KEK` | all | Base64 32-byte key-encryption key: seals and opens BYOK keys, derives the cache-salt key and the per-tenant PII surrogate keys. Rotating it changes every tenant's surrogates (only costs cache misses) |
 | `CALIBAN_DATABASE_URL` | control plane | Postgres store; unset means in-memory |
 | `CALIBAN_WEB_DIR` | control plane | Built web console (overrides `[server] web_dir`) |
 | `CALIBAN_USAGE_WAL` | data plane | JSONL usage log path |
@@ -272,7 +280,7 @@ Next, in order:
 1. Control plane: per-tenant DEKs (so a tenant delete crypto-shreds its BYOK keys), OIDC actors in the audit log, usage shipping from routers to the control plane, push (long-poll) instead of polling (faster revocation in split mode).
 2. MongoDB connector: wire `introspect` and `propose` into the control plane's introspection job; `$jsonSchema`-declared types; map and scalar-array attributes; per-shard sampling.
 3. CDC replica and planner: connect the planner to the `explain` gate and replica lag in a query service; delta Parquet with compaction instead of whole-table rewrites; resume from the manifest after a restart (today it re-snapshots); parallel `_id`-range snapshots; arrays nested in arrays.
-4. PII: tenant-scoped surrogates so pseudonymised requests can hit the cache; licence sign-off on the NER model's fine-tuning data (see `MODELS.md`).
+4. PII: licence sign-off on the NER model's fine-tuning data (see `MODELS.md`); FF1 format-preserving encryption for structured IDs; coreference so a first name maps to the surrogate's first name.
 5. Gateway: Valkey quota store, tokenizer-based estimates, rate-limit headers on successful responses, tool-call argument rehydration in streams, `Idempotency-Key`, the semantic cache, and the embedding kNN and ONNX intent classifiers.
 
 ## Related repositories

@@ -68,6 +68,12 @@ licence = "proprietary"
 id = "acme"
 name = "Acme Corp"
 pii_mode = "reversible"
+# Surrogate consistency in reversible mode. "tenant" (default): the same value always gets the
+# same surrogate in this tenant (keyed HMAC, per-tenant key derived from CALIBAN_KEK), so
+# pseudonymised requests can hit the exact cache; sessions of the tenant become linkable through
+# their surrogates. "session": fresh surrogates per request (unlinkable, PII requests bypass the
+# cache). Surrogates never cross tenants.
+# pii_surrogate_scope = "tenant"
 # SHA-256 hex of each API key. Generate a key with `caliban keygen`.
 api_key_hashes = [
   # "3f5c…",
