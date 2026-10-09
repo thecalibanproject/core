@@ -215,8 +215,22 @@ async fn run_workload(e: &Env) -> Vec<Sample> {
     let mut out = Vec::new();
     for (i, p) in PROMPTS.iter().enumerate() {
         let tag = format!("{p} [{i}]");
-        out.push(e.sample("OpenAI client, OpenAI-compatible upstream, JSON", Api::OpenAi, json!({"model": "oa/m", "messages": msgs(&tag)})).await);
-        out.push(e.sample("OpenAI client, OpenAI-compatible upstream, stream", Api::OpenAi, json!({"model": "oa/m", "stream": true, "messages": msgs(&tag)})).await);
+        out.push(
+            e.sample(
+                "OpenAI client, OpenAI-compatible upstream, JSON",
+                Api::OpenAi,
+                json!({"model": "oa/m", "messages": msgs(&tag)}),
+            )
+            .await,
+        );
+        out.push(
+            e.sample(
+                "OpenAI client, OpenAI-compatible upstream, stream",
+                Api::OpenAi,
+                json!({"model": "oa/m", "stream": true, "messages": msgs(&tag)}),
+            )
+            .await,
+        );
         out.push(
             e.sample(
                 "OpenAI client, OpenAI-compatible upstream, stream, include_usage: false",
@@ -225,13 +239,29 @@ async fn run_workload(e: &Env) -> Vec<Sample> {
             )
             .await,
         );
-        out.push(e.sample("OpenAI client, Anthropic upstream (translated), JSON", Api::OpenAi, json!({"model": "anth/m", "messages": msgs(&tag)})).await);
         out.push(
-            e.sample("OpenAI client, Anthropic upstream (translated), stream", Api::OpenAi, json!({"model": "anth/m", "stream": true, "messages": msgs(&tag)})).await,
+            e.sample(
+                "OpenAI client, Anthropic upstream (translated), JSON",
+                Api::OpenAi,
+                json!({"model": "anth/m", "messages": msgs(&tag)}),
+            )
+            .await,
         );
         out.push(
-            e.sample("Anthropic client, OpenAI-compatible upstream (translated), JSON", Api::Anthropic, json!({"model": "oa/m", "max_tokens": 128, "messages": msgs(&tag)}))
-                .await,
+            e.sample(
+                "OpenAI client, Anthropic upstream (translated), stream",
+                Api::OpenAi,
+                json!({"model": "anth/m", "stream": true, "messages": msgs(&tag)}),
+            )
+            .await,
+        );
+        out.push(
+            e.sample(
+                "Anthropic client, OpenAI-compatible upstream (translated), JSON",
+                Api::Anthropic,
+                json!({"model": "oa/m", "max_tokens": 128, "messages": msgs(&tag)}),
+            )
+            .await,
         );
         out.push(
             e.sample(
@@ -242,7 +272,12 @@ async fn run_workload(e: &Env) -> Vec<Sample> {
             .await,
         );
         out.push(
-            e.sample("Anthropic client, Anthropic upstream (native), JSON", Api::Anthropic, json!({"model": "anth/m", "max_tokens": 128, "messages": msgs(&tag)})).await,
+            e.sample(
+                "Anthropic client, Anthropic upstream (native), JSON",
+                Api::Anthropic,
+                json!({"model": "anth/m", "max_tokens": 128, "messages": msgs(&tag)}),
+            )
+            .await,
         );
         out.push(
             e.sample(
@@ -252,28 +287,54 @@ async fn run_workload(e: &Env) -> Vec<Sample> {
             )
             .await,
         );
-        out.push(e.sample("caliban/auto with fallback (first candidate 500s)", Api::OpenAi, json!({"model": "caliban/auto", "messages": msgs(&tag)})).await);
+        out.push(
+            e.sample(
+                "caliban/auto with fallback (first candidate 500s)",
+                Api::OpenAi,
+                json!({"model": "caliban/auto", "messages": msgs(&tag)}),
+            )
+            .await,
+        );
     }
     // Native Anthropic prompt caching: a cache_control breakpoint on a long system prompt; the
     // first request writes the cache, repeats read it.
     let system = json!([{"type": "text", "text": "You are the finance assistant. ".repeat(40), "cache_control": {"type": "ephemeral"}}]);
     for stream in [false, false, true, true] {
         let body = json!({"model": "anth/m", "max_tokens": 128, "stream": stream, "system": system, "messages": msgs(&format!("What is due this week? stream={stream}"))});
-        out.push(e.sample("Anthropic native with cache_control (cache write, then reads)", Api::Anthropic, body.clone()).await);
+        out.push(
+            e.sample("Anthropic native with cache_control (cache write, then reads)", Api::Anthropic, body.clone())
+                .await,
+        );
         out.push(e.sample("Anthropic native with cache_control (cache write, then reads)", Api::Anthropic, body).await);
     }
     // The same with the 1-hour TTL (written at 2x, read at 0.1x).
     let system_1h = json!([{"type": "text", "text": "You are the treasury assistant. ".repeat(40), "cache_control": {"type": "ephemeral", "ttl": "1h"}}]);
     for stream in [false, true] {
         let body = json!({"model": "anth/m", "max_tokens": 128, "stream": stream, "system": system_1h, "messages": msgs(&format!("Which invoices are overdue? stream={stream}"))});
-        out.push(e.sample("Anthropic native with cache_control, 1-hour TTL (write, then read)", Api::Anthropic, body.clone()).await);
-        out.push(e.sample("Anthropic native with cache_control, 1-hour TTL (write, then read)", Api::Anthropic, body).await);
+        out.push(
+            e.sample(
+                "Anthropic native with cache_control, 1-hour TTL (write, then read)",
+                Api::Anthropic,
+                body.clone(),
+            )
+            .await,
+        );
+        out.push(
+            e.sample("Anthropic native with cache_control, 1-hour TTL (write, then read)", Api::Anthropic, body).await,
+        );
     }
     // Provider-side prefix cache on the OpenAI-compatible upstream (repeats report cached_tokens).
     for stream in [false, true] {
         let body = json!({"model": "oa/m", "stream": stream, "messages": msgs(&format!("Repeated long prompt for the prefix cache. stream={stream}"))});
         for _ in 0..3 {
-            out.push(e.sample("OpenAI-compatible upstream, provider prefix-cache hits (cached_tokens)", Api::OpenAi, body.clone()).await);
+            out.push(
+                e.sample(
+                    "OpenAI-compatible upstream, provider prefix-cache hits (cached_tokens)",
+                    Api::OpenAi,
+                    body.clone(),
+                )
+                .await,
+            );
         }
     }
     // Exact-cache hits: no upstream call, nothing billed, nothing metered.
@@ -414,12 +475,22 @@ async fn metered_usage_matches_provider_bills() {
         assert!(s.event["cost_usd"].is_number(), "{l}: priced model has a cost");
         assert_cost_matches(s);
     }
-    let (metered, bill): (f64, f64) = samples.iter().fold((0.0, 0.0), |(m, b), s| (m + s.metered_cost(), b + s.provider_cost()));
+    let (metered, bill): (f64, f64) =
+        samples.iter().fold((0.0, 0.0), |(m, b), s| (m + s.metered_cost(), b + s.provider_cost()));
     assert!((metered - bill).abs() / bill < 0.01, "total: metered {metered} vs provider bill {bill}");
     // The workload must actually exercise the cache paths.
-    assert!(samples.iter().any(|s| s.billed_cached() > 0 && !s.bills[0].anthropic), "OpenAI-side cached tokens exercised");
-    assert!(samples.iter().any(|s| s.bills.first().is_some_and(|b| b.cache_creation_tokens > 0)), "Anthropic cache writes exercised");
-    assert!(samples.iter().any(|s| s.bills.first().is_some_and(|b| b.cache_creation_1h_tokens > 0)), "Anthropic 1-hour cache writes exercised");
+    assert!(
+        samples.iter().any(|s| s.billed_cached() > 0 && !s.bills[0].anthropic),
+        "OpenAI-side cached tokens exercised"
+    );
+    assert!(
+        samples.iter().any(|s| s.bills.first().is_some_and(|b| b.cache_creation_tokens > 0)),
+        "Anthropic cache writes exercised"
+    );
+    assert!(
+        samples.iter().any(|s| s.bills.first().is_some_and(|b| b.cache_creation_1h_tokens > 0)),
+        "Anthropic 1-hour cache writes exercised"
+    );
     assert!(samples.iter().any(|s| s.event["cache"] == "hit"), "gateway cache hits exercised");
 }
 
@@ -440,7 +511,11 @@ async fn cost_matches_provider_bill_with_prompt_caching() {
             let s = e.sample("anthropic cached", Api::Anthropic, body).await;
             let b = s.bills[0];
             if i == 0 {
-                assert!(b.cache_creation_tokens > 0 && (ttl.is_none() || b.cache_creation_1h_tokens == b.cache_creation_tokens), "{ttl:?}: first request writes");
+                assert!(
+                    b.cache_creation_tokens > 0
+                        && (ttl.is_none() || b.cache_creation_1h_tokens == b.cache_creation_tokens),
+                    "{ttl:?}: first request writes"
+                );
             } else {
                 assert!(b.cache_read_tokens > 0, "{ttl:?}: later requests read");
             }
@@ -486,8 +561,10 @@ async fn stream_without_client_usage_is_still_metered() {
 /// whole generation it produced (the mock finishes its response), so the estimate is a floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_disconnect_is_metered_as_an_estimate() {
-    let e = setup_with(MockConfig { chunk_chars: 2, chunk_delay: Duration::from_millis(5), ..Default::default() }).await;
-    let text = "Write a long answer about the quarterly close, the accruals, the reconciliations and the audit. ".repeat(3);
+    let e =
+        setup_with(MockConfig { chunk_chars: 2, chunk_delay: Duration::from_millis(5), ..Default::default() }).await;
+    let text =
+        "Write a long answer about the quarterly close, the accruals, the reconciliations and the audit. ".repeat(3);
     let body = json!({"model": "oa/m", "stream": true, "messages": msgs(&text)});
     let wal_before = e.gw.wal_events().len();
     let mut resp = caliban_bench::harness::client()
@@ -514,6 +591,14 @@ async fn client_disconnect_is_metered_as_an_estimate() {
     let bill = e.mock.log().last().unwrap().bill.unwrap();
     let (prompt, completion) = (ev["prompt_tokens"].as_u64().unwrap(), ev["completion_tokens"].as_u64().unwrap());
     assert!(prompt > 0, "prompt estimate, not 0");
-    assert!(completion > 0 && completion < bill.output_tokens, "estimated output {completion} is below the {} billed", bill.output_tokens);
-    println!("disconnect: billed {} + {}, metered (estimated) {prompt} + {completion}", bill.total_prompt_tokens(), bill.output_tokens);
+    assert!(
+        completion > 0 && completion < bill.output_tokens,
+        "estimated output {completion} is below the {} billed",
+        bill.output_tokens
+    );
+    println!(
+        "disconnect: billed {} + {}, metered (estimated) {prompt} + {completion}",
+        bill.total_prompt_tokens(),
+        bill.output_tokens
+    );
 }

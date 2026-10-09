@@ -121,9 +121,10 @@ impl ChatRequest {
                 Value::Array(parts) => {
                     for p in parts {
                         if p.get("type").and_then(Value::as_str) == Some("text")
-                            && let Some(Value::String(s)) = p.get_mut("text") {
-                                f(&role, s);
-                            }
+                            && let Some(Value::String(s)) = p.get_mut("text")
+                        {
+                            f(&role, s);
+                        }
                     }
                 }
                 _ => {}
@@ -136,13 +137,9 @@ impl ChatRequest {
         let m = self.messages.iter().rev().find(|m| m.role == "user")?;
         match &m.content {
             Value::String(s) => Some(s.clone()),
-            Value::Array(parts) => Some(
-                parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
+            Value::Array(parts) => {
+                Some(parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"))
+            }
             _ => None,
         }
     }
@@ -176,9 +173,10 @@ impl ChatRequest {
 
     /// Requested reasoning level: the `caliban.reasoning` extension wins over `reasoning_effort`.
     pub fn reasoning_pref(&self) -> Option<ReasoningPref> {
-        self.caliban.as_ref().and_then(|c| c.reasoning).or_else(|| {
-            self.extra.get("reasoning_effort").and_then(Value::as_str).and_then(ReasoningPref::from_effort)
-        })
+        self.caliban
+            .as_ref()
+            .and_then(|c| c.reasoning)
+            .or_else(|| self.extra.get("reasoning_effort").and_then(Value::as_str).and_then(ReasoningPref::from_effort))
     }
 
     pub fn has_tools(&self) -> bool {
@@ -273,7 +271,10 @@ impl Usage {
         let breakdown = |k: &str| u.get("cache_creation").and_then(|c| c.get(k)).and_then(Value::as_u64);
         let (w5, w1h) = (breakdown("ephemeral_5m_input_tokens"), breakdown("ephemeral_1h_input_tokens"));
         // The total is normally reported; fall back to the per-TTL breakdown when it is not.
-        let written = u.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or_else(|| w5.unwrap_or(0) + w1h.unwrap_or(0));
+        let written = u
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| w5.unwrap_or(0) + w1h.unwrap_or(0));
         Usage {
             prompt_tokens: g("input_tokens") + cached + written,
             completion_tokens: g("output_tokens"),
@@ -319,7 +320,9 @@ mod tests {
 
     #[test]
     fn text_parts_are_visited() {
-        let mut r = req(r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"x"}}]}]}"#);
+        let mut r = req(
+            r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"x"}}]}]}"#,
+        );
         let mut seen = vec![];
         r.for_each_text_mut(|_, s| {
             seen.push(s.clone());
@@ -339,18 +342,33 @@ mod tests {
 
     #[test]
     fn anthropic_usage_adds_cache_tokens() {
-        let u = Usage::from_anthropic_usage(&serde_json::json!({"input_tokens": 10, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5, "output_tokens": 7}));
-        assert_eq!(u, Usage { prompt_tokens: 115, completion_tokens: 7, cached_prompt_tokens: 100, cache_write_tokens: 5, cache_write_1h_tokens: 0 });
+        let u = Usage::from_anthropic_usage(
+            &serde_json::json!({"input_tokens": 10, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5, "output_tokens": 7}),
+        );
+        assert_eq!(
+            u,
+            Usage {
+                prompt_tokens: 115,
+                completion_tokens: 7,
+                cached_prompt_tokens: 100,
+                cache_write_tokens: 5,
+                cache_write_1h_tokens: 0
+            }
+        );
         assert_eq!(u.uncached_prompt_tokens(), 10);
     }
 
     #[test]
     fn anthropic_usage_splits_cache_write_ttls() {
-        let u = Usage::from_anthropic_usage(&serde_json::json!({"input_tokens": 3, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 50, "output_tokens": 2,
-            "cache_creation": {"ephemeral_5m_input_tokens": 20, "ephemeral_1h_input_tokens": 30}}));
+        let u = Usage::from_anthropic_usage(
+            &serde_json::json!({"input_tokens": 3, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 50, "output_tokens": 2,
+            "cache_creation": {"ephemeral_5m_input_tokens": 20, "ephemeral_1h_input_tokens": 30}}),
+        );
         assert_eq!((u.prompt_tokens, u.cache_write_tokens, u.cache_write_1h_tokens), (53, 50, 30));
         // Breakdown only (no total): the total is the sum.
-        let u = Usage::from_anthropic_usage(&serde_json::json!({"input_tokens": 1, "cache_creation": {"ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 6}}));
+        let u = Usage::from_anthropic_usage(
+            &serde_json::json!({"input_tokens": 1, "cache_creation": {"ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 6}}),
+        );
         assert_eq!((u.prompt_tokens, u.cache_write_tokens, u.cache_write_1h_tokens), (11, 10, 6));
     }
 
@@ -359,7 +377,10 @@ mod tests {
         for (so, extra) in [
             (None, None),
             (Some(serde_json::json!({"include_usage": false})), None),
-            (Some(serde_json::json!({"include_usage": false, "continuous_usage_stats": true})), Some("continuous_usage_stats")),
+            (
+                Some(serde_json::json!({"include_usage": false, "continuous_usage_stats": true})),
+                Some("continuous_usage_stats"),
+            ),
             (Some(serde_json::json!(null)), None),
         ] {
             let mut r = req(r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"x"}]}"#);
@@ -379,8 +400,18 @@ mod tests {
     #[test]
     fn openai_usage_reads_translated_cache_writes() {
         let u = Usage::from_openai(&serde_json::json!({"usage": {"prompt_tokens": 20, "completion_tokens": 1,
-            "prompt_tokens_details": {"cached_tokens": 5, "cache_write_tokens": 10, "cache_write_1h_tokens": 4}}})).unwrap();
-        assert_eq!(u, Usage { prompt_tokens: 20, completion_tokens: 1, cached_prompt_tokens: 5, cache_write_tokens: 10, cache_write_1h_tokens: 4 });
+            "prompt_tokens_details": {"cached_tokens": 5, "cache_write_tokens": 10, "cache_write_1h_tokens": 4}}}))
+        .unwrap();
+        assert_eq!(
+            u,
+            Usage {
+                prompt_tokens: 20,
+                completion_tokens: 1,
+                cached_prompt_tokens: 5,
+                cache_write_tokens: 10,
+                cache_write_1h_tokens: 4
+            }
+        );
     }
 
     #[test]

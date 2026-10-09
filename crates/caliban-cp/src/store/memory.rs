@@ -82,16 +82,25 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
     match m {
         Mutation::CreateTenant(t) => {
             match st.tenant_record(&t.id) {
-                Some(x) if x.is_active() => return Err(StoreError::Conflict(format!("tenant '{}' already exists", t.id))),
+                Some(x) if x.is_active() => {
+                    return Err(StoreError::Conflict(format!("tenant '{}' already exists", t.id)));
+                }
                 Some(_) => {
-                    return Err(StoreError::Conflict(format!("tenant id '{}' belonged to a deleted tenant and cannot be reused", t.id)));
+                    return Err(StoreError::Conflict(format!(
+                        "tenant id '{}' belonged to a deleted tenant and cannot be reused",
+                        t.id
+                    )));
                 }
                 None => {}
             }
             st.tenants.push(t.clone());
         }
         Mutation::DeleteTenant { id, at } => {
-            let t = st.tenants.iter_mut().find(|t| &t.id == id && t.is_active()).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
+            let t = st
+                .tenants
+                .iter_mut()
+                .find(|t| &t.id == id && t.is_active())
+                .ok_or_else(|| StoreError::NotFound("tenant".into()))?;
             t.status = super::TenantStatus::Deleted;
             t.deleted_at = Some(*at);
             for k in st.api_keys.iter_mut().filter(|k| &k.tenant_id == id && k.is_active()) {
@@ -109,7 +118,11 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             }
         }
         Mutation::UpdateTenant { id, pii_default, pii_surrogate_scope, semantic_cache } => {
-            let t = st.tenants.iter_mut().find(|t| &t.id == id && t.is_active()).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
+            let t = st
+                .tenants
+                .iter_mut()
+                .find(|t| &t.id == id && t.is_active())
+                .ok_or_else(|| StoreError::NotFound("tenant".into()))?;
             if let Some(m) = pii_default {
                 t.pii_default = *m;
             }
@@ -157,7 +170,11 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             st.models.push(model.clone());
         }
         Mutation::DeleteModel(id) => {
-            let pos = st.models.iter().position(|x| x.id.as_str() == id).ok_or_else(|| StoreError::NotFound("model".into()))?;
+            let pos = st
+                .models
+                .iter()
+                .position(|x| x.id.as_str() == id)
+                .ok_or_else(|| StoreError::NotFound("model".into()))?;
             st.models.remove(pos);
         }
         Mutation::CreateSharedProvider(p) => {
@@ -190,7 +207,11 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             st.datasources.push(ds.clone());
         }
         Mutation::SetDatasourceStatus { id, status } => {
-            let ds = st.datasources.iter_mut().find(|d| &d.id == id && d.is_live()).ok_or_else(|| StoreError::NotFound("datasource".into()))?;
+            let ds = st
+                .datasources
+                .iter_mut()
+                .find(|d| &d.id == id && d.is_live())
+                .ok_or_else(|| StoreError::NotFound("datasource".into()))?;
             ds.status.clone_from(status);
         }
         Mutation::DeleteDatasource { tenant_id, id, at } => {
@@ -206,8 +227,14 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
         }
         Mutation::CreateNode(n) => {
             need_tenant(st, &n.tenant_id)?;
-            let version =
-                st.nodes.iter().filter(|x| x.tenant_id == n.tenant_id && x.name == n.name).map(|x| x.version).max().unwrap_or(0) + 1;
+            let version = st
+                .nodes
+                .iter()
+                .filter(|x| x.tenant_id == n.tenant_id && x.name == n.name)
+                .map(|x| x.version)
+                .max()
+                .unwrap_or(0)
+                + 1;
             st.nodes.push(super::NodeRecord { version, ..n.clone() });
         }
         Mutation::DeleteNode { tenant_id, id, at } => {
@@ -221,10 +248,11 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
         }
         Mutation::ProposeOntology { tenant_id, elements } => {
             need_tenant(st, tenant_id)?;
-            let onto = st
-                .ontologies
-                .entry(tenant_id.clone())
-                .or_insert_with(|| Ontology { tenant_id: tenant_id.clone(), version: 0, elements: vec![] });
+            let onto = st.ontologies.entry(tenant_id.clone()).or_insert_with(|| Ontology {
+                tenant_id: tenant_id.clone(),
+                version: 0,
+                elements: vec![],
+            });
             for e in elements {
                 match onto.elements.iter_mut().find(|x| x.id == e.id) {
                     Some(x) => *x = e.clone(),

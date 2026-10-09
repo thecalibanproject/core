@@ -157,7 +157,12 @@ pub fn cost(t: Tokens, p: Prices) -> Option<f64> {
 }
 
 /// Cost with every prompt token at the input price (estimates and reservations).
-pub fn cost_usd(prompt: u64, completion: u64, price_in_per_mtok: Option<f64>, price_out_per_mtok: Option<f64>) -> Option<f64> {
+pub fn cost_usd(
+    prompt: u64,
+    completion: u64,
+    price_in_per_mtok: Option<f64>,
+    price_out_per_mtok: Option<f64>,
+) -> Option<f64> {
     cost(Tokens { prompt, completion, ..Tokens::default() }, Prices::flat(price_in_per_mtok, price_out_per_mtok))
 }
 
@@ -237,7 +242,13 @@ mod tests {
     fn cache_reads_and_writes_are_priced_separately() {
         // 1000 prompt tokens: 600 read from cache, 300 written (100 of them 1-hour), 100 uncached.
         let t = Tokens { prompt: 1000, completion: 50, cache_read: 600, cache_write: 300, cache_write_1h: 100 };
-        let p = Prices { input: Some(3.0), output: Some(15.0), cache_read: Some(0.3), cache_write: Some(3.75), cache_write_1h: Some(6.0) };
+        let p = Prices {
+            input: Some(3.0),
+            output: Some(15.0),
+            cache_read: Some(0.3),
+            cache_write: Some(3.75),
+            cache_write_1h: Some(6.0),
+        };
         let want = (100.0 * 3.0 + 600.0 * 0.3 + 200.0 * 3.75 + 100.0 * 6.0 + 50.0 * 15.0) / 1e6;
         assert!(close(cost(t, p), want), "{:?} vs {want}", cost(t, p));
         // 1-hour writes default to the 5-minute write price.
@@ -256,7 +267,16 @@ mod tests {
     fn inconsistent_counts_never_underflow() {
         // More cache tokens than prompt tokens (a confused upstream): clamped, never negative.
         let t = Tokens { prompt: 10, completion: 0, cache_read: 8, cache_write: 8, cache_write_1h: 20 };
-        let c = cost(t, Prices { input: Some(1.0), output: Some(1.0), cache_read: Some(0.1), cache_write: Some(2.0), cache_write_1h: Some(4.0) });
+        let c = cost(
+            t,
+            Prices {
+                input: Some(1.0),
+                output: Some(1.0),
+                cache_read: Some(0.1),
+                cache_write: Some(2.0),
+                cache_write_1h: Some(4.0),
+            },
+        );
         assert!(close(c, (8.0 * 0.1 + 2.0 * 4.0) / 1e6), "{c:?}");
     }
 }

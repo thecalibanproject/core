@@ -17,8 +17,7 @@
 
 use crate::{FieldInfo, ObjectInfo, ReferenceInfo, SchemaSnapshot};
 use caliban_ontology::model::{
-    AttributeDef, Cardinality, DataType, Discriminator, ElementSpec, EntityBinding, EntityDef,
-    RelationDef,
+    AttributeDef, Cardinality, DataType, Discriminator, ElementSpec, EntityBinding, EntityDef, RelationDef,
 };
 use caliban_ontology::{Element, Provenance, Status};
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,10 +32,7 @@ pub struct ProposeOptions {
 
 impl Default for ProposeOptions {
     fn default() -> Self {
-        Self {
-            min_overlap: 0.95,
-            min_presence: 0.01,
-        }
+        Self { min_overlap: 0.95, min_presence: 0.01 }
     }
 }
 
@@ -46,10 +42,7 @@ pub fn singular(word: &str) -> String {
     let cut = |n: usize| word[..word.len() - n].to_owned();
     if l.ends_with("ies") && l.len() > 3 {
         format!("{}y", cut(3))
-    } else if ["sses", "xes", "ches", "shes", "zes"]
-        .iter()
-        .any(|s| l.ends_with(s))
-    {
+    } else if ["sses", "xes", "ches", "shes", "zes"].iter().any(|s| l.ends_with(s)) {
         cut(2)
     } else if l.ends_with("ss") || l.ends_with("us") || l.ends_with("is") || l.len() <= 3 {
         word.to_owned()
@@ -93,11 +86,7 @@ fn words(s: &str) -> Vec<String> {
 pub fn snake_case(path: &str) -> String {
     let lead: String = path.chars().take_while(|c| *c == '_').collect();
     let w = words(path);
-    if w.is_empty() {
-        path.to_owned()
-    } else {
-        format!("{lead}{}", w.join("_"))
-    }
+    if w.is_empty() { path.to_owned() } else { format!("{lead}{}", w.join("_")) }
 }
 
 /// `order_items` → `OrderItem` (singularized), `lines` → `Line`.
@@ -109,9 +98,7 @@ pub fn entity_name(collection: &str) -> String {
     w.iter()
         .map(|x| {
             let mut c = x.chars();
-            c.next()
-                .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
-                .unwrap_or_default()
+            c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()
         })
         .collect()
 }
@@ -119,9 +106,7 @@ pub fn entity_name(collection: &str) -> String {
 fn human(s: &str) -> String {
     let w = words(s).join(" ");
     let mut c = w.chars();
-    c.next()
-        .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
-        .unwrap_or_default()
+    c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()
 }
 
 /// Map a BSON type name to the ontology data type.
@@ -172,13 +157,9 @@ impl Owners {
     fn owner<'a>(&'a self, f: &'a FieldInfo) -> (&'a str, &'a str) {
         match &f.parent_array {
             Some(a) => match self.arrays.get(a) {
-                Some(e) => (
-                    e.as_str(),
-                    f.path
-                        .strip_prefix(a.as_str())
-                        .map(|p| p.trim_start_matches('.'))
-                        .unwrap_or(&f.path),
-                ),
+                Some(e) => {
+                    (e.as_str(), f.path.strip_prefix(a.as_str()).map(|p| p.trim_start_matches('.')).unwrap_or(&f.path))
+                }
                 None => (self.root.as_str(), f.path.as_str()),
             },
             None => (self.root.as_str(), f.path.as_str()),
@@ -225,10 +206,7 @@ fn propose_object(
     } else {
         ""
     };
-    let rows = obj
-        .estimated_rows
-        .map(|n| format!(" (~{n} documents)"))
-        .unwrap_or_default();
+    let rows = obj.estimated_rows.map(|n| format!(" (~{n} documents)")).unwrap_or_default();
     let root_conf = if obj.unstable { 0.5 } else { 0.9 };
     out.push(element(
         root.to_owned(),
@@ -236,11 +214,7 @@ fn propose_object(
         format!(
             "Documents of the `{}` {}{rows}.{unstable_note}",
             obj.name,
-            if obj.kind.is_empty() {
-                "collection"
-            } else {
-                &obj.kind
-            }
+            if obj.kind.is_empty() { "collection" } else { &obj.kind }
         ),
         vec![obj.name.clone()],
         Provenance::Introspect,
@@ -293,15 +267,9 @@ fn propose_object(
     }
 
     // Embedded entities: arrays of documents, outermost first so parents exist before children.
-    let mut owners = Owners {
-        arrays: BTreeMap::new(),
-        root: root.to_owned(),
-    };
-    let mut arrays: Vec<&FieldInfo> = obj
-        .fields
-        .iter()
-        .filter(|f| f.is_array && f.array.as_ref().is_some_and(|a| a.of_documents()))
-        .collect();
+    let mut owners = Owners { arrays: BTreeMap::new(), root: root.to_owned() };
+    let mut arrays: Vec<&FieldInfo> =
+        obj.fields.iter().filter(|f| f.is_array && f.array.as_ref().is_some_and(|a| a.of_documents())).collect();
     arrays.sort_by_key(|f| f.path.matches('.').count());
     for f in arrays {
         let (parent, rel) = owners.owner(f);
@@ -364,11 +332,8 @@ fn propose_object(
             column = format!("{column}_{i}");
         }
         taken.insert(column.clone());
-        let types: Vec<String> = f
-            .types
-            .iter()
-            .map(|t| format!("{t} {}", f.type_counts.get(t).copied().unwrap_or(0)))
-            .collect();
+        let types: Vec<String> =
+            f.types.iter().map(|t| format!("{t} {}", f.type_counts.get(t).copied().unwrap_or(0))).collect();
         let mut desc = format!(
             "`{}` in {}: present in {}, null in {}; types: {}.",
             rel,
@@ -381,12 +346,7 @@ fn propose_object(
             desc.push_str(&format!(" ~{d} distinct."));
         }
         if !f.top_values.is_empty() {
-            let tv: Vec<String> = f
-                .top_values
-                .iter()
-                .take(5)
-                .map(|(v, n)| format!("{v} ({n})"))
-                .collect();
+            let tv: Vec<String> = f.top_values.iter().take(5).map(|(v, n)| format!("{v} ({n})")).collect();
             desc.push_str(&format!(" Top values: {}.", tv.join(", ")));
         }
         if f.polymorphic {
@@ -399,11 +359,7 @@ fn propose_object(
         if f.polymorphic {
             confidence *= 0.5;
         }
-        let synonyms = if rel != column {
-            vec![rel.to_owned()]
-        } else {
-            vec![]
-        };
+        let synonyms = if rel != column { vec![rel.to_owned()] } else { vec![] };
         out.push(element(
             format!("{entity}.{column}"),
             human(rel),
@@ -462,11 +418,7 @@ fn propose_relation(
             r.probed,
             r.value_type,
             pct(r.overlap),
-            if r.name_match {
-                "; field name matches the target"
-            } else {
-                ""
-            }
+            if r.name_match { "; field name matches the target" } else { "" }
         ),
         vec![local_path.to_owned()],
         Provenance::Profile,
@@ -546,11 +498,7 @@ mod tests {
                         field("shipping", "object", 0.5, None),
                         field("shipping.city", "string", 0.5, None),
                     ],
-                    indexes: vec![IndexInfo {
-                        name: "_id_".into(),
-                        keys: vec!["_id".into()],
-                        unique: true,
-                    }],
+                    indexes: vec![IndexInfo { name: "_id_".into(), keys: vec!["_id".into()], unique: true }],
                     kind: "collection".into(),
                     sampled: 1000,
                     discriminators: vec![],
@@ -615,65 +563,36 @@ mod tests {
         ] {
             assert!(ids.contains(&want), "missing {want} in {ids:?}");
         }
-        assert!(
-            !ids.contains(&"Order._id")
-                && !ids.contains(&"Order.lines")
-                && !ids.contains(&"Order.shipping")
-        );
+        assert!(!ids.contains(&"Order._id") && !ids.contains(&"Order.lines") && !ids.contains(&"Order.shipping"));
         assert!(els.iter().all(|e| e.status == Status::Proposed));
 
         let line = els.iter().find(|e| e.id == "OrderLine").unwrap();
         assert_eq!(
             line.spec,
             ElementSpec::Entity(EntityDef {
-                binding: EntityBinding::Embedded {
-                    parent: "Order".into(),
-                    array_path: "lines".into(),
-                    table: None
-                },
+                binding: EntityBinding::Embedded { parent: "Order".into(), array_path: "lines".into(), table: None },
                 keys: vec![]
             })
         );
         let price = els.iter().find(|e| e.id == "OrderLine.unit_price").unwrap();
-        let ElementSpec::Attribute(a) = &price.spec else {
-            panic!()
-        };
-        assert_eq!(
-            (a.path.as_str(), a.column.as_str(), a.data_type),
-            ("unitPrice", "unit_price", DataType::Number)
-        );
+        let ElementSpec::Attribute(a) = &price.spec else { panic!() };
+        assert_eq!((a.path.as_str(), a.column.as_str(), a.data_type), ("unitPrice", "unit_price", DataType::Number));
         let created = els.iter().find(|e| e.id == "Order.created_at").unwrap();
-        let ElementSpec::Attribute(a) = &created.spec else {
-            panic!()
-        };
+        let ElementSpec::Attribute(a) = &created.spec else { panic!() };
         assert_eq!(a.data_type, DataType::Timestamp);
 
-        let rel = els
-            .iter()
-            .find(|e| e.id == "Order.customer_id->Customer")
-            .unwrap();
+        let rel = els.iter().find(|e| e.id == "Order.customer_id->Customer").unwrap();
         assert_eq!(rel.provenance, Provenance::Profile);
         assert!(rel.requires_human_review());
-        let ElementSpec::Relation(r) = &rel.spec else {
-            panic!()
-        };
+        let ElementSpec::Relation(r) = &rel.spec else { panic!() };
         assert_eq!(r.cardinality, Cardinality::ManyToOne);
         assert!(!r.verified && r.foreign_indexed);
-        assert_eq!(
-            (r.local_column.as_str(), r.foreign_column.as_str()),
-            ("customer_id", "_id")
-        );
+        assert_eq!((r.local_column.as_str(), r.foreign_column.as_str()), ("customer_id", "_id"));
         assert!(rel.description.as_ref().unwrap().contains("100% overlap"));
 
         let sub = els.iter().find(|e| e.id == "BusinessCustomer").unwrap();
         let ElementSpec::Entity(EntityDef {
-            binding:
-                EntityBinding::Root {
-                    discriminator: Some(d),
-                    table,
-                    ..
-                },
-            ..
+            binding: EntityBinding::Root { discriminator: Some(d), table, .. }, ..
         }) = &sub.spec
         else {
             panic!()
@@ -686,10 +605,6 @@ mod tests {
     fn low_overlap_reference_is_not_proposed() {
         let mut s = snapshot();
         s.references[0].overlap = 0.6;
-        assert!(
-            !propose(&s)
-                .iter()
-                .any(|e| matches!(e.spec, ElementSpec::Relation(_)))
-        );
+        assert!(!propose(&s).iter().any(|e| matches!(e.spec, ElementSpec::Relation(_))));
     }
 }

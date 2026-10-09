@@ -27,7 +27,12 @@ pub struct SnapshotSource {
 }
 
 impl SnapshotSource {
-    pub fn new(control_plane_url: &str, token: String, verifier: SnapshotVerifier, cache: Option<PathBuf>) -> Result<Self> {
+    pub fn new(
+        control_plane_url: &str,
+        token: String,
+        verifier: SnapshotVerifier,
+        cache: Option<PathBuf>,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
@@ -153,7 +158,9 @@ impl SnapshotSource {
                     handle.store(Snapshot::new(p.config, p.version));
                 }
                 Ok(None) => tracing::debug!(version = %self.version, "snapshot unchanged"),
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), serving = %self.version, "snapshot poll failed; keeping last good snapshot"),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), serving = %self.version, "snapshot poll failed; keeping last good snapshot")
+                }
             }
         }
     }
@@ -186,7 +193,8 @@ mod tests {
     }
 
     fn source(public: &str, cache: Option<PathBuf>) -> SnapshotSource {
-        SnapshotSource::new("http://127.0.0.1:9", "t".into(), SnapshotVerifier::from_b64_list(public).unwrap(), cache).unwrap()
+        SnapshotSource::new("http://127.0.0.1:9", "t".into(), SnapshotVerifier::from_b64_list(public).unwrap(), cache)
+            .unwrap()
     }
 
     #[test]

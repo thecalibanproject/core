@@ -250,7 +250,12 @@ fn truncate(s: &str, max_chars: usize) -> &str {
 
 /// `[routing]` overrides on top of the calibrated parameters.
 fn effective_params<'a>(base: &'a KnnParams, r: &caliban_config::RoutingConfig) -> Cow<'a, KnnParams> {
-    if r.k.is_none() && r.temperature.is_none() && r.abstain_threshold.is_none() && r.margin_threshold.is_none() && r.oos_threshold.is_none() {
+    if r.k.is_none()
+        && r.temperature.is_none()
+        && r.abstain_threshold.is_none()
+        && r.margin_threshold.is_none()
+        && r.oos_threshold.is_none()
+    {
         return Cow::Borrowed(base);
     }
     let mut p = base.clone();
@@ -276,7 +281,12 @@ fn effective_params<'a>(base: &'a KnnParams, r: &caliban_config::RoutingConfig) 
 
 impl Router {
     pub fn new(classifier: Box<dyn IntentClassifier>) -> Self {
-        Self { classifier, knn: ArcSwapOption::empty(), profile: ArcSwapOption::empty(), refresh: Mutex::new(RefreshState::default()) }
+        Self {
+            classifier,
+            knn: ArcSwapOption::empty(),
+            profile: ArcSwapOption::empty(),
+            refresh: Mutex::new(RefreshState::default()),
+        }
     }
 
     /// True when Stage-1 kNN has an index loaded.
@@ -347,7 +357,12 @@ impl Router {
         report
     }
 
-    async fn build_knn(&self, snap: &Snapshot, embedder: Option<&dyn PromptEmbedder>, report: &mut RefreshReport) -> Result<KnnState, String> {
+    async fn build_knn(
+        &self,
+        snap: &Snapshot,
+        embedder: Option<&dyn PromptEmbedder>,
+        report: &mut RefreshReport,
+    ) -> Result<KnnState, String> {
         let r = &snap.config.routing;
         let embedder = embedder.ok_or_else(|| {
             format!(
@@ -394,7 +409,10 @@ impl Router {
             }
             None => {
                 let texts: Vec<String> = ex.iter().map(|e| format!("{prefix}{}", e.text)).collect();
-                let cache_path = r.exemplar_cache_dir.as_ref().map(|d| std::path::Path::new(d).join(format!("knn-exemplars-{}.json", &exemplars_fp[..16])));
+                let cache_path = r
+                    .exemplar_cache_dir
+                    .as_ref()
+                    .map(|d| std::path::Path::new(d).join(format!("knn-exemplars-{}.json", &exemplars_fp[..16])));
                 let cached = cache_path.as_ref().and_then(|p| read_cache(p, &space, &exemplars_fp, texts.len()));
                 let vectors = match cached {
                     Some(v) => {
@@ -423,7 +441,9 @@ impl Router {
                 };
                 let intents: Vec<String> = ex.iter().map(|e| e.intent.clone()).collect();
                 let owners: Vec<Option<String>> = ex.iter().map(|e| e.owner.clone()).collect();
-                Arc::new(KnnIndex::build(vectors, &intents, &owners).map_err(|e| format!("building the kNN index: {e}"))?)
+                Arc::new(
+                    KnnIndex::build(vectors, &intents, &owners).map_err(|e| format!("building the kNN index: {e}"))?,
+                )
             }
         };
         report.intents = index.intents().len();
@@ -431,12 +451,25 @@ impl Router {
     }
 
     /// Synchronous routing without Stage 1: pinned model, or keyword rules, then the policy.
-    pub fn route(&self, snap: &Snapshot, tenant: &TenantConfig, req: &ChatRequest, constraints: Constraints) -> Result<RouteDecision, RouteError> {
+    pub fn route(
+        &self,
+        snap: &Snapshot,
+        tenant: &TenantConfig,
+        req: &ChatRequest,
+        constraints: Constraints,
+    ) -> Result<RouteDecision, RouteError> {
         if let Some(d) = pinned(snap, tenant, req, constraints)? {
             return Ok(d);
         }
         let (intent, confidence) = self.classifier.classify(&req.last_user_text().unwrap_or_default());
-        self.select(snap, tenant, req, constraints, Intent { intent, confidence, stage: "keyword", knn_fallback: None, knn: None }, &AlwaysHealthy)
+        self.select(
+            snap,
+            tenant,
+            req,
+            constraints,
+            Intent { intent, confidence, stage: "keyword", knn_fallback: None, knn: None },
+            &AlwaysHealthy,
+        )
     }
 
     /// Full staged routing: pinned model, then Stage-1 kNN within the budget (falling back to the
@@ -455,7 +488,13 @@ impl Router {
         }
         let text = req.last_user_text().unwrap_or_default();
         let intent = match self.stage1(snap, tenant, &text, embedder).await {
-            Stage1::Accepted(out, trace) => Intent { intent: out.intent, confidence: out.confidence, stage: "knn", knn_fallback: None, knn: Some(trace) },
+            Stage1::Accepted(out, trace) => Intent {
+                intent: out.intent,
+                confidence: out.confidence,
+                stage: "knn",
+                knn_fallback: None,
+                knn: Some(trace),
+            },
             Stage1::Fallback(reason, trace) => {
                 let (intent, confidence) = self.classifier.classify(&text);
                 Intent { intent, confidence, stage: "keyword", knn_fallback: Some(reason), knn: trace }
@@ -468,13 +507,21 @@ impl Router {
         self.select(snap, tenant, req, constraints, intent, health)
     }
 
-    async fn stage1(&self, snap: &Snapshot, tenant: &TenantConfig, text: &str, embedder: Option<&dyn PromptEmbedder>) -> Stage1 {
+    async fn stage1(
+        &self,
+        snap: &Snapshot,
+        tenant: &TenantConfig,
+        text: &str,
+        embedder: Option<&dyn PromptEmbedder>,
+    ) -> Stage1 {
         let r = &snap.config.routing;
         if !r.knn_enabled_for(&tenant.id) {
             return Stage1::Off;
         }
         let Some(state) = self.knn.load_full() else { return Stage1::Fallback("unavailable", None) };
-        let Some(emb) = embedder.filter(|e| e.space_id() == state.space) else { return Stage1::Fallback("unavailable", None) };
+        let Some(emb) = embedder.filter(|e| e.space_id() == state.space) else {
+            return Stage1::Fallback("unavailable", None);
+        };
         let text = truncate(text.trim(), MAX_EMBED_CHARS);
         if text.is_empty() {
             return Stage1::Fallback("no_text", None);
@@ -504,7 +551,15 @@ impl Router {
         }
     }
 
-    fn select(&self, snap: &Snapshot, tenant: &TenantConfig, req: &ChatRequest, constraints: Constraints, i: Intent, health: &dyn ModelHealth) -> Result<RouteDecision, RouteError> {
+    fn select(
+        &self,
+        snap: &Snapshot,
+        tenant: &TenantConfig,
+        req: &ChatRequest,
+        constraints: Constraints,
+        i: Intent,
+        health: &dyn ModelHealth,
+    ) -> Result<RouteDecision, RouteError> {
         let profile = self.profile.load_full();
         let quality = policy::QualitySource { snap, profile: profile.as_deref() };
         let sel = policy::select(snap, tenant, req, constraints, &i.intent, &quality, health).map_err(|e| match e {
@@ -539,12 +594,18 @@ struct Intent {
 }
 
 /// Stage 0: a named model (anything but `caliban/auto`) is used as is, if the tenant may use it.
-fn pinned(snap: &Snapshot, tenant: &TenantConfig, req: &ChatRequest, constraints: Constraints) -> Result<Option<RouteDecision>, RouteError> {
+fn pinned(
+    snap: &Snapshot,
+    tenant: &TenantConfig,
+    req: &ChatRequest,
+    constraints: Constraints,
+) -> Result<Option<RouteDecision>, RouteError> {
     if req.model == AUTO_MODEL {
         return Ok(None);
     }
     let id = ModelId::from(req.model.as_str());
-    let entry = snap.models_for(tenant).find(|m| m.id == id).ok_or_else(|| RouteError::UnknownModel(req.model.clone()))?;
+    let entry =
+        snap.models_for(tenant).find(|m| m.id == id).ok_or_else(|| RouteError::UnknownModel(req.model.clone()))?;
     if entry.trust_tier > constraints.max_tier {
         return Err(RouteError::PolicyExcludesAll(constraints.max_tier));
     }
@@ -603,7 +664,11 @@ fn log_decision(tenant: &TenantConfig, d: &RouteDecision) {
 fn read_cache(path: &std::path::Path, space: &str, fp: &str, n: usize) -> Option<Vec<Vec<f32>>> {
     let raw = std::fs::read(path).ok()?;
     let c: ExemplarCache = serde_json::from_slice(&raw).ok()?;
-    let ok = c.format == CACHE_FORMAT && c.space == space && c.fingerprint == fp && c.vectors.len() == n && c.vectors.iter().all(|v| v.len() == c.dim);
+    let ok = c.format == CACHE_FORMAT
+        && c.space == space
+        && c.fingerprint == fp
+        && c.vectors.len() == n
+        && c.vectors.iter().all(|v| v.len() == c.dim);
     ok.then_some(c.vectors)
 }
 

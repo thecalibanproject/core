@@ -11,11 +11,17 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum SecretRef {
-    Env { env: String },
-    File { file: String },
+    Env {
+        env: String,
+    },
+    File {
+        file: String,
+    },
     /// AES-256-GCM ciphertext under the process KEK (`CALIBAN_KEK`). Used for BYOK keys added
     /// through the control plane.
-    Sealed { sealed: String },
+    Sealed {
+        sealed: String,
+    },
 }
 
 impl SecretRef {

@@ -118,7 +118,11 @@ pub fn numeric_slots(text: &str) -> Vec<String> {
 
 /// `{prefix}_{model}_{dim}`, with characters outside `[a-z0-9_-]` replaced by `_`.
 pub fn collection_name(prefix: &str, embedding_model: &str, dim: usize) -> String {
-    let model: String = embedding_model.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let model: String = embedding_model
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
     format!("{prefix}_{model}_{dim}")
 }
 
@@ -163,7 +167,12 @@ pub struct SemanticCache {
 
 impl SemanticCache {
     pub fn new(store: Arc<dyn VectorStore>, prefix: impl Into<String>) -> Self {
-        Self { store, prefix: prefix.into(), budgets: Mutex::new(HashMap::new()), last_sweep: Mutex::new(HashMap::new()) }
+        Self {
+            store,
+            prefix: prefix.into(),
+            budgets: Mutex::new(HashMap::new()),
+            last_sweep: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn store(&self) -> &Arc<dyn VectorStore> {
@@ -181,9 +190,24 @@ impl SemanticCache {
 
     /// Finds the best entry for `vector` among the tenant's peers. `draw` is uniform in `[0, 1)`
     /// (exploration); `now` is unix seconds.
-    pub async fn lookup(&self, key: &SemanticKey, embedding_model: &str, vector: &[f32], policy: &ThresholdPolicy, draw: f32, now: i64) -> Result<Lookup, StoreError> {
+    pub async fn lookup(
+        &self,
+        key: &SemanticKey,
+        embedding_model: &str,
+        vector: &[f32],
+        policy: &ThresholdPolicy,
+        draw: f32,
+        now: i64,
+    ) -> Result<Lookup, StoreError> {
         let collection = self.collection(embedding_model, vector.len());
-        let q = SearchQuery { collection: &collection, tenant: &key.tenant, partition: &key.partition, vector, limit: CANDIDATES, now };
+        let q = SearchQuery {
+            collection: &collection,
+            tenant: &key.tenant,
+            partition: &key.partition,
+            vector,
+            limit: CANDIDATES,
+            now,
+        };
         let candidates = self.store.search(&q).await?;
         let offset = self.tenant_offset(&key.tenant);
         let mut verify = None;
@@ -191,7 +215,13 @@ impl SemanticCache {
             if c.payload.tenant_id != key.tenant {
                 continue; // never trust a store that ignored the filter
             }
-            let m = |kind| Match { collection: collection.clone(), id: c.id.clone(), similarity: c.score, verify: kind, payload: c.payload.clone() };
+            let m = |kind| Match {
+                collection: collection.clone(),
+                id: c.id.clone(),
+                similarity: c.score,
+                verify: kind,
+                payload: c.payload.clone(),
+            };
             match policy::decide(policy, &c.payload.stats, c.score, offset, draw) {
                 Decision::Serve => return Ok(Lookup::Hit(m(None))),
                 Decision::Verify(kind) if verify.is_none() => verify = Some(m(Some(kind))),
@@ -202,7 +232,15 @@ impl SemanticCache {
     }
 
     /// Stores a response under `key`. Also sweeps expired entries of the collection now and then.
-    pub async fn insert(&self, key: &SemanticKey, embedding_model: &str, vector: &[f32], entry: NewEntry, policy: &ThresholdPolicy, now: i64) -> Result<(), StoreError> {
+    pub async fn insert(
+        &self,
+        key: &SemanticKey,
+        embedding_model: &str,
+        vector: &[f32],
+        entry: NewEntry,
+        policy: &ThresholdPolicy,
+        now: i64,
+    ) -> Result<(), StoreError> {
         let collection = self.collection(embedding_model, vector.len());
         let payload = EntryPayload {
             tenant_id: key.tenant.clone(),
@@ -245,7 +283,12 @@ impl SemanticCache {
 
     /// Records whether the entry's answer was right for a prompt at `m.similarity`. Explore
     /// samples also feed the tenant's error budget. Returns the entry's new stats.
-    pub async fn record_verification(&self, m: &Match, correct: bool, policy: &ThresholdPolicy) -> Result<EntryStats, StoreError> {
+    pub async fn record_verification(
+        &self,
+        m: &Match,
+        correct: bool,
+        policy: &ThresholdPolicy,
+    ) -> Result<EntryStats, StoreError> {
         let mut stats = m.payload.stats.clone();
         stats.observe(m.similarity, correct);
         if m.verify == Some(VerifyKind::Explore) {
@@ -269,7 +312,8 @@ impl SemanticCache {
     /// same tenant.
     pub async fn purge_tenant_everywhere(&self, tenant: &str) -> Result<usize, StoreError> {
         let own = format!("{}_", self.prefix);
-        let collections: Vec<String> = self.store.list_collections().await?.into_iter().filter(|c| c.starts_with(&own)).collect();
+        let collections: Vec<String> =
+            self.store.list_collections().await?.into_iter().filter(|c| c.starts_with(&own)).collect();
         for c in &collections {
             self.store.delete_tenant(c, tenant).await?;
         }
@@ -298,22 +342,44 @@ mod tests {
         NewEntry { model: "ext/mock".into(), response: "{}".into(), prompt_tokens: 3, completion_tokens: 4, ttl_secs }
     }
 
-    const P: ThresholdPolicy = ThresholdPolicy { threshold: 0.95, min_threshold: 0.90, grey_band: 0.03, max_error_rate: 0.02, verify_rate: 0.0 };
+    const P: ThresholdPolicy = ThresholdPolicy {
+        threshold: 0.95,
+        min_threshold: 0.90,
+        grey_band: 0.03,
+        max_error_rate: 0.02,
+        verify_rate: 0.0,
+    };
 
     #[test]
     fn partition_separates_tenants_context_numbers_and_people() {
         let a = key("a", "revenue in Q3 2025?", b"sys");
-        assert_eq!(a.partition, key("a", "what was revenue in Q3 2025", b"sys").partition, "same slots, wording may differ");
+        assert_eq!(
+            a.partition,
+            key("a", "what was revenue in Q3 2025", b"sys").partition,
+            "same slots, wording may differ"
+        );
         assert_ne!(a.partition, key("b", "revenue in Q3 2025?", b"sys").partition, "tenant");
-        assert_ne!(a.partition, key("a", "revenue in Q3 2025?", b"other system prompt").partition, "context and params");
+        assert_ne!(
+            a.partition,
+            key("a", "revenue in Q3 2025?", b"other system prompt").partition,
+            "context and params"
+        );
         assert_ne!(a.partition, key("a", "revenue in Q3 2026?", b"sys").partition, "numbers must match");
         assert_ne!(a.point_id, key("a", "what was revenue in Q3 2025", b"sys").point_id, "one point per prompt");
         assert_eq!(a.point_id, key("a", "revenue in Q3 2025?", b"sys").point_id);
 
         let t: TenantId = "a".into();
         let with = |s: &[&str]| {
-            SemanticKey::new(&KeyParts { tenant: &t, model: "m", shape: ResponseShape::Openai, context_hash: blake3::hash(b"x"), prompt: "email them", surrogates: s, pii_mode: PiiMode::Reversible })
-                .partition
+            SemanticKey::new(&KeyParts {
+                tenant: &t,
+                model: "m",
+                shape: ResponseShape::Openai,
+                context_hash: blake3::hash(b"x"),
+                prompt: "email them",
+                surrogates: s,
+                pii_mode: PiiMode::Reversible,
+            })
+            .partition
         };
         assert_eq!(with(&["Ann Lee", "a@x.io"]), with(&["a@x.io", "ann lee"]));
         assert_ne!(with(&["Ann Lee"]), with(&["Bob Ray"]), "a different person never shares an answer");
@@ -328,7 +394,10 @@ mod tests {
 
     #[test]
     fn collection_names_are_safe() {
-        assert_eq!(collection_name("caliban_semcache", "local/Qwen3-Embed:0.6B", 1024), "caliban_semcache_local_qwen3-embed_0_6b_1024");
+        assert_eq!(
+            collection_name("caliban_semcache", "local/Qwen3-Embed:0.6B", 1024),
+            "caliban_semcache_local_qwen3-embed_0_6b_1024"
+        );
     }
 
     #[tokio::test]
@@ -351,7 +420,9 @@ mod tests {
         let store = Arc::new(MemoryStore::default());
         let c = SemanticCache::new(store.clone(), "t");
         // Two embedding models (an old and a new `embedding_model`), two tenants.
-        for (tenant, model, v) in [("a", "emb", vec![1.0f32, 0.0]), ("a", "emb2", vec![1.0, 0.0, 0.0]), ("b", "emb", vec![0.0, 1.0])] {
+        for (tenant, model, v) in
+            [("a", "emb", vec![1.0f32, 0.0]), ("a", "emb2", vec![1.0, 0.0, 0.0]), ("b", "emb", vec![0.0, 1.0])]
+        {
             c.insert(&key(tenant, "hi", b""), model, &v, entry(60), &P, 1000).await.unwrap();
         }
         // Another deployment's collection in the same store is left alone.
@@ -393,10 +464,14 @@ mod tests {
         let Lookup::Verify(m) = c.lookup(&k, "emb", &near, &P, 0.5, 1001).await.unwrap() else { panic!("grey zone") };
         assert_eq!(m.verify, Some(VerifyKind::GreyZone));
         c.record_verification(&m, true, &P).await.unwrap();
-        let Lookup::Verify(m) = c.lookup(&k, "emb", &near, &P, 0.5, 1001).await.unwrap() else { panic!("still grey after one") };
+        let Lookup::Verify(m) = c.lookup(&k, "emb", &near, &P, 0.5, 1001).await.unwrap() else {
+            panic!("still grey after one")
+        };
         let stats = c.record_verification(&m, true, &P).await.unwrap();
         assert_eq!(stats.verified_ok, 2);
-        let Lookup::Hit(m) = c.lookup(&k, "emb", &near, &P, 0.5, 1001).await.unwrap() else { panic!("learned threshold now serves it") };
+        let Lookup::Hit(m) = c.lookup(&k, "emb", &near, &P, 0.5, 1001).await.unwrap() else {
+            panic!("learned threshold now serves it")
+        };
         c.record_hit(&m, &P).await.unwrap();
         let p = store.get(&m.collection, &m.id).unwrap();
         assert_eq!(p.stats.hits, 1);

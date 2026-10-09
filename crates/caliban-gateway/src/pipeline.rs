@@ -11,8 +11,8 @@
 //! `cache_control` breakpoints, server tools and thinking signatures survive.
 
 use crate::error::Dialect;
-use crate::route_embed::{self, RouteMeta};
 use crate::metering::{self, Metered};
+use crate::route_embed::{self, RouteMeta};
 use crate::{ApiError, Gateway, auth, limits, quirks, semantic, stream, telemetry};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -57,7 +57,12 @@ pub(crate) struct Outcome {
 }
 
 /// Entry point for both chat dialects.
-pub(crate) async fn handle(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, dialect: Dialect) -> Result<Response, ApiError> {
+pub(crate) async fn handle(
+    gw: Arc<Gateway>,
+    headers: HeaderMap,
+    body: Bytes,
+    dialect: Dialect,
+) -> Result<Response, ApiError> {
     let request_id = RequestId::new();
     let span = telemetry::request_span("chat", dialect, &request_id);
     telemetry::link_parent(&span, &headers);
@@ -70,7 +75,9 @@ pub(crate) async fn handle(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, di
 
 fn parse(body: &[u8], dialect: Dialect) -> Result<(ChatRequest, Option<Value>), CalibanError> {
     match dialect {
-        Dialect::OpenAi => Ok((ChatRequest::from_openai_json(body).map_err(|e| CalibanError::InvalidRequest(e.to_string()))?, None)),
+        Dialect::OpenAi => {
+            Ok((ChatRequest::from_openai_json(body).map_err(|e| CalibanError::InvalidRequest(e.to_string()))?, None))
+        }
         Dialect::Anthropic => {
             let v: Value = serde_json::from_slice(body).map_err(|e| CalibanError::InvalidRequest(e.to_string()))?;
             let req = anthropic::to_chat_request(&v).map_err(|e| CalibanError::InvalidRequest(e.to_string()))?;
@@ -83,7 +90,14 @@ fn header_str(h: &HeaderMap, name: &str) -> Option<String> {
     h.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
 }
 
-async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialect, request_id: RequestId, span: Span) -> Result<Response, ApiError> {
+async fn run(
+    gw: Arc<Gateway>,
+    headers: &HeaderMap,
+    body: &[u8],
+    dialect: Dialect,
+    request_id: RequestId,
+    span: Span,
+) -> Result<Response, ApiError> {
     let started = Instant::now();
     let snap = gw.config.load();
     let caller = auth::caller(&snap, headers)?;
@@ -100,7 +114,10 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
         return Err(CalibanError::InvalidRequest("messages must not be empty".into()).into());
     }
     let client_usage = dialect == Dialect::Anthropic || metering::client_wants_stream_usage(&req.extra);
-    let native_opts = NativeOptions { anthropic_version: header_str(headers, "anthropic-version"), anthropic_beta: header_str(headers, "anthropic-beta") };
+    let native_opts = NativeOptions {
+        anthropic_version: header_str(headers, "anthropic-version"),
+        anthropic_beta: header_str(headers, "anthropic-beta"),
+    };
     let ext = req.ext();
     let pii_mode = ext.pii.unwrap_or_else(|| snap.pii_mode_for(&tenant));
 
@@ -143,7 +160,8 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
         .find_map(|id| snap.model(id))
         .and_then(|m| cost_usd(est_prompt, est_out, m.price_in_per_mtok, m.price_out_per_mtok))
         .unwrap_or(0.0);
-    let mut settlement = limits::reserve(&gw, tenant.id.as_str(), &policy, Amount { tokens: est_prompt + est_out, usd }).await?;
+    let mut settlement =
+        limits::reserve(&gw, tenant.id.as_str(), &policy, Amount { tokens: est_prompt + est_out, usd }).await?;
 
     let salt = quirks::tenant_salt(&gw.salt_key, tenant.id.as_str());
     let mut native_protected: Option<NativeProtected> = None;
@@ -193,8 +211,10 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
         // same tenant gives the same body, so repeats hit; other tenants have other surrogates and
         // the tenant is in the key anyway. Session-scoped surrogates differ on every request, so
         // such requests bypass the cache (they could never hit). Masking is deterministic.
-        let deterministic_pii = pii_entities == 0 || surrogate_scope == PiiSurrogateScope::Tenant || pii_mode == PiiMode::Mask;
-        let native_tools = native_body.is_some_and(|b| b.get("tools").and_then(Value::as_array).is_some_and(|a| !a.is_empty()));
+        let deterministic_pii =
+            pii_entities == 0 || surrogate_scope == PiiSurrogateScope::Tenant || pii_mode == PiiMode::Mask;
+        let native_tools =
+            native_body.is_some_and(|b| b.get("tools").and_then(Value::as_array).is_some_and(|a| !a.is_empty()));
         let cacheable = attempt == 0
             && ext.cache.unwrap_or_default() != CacheMode::Off
             && snap.config.cache.exact_enabled
@@ -218,15 +238,20 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
         // user message may differ. Looked up after a T1 miss.
         let mut sem = (attempt == 0 && !native_tools)
             .then(|| {
-                semantic::prepare(&gw, &snap, &tenant, semantic::Inputs {
-                    req: &req,
-                    upstream_body: &upstream_body,
-                    model: &model,
-                    is_native,
-                    pii_mode,
-                    vault: &protected.vault,
-                    pii_ok: deterministic_pii && (use_protected || protected.entities == 0),
-                })
+                semantic::prepare(
+                    &gw,
+                    &snap,
+                    &tenant,
+                    semantic::Inputs {
+                        req: &req,
+                        upstream_body: &upstream_body,
+                        model: &model,
+                        is_native,
+                        pii_mode,
+                        vault: &protected.vault,
+                        pii_ok: deterministic_pii && (use_protected || protected.entities == 0),
+                    },
+                )
             })
             .flatten();
 
@@ -253,7 +278,14 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
             if let Some(hit) = hit {
                 let outcome = Outcome { cache: CacheStatus::Hit, cache_tier: Some(CacheTier::Exact), ..outcome };
                 let body = render_cached(&hit.body, rh.as_ref(), is_native, dialect);
-                finish(&gw, &outcome, Metered::hit(Usage::default()), hit.prompt_tokens + hit.completion_tokens, settlement).await;
+                finish(
+                    &gw,
+                    &outcome,
+                    Metered::hit(Usage::default()),
+                    hit.prompt_tokens + hit.completion_tokens,
+                    settlement,
+                )
+                .await;
                 return Ok(json_response(&outcome, body, Some(0.0)));
             }
         }
@@ -279,7 +311,9 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
                 }
                 // The cache keeps the pseudonymised body (before rehydration): a hit is restored with
                 // the vault of the request that hits, never with this one's originals.
-                let cache_bytes = |v: &Value| (key.is_some() || sem.is_some()).then(|| Bytes::from(serde_json::to_vec(v).unwrap_or_default()));
+                let cache_bytes = |v: &Value| {
+                    (key.is_some() || sem.is_some()).then(|| Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
+                };
                 let (client_body, cache_body, usage) = if is_native {
                     set_model(&mut v, &model);
                     let usage = match v.get("usage").filter(|u| u.is_object()) {
@@ -296,14 +330,17 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
                         quirks::normalize_message(&mut v);
                     }
                     set_model(&mut v, &model);
-                    let usage = Usage::from_openai(&v).map_or_else(|| metering::json_estimate(est_prompt, &v), Metered::provider);
+                    let usage = Usage::from_openai(&v)
+                        .map_or_else(|| metering::json_estimate(est_prompt, &v), Metered::provider);
                     let cache_body = cache_bytes(&v);
                     if let Some(r) = &rh {
                         rehydrate_message(&mut v, r);
                     }
                     let client = match dialect {
                         Dialect::OpenAi => Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
-                        Dialect::Anthropic => Bytes::from(serde_json::to_vec(&anthropic::from_openai_response(&v)).unwrap_or_default()),
+                        Dialect::Anthropic => {
+                            Bytes::from(serde_json::to_vec(&anthropic::from_openai_response(&v)).unwrap_or_default())
+                        }
                     };
                     (client, cache_body, usage)
                 };
@@ -312,12 +349,15 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
                 }
                 if let (Some(k), Some(cache_body)) = (key, cache_body) {
                     gw.cache
-                        .put(k, CachedResponse {
-                            body: cache_body,
-                            model: model.id.to_string(),
-                            prompt_tokens: usage.usage.prompt_tokens,
-                            completion_tokens: usage.usage.completion_tokens,
-                        })
+                        .put(
+                            k,
+                            CachedResponse {
+                                body: cache_body,
+                                model: model.id.to_string(),
+                                prompt_tokens: usage.usage.prompt_tokens,
+                                completion_tokens: usage.usage.completion_tokens,
+                            },
+                        )
                         .await;
                 }
                 telemetry::record_usage(&us, usage.usage);
@@ -375,13 +415,21 @@ struct NativeProtected {
 /// Applies the PII engine to every client-written text segment of a native Anthropic body
 /// (system, text blocks, tool results) with the request's scope key, leaving all other fields
 /// untouched.
-async fn protect_native(gw: &Gateway, native: &Value, mode: PiiMode, scope_key: &[u8]) -> Result<NativeProtected, ApiError> {
+async fn protect_native(
+    gw: &Gateway,
+    native: &Value,
+    mode: PiiMode,
+    scope_key: &[u8],
+) -> Result<NativeProtected, ApiError> {
     let mut body = native.clone();
     let mut texts = Vec::new();
     anthropic::for_each_text_mut(&mut body, |s| texts.push(std::mem::take(s)));
     let tmp = ChatRequest {
         model: String::new(),
-        messages: texts.into_iter().map(|t| Message { role: "user".into(), content: Value::String(t), extra: Map::new() }).collect(),
+        messages: texts
+            .into_iter()
+            .map(|t| Message { role: "user".into(), content: Value::String(t), extra: Map::new() })
+            .collect(),
         stream: false,
         caliban: None,
         extra: Map::new(),
@@ -400,7 +448,11 @@ async fn protect_native(gw: &Gateway, native: &Value, mode: PiiMode, scope_key: 
 }
 
 /// Model + the provider the tenant reaches it through (own BYOK provider first, then shared pools).
-pub(crate) fn resolve(snap: &Snapshot, tenant: &TenantConfig, id: &caliban_types::ModelId) -> Option<(ModelEntry, ProviderConfig)> {
+pub(crate) fn resolve(
+    snap: &Snapshot,
+    tenant: &TenantConfig,
+    id: &caliban_types::ModelId,
+) -> Option<(ModelEntry, ProviderConfig)> {
     let model = snap.model(id)?.clone();
     let provider = snap.provider_for(tenant, &model.provider)?.clone();
     Some((model, provider))

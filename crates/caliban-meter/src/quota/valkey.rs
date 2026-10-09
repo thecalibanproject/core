@@ -140,18 +140,26 @@ impl ValkeyQuota {
     /// take longer than one quota call is allowed to).
     pub async fn ping_within(&self, limit: Duration) -> Result<(), QuotaError> {
         let mut conn = self.conn.clone();
-        self.bounded_by(limit, async move { redis::cmd("PING").query_async::<String>(&mut conn).await }).await.map(|_| ())
+        self.bounded_by(limit, async move { redis::cmd("PING").query_async::<String>(&mut conn).await })
+            .await
+            .map(|_| ())
     }
 
     async fn bounded<T>(&self, fut: impl Future<Output = redis::RedisResult<T>>) -> Result<T, QuotaError> {
         self.bounded_by(self.timeout, fut).await
     }
 
-    async fn bounded_by<T>(&self, limit: Duration, fut: impl Future<Output = redis::RedisResult<T>>) -> Result<T, QuotaError> {
+    async fn bounded_by<T>(
+        &self,
+        limit: Duration,
+        fut: impl Future<Output = redis::RedisResult<T>>,
+    ) -> Result<T, QuotaError> {
         match tokio::time::timeout(limit, fut).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(QuotaError::Backend(format!("valkey {}: {e}", self.endpoint))),
-            Err(_) => Err(QuotaError::Backend(format!("valkey {}: no reply within {} ms", self.endpoint, limit.as_millis()))),
+            Err(_) => {
+                Err(QuotaError::Backend(format!("valkey {}: no reply within {} ms", self.endpoint, limit.as_millis())))
+            }
         }
     }
 
@@ -263,7 +271,10 @@ impl QuotaStore for ValkeyQuota {
             [i, wait_us] => {
                 let scope = usize::try_from(*i - 1).ok().and_then(|i| scopes.get(i).copied());
                 let scope = scope.ok_or_else(|| QuotaError::Backend(format!("rate script: bad limit index {i}")))?;
-                Err(QuotaError::Exceeded { scope, retry_after: Duration::from_micros(u64::try_from(*wait_us).unwrap_or(1).max(1)) })
+                Err(QuotaError::Exceeded {
+                    scope,
+                    retry_after: Duration::from_micros(u64::try_from(*wait_us).unwrap_or(1).max(1)),
+                })
             }
             other => Err(QuotaError::Backend(format!("rate script: unexpected reply {other:?}"))),
         }
@@ -285,7 +296,8 @@ impl QuotaStore for ValkeyQuota {
         if status == "ok" {
             return Ok(Reservation { tenant: tenant.to_owned(), amount, day: n, tracked: true, local: false });
         }
-        let scope = scope_named(&status).ok_or_else(|| QuotaError::Backend(format!("reserve script: unexpected reply {status}")))?;
+        let scope = scope_named(&status)
+            .ok_or_else(|| QuotaError::Backend(format!("reserve script: unexpected reply {status}")))?;
         Err(QuotaError::Exceeded { scope, retry_after: Duration::from_millis(u64::try_from(n).unwrap_or(1).max(1)) })
     }
 
@@ -324,7 +336,9 @@ mod tests {
 
     #[tokio::test]
     async fn key_layout() {
-        let v = ValkeyQuota::new(&ValkeyOptions { key_prefix: "p".into(), ..ValkeyOptions::new("redis://127.0.0.1:1") }).unwrap();
+        let v =
+            ValkeyQuota::new(&ValkeyOptions { key_prefix: "p".into(), ..ValkeyOptions::new("redis://127.0.0.1:1") })
+                .unwrap();
         assert_eq!(v.key("acme", "rpm"), "p:{acme}:rpm");
         assert_eq!(v.budget_keys("a:b"), ["p:{a%3Ab}:tpm".to_owned(), "p:{a%3Ab}:day".to_owned()]);
         assert!(ValkeyQuota::new(&ValkeyOptions::new("http://nope")).is_err());

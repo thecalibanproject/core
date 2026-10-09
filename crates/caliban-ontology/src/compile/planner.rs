@@ -72,14 +72,17 @@ pub fn choose(i: &PlanInputs) -> Result<Decision, PlanError> {
     if !replica_ok {
         // With no replica, still refuse plans that explain() shows to be full scans.
         return match i.explain {
-            Some(e) if !e.uses_index && e.docs_examined.is_some_and(|d| d > i.native_budget) => Err(PlanError::TooExpensive),
+            Some(e) if !e.uses_index && e.docs_examined.is_some_and(|d| d > i.native_budget) => {
+                Err(PlanError::TooExpensive)
+            }
             _ => Ok(Decision { lane: Lane::Native, reason: "no replica" }),
         };
     }
     if let (Some(slo), Some(lag)) = (i.freshness_slo_secs, i.replica_lag_secs)
-        && lag > slo {
-            return Ok(Decision { lane: Lane::Native, reason: "replica lag exceeds freshness SLO" });
-        }
+        && lag > slo
+    {
+        return Ok(Decision { lane: Lane::Native, reason: "replica lag exceeds freshness SLO" });
+    }
     if cheap_native {
         Ok(Decision { lane: Lane::Native, reason: "indexed and within native budget" })
     } else {
@@ -126,7 +129,10 @@ mod tests {
 
     #[test]
     fn scans_go_to_a_fresh_replica() {
-        let i = PlanInputs { explain: Some(ExplainSummary { uses_index: false, docs_examined: Some(9_000_000) }), ..base() };
+        let i = PlanInputs {
+            explain: Some(ExplainSummary { uses_index: false, docs_examined: Some(9_000_000) }),
+            ..base()
+        };
         assert_eq!(choose(&i).unwrap().lane, Lane::Replica);
     }
 

@@ -73,17 +73,12 @@ impl ArrayStats {
     /// Arrays whose elements are (≥80%) documents are child-entity candidates.
     pub fn of_documents(&self) -> bool {
         let total: u64 = self.element_types.values().sum();
-        total > 0
-            && self.element_types.get("object").copied().unwrap_or(0) as f64 >= 0.8 * total as f64
+        total > 0 && self.element_types.get("object").copied().unwrap_or(0) as f64 >= 0.8 * total as f64
     }
 
     /// Most frequent element type.
     pub fn dominant_element_type(&self) -> Option<&str> {
-        self.element_types
-            .iter()
-            .filter(|(t, _)| *t != "null")
-            .max_by_key(|(_, n)| **n)
-            .map(|(t, _)| t.as_str())
+        self.element_types.iter().filter(|(t, _)| *t != "null").max_by_key(|(_, n)| **n).map(|(t, _)| t.as_str())
     }
 }
 
@@ -126,24 +121,15 @@ pub struct FieldInfo {
 impl FieldInfo {
     /// Most frequent non-null type, if any.
     pub fn dominant_type(&self) -> Option<&str> {
-        self.types
-            .iter()
-            .map(String::as_str)
-            .find(|t| *t != "null" && *t != "undefined")
+        self.types.iter().map(String::as_str).find(|t| *t != "null" && *t != "undefined")
     }
 
     /// Share of the non-null occurrences that have the dominant type.
     pub fn dominant_share(&self) -> f32 {
-        let non_null: u64 = self
-            .type_counts
-            .iter()
-            .filter(|(t, _)| *t != "null" && *t != "undefined")
-            .map(|(_, n)| n)
-            .sum();
+        let non_null: u64 =
+            self.type_counts.iter().filter(|(t, _)| *t != "null" && *t != "undefined").map(|(_, n)| n).sum();
         match self.dominant_type() {
-            Some(t) if non_null > 0 => {
-                self.type_counts.get(t).copied().unwrap_or(0) as f32 / non_null as f32
-            }
+            Some(t) if non_null > 0 => self.type_counts.get(t).copied().unwrap_or(0) as f32 / non_null as f32,
             _ => 0.0,
         }
     }
@@ -198,11 +184,7 @@ impl ObjectInfo {
 
     /// Is `path` the first key of some index (so `$lookup`/filters on it can use the index)?
     pub fn is_indexed(&self, path: &str) -> bool {
-        path == "_id"
-            || self
-                .indexes
-                .iter()
-                .any(|i| i.keys.first().is_some_and(|k| k == path))
+        path == "_id" || self.indexes.iter().any(|i| i.keys.first().is_some_and(|k| k == path))
     }
 }
 

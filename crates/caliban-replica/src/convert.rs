@@ -17,8 +17,8 @@ use crate::projection::{ColumnType, ID, TableKind, TableSpec};
 use caliban_connect::infer::{bson_f64, get_path};
 use caliban_connect::mongo::bson::{Bson, Document};
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, Int64Array,
-    Int64Builder, StringBuilder, TimestampMicrosecondArray, TimestampMicrosecondBuilder,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, Int64Array, Int64Builder,
+    StringBuilder, TimestampMicrosecondArray, TimestampMicrosecondBuilder,
 };
 use datafusion::arrow::datatypes::{DataType as ArrowType, TimeUnit};
 use datafusion::arrow::error::ArrowError;
@@ -52,9 +52,7 @@ pub fn key_string(b: &Bson) -> Option<String> {
         Bson::Double(d) => d.to_string(),
         Bson::Decimal128(d) => d.to_string(),
         Bson::Boolean(v) => v.to_string(),
-        Bson::DateTime(d) => d
-            .try_to_rfc3339_string()
-            .unwrap_or_else(|_| d.timestamp_millis().to_string()),
+        Bson::DateTime(d) => d.try_to_rfc3339_string().unwrap_or_else(|_| d.timestamp_millis().to_string()),
         Bson::Null | Bson::Undefined => return None,
         other => caliban_connect::infer::bson_to_json(other).to_string(),
     })
@@ -74,11 +72,7 @@ pub fn cell(b: Option<&Bson>, ty: ColumnType) -> Cell {
             _ => Cell::Null,
         },
         ColumnType::TimestampUtc => match b {
-            Bson::DateTime(d) => d
-                .timestamp_millis()
-                .checked_mul(1000)
-                .map(Cell::Ts)
-                .unwrap_or(Cell::Null),
+            Bson::DateTime(d) => d.timestamp_millis().checked_mul(1000).map(Cell::Ts).unwrap_or(Cell::Null),
             Bson::Timestamp(t) => Cell::Ts(i64::from(t.time) * 1_000_000),
             _ => Cell::Null,
         },
@@ -92,9 +86,9 @@ pub fn cell(b: Option<&Bson>, ty: ColumnType) -> Cell {
 /// Does a root document belong in this table (discriminator check)?
 pub fn matches_table(spec: &TableSpec, doc: &Document) -> bool {
     match &spec.kind {
-        TableKind::Root {
-            discriminator: Some(d),
-        } => matches!(get_path(doc, &d.path), Some(Bson::String(v)) if *v == d.value),
+        TableKind::Root { discriminator: Some(d) } => {
+            matches!(get_path(doc, &d.path), Some(Bson::String(v)) if *v == d.value)
+        }
         _ => true,
     }
 }
@@ -103,13 +97,7 @@ pub fn matches_table(spec: &TableSpec, doc: &Document) -> bool {
 pub fn root_row(spec: &TableSpec, doc: &Document) -> Row {
     spec.columns
         .iter()
-        .map(|c| {
-            if c.name == ID {
-                cell(doc.get(ID), ColumnType::Utf8)
-            } else {
-                cell(get_path(doc, &c.path), c.ty)
-            }
-        })
+        .map(|c| if c.name == ID { cell(doc.get(ID), ColumnType::Utf8) } else { cell(get_path(doc, &c.path), c.ty) })
         .collect()
 }
 
@@ -142,10 +130,7 @@ pub fn child_rows(spec: &TableSpec, parent_id: &str, doc: &Document) -> Vec<Row>
 }
 
 /// Builds a `RecordBatch` with the table's schema from rows in order.
-pub fn to_batch<'a>(
-    spec: &TableSpec,
-    rows: impl Iterator<Item = &'a Row> + Clone,
-) -> Result<RecordBatch, ArrowError> {
+pub fn to_batch<'a>(spec: &TableSpec, rows: impl Iterator<Item = &'a Row> + Clone) -> Result<RecordBatch, ArrowError> {
     let schema = spec.schema();
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(spec.columns.len());
     for (i, c) in spec.columns.iter().enumerate() {
@@ -163,34 +148,22 @@ pub fn to_batch<'a>(
             }
             ColumnType::Float64 => {
                 let mut b = Float64Builder::new();
-                col.for_each(|v| {
-                    b.append_option(if let Cell::F64(x) = v { Some(*x) } else { None })
-                });
+                col.for_each(|v| b.append_option(if let Cell::F64(x) = v { Some(*x) } else { None }));
                 Arc::new(b.finish())
             }
             ColumnType::Int64 => {
                 let mut b = Int64Builder::new();
-                col.for_each(|v| {
-                    b.append_option(if let Cell::I64(x) = v { Some(*x) } else { None })
-                });
+                col.for_each(|v| b.append_option(if let Cell::I64(x) = v { Some(*x) } else { None }));
                 Arc::new(b.finish())
             }
             ColumnType::TimestampUtc => {
                 let mut b = TimestampMicrosecondBuilder::new().with_timezone("UTC");
-                col.for_each(|v| {
-                    b.append_option(if let Cell::Ts(x) = v { Some(*x) } else { None })
-                });
+                col.for_each(|v| b.append_option(if let Cell::Ts(x) = v { Some(*x) } else { None }));
                 Arc::new(b.finish())
             }
             ColumnType::Bool => {
                 let mut b = BooleanBuilder::new();
-                col.for_each(|v| {
-                    b.append_option(if let Cell::Bool(x) = v {
-                        Some(*x)
-                    } else {
-                        None
-                    })
-                });
+                col.for_each(|v| b.append_option(if let Cell::Bool(x) = v { Some(*x) } else { None }));
                 Arc::new(b.finish())
             }
         };
@@ -206,11 +179,8 @@ pub fn batches_to_json(batches: &[RecordBatch]) -> Result<Vec<J>, ArrowError> {
     for b in batches {
         let schema = b.schema();
         let fmt_opts = FormatOptions::default().with_null("null");
-        let formatters: Vec<ArrayFormatter<'_>> = b
-            .columns()
-            .iter()
-            .map(|c| ArrayFormatter::try_new(c.as_ref(), &fmt_opts))
-            .collect::<Result<_, _>>()?;
+        let formatters: Vec<ArrayFormatter<'_>> =
+            b.columns().iter().map(|c| ArrayFormatter::try_new(c.as_ref(), &fmt_opts)).collect::<Result<_, _>>()?;
         for row in 0..b.num_rows() {
             let mut obj = Map::new();
             for (i, col) in b.columns().iter().enumerate() {
@@ -220,19 +190,12 @@ pub fn batches_to_json(batches: &[RecordBatch]) -> Result<Vec<J>, ArrowError> {
                 } else {
                     match col.data_type() {
                         ArrowType::Float64 => {
-                            let x = col
-                                .as_any()
-                                .downcast_ref::<Float64Array>()
-                                .map(|a| a.value(row));
-                            x.and_then(serde_json::Number::from_f64)
-                                .map(J::Number)
-                                .unwrap_or(J::Null)
+                            let x = col.as_any().downcast_ref::<Float64Array>().map(|a| a.value(row));
+                            x.and_then(serde_json::Number::from_f64).map(J::Number).unwrap_or(J::Null)
                         }
-                        ArrowType::Int64 => col
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .map(|a| J::from(a.value(row)))
-                            .unwrap_or(J::Null),
+                        ArrowType::Int64 => {
+                            col.as_any().downcast_ref::<Int64Array>().map(|a| J::from(a.value(row))).unwrap_or(J::Null)
+                        }
                         ArrowType::Boolean => col
                             .as_any()
                             .downcast_ref::<BooleanArray>()
@@ -242,11 +205,9 @@ pub fn batches_to_json(batches: &[RecordBatch]) -> Result<Vec<J>, ArrowError> {
                             .as_any()
                             .downcast_ref::<TimestampMicrosecondArray>()
                             .and_then(|a| {
-                                caliban_connect::mongo::bson::DateTime::from_millis(
-                                    a.value(row) / 1000,
-                                )
-                                .try_to_rfc3339_string()
-                                .ok()
+                                caliban_connect::mongo::bson::DateTime::from_millis(a.value(row) / 1000)
+                                    .try_to_rfc3339_string()
+                                    .ok()
                             })
                             .map(J::String)
                             .unwrap_or(J::Null),
@@ -260,9 +221,7 @@ pub fn batches_to_json(batches: &[RecordBatch]) -> Result<Vec<J>, ArrowError> {
                             let s = formatters[i].value(row).to_string();
                             s.parse::<i64>().map(J::from).unwrap_or(J::String(s))
                         }
-                        ArrowType::Float32
-                        | ArrowType::Decimal128(..)
-                        | ArrowType::Decimal256(..) => {
+                        ArrowType::Float32 | ArrowType::Decimal128(..) | ArrowType::Decimal256(..) => {
                             let s = formatters[i].value(row).to_string();
                             s.parse::<f64>()
                                 .ok()
@@ -292,47 +251,20 @@ mod tests {
     #[test]
     fn coerces_bson_to_column_types() {
         let oid = ObjectId::parse_str("65a1f0c2e4b0a1b2c3d4e5f6").unwrap();
-        assert_eq!(
-            cell(Some(&Bson::ObjectId(oid)), ColumnType::Utf8),
-            Cell::Str("65a1f0c2e4b0a1b2c3d4e5f6".into())
-        );
-        assert_eq!(
-            cell(Some(&Bson::Int32(3)), ColumnType::Float64),
-            Cell::F64(3.0)
-        );
-        assert_eq!(
-            cell(Some(&Bson::Int64(7)), ColumnType::Utf8),
-            Cell::Str("7".into())
-        );
+        assert_eq!(cell(Some(&Bson::ObjectId(oid)), ColumnType::Utf8), Cell::Str("65a1f0c2e4b0a1b2c3d4e5f6".into()));
+        assert_eq!(cell(Some(&Bson::Int32(3)), ColumnType::Float64), Cell::F64(3.0));
+        assert_eq!(cell(Some(&Bson::Int64(7)), ColumnType::Utf8), Cell::Str("7".into()));
         let dec: Decimal128 = "12.5".parse().unwrap();
+        assert_eq!(cell(Some(&Bson::Decimal128(dec)), ColumnType::Float64), Cell::F64(12.5));
+        assert_eq!(cell(Some(&Bson::String("x".into())), ColumnType::Float64), Cell::Null);
         assert_eq!(
-            cell(Some(&Bson::Decimal128(dec)), ColumnType::Float64),
-            Cell::F64(12.5)
-        );
-        assert_eq!(
-            cell(Some(&Bson::String("x".into())), ColumnType::Float64),
-            Cell::Null
-        );
-        assert_eq!(
-            cell(
-                Some(&Bson::DateTime(DateTime::from_millis(1_500))),
-                ColumnType::TimestampUtc
-            ),
+            cell(Some(&Bson::DateTime(DateTime::from_millis(1_500))), ColumnType::TimestampUtc),
             Cell::Ts(1_500_000)
         );
-        assert_eq!(
-            cell(
-                Some(&Bson::String("2026-01-01".into())),
-                ColumnType::TimestampUtc
-            ),
-            Cell::Null
-        );
+        assert_eq!(cell(Some(&Bson::String("2026-01-01".into())), ColumnType::TimestampUtc), Cell::Null);
         assert_eq!(cell(Some(&Bson::Null), ColumnType::Utf8), Cell::Null);
         assert_eq!(cell(None, ColumnType::Bool), Cell::Null);
-        assert_eq!(
-            cell(Some(&Bson::Document(doc! {})), ColumnType::Utf8),
-            Cell::Null
-        );
+        assert_eq!(cell(Some(&Bson::Document(doc! {})), ColumnType::Utf8), Cell::Null);
     }
 
     #[test]
@@ -374,9 +306,6 @@ mod tests {
 
         assert!(child_rows(lines, "2", &doc! { "_id": 2, "lines": [] }).is_empty());
         assert!(child_rows(lines, "3", &doc! { "_id": 3 }).is_empty());
-        assert_eq!(
-            child_rows(lines, "4", &doc! { "_id": 4, "lines": { "category": "x" } }).len(),
-            1
-        );
+        assert_eq!(child_rows(lines, "4", &doc! { "_id": 4, "lines": { "category": "x" } }).len(), 1);
     }
 }

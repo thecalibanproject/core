@@ -71,7 +71,11 @@ pub fn from_openai_response(v: &Value) -> Value {
     let choice = v.pointer("/choices/0");
     let msg = choice.and_then(|c| c.get("message"));
     let mut content = Vec::new();
-    if let Some(r) = msg.and_then(|m| m.get("reasoning_content").or_else(|| m.get("reasoning"))).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+    if let Some(r) = msg
+        .and_then(|m| m.get("reasoning_content").or_else(|| m.get("reasoning")))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
         content.push(json!({ "type": "thinking", "thinking": r, "signature": "" }));
     }
     if let Some(t) = msg.and_then(|m| m.get("content")).and_then(Value::as_str).filter(|s| !s.is_empty()) {
@@ -157,7 +161,10 @@ mod tests {
         assert_eq!(a["stop_reason"], "tool_use");
         assert_eq!(a["content"][0], json!({"type": "thinking", "thinking": "User wants weather.", "signature": ""}));
         assert_eq!(a["content"][1], json!({"type": "text", "text": "Let me check."}));
-        assert_eq!(a["content"][2], json!({"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}}));
+        assert_eq!(
+            a["content"][2],
+            json!({"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}})
+        );
         assert_eq!(a["usage"]["input_tokens"], 20);
         assert_eq!(a["usage"]["cache_read_input_tokens"], 10);
         assert_eq!(a["usage"]["output_tokens"], 12);
@@ -165,7 +172,9 @@ mod tests {
 
     #[test]
     fn finish_reasons() {
-        let mk = |f: &str| from_openai_response(&json!({"choices": [{"message": {"content": "x"}, "finish_reason": f}]}))["stop_reason"].clone();
+        let mk = |f: &str| {
+            from_openai_response(&json!({"choices": [{"message": {"content": "x"}, "finish_reason": f}]}))["stop_reason"].clone()
+        };
         assert_eq!(mk("stop"), "end_turn");
         assert_eq!(mk("length"), "max_tokens");
     }

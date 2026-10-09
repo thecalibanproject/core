@@ -32,7 +32,8 @@ pub async fn count_tokens(State(gw): State<Arc<Gateway>>, headers: HeaderMap, bo
         if let Some(o) = v.as_object_mut() {
             o.entry("max_tokens").or_insert(Value::from(1));
         }
-        let req = caliban_ir::anthropic::to_chat_request(&v).map_err(|e| CalibanError::InvalidRequest(e.to_string()))?;
+        let req =
+            caliban_ir::anthropic::to_chat_request(&v).map_err(|e| CalibanError::InvalidRequest(e.to_string()))?;
         Ok(axum::Json(serde_json::json!({ "input_tokens": req.estimate_prompt_tokens() })).into_response())
     };
     run().unwrap_or_else(|e| ApiError::from(e).with_dialect(Dialect::Anthropic).into_response())

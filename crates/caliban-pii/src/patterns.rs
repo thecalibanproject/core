@@ -18,7 +18,13 @@ impl PatternDetector {
         let r = |p: &str| Regex::new(p).expect("static regex");
         let rules: Vec<Rule> = vec![
             // Credentials first: these block the request.
-            (EntityType::Secret, r(r"\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|xox[abprs]-[A-Za-z0-9-]{10,}|cal_[A-Za-z0-9]{24,})\b"), always),
+            (
+                EntityType::Secret,
+                r(
+                    r"\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|xox[abprs]-[A-Za-z0-9-]{10,}|cal_[A-Za-z0-9]{24,})\b",
+                ),
+                always,
+            ),
             (EntityType::Secret, r(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), always),
             (EntityType::Secret, r(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), always),
             (EntityType::Email, r(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b"), always),
@@ -27,7 +33,11 @@ impl PatternDetector {
             (EntityType::UsSsn, r(r"\b\d{3}-\d{2}-\d{4}\b"), ssn_valid),
             (EntityType::Phone, r(r"\+\d{1,3}(?:[ .-]?\(?\d{2,4}\)?){2,4}\b"), phone_valid),
             (EntityType::Phone, r(r"(?:\(\d{3}\) ?|\b\d{3}-)\d{3}-\d{4}\b"), phone_valid),
-            (EntityType::IpAddress, r(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"), always),
+            (
+                EntityType::IpAddress,
+                r(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"),
+                always,
+            ),
         ];
         Self { rules }
     }
@@ -116,7 +126,8 @@ mod tests {
     use super::*;
 
     fn kinds(t: &str) -> Vec<EntityType> {
-        let mut v: Vec<_> = crate::merge_spans(PatternDetector::new().detect(t)).into_iter().map(|s| s.entity).collect();
+        let mut v: Vec<_> =
+            crate::merge_spans(PatternDetector::new().detect(t)).into_iter().map(|s| s.entity).collect();
         v.sort();
         v
     }

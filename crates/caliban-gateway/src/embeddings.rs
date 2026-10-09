@@ -25,10 +25,19 @@ pub async fn embeddings(State(gw): State<Arc<Gateway>>, headers: HeaderMap, body
     let request_id = RequestId::new();
     let span = telemetry::request_span("embeddings", Dialect::OpenAi, &request_id);
     telemetry::link_parent(&span, &headers);
-    run(gw, headers, body, request_id, span.clone()).instrument(span.clone()).await.inspect_err(|e| telemetry::record_error(&span, e.error.kind()))
+    run(gw, headers, body, request_id, span.clone())
+        .instrument(span.clone())
+        .await
+        .inspect_err(|e| telemetry::record_error(&span, e.error.kind()))
 }
 
-async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: RequestId, span: Span) -> Result<Response, ApiError> {
+async fn run(
+    gw: Arc<Gateway>,
+    headers: HeaderMap,
+    body: Bytes,
+    request_id: RequestId,
+    span: Span,
+) -> Result<Response, ApiError> {
     let started = Instant::now();
     let snap = gw.config.load();
     let caller = auth::caller(&snap, &headers)?;
@@ -38,7 +47,11 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
     limits::check_rate(&gw, tenant.id.as_str(), Some(&caller.key_hash), &policy).await?;
 
     let mut v: Value = serde_json::from_slice(&body).map_err(|e| CalibanError::InvalidRequest(e.to_string()))?;
-    let model_id = v.get("model").and_then(Value::as_str).ok_or_else(|| CalibanError::InvalidRequest("model is required".into()))?.to_owned();
+    let model_id = v
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CalibanError::InvalidRequest("model is required".into()))?
+        .to_owned();
     span.record("otel.name", format!("embeddings {model_id}"));
     span.record("gen_ai.request.model", model_id.as_str());
     let (model, provider) = resolve(&snap, &tenant, &ModelId::from(model_id.as_str()))
@@ -108,13 +121,19 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
 async fn mask_inputs(gw: &Gateway, v: &mut Value) -> Result<usize, ApiError> {
     let texts: Vec<String> = match v.get("input") {
         Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(a)) if a.iter().all(Value::is_string) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
+        Some(Value::Array(a)) if a.iter().all(Value::is_string) => {
+            a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()
+        }
         // Token-id inputs carry no text to scan.
         _ => return Ok(0),
     };
     let (masked, entities) = mask_texts(gw, texts).await?;
     let masked: Vec<Value> = masked.into_iter().map(Value::String).collect();
-    v["input"] = if v.get("input").is_some_and(Value::is_string) { masked.into_iter().next().unwrap_or(Value::Null) } else { Value::Array(masked) };
+    v["input"] = if v.get("input").is_some_and(Value::is_string) {
+        masked.into_iter().next().unwrap_or(Value::Null)
+    } else {
+        Value::Array(masked)
+    };
     Ok(entities)
 }
 
@@ -122,7 +141,10 @@ async fn mask_inputs(gw: &Gateway, v: &mut Value) -> Result<usize, ApiError> {
 pub(crate) async fn mask_texts(gw: &Gateway, texts: Vec<String>) -> Result<(Vec<String>, usize), ApiError> {
     let req = ChatRequest {
         model: String::new(),
-        messages: texts.into_iter().map(|t| Message { role: "user".into(), content: Value::String(t), extra: Default::default() }).collect(),
+        messages: texts
+            .into_iter()
+            .map(|t| Message { role: "user".into(), content: Value::String(t), extra: Default::default() })
+            .collect(),
         stream: false,
         caliban: None,
         extra: Default::default(),

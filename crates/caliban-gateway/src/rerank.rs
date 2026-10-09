@@ -39,10 +39,19 @@ pub async fn rerank(State(gw): State<Arc<Gateway>>, headers: HeaderMap, body: By
     let request_id = RequestId::new();
     let span = telemetry::request_span("rerank", Dialect::OpenAi, &request_id);
     telemetry::link_parent(&span, &headers);
-    run(gw, headers, body, request_id, span.clone()).instrument(span.clone()).await.inspect_err(|e| telemetry::record_error(&span, e.error.kind()))
+    run(gw, headers, body, request_id, span.clone())
+        .instrument(span.clone())
+        .await
+        .inspect_err(|e| telemetry::record_error(&span, e.error.kind()))
 }
 
-async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: RequestId, span: Span) -> Result<Response, ApiError> {
+async fn run(
+    gw: Arc<Gateway>,
+    headers: HeaderMap,
+    body: Bytes,
+    request_id: RequestId,
+    span: Span,
+) -> Result<Response, ApiError> {
     let started = Instant::now();
     let snap = gw.config.load();
     let caller = auth::caller(&snap, &headers)?;
@@ -57,8 +66,9 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
     }
     span.record("otel.name", format!("rerank {}", req.model));
     span.record("gen_ai.request.model", req.model.as_str());
-    let (model, provider) = resolve(&snap, &tenant, &ModelId::from(req.model.as_str()))
-        .ok_or_else(|| CalibanError::InvalidRequest(format!("model '{}' is not available to this tenant", req.model)))?;
+    let (model, provider) = resolve(&snap, &tenant, &ModelId::from(req.model.as_str())).ok_or_else(|| {
+        CalibanError::InvalidRequest(format!("model '{}' is not available to this tenant", req.model))
+    })?;
     if model.kind != ModelKind::Rerank {
         return Err(CalibanError::InvalidRequest(format!("model '{}' is not a rerank model", req.model)).into());
     }
@@ -110,7 +120,8 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
             r
         })
         .collect();
-    let reported = raw.pointer("/usage/total_tokens").or_else(|| raw.pointer("/usage/prompt_tokens")).and_then(Value::as_u64);
+    let reported =
+        raw.pointer("/usage/total_tokens").or_else(|| raw.pointer("/usage/prompt_tokens")).and_then(Value::as_u64);
     let prompt_tokens = reported.unwrap_or(est);
     let usage = Usage { prompt_tokens, ..Usage::default() };
     let usage = if reported.is_some() { Metered::provider(usage) } else { Metered::estimated(usage) };
@@ -132,7 +143,9 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
     };
     let model_id = outcome.model.id.to_string();
     finish(&gw, &outcome, usage, 0, settlement).await;
-    let mut resp = axum::Json(json!({ "model": model_id, "results": results, "usage": { "total_tokens": prompt_tokens } })).into_response();
+    let mut resp =
+        axum::Json(json!({ "model": model_id, "results": results, "usage": { "total_tokens": prompt_tokens } }))
+            .into_response();
     caliban_headers(resp.headers_mut(), &outcome);
     Ok(resp)
 }

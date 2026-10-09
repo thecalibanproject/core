@@ -41,7 +41,8 @@ async fn send(app: &axum::Router, method: &str, uri: &str, bearer: &str, body: O
 async fn mint(cp: &axum::Router, tenant: &str) -> (String, String) {
     let (s, _) = send(cp, "POST", "/api/v1/tenants", ADMIN, Some(json!({"name": tenant}))).await;
     assert_eq!(s, StatusCode::CREATED);
-    let (s, k) = send(cp, "POST", &format!("/api/v1/tenants/{tenant}/api-keys"), ADMIN, Some(json!({"name": "e2e"}))).await;
+    let (s, k) =
+        send(cp, "POST", &format!("/api/v1/tenants/{tenant}/api-keys"), ADMIN, Some(json!({"name": "e2e"}))).await;
     assert_eq!(s, StatusCode::CREATED);
     (k["key"].as_str().unwrap().to_owned(), k["id"].as_str().unwrap().to_owned())
 }
@@ -61,7 +62,10 @@ async fn standalone_rejects_a_revoked_key_on_the_next_request() {
     let (key, id) = mint(&cp, "globex").await;
     let (key2, _) = mint(&cp, "initech").await;
     assert_eq!(send(&dp, "GET", "/v1/models", &key, None).await.0, StatusCode::OK);
-    assert_eq!(send(&cp, "DELETE", &format!("/api/v1/tenants/globex/api-keys/{id}"), ADMIN, None).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        send(&cp, "DELETE", &format!("/api/v1/tenants/globex/api-keys/{id}"), ADMIN, None).await.0,
+        StatusCode::NO_CONTENT
+    );
     let (s, e) = send(&dp, "GET", "/v1/models", &key, None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "{e}");
 
@@ -90,14 +94,19 @@ async fn split_router_rejects_a_revoked_key_after_its_next_snapshot_poll() {
     let (key, id) = mint(&cp_app, "globex").await;
 
     // Router: config only from verified snapshots (what `SnapshotSource::run` does on each poll).
-    let mut source = SnapshotSource::new(&url, "router-secret".into(), SnapshotVerifier::from_b64_list(&public).unwrap(), None).unwrap();
+    let mut source =
+        SnapshotSource::new(&url, "router-secret".into(), SnapshotVerifier::from_b64_list(&public).unwrap(), None)
+            .unwrap();
     let first = source.fetch().await.unwrap().expect("first snapshot");
     let router_handle = ConfigHandle::new(Snapshot::new(first.config, first.version));
     let dp = gateway(router_handle.clone());
     assert_eq!(send(&dp, "GET", "/v1/models", &key, None).await.0, StatusCode::OK);
     assert!(source.fetch().await.unwrap().is_none(), "unchanged → 304");
 
-    assert_eq!(send(&cp_app, "DELETE", &format!("/api/v1/tenants/globex/api-keys/{id}"), ADMIN, None).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        send(&cp_app, "DELETE", &format!("/api/v1/tenants/globex/api-keys/{id}"), ADMIN, None).await.0,
+        StatusCode::NO_CONTENT
+    );
     // Until the router polls, it still serves its last snapshot (fail-static by design).
     assert_eq!(send(&dp, "GET", "/v1/models", &key, None).await.0, StatusCode::OK);
     let next = source.fetch().await.unwrap().expect("a revoke publishes a new snapshot");

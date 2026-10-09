@@ -35,7 +35,8 @@ fn main() {
     println!("cores={cores} text={tokens} tokens ({} bytes)", text.len());
 
     for threads in [1, 2, 4] {
-        let d = NerDetector::load(&dir, NerOptions { intra_threads: threads, sessions: 1, ..NerOptions::default() }).unwrap();
+        let d = NerDetector::load(&dir, NerOptions { intra_threads: threads, sessions: 1, ..NerOptions::default() })
+            .unwrap();
         let _ = d.try_detect(&text).unwrap(); // warm-up
         // Median of 15: robust against other load on the machine.
         let mut runs = Vec::new();
@@ -70,7 +71,9 @@ fn main() {
     let clients = 8;
     let per = 5;
     for (sessions, intra) in [(1, cores.min(4)), (2, (cores / 2).clamp(1, 4)), (4, (cores / 4).max(1))] {
-        let d = Arc::new(NerDetector::load(&dir, NerOptions { sessions, intra_threads: intra, ..NerOptions::default() }).unwrap());
+        let d = Arc::new(
+            NerDetector::load(&dir, NerOptions { sessions, intra_threads: intra, ..NerOptions::default() }).unwrap(),
+        );
         let _ = d.try_detect(&text);
         let t = Instant::now();
         let hs: Vec<_> = (0..clients)
@@ -104,11 +107,28 @@ jane.doe@acme.com and the card on file is 4111 1111 1111 1111. Keep it friendly 
 and mention that the invoice is attached.";
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let d = NerOptions::default();
-    println!("cores={cores}; default sessions={} intra_threads={} spinning={}", d.sessions, d.intra_threads, d.intra_spinning);
-    let configs = [(1, 4, true), (1, 4, false), (2, 1, false), (2, 2, false), (4, 1, false), (4, 1, true), (4, 2, false), (5, 1, false), (8, 1, false)];
+    println!(
+        "cores={cores}; default sessions={} intra_threads={} spinning={}",
+        d.sessions, d.intra_threads, d.intra_spinning
+    );
+    let configs = [
+        (1, 4, true),
+        (1, 4, false),
+        (2, 1, false),
+        (2, 2, false),
+        (4, 1, false),
+        (4, 1, true),
+        (4, 2, false),
+        (5, 1, false),
+        (8, 1, false),
+    ];
     for (sessions, intra, spin) in configs {
         let det = Arc::new(
-            NerDetector::load(dir, NerOptions { sessions, intra_threads: intra, intra_spinning: spin, ..NerOptions::default() }).unwrap(),
+            NerDetector::load(
+                dir,
+                NerOptions { sessions, intra_threads: intra, intra_spinning: spin, ..NerOptions::default() },
+            )
+            .unwrap(),
         );
         for _ in 0..20 {
             det.try_detect(prompt).unwrap();
@@ -137,6 +157,9 @@ and mention that the invoice is attached.";
             .collect();
         hs.into_iter().for_each(|h| h.join().unwrap());
         let rps = (sessions * per) as f64 / t.elapsed().as_secs_f64();
-        println!("sessions={sessions} intra={intra} spin={spin}: c=1 p50 {:.2} ms p99 {:.2} ms; saturated {rps:.0} req/s", one[50], one[99]);
+        println!(
+            "sessions={sessions} intra={intra} spin={spin}: c=1 p50 {:.2} ms p99 {:.2} ms; saturated {rps:.0} req/s",
+            one[50], one[99]
+        );
     }
 }

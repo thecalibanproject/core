@@ -48,12 +48,7 @@ pub struct MockConfig {
 
 impl Default for MockConfig {
     fn default() -> Self {
-        Self {
-            latency: Duration::ZERO,
-            chunk_delay: Duration::ZERO,
-            chunk_chars: 4,
-            record: true,
-        }
+        Self { latency: Duration::ZERO, chunk_delay: Duration::ZERO, chunk_chars: 4, record: true }
     }
 }
 
@@ -73,10 +68,7 @@ pub struct Entry {
 impl Entry {
     /// The credential the request was made with, whichever header carried it.
     pub fn credential(&self) -> Option<&str> {
-        self.auth
-            .as_deref()
-            .map(|a| a.trim_start_matches("Bearer "))
-            .or(self.x_api_key.as_deref())
+        self.auth.as_deref().map(|a| a.trim_start_matches("Bearer ")).or(self.x_api_key.as_deref())
     }
 
     /// Text of the last user message (string or text parts).
@@ -134,10 +126,7 @@ impl Mock {
     pub async fn start(addr: &str, cfg: MockConfig) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
-        let shared = Arc::new(Shared {
-            cfg,
-            rec: Mutex::new(Recorder::default()),
-        });
+        let shared = Arc::new(Shared { cfg, rec: Mutex::new(Recorder::default()) });
         let app = router(Arc::clone(&shared));
         tokio::spawn(async move {
             let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
@@ -208,11 +197,7 @@ fn text_of(content: &Value) -> String {
 pub fn last_user_text(body: &Value) -> String {
     body.get("messages")
         .and_then(Value::as_array)
-        .and_then(|m| {
-            m.iter()
-                .rev()
-                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        })
+        .and_then(|m| m.iter().rev().find(|m| m.get("role").and_then(Value::as_str) == Some("user")))
         .map(|m| text_of(&m["content"]))
         .unwrap_or_default()
 }
@@ -224,12 +209,7 @@ pub fn prompt_tokens(body: &Value) -> u64 {
     if let Some(sys) = body.get("system") {
         bytes += text_of(sys).len();
     }
-    for m in body
-        .get("messages")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for m in body.get("messages").and_then(Value::as_array).into_iter().flatten() {
         bytes += text_of(&m["content"]).len() + 4;
     }
     8 + (bytes as u64).div_ceil(4)
@@ -248,11 +228,7 @@ fn prompt_hash(body: &Value) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     h.update(body.get("system").map(Value::to_string).unwrap_or_default());
-    h.update(
-        body.get("messages")
-            .map(Value::to_string)
-            .unwrap_or_default(),
-    );
+    h.update(body.get("messages").map(Value::to_string).unwrap_or_default());
     hex::encode(h.finalize())
 }
 
@@ -262,12 +238,7 @@ fn chunks(text: &str, n: usize) -> Vec<String> {
 }
 
 fn json_resp(v: &Value) -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        v.to_string(),
-    )
-        .into_response()
+    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
 }
 
 /// SSE response whose frames are sent with `delay` between them.
@@ -298,10 +269,7 @@ async fn chat(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
     };
     let model = body.get("model").cloned().unwrap_or(Value::Null);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let include_usage = body
-        .pointer("/stream_options/include_usage")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let include_usage = body.pointer("/stream_options/include_usage").and_then(Value::as_bool).unwrap_or(false);
     let auth = header(&headers, "authorization");
     if model == "mock-fail-500" {
         if s.cfg.record {
@@ -313,11 +281,7 @@ async fn chat(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
                 bill: None,
             });
         }
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            r#"{"error":{"message":"mock failure"}}"#,
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":{"message":"mock failure"}}"#).into_response();
     }
     let text = reply_text(&body);
     let prompt = prompt_tokens(&body);
@@ -359,11 +323,7 @@ async fn chat(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
         let mut frames = Vec::new();
         let pieces = chunks(&text, s.cfg.chunk_chars);
         for (i, p) in pieces.iter().enumerate() {
-            let delta = if i == 0 {
-                json!({"role": "assistant", "content": p})
-            } else {
-                json!({"content": p})
-            };
+            let delta = if i == 0 { json!({"role": "assistant", "content": p}) } else { json!({"content": p}) };
             let c = json!({"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 0, "model": model,
                            "choices": [{"index": 0, "delta": delta, "finish_reason": null}]});
             frames.push(format!("data: {c}\n\n"));
@@ -410,12 +370,7 @@ fn anthropic_cacheable_tokens(body: &Value) -> u64 {
     if let Some(sys) = body.get("system") {
         visit(sys, 0);
     }
-    for m in body
-        .get("messages")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for m in body.get("messages").and_then(Value::as_array).into_iter().flatten() {
         visit(&m["content"], 4);
     }
     (upto as u64).div_ceil(4)
@@ -466,24 +421,19 @@ async fn messages(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
         "cache_creation": {"ephemeral_5m_input_tokens": created - created_1h, "ephemeral_1h_input_tokens": created_1h}});
     wait(&s.cfg).await;
     if stream {
-        let ev = |e: Value| {
-            format!(
-                "event: {}\ndata: {e}\n\n",
-                e["type"].as_str().unwrap_or("message")
-            )
-        };
+        let ev = |e: Value| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap_or("message"));
         let mut frames = vec![
             ev(
                 json!({"type": "message_start", "message": {"id": "msg_mock", "type": "message", "role": "assistant", "model": model, "content": [],
                       "stop_reason": null, "stop_sequence": null,
                       "usage": with_output(&usage, 1)}}),
             ),
-            ev(
-                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
-            ),
+            ev(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})),
         ];
         for p in chunks(&text, s.cfg.chunk_chars) {
-            frames.push(ev(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": p}})));
+            frames.push(ev(
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": p}}),
+            ));
         }
         frames.push(ev(json!({"type": "content_block_stop", "index": 0})));
         frames.push(ev(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": output}})));
@@ -542,9 +492,8 @@ async fn embeddings(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
         });
     }
     wait(&s.cfg).await;
-    let data: Vec<Value> = (0..n)
-        .map(|i| json!({"object": "embedding", "index": i, "embedding": [0.1, 0.2, 0.3]}))
-        .collect();
+    let data: Vec<Value> =
+        (0..n).map(|i| json!({"object": "embedding", "index": i, "embedding": [0.1, 0.2, 0.3]})).collect();
     json_resp(
         &json!({"object": "list", "model": body["model"], "data": data, "usage": {"prompt_tokens": 5, "total_tokens": 5}}),
     )
@@ -575,9 +524,6 @@ mod tests {
         let b = json!({"system": [{"type": "text", "text": "aaaaaaaa", "cache_control": {"type": "ephemeral"}}],
                        "messages": [{"role": "user", "content": "bbbb"}]});
         assert_eq!(anthropic_cacheable_tokens(&b), 2);
-        assert_eq!(
-            anthropic_cacheable_tokens(&json!({"messages": [{"role": "user", "content": "x"}]})),
-            0
-        );
+        assert_eq!(anthropic_cacheable_tokens(&json!({"messages": [{"role": "user", "content": "x"}]})), 0);
     }
 }

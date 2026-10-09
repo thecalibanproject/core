@@ -9,7 +9,11 @@ use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use std::sync::Arc;
 
-pub async fn chat_completions(State(gw): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+pub async fn chat_completions(
+    State(gw): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
     pipeline::handle(gw, headers, body, Dialect::OpenAi).await
 }
 

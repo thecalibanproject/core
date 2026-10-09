@@ -85,7 +85,8 @@ impl PiiPoolOptions {
             self.queue = v.trim().parse().map_err(|_| format!("CALIBAN_PII_NER_QUEUE: not a number: {v:?}"))?;
         }
         if let Some(v) = get("CALIBAN_PII_NER_QUEUE_WAIT_MS") {
-            let ms: u64 = v.trim().parse().map_err(|_| format!("CALIBAN_PII_NER_QUEUE_WAIT_MS: not a number: {v:?}"))?;
+            let ms: u64 =
+                v.trim().parse().map_err(|_| format!("CALIBAN_PII_NER_QUEUE_WAIT_MS: not a number: {v:?}"))?;
             self.queue_wait = Duration::from_millis(ms);
         }
         if let Some(v) = get("CALIBAN_PII_NER_OVERFLOW") {
@@ -215,7 +216,12 @@ impl Gateway {
     /// inline; a heavy engine runs on the worker pool, with its overflow policy when the queue is
     /// full. A detector failure or a credential is a 403 and a pool failure a 500: both fail
     /// closed, nothing is sent upstream.
-    pub(crate) async fn protect(&self, mut req: ChatRequest, mode: PiiMode, scope_key: &[u8]) -> Result<(ChatRequest, Protected), ApiError> {
+    pub(crate) async fn protect(
+        &self,
+        mut req: ChatRequest,
+        mode: PiiMode,
+        scope_key: &[u8],
+    ) -> Result<(ChatRequest, Protected), ApiError> {
         let policy = |e: PiiError| ApiError::from(CalibanError::PolicyViolation(e.to_string()));
         let Some(pool) = self.pii_pool.as_ref().filter(|_| mode != PiiMode::Off) else {
             let p = self.pii.protect(&mut req, mode, scope_key).map_err(policy)?;
@@ -238,11 +244,21 @@ impl Gateway {
         }
     }
 
-    fn overflow(&self, pool: &PiiPool, mut req: ChatRequest, mode: PiiMode, scope_key: &[u8]) -> Result<(ChatRequest, Protected), ApiError> {
+    fn overflow(
+        &self,
+        pool: &PiiPool,
+        mut req: ChatRequest,
+        mode: PiiMode,
+        scope_key: &[u8],
+    ) -> Result<(ChatRequest, Protected), ApiError> {
         match pool.opts.overflow {
             Overflow::Reject => {
                 let n = pool.stats.rejected.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::warn!(rejected_total = n, queue = pool.opts.queue, "PII model queue full: request rejected with 503 (CALIBAN_PII_NER_OVERFLOW=reject)");
+                tracing::warn!(
+                    rejected_total = n,
+                    queue = pool.opts.queue,
+                    "PII model queue full: request rejected with 503 (CALIBAN_PII_NER_OVERFLOW=reject)"
+                );
                 Err(ApiError::overloaded(
                     "PII screening is at capacity; the request was not sent upstream. Retry later.",
                     "pii_ner_queue",
@@ -251,9 +267,16 @@ impl Gateway {
             }
             Overflow::Degrade => {
                 let n = pool.stats.degraded.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::warn!(degraded_total = n, queue = pool.opts.queue, "PII model queue full: screened with the regex tier only (CALIBAN_PII_NER_OVERFLOW=degrade)");
+                tracing::warn!(
+                    degraded_total = n,
+                    queue = pool.opts.queue,
+                    "PII model queue full: screened with the regex tier only (CALIBAN_PII_NER_OVERFLOW=degrade)"
+                );
                 tracing::Span::current().record("caliban.pii.degraded", true);
-                let p = self.pii.protect_light(&mut req, mode, scope_key).map_err(|e| ApiError::from(CalibanError::PolicyViolation(e.to_string())))?;
+                let p = self
+                    .pii
+                    .protect_light(&mut req, mode, scope_key)
+                    .map_err(|e| ApiError::from(CalibanError::PolicyViolation(e.to_string())))?;
                 Ok((req, p))
             }
         }
@@ -356,9 +379,16 @@ mod tests {
             move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
         };
         let o = PiiPoolOptions::new(4).with_env(env(&[])).unwrap();
-        assert_eq!((o.workers, o.queue, o.queue_wait, o.overflow), (4, DEFAULT_QUEUE, Duration::ZERO, Overflow::Reject));
+        assert_eq!(
+            (o.workers, o.queue, o.queue_wait, o.overflow),
+            (4, DEFAULT_QUEUE, Duration::ZERO, Overflow::Reject)
+        );
         let o = PiiPoolOptions::new(2)
-            .with_env(env(&[("CALIBAN_PII_NER_QUEUE", "16"), ("CALIBAN_PII_NER_QUEUE_WAIT_MS", "250"), ("CALIBAN_PII_NER_OVERFLOW", "Degrade")]))
+            .with_env(env(&[
+                ("CALIBAN_PII_NER_QUEUE", "16"),
+                ("CALIBAN_PII_NER_QUEUE_WAIT_MS", "250"),
+                ("CALIBAN_PII_NER_OVERFLOW", "Degrade"),
+            ]))
             .unwrap();
         assert_eq!((o.queue, o.queue_wait, o.overflow), (16, Duration::from_millis(250), Overflow::Degrade));
         assert!(PiiPoolOptions::new(1).with_env(env(&[("CALIBAN_PII_NER_OVERFLOW", "degarde")])).is_err());
@@ -391,7 +421,10 @@ mod tests {
             if self.fail {
                 return Err(DetectError { detector: "ner", message: "inference failed".into() });
             }
-            Ok(text.match_indices("Zed").map(|(i, m)| Span { start: i, end: i + m.len(), entity: EntityType::Person }).collect())
+            Ok(text
+                .match_indices("Zed")
+                .map(|(i, m)| Span { start: i, end: i + m.len(), entity: EntityType::Person })
+                .collect())
         }
         fn is_heavy(&self) -> bool {
             true
@@ -405,7 +438,10 @@ mod tests {
     }
 
     fn chat(text: &str) -> ChatRequest {
-        ChatRequest::from_openai_json(serde_json::json!({"model": "m", "messages": [{"role": "user", "content": text}]}).to_string().as_bytes()).unwrap()
+        ChatRequest::from_openai_json(
+            serde_json::json!({"model": "m", "messages": [{"role": "user", "content": text}]}).to_string().as_bytes(),
+        )
+        .unwrap()
     }
 
     const TEXT: &str = "Zed wrote from zed@acme.com";
@@ -434,7 +470,10 @@ mod tests {
     async fn full_queue_fails_closed_with_503_and_retry_after() {
         let gate = Arc::new(std::sync::Barrier::new(2));
         let calls = Arc::new(AtomicUsize::new(0));
-        let gw = gateway(SlowModel { gate: Some(Arc::clone(&gate)), calls: Arc::clone(&calls), fail: false }, PiiPoolOptions { queue: 0, ..PiiPoolOptions::new(1) });
+        let gw = gateway(
+            SlowModel { gate: Some(Arc::clone(&gate)), calls: Arc::clone(&calls), fail: false },
+            PiiPoolOptions { queue: 0, ..PiiPoolOptions::new(1) },
+        );
         let busy = occupy(&gw).await;
         let err = gw.protect(chat(TEXT), PiiMode::Reversible, b"k").await.unwrap_err();
         assert!(matches!(err.error, CalibanError::Overloaded(_)));

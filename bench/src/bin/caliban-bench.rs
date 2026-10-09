@@ -206,13 +206,7 @@ fn scenarios() -> Vec<Scenario> {
         ..s(name, what, Profile::Default, true, pii_tenant)
     };
     vec![
-        s(
-            "chat",
-            "OpenAI chat, non-streaming, PII off",
-            Profile::Default,
-            false,
-            false,
-        ),
+        s("chat", "OpenAI chat, non-streaming, PII off", Profile::Default, false, false),
         s(
             "chat+pii",
             "OpenAI chat, non-streaming, PII reversible (regex tier), 2 entities",
@@ -220,13 +214,7 @@ fn scenarios() -> Vec<Scenario> {
             false,
             true,
         ),
-        s(
-            "stream",
-            "OpenAI chat, streaming, PII off",
-            Profile::Default,
-            true,
-            false,
-        ),
+        s("stream", "OpenAI chat, streaming, PII off", Profile::Default, true, false),
         s(
             "stream+pii",
             "OpenAI chat, streaming, PII reversible (regex tier), 2 entities, streaming rehydration",
@@ -257,18 +245,8 @@ fn scenarios() -> Vec<Scenario> {
             "OpenAI chat, streaming with a delay between upstream chunks (see the paced chunk delay), PII off",
             false,
         ),
-        paced(
-            "stream-paced+pii",
-            "As `stream-paced`, PII reversible (regex tier), streaming rehydration",
-            true,
-        ),
-        s(
-            "chat+wal",
-            "OpenAI chat, non-streaming, PII off, usage JSONL WAL on",
-            Profile::Wal,
-            false,
-            false,
-        ),
+        paced("stream-paced+pii", "As `stream-paced`, PII reversible (regex tier), streaming rehydration", true),
+        s("chat+wal", "OpenAI chat, non-streaming, PII off, usage JSONL WAL on", Profile::Wal, false, false),
         s(
             "chat+pii+ner",
             "OpenAI chat, non-streaming, PII reversible with the L1 NER model",
@@ -276,13 +254,7 @@ fn scenarios() -> Vec<Scenario> {
             false,
             true,
         ),
-        s(
-            "stream+pii+ner",
-            "OpenAI chat, streaming, PII reversible with the L1 NER model",
-            Profile::Ner,
-            true,
-            true,
-        ),
+        s("stream+pii+ner", "OpenAI chat, streaming, PII reversible with the L1 NER model", Profile::Ner, true, true),
         Scenario {
             ner_background: true,
             ..s(
@@ -415,26 +387,19 @@ async fn start_mock(
 
 /// Starts the mocks and the gateways this run needs on this host.
 async fn launch(args: &Args, needs: &dyn Fn(Profile) -> bool) -> Result<(Endpoints, Local)> {
-    let caliban = args
-        .caliban
-        .as_ref()
-        .context("--caliban is required unless --remote is given")?;
+    let caliban = args.caliban.as_ref().context("--caliban is required unless --remote is given")?;
     let mock_bin = match &args.mock {
         Some(p) => p.clone(),
         None => std::env::current_exe()?.with_file_name("mock-upstream"),
     };
-    let advertise = args.advertise.clone().unwrap_or_else(|| {
-        if args.bind == "0.0.0.0" {
-            "127.0.0.1".into()
-        } else {
-            args.bind.clone()
-        }
-    });
-    let ner_dir = std::env::var("CALIBAN_PII_NER_DIR")
-        .ok()
-        .filter(|d| !d.trim().is_empty());
+    let advertise = args
+        .advertise
+        .clone()
+        .unwrap_or_else(|| if args.bind == "0.0.0.0" { "127.0.0.1".into() } else { args.bind.clone() });
+    let ner_dir = std::env::var("CALIBAN_PII_NER_DIR").ok().filter(|d| !d.trim().is_empty());
     let (mock, mock_local, mock_public) =
-        start_mock(&mock_bin, args.mock_latency_ms, 0.0, &args.bind, &advertise, args.mock_ports.first().copied()).await?;
+        start_mock(&mock_bin, args.mock_latency_ms, 0.0, &args.bind, &advertise, args.mock_ports.first().copied())
+            .await?;
     let (paced_mock, paced_local, paced_public) = start_mock(
         &mock_bin,
         args.mock_latency_ms,
@@ -446,35 +411,17 @@ async fn launch(args: &Args, needs: &dyn Fn(Profile) -> bool) -> Result<(Endpoin
     .await?;
     let (plain_key, plain_hash) = new_key("benchplain");
     let (pii_key, pii_hash) = new_key("benchpii");
-    let cfg = config(
-        &format!("{mock_local}/v1"),
-        &format!("{paced_local}/v1"),
-        &plain_hash,
-        &pii_hash,
-    );
+    let cfg = config(&format!("{mock_local}/v1"), &format!("{paced_local}/v1"), &plain_hash, &pii_hash);
     let env = vec![("BENCH_UPSTREAM_KEY".to_owned(), UPSTREAM_KEY.to_owned())];
-    let base = Launch {
-        config: cfg,
-        env,
-        bind: Some(args.bind.clone()),
-        advertise: Some(advertise),
-        ..Default::default()
-    };
+    let base =
+        Launch { config: cfg, env, bind: Some(args.bind.clone()), advertise: Some(advertise), ..Default::default() };
 
     let mut skipped: Vec<String> = Vec::new();
     let port = |i: usize| args.gateway_ports.get(i).copied();
     let mut gateways = vec![Caliban::start(caliban, &Launch { dp_port: port(0), ..base.clone() }).await?];
     let default_gw = gateways[0].dp.clone();
     let wal_gw = if needs(Profile::Wal) {
-        let g = Caliban::start(
-            caliban,
-            &Launch {
-                usage_wal: true,
-                dp_port: port(1),
-                ..base.clone()
-            },
-        )
-        .await?;
+        let g = Caliban::start(caliban, &Launch { usage_wal: true, dp_port: port(1), ..base.clone() }).await?;
         let dp = g.dp.clone();
         gateways.push(g);
         Some(dp)
@@ -486,12 +433,8 @@ async fn launch(args: &Args, needs: &dyn Fn(Profile) -> bool) -> Result<(Endpoin
         (Some(bin), Some(dir)) => {
             let mut e = base.env.clone();
             e.push(("CALIBAN_PII_NER_DIR".into(), dir.clone()));
-            let launch = Launch {
-                env: e,
-                startup_timeout: Some(Duration::from_secs(180)),
-                dp_port: port(2),
-                ..base.clone()
-            };
+            let launch =
+                Launch { env: e, startup_timeout: Some(Duration::from_secs(180)), dp_port: port(2), ..base.clone() };
             match Caliban::start(bin, &launch).await {
                 Ok(c) => {
                     let dp = c.dp.clone();
@@ -527,21 +470,15 @@ async fn launch(args: &Args, needs: &dyn Fn(Profile) -> bool) -> Result<(Endpoin
         skipped,
         ner_dir,
     };
-    Ok((
-        ep,
-        Local {
-            _mocks: (mock, paced_mock),
-            _gateways: gateways,
-        },
-    ))
+    Ok((ep, Local { _mocks: (mock, paced_mock), _gateways: gateways }))
 }
 
 /// Waits for Ctrl-C, or SIGTERM on Unix.
 async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("SIGTERM handler");
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
@@ -561,11 +498,7 @@ struct Row {
 const QS: [(f64, &str); 4] = [(0.5, "p50"), (0.9, "p90"), (0.99, "p99"), (1.0, "max")];
 
 fn fmt_ms(v: f64) -> String {
-    if v.is_nan() {
-        "n/a".into()
-    } else {
-        format!("{v:.3}")
-    }
+    if v.is_nan() { "n/a".into() } else { format!("{v:.3}") }
 }
 
 fn overhead(g: &hdrhistogram::Histogram<u64>, d: &hdrhistogram::Histogram<u64>, q: f64) -> f64 {
@@ -577,19 +510,19 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     // `--only stream` matches every scenario containing "stream"; `--only =stream` only that one.
     let wanted = |name: &str| {
-        args.only.is_empty() || args.only.iter().any(|o| o.strip_prefix('=').map_or_else(|| name.contains(o.as_str()), |exact| name == exact))
+        args.only.is_empty()
+            || args
+                .only
+                .iter()
+                .any(|o| o.strip_prefix('=').map_or_else(|| name.contains(o.as_str()), |exact| name == exact))
     };
     let all = scenarios();
     let needs = |p: Profile| all.iter().any(|s| s.profile == p && wanted(s.name));
 
     let (ep, local) = match &args.remote {
         Some(p) => {
-            let text =
-                std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-            (
-                serde_json::from_str::<Endpoints>(&text).context("parsing the --remote file")?,
-                None,
-            )
+            let text = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+            (serde_json::from_str::<Endpoints>(&text).context("parsing the --remote file")?, None)
         }
         None => {
             let (ep, local) = launch(&args, &needs).await?;
@@ -598,10 +531,7 @@ async fn main() -> Result<()> {
     };
     if let Some(path) = &args.serve {
         std::fs::write(path, serde_json::to_string_pretty(&ep)?)?;
-        eprintln!(
-            "serving; endpoints in {} (Ctrl-C or SIGTERM to stop)",
-            path.display()
-        );
+        eprintln!("serving; endpoints in {} (Ctrl-C or SIGTERM to stop)", path.display());
         wait_for_shutdown().await;
         drop(local);
         return Ok(());
@@ -661,27 +591,14 @@ async fn main() -> Result<()> {
         let pre = post_json(
             &http,
             &gw_t.url,
-            &gw_t
-                .headers
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.clone()))
-                .collect::<Vec<_>>(),
+            &gw_t.headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>(),
             &sc.gw_body,
         )
         .await;
         if !pre.status.is_success() {
-            bail!(
-                "{}: pre-flight failed: {} {}",
-                sc.name,
-                pre.status,
-                pre.text
-            );
+            bail!("{}: pre-flight failed: {} {}", sc.name, pre.status, pre.text);
         }
-        let text = if sc.stream {
-            pre.stream_text()
-        } else {
-            pre.content()
-        };
+        let text = if sc.stream { pre.stream_text() } else { pre.content() };
         let rehydrated = text.contains("jane.doe@acme.com") && text.contains("4111 1111 1111 1111");
         let pii = pre.header("x-caliban-pii-entities").unwrap_or_default();
         let mut cache = pre.header("x-caliban-cache").unwrap_or_default();
@@ -689,11 +606,7 @@ async fn main() -> Result<()> {
             let again = post_json(
                 &http,
                 &gw_t.url,
-                &gw_t
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.clone()))
-                    .collect::<Vec<_>>(),
+                &gw_t.headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>(),
                 &sc.gw_body,
             )
             .await;
@@ -703,10 +616,7 @@ async fn main() -> Result<()> {
             }
         }
         if sc.pii_tenant && (pii.parse::<u32>().unwrap_or(0) < 2 || !rehydrated) {
-            bail!(
-                "{}: expected >= 2 PII entities and a rehydrated reply, got {pii} entities: {text}",
-                sc.name
-            );
+            bail!("{}: expected >= 2 PII entities and a rehydrated reply, got {pii} entities: {text}", sc.name);
         }
         checks.push(format!("`{}`: status {}, x-caliban-cache `{cache}`, x-caliban-pii-entities `{pii}`, reply rehydrated: {rehydrated}", sc.name, pre.status.as_u16()));
 
@@ -735,11 +645,8 @@ async fn main() -> Result<()> {
         }
         for &c in &args.concurrency {
             eprintln!("{} @ c={c}", sc.name);
-            let (requests, warmup) = if sc.paced {
-                (args.paced_requests, (args.warmup / 10).max(c))
-            } else {
-                (args.requests, args.warmup)
-            };
+            let (requests, warmup) =
+                if sc.paced { (args.paced_requests, (args.warmup / 10).max(c)) } else { (args.requests, args.warmup) };
             load::run(&http, &direct_t, c, warmup).await;
             load::run(&http, &gw_t, c, warmup).await;
             let (mut d, mut g) = (Stats::empty(), Stats::empty());
@@ -756,12 +663,7 @@ async fn main() -> Result<()> {
                 d.errors,
                 g.errors
             );
-            rows.push(Row {
-                scenario: sc.name,
-                concurrency: c,
-                direct: d,
-                gateway: g,
-            });
+            rows.push(Row { scenario: sc.name, concurrency: c, direct: d, gateway: g });
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(b) = background {
@@ -813,17 +715,9 @@ fn render(
     let _ = writeln!(
         o,
         "- Requests per side per row: {} measured ({} for paced streams) in {} interleaved rounds, after {} warm-up; mock latency {} ms; paced chunk delay {} ms.",
-        args.requests,
-        args.paced_requests,
-        args.rounds,
-        args.warmup,
-        args.mock_latency_ms,
-        args.paced_chunk_delay_ms
+        args.requests, args.paced_requests, args.rounds, args.warmup, args.mock_latency_ms, args.paced_chunk_delay_ms
     );
-    let _ = writeln!(
-        o,
-        "- Overhead at quantile q = gateway latency at q minus direct latency at q, in milliseconds."
-    );
+    let _ = writeln!(o, "- Overhead at quantile q = gateway latency at q minus direct latency at q, in milliseconds.");
     if let Some(d) = ner_dir {
         let _ = writeln!(o, "- NER artifact: `{d}`");
     }
@@ -836,10 +730,7 @@ fn render(
     let mut worst99 = (f64::MIN, "", 0usize);
     for r in rows.iter().filter(|r| !r.scenario.contains("ner")) {
         let paced = r.scenario.contains("paced");
-        for (h_g, h_d) in [
-            (&r.gateway.total, &r.direct.total),
-            (&r.gateway.ttfb, &r.direct.ttfb),
-        ] {
+        for (h_g, h_d) in [(&r.gateway.total, &r.direct.total), (&r.gateway.ttfb, &r.direct.ttfb)] {
             if h_g.is_empty() || (paced && std::ptr::eq(h_g, &r.gateway.total)) {
                 continue;
             }
@@ -854,10 +745,7 @@ fn render(
         }
     }
     let _ = writeln!(o, "## Summary\n");
-    let _ = writeln!(
-        o,
-        "Gateway rows (NER rows and paced-stream totals excluded; see the comment in `render`):\n"
-    );
+    let _ = writeln!(o, "Gateway rows (NER rows and paced-stream totals excluded; see the comment in `render`):\n");
     if worst.1.is_empty() {
         let _ = writeln!(o, "- No gateway rows in this run.\n");
     } else {
@@ -867,11 +755,7 @@ fn render(
             worst.0,
             worst.1,
             worst.2,
-            if worst.0 < 3.0 {
-                "**Pass.**"
-            } else {
-                "**Fail.**"
-            }
+            if worst.0 < 3.0 { "**Pass.**" } else { "**Fail.**" }
         );
         let _ = writeln!(
             o,
@@ -901,11 +785,7 @@ fn render(
 
     let _ = writeln!(o, "## Scenarios\n");
     for s in all {
-        let status = if rows.iter().any(|r| r.scenario == s.name) {
-            ""
-        } else {
-            " (not run)"
-        };
+        let status = if rows.iter().any(|r| r.scenario == s.name) { "" } else { " (not run)" };
         let _ = writeln!(o, "- `{}`: {}{status}", s.name, s.what);
     }
     let _ = writeln!(o);
@@ -916,10 +796,7 @@ fn render(
         }
         let _ = writeln!(o);
     }
-    let _ = writeln!(
-        o,
-        "Pre-flight checks (one request each, before measuring):\n"
-    );
+    let _ = writeln!(o, "Pre-flight checks (one request each, before measuring):\n");
     for c in checks {
         let _ = writeln!(o, "- {c}");
     }
@@ -933,11 +810,7 @@ fn render(
         );
         let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
         for r in rows {
-            let (g, d) = if ttfb {
-                (&r.gateway.ttfb, &r.direct.ttfb)
-            } else {
-                (&r.gateway.total, &r.direct.total)
-            };
+            let (g, d) = if ttfb { (&r.gateway.ttfb, &r.direct.ttfb) } else { (&r.gateway.total, &r.direct.total) };
             if g.is_empty() {
                 continue;
             }
@@ -963,10 +836,7 @@ fn render(
     table(&mut o, "Streaming: time-to-first-byte overhead (ms)", true);
 
     let _ = writeln!(o, "## Absolute latencies (ms)\n");
-    let _ = writeln!(
-        o,
-        "| Scenario | Conc. | Side | p50 | p90 | p99 | max | req/s |"
-    );
+    let _ = writeln!(o, "| Scenario | Conc. | Side | p50 | p90 | p99 | max | req/s |");
     let _ = writeln!(o, "|---|---:|---|---:|---:|---:|---:|---:|");
     for r in rows {
         for (side, s) in [("direct", &r.direct), ("gateway", &r.gateway)] {

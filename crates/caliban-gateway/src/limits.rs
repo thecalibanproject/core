@@ -8,7 +8,9 @@
 use crate::{ApiError, Gateway};
 use caliban_config::{Limits, LimitsConfig, QuotaStoreKind};
 use caliban_meter::quota::valkey::{DEFAULT_PREFIX, DEFAULT_TIMEOUT};
-use caliban_meter::quota::{Amount, FallbackQuota, InMemoryQuota, QuotaError, QuotaPolicy, QuotaStore, Settlement, ValkeyOptions, ValkeyQuota};
+use caliban_meter::quota::{
+    Amount, FallbackQuota, InMemoryQuota, QuotaError, QuotaPolicy, QuotaStore, Settlement, ValkeyOptions, ValkeyQuota,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,12 +23,15 @@ pub fn quota_store(l: &LimitsConfig) -> Result<Arc<dyn QuotaStore>, String> {
     match l.store {
         QuotaStoreKind::Memory => {
             if env("CALIBAN_VALKEY_URL").is_some() {
-                tracing::info!("CALIBAN_VALKEY_URL is set but [limits] store = \"memory\": quotas are enforced per router process");
+                tracing::info!(
+                    "CALIBAN_VALKEY_URL is set but [limits] store = \"memory\": quotas are enforced per router process"
+                );
             }
             Ok(Arc::new(InMemoryQuota::new()))
         }
         QuotaStoreKind::Valkey => {
-            let url = env("CALIBAN_VALKEY_URL").ok_or("[limits] store = \"valkey\" needs CALIBAN_VALKEY_URL (redis:// or rediss://)")?;
+            let url = env("CALIBAN_VALKEY_URL")
+                .ok_or("[limits] store = \"valkey\" needs CALIBAN_VALKEY_URL (redis:// or rediss://)")?;
             let opts = ValkeyOptions {
                 url,
                 password: env("CALIBAN_VALKEY_PASSWORD"),
@@ -38,7 +43,12 @@ pub fn quota_store(l: &LimitsConfig) -> Result<Arc<dyn QuotaStore>, String> {
             tokio::spawn(async move {
                 if probe.probe(Duration::from_secs(3)).await {
                     let v = probe.shared();
-                    tracing::info!(valkey = v.endpoint(), prefix = v.key_prefix(), timeout_ms = v.timeout().as_millis() as u64, "quota store: valkey (shared by all routers)");
+                    tracing::info!(
+                        valkey = v.endpoint(),
+                        prefix = v.key_prefix(),
+                        timeout_ms = v.timeout().as_millis() as u64,
+                        "quota store: valkey (shared by all routers)"
+                    );
                 }
             });
             Ok(store)
@@ -101,7 +111,8 @@ mod tests {
         assert_eq!(mem.status().store, "memory");
         // `valkey` without a URL refuses to start (only checkable when the variable is unset).
         if std::env::var_os("CALIBAN_VALKEY_URL").is_none() {
-            let err = quota_store(&LimitsConfig { store: QuotaStoreKind::Valkey, ..LimitsConfig::default() }).err().unwrap();
+            let err =
+                quota_store(&LimitsConfig { store: QuotaStoreKind::Valkey, ..LimitsConfig::default() }).err().unwrap();
             assert!(err.contains("CALIBAN_VALKEY_URL"), "{err}");
         }
     }

@@ -29,7 +29,9 @@ fn sovereign_constraint_drops_external_models() {
     let s = example();
     let t = s.tenant(&"acme".into()).unwrap();
     let long = "please think carefully about the following long request that has many words in it ok";
-    let d = Router::default().route(&s, t, &req(AUTO_MODEL, long), Constraints { max_tier: TrustTier::T0Sovereign }).unwrap();
+    let d = Router::default()
+        .route(&s, t, &req(AUTO_MODEL, long), Constraints { max_tier: TrustTier::T0Sovereign })
+        .unwrap();
     assert_eq!(d.intent, "default");
     assert_eq!(d.candidates, vec![ModelId::from("local/gpt-oss-20b")]);
 }
@@ -157,7 +159,10 @@ async fn knn_decides_the_intent_and_the_header_says_so() {
     let e = HashEmbedder::default();
     let r = ready(&s, &e).await;
     let t = s.tenant(&"acme".into()).unwrap();
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&e), &AlwaysHealthy).await.unwrap();
+    let d = r
+        .route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&e), &AlwaysHealthy)
+        .await
+        .unwrap();
     assert_eq!((d.intent.as_str(), d.stage, d.knn_fallback), ("translate", "knn", None));
     assert!(d.confidence > 0.5);
     assert!(d.intent_header().starts_with("translate;confidence=0."));
@@ -169,11 +174,16 @@ async fn knn_decides_the_intent_and_the_header_says_so() {
 
 #[tokio::test]
 async fn quality_floor_picks_the_cheapest_qualifying_model() {
-    let s = staged("[routing.floors]\ntranslate = 0.8\n[routing.quality.\"ext/mid\"]\ntranslate = 0.85\n[routing.quality.\"ext/big\"]\ntranslate = 0.95\n[routing.quality.\"local/small\"]\ntranslate = 0.5\n");
+    let s = staged(
+        "[routing.floors]\ntranslate = 0.8\n[routing.quality.\"ext/mid\"]\ntranslate = 0.85\n[routing.quality.\"ext/big\"]\ntranslate = 0.95\n[routing.quality.\"local/small\"]\ntranslate = 0.5\n",
+    );
     let e = HashEmbedder::default();
     let r = ready(&s, &e).await;
     let t = s.tenant(&"acme".into()).unwrap();
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&e), &AlwaysHealthy).await.unwrap();
+    let d = r
+        .route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&e), &AlwaysHealthy)
+        .await
+        .unwrap();
     assert_eq!((d.policy, d.floor), ("quality_floor", Some(0.8)));
     assert_eq!(d.candidates, vec![ModelId::from("ext/mid"), ModelId::from("ext/big")]);
 }
@@ -186,7 +196,17 @@ async fn timeout_falls_back_to_the_rules_within_budget() {
     let slow = HashEmbedder::default().with_delay(Duration::from_millis(200));
     let t = s.tenant(&"acme".into()).unwrap();
     let started = Instant::now();
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, "summarize this email thread for me"), Constraints::default(), Some(&slow), &AlwaysHealthy).await.unwrap();
+    let d = r
+        .route_auto(
+            &s,
+            t,
+            &req(AUTO_MODEL, "summarize this email thread for me"),
+            Constraints::default(),
+            Some(&slow),
+            &AlwaysHealthy,
+        )
+        .await
+        .unwrap();
     assert!(started.elapsed() < Duration::from_millis(150), "{:?}", started.elapsed());
     assert_eq!((d.stage, d.knn_fallback, d.intent.as_str()), ("keyword", Some("timeout"), "summarize"));
     assert!(d.intent_header().ends_with(";stage=keyword;knn=timeout"));
@@ -198,13 +218,20 @@ async fn embedder_errors_and_foreign_spaces_fall_back() {
     let r = ready(&s, &HashEmbedder::default()).await;
     let t = s.tenant(&"acme".into()).unwrap();
     let failing = Probe { fail: true, ..Probe::new() };
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&failing), &AlwaysHealthy).await.unwrap();
+    let d = r
+        .route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&failing), &AlwaysHealthy)
+        .await
+        .unwrap();
     assert_eq!((d.stage, d.knn_fallback), ("keyword", Some("embed_error")));
     let other = Probe { space: Some("other-model".into()), ..Probe::new() };
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&other), &AlwaysHealthy).await.unwrap();
+    let d = r
+        .route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&other), &AlwaysHealthy)
+        .await
+        .unwrap();
     assert_eq!(d.knn_fallback, Some("unavailable"));
     assert_eq!(other.calls.load(Ordering::SeqCst), 0);
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), None, &AlwaysHealthy).await.unwrap();
+    let d =
+        r.route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), None, &AlwaysHealthy).await.unwrap();
     assert_eq!(d.knn_fallback, Some("unavailable"));
 }
 
@@ -215,7 +242,8 @@ async fn abstain_uses_the_rules_choice() {
     let e = HashEmbedder::default();
     let r = ready(&s, &e).await;
     let t = s.tenant(&"acme".into()).unwrap();
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, "hi"), Constraints::default(), Some(&e), &AlwaysHealthy).await.unwrap();
+    let d =
+        r.route_auto(&s, t, &req(AUTO_MODEL, "hi"), Constraints::default(), Some(&e), &AlwaysHealthy).await.unwrap();
     assert_eq!((d.stage, d.knn_fallback, d.intent.as_str()), ("keyword", Some("abstain_oos"), "chat"));
     let out = d.knn.unwrap().outcome.unwrap();
     assert!(out.top1_similarity < 0.999);
@@ -227,17 +255,32 @@ async fn knn_can_be_turned_off_per_tenant() {
     let e = HashEmbedder::default();
     let r = ready(&s, &e).await;
     let t = s.tenant(&"acme".into()).unwrap();
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&e), &AlwaysHealthy).await.unwrap();
+    let d = r
+        .route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&e), &AlwaysHealthy)
+        .await
+        .unwrap();
     assert_eq!((d.stage, d.knn_fallback), ("keyword", None));
 }
 
 #[tokio::test]
 async fn tenant_exemplars_add_custom_intents() {
-    let s = staged("[routing.tenants.acme.exemplars]\n\"legal.review\" = [\"review this nda clause for risky indemnity terms\", \"check the liability cap in this msa\"]\n");
+    let s = staged(
+        "[routing.tenants.acme.exemplars]\n\"legal.review\" = [\"review this nda clause for risky indemnity terms\", \"check the liability cap in this msa\"]\n",
+    );
     let e = HashEmbedder::default();
     let r = ready(&s, &e).await;
     let t = s.tenant(&"acme".into()).unwrap();
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, "review this nda clause for indemnity terms"), Constraints::default(), Some(&e), &AlwaysHealthy).await.unwrap();
+    let d = r
+        .route_auto(
+            &s,
+            t,
+            &req(AUTO_MODEL, "review this nda clause for indemnity terms"),
+            Constraints::default(),
+            Some(&e),
+            &AlwaysHealthy,
+        )
+        .await
+        .unwrap();
     assert_eq!(d.intent, "legal.review");
     // No route for the custom intent: the default route.
     assert_eq!(d.route, "default");
@@ -298,7 +341,8 @@ async fn missing_embedder_is_retried_and_rules_serve_meanwhile() {
     assert_eq!(rep.errors.len(), 1);
     assert!(!r.knn_ready());
     let t = s.tenant(&"acme".into()).unwrap();
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), None, &AlwaysHealthy).await.unwrap();
+    let d =
+        r.route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), None, &AlwaysHealthy).await.unwrap();
     assert_eq!((d.stage, d.knn_fallback), ("keyword", Some("unavailable")));
     // Not retried immediately.
     assert!(!r.needs_refresh(&s));
@@ -310,7 +354,10 @@ async fn calibration_and_profile_artifacts_are_applied() {
     write_artifact(
         &cal,
         "intent_head",
-        &[("config.json", r#"{"type":"knn","k":3,"smoothing":0.001,"aggregation":"softmax_over_neighbours_sum_by_class","similarity":"cosine"}"#)],
+        &[(
+            "config.json",
+            r#"{"type":"knn","k":3,"smoothing":0.001,"aggregation":"softmax_over_neighbours_sum_by_class","similarity":"cosine"}"#,
+        )],
         serde_json::json!({
             "labels": ["translate"],
             "calibration": {"method": "temperature", "temperature": 0.07, "default_threshold": 0.4, "oos_threshold": 0.05, "oos_score": "top1_similarity"},
@@ -336,10 +383,16 @@ async fn calibration_and_profile_artifacts_are_applied() {
     let r = Router::default();
     assert!(r.needs_refresh(&s));
     let rep = r.refresh(&s, Some(&e)).await;
-    assert_eq!((rep.calibration.as_deref(), rep.profile.as_deref()), (Some("test-artifact@1.0.0"), Some("test-artifact@1.0.0")));
+    assert_eq!(
+        (rep.calibration.as_deref(), rep.profile.as_deref()),
+        (Some("test-artifact@1.0.0"), Some("test-artifact@1.0.0"))
+    );
     assert!(rep.warnings.is_empty(), "{:?}", rep.warnings);
     let t = s.tenant(&"acme".into()).unwrap();
-    let d = r.route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&e), &AlwaysHealthy).await.unwrap();
+    let d = r
+        .route_auto(&s, t, &req(AUTO_MODEL, TRANSLATE), Constraints::default(), Some(&e), &AlwaysHealthy)
+        .await
+        .unwrap();
     assert_eq!(d.knn.as_ref().unwrap().calibration.as_deref(), Some("test-artifact@1.0.0"));
     // Profile: local/small (0.9, free) meets the 0.85 floor and is cheapest.
     assert_eq!((d.policy, d.candidates[0].as_str()), ("quality_floor", "local/small"));
@@ -358,7 +411,13 @@ async fn knn_latency_report() {
     let e = HashEmbedder::default();
     let r = ready(&s, &e).await;
     let t = s.tenant(&"acme".into()).unwrap();
-    let prompts = ["write a python function to parse dates", TRANSLATE, "top customers by revenue last quarter", "summarize the notes below", "hello"];
+    let prompts = [
+        "write a python function to parse dates",
+        TRANSLATE,
+        "top customers by revenue last quarter",
+        "summarize the notes below",
+        "hello",
+    ];
     let n = 500;
     let mut samples = Vec::with_capacity(n);
     for i in 0..n {
@@ -375,7 +434,8 @@ async fn knn_latency_report() {
 
     // Brute force at a larger scale: 5,000 exemplars x 1,024 dims.
     let dim = 1024;
-    let rows: Vec<Vec<f32>> = (0..5000).map(|i| hash_embed(&format!("exemplar number {i} about topic {}", i % 37), dim)).collect();
+    let rows: Vec<Vec<f32>> =
+        (0..5000).map(|i| hash_embed(&format!("exemplar number {i} about topic {}", i % 37), dim)).collect();
     let intents: Vec<String> = (0..5000).map(|i| format!("intent{}", i % 12)).collect();
     let idx = KnnIndex::build(rows, &intents, &vec![None; 5000]).unwrap();
     let q = hash_embed("exemplar about topic 5", dim);

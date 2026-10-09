@@ -164,9 +164,14 @@ pub fn lower(model: &Model, plan: &Plan, opts: &NativeOptions<'_>) -> Result<Mon
     for (entity, role) in &plan.entities {
         let Role::Reference { via } = role else { continue };
         if !via.foreign_indexed {
-            return Err(CompileError::NoPath { from: plan.root.clone(), to: format!("{entity} (unindexed $lookup; use the replica lane)") });
+            return Err(CompileError::NoPath {
+                from: plan.root.clone(),
+                to: format!("{entity} (unindexed $lookup; use the replica lane)"),
+            });
         }
-        let EntityBinding::Root { collection: from, discriminator, .. } = &model.entities[entity].binding else { continue };
+        let EntityBinding::Root { collection: from, discriminator, .. } = &model.entities[entity].binding else {
+            continue;
+        };
         let a = alias(entity);
         let mut project = Map::new();
         project.insert(via.foreign_path.clone(), json!(1));
@@ -214,8 +219,12 @@ pub fn lower(model: &Model, plan: &Plan, opts: &NativeOptions<'_>) -> Result<Mon
     }
 
     // 4. Group by dimensions, compute metrics.
-    let dims: Vec<(String, String)> =
-        plan.query.dimensions.iter().map(|d| (out_name(&d.id).to_owned(), format!("${}", path(model, plan, &d.id)))).collect();
+    let dims: Vec<(String, String)> = plan
+        .query
+        .dimensions
+        .iter()
+        .map(|d| (out_name(&d.id).to_owned(), format!("${}", path(model, plan, &d.id))))
+        .collect();
     let group_id = match dims.as_slice() {
         [] => J::Null,
         [(_, p)] => J::String(p.clone()),
@@ -249,7 +258,11 @@ pub fn lower(model: &Model, plan: &Plan, opts: &NativeOptions<'_>) -> Result<Mon
             Aggregation::CountDistinct => json!({ "$addToSet": e }),
         };
         group.insert(name.clone(), acc);
-        let proj = if def.aggregation == Aggregation::CountDistinct { json!({ "$size": format!("${name}") }) } else { json!(1) };
+        let proj = if def.aggregation == Aggregation::CountDistinct {
+            json!({ "$size": format!("${name}") })
+        } else {
+            json!(1)
+        };
         project.insert(name, proj);
     }
     pipeline.push(json!({ "$group": group }));
@@ -293,12 +306,33 @@ pub enum LintError {
 }
 
 const ALLOWED_STAGES: &[&str] = &[
-    "$match", "$project", "$set", "$addFields", "$unwind", "$group", "$sort", "$limit", "$skip", "$count", "$bucket",
-    "$lookup", "$facet", "$setWindowFields",
+    "$match",
+    "$project",
+    "$set",
+    "$addFields",
+    "$unwind",
+    "$group",
+    "$sort",
+    "$limit",
+    "$skip",
+    "$count",
+    "$bucket",
+    "$lookup",
+    "$facet",
+    "$setWindowFields",
 ];
 const DENIED_ANYWHERE: &[&str] = &[
-    "$where", "$function", "$accumulator", "$out", "$merge", "$unionWith", "$currentOp", "$listSessions", "$collStats",
-    "$documents", "$graphLookup",
+    "$where",
+    "$function",
+    "$accumulator",
+    "$out",
+    "$merge",
+    "$unionWith",
+    "$currentOp",
+    "$listSessions",
+    "$collStats",
+    "$documents",
+    "$graphLookup",
 ];
 
 /// Defensive lint for any pipeline Caliban runs (compiled or from a verified query).

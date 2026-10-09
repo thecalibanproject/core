@@ -27,9 +27,7 @@ pub mod convert;
 pub mod projection;
 
 use caliban_connect::mongo::bson::{self, Bson, Document, Timestamp, doc};
-use caliban_connect::mongo::mongodb::change_stream::event::{
-    ChangeStreamEvent, OperationType, ResumeToken,
-};
+use caliban_connect::mongo::mongodb::change_stream::event::{ChangeStreamEvent, OperationType, ResumeToken};
 use caliban_connect::mongo::mongodb::options::FullDocumentType;
 use caliban_connect::mongo::mongodb::{Collection, Database};
 use caliban_connect::mongo::{MongoConnector, ts_to_u64};
@@ -214,16 +212,10 @@ pub fn resume_token_time(token: &ResumeToken) -> Option<Timestamp> {
 
 impl Replica {
     /// Creates an empty replica for the approved entities of `model` bound to `datasource`.
-    pub fn new(
-        model: &Model,
-        datasource: Option<&str>,
-        cfg: ReplicaConfig,
-    ) -> Result<Self, ReplicaError> {
+    pub fn new(model: &Model, datasource: Option<&str>, cfg: ReplicaConfig) -> Result<Self, ReplicaError> {
         let projection = Projection::from_model(model, datasource)?;
         if projection.tables.is_empty() {
-            return Err(ReplicaError::Projection(
-                "no approved root entities to replicate".into(),
-            ));
+            return Err(ReplicaError::Projection("no approved root entities to replicate".into()));
         }
         std::fs::create_dir_all(&cfg.dir).map_err(storage)?;
         let mut state = State::default();
@@ -283,10 +275,7 @@ impl Replica {
     pub async fn snapshot(&self, conn: &MongoConnector) -> Result<SnapshotStats, ReplicaError> {
         self.set_status(ReplicaStatus::Snapshotting);
         let start = conn.cluster_time().await.map_err(source)?;
-        let mut stats = SnapshotStats {
-            start_time: ts_to_u64(start),
-            ..Default::default()
-        };
+        let mut stats = SnapshotStats { start_time: ts_to_u64(start), ..Default::default() };
         {
             let mut st = self.inner.state.lock();
             for t in st.tables.values_mut() {
@@ -306,10 +295,7 @@ impl Replica {
                 .map_err(source)?;
             let mut n = 0u64;
             while let Some(d) = cursor.try_next().await.map_err(source)? {
-                self.inner
-                    .state
-                    .lock()
-                    .upsert(&self.inner.projection, &coll, &d);
+                self.inner.state.lock().upsert(&self.inner.projection, &coll, &d);
                 n += 1;
             }
             stats.documents.insert(coll, n);
@@ -319,17 +305,9 @@ impl Replica {
             st.last_applied = st.last_applied.max(stats.start_time);
             st.resume_token = None;
             for (name, t) in &st.tables {
-                stats
-                    .rows
-                    .insert(name.clone(), t.rows.values().map(|r| r.len() as u64).sum());
+                stats.rows.insert(name.clone(), t.rows.values().map(|r| r.len() as u64).sum());
             }
-            st.dirty = self
-                .inner
-                .projection
-                .tables
-                .iter()
-                .map(|t| t.name.clone())
-                .collect();
+            st.dirty = self.inner.projection.tables.iter().map(|t| t.name.clone()).collect();
         }
         self.flush()?;
         self.set_status(ReplicaStatus::Snapshotted);
@@ -345,11 +323,7 @@ impl Replica {
             let Some(spec) = self.inner.projection.table(name) else {
                 continue;
             };
-            let data = st
-                .tables
-                .get(name)
-                .map(|t| t.rows.values().flatten().collect::<Vec<_>>())
-                .unwrap_or_default();
+            let data = st.tables.get(name).map(|t| t.rows.values().flatten().collect::<Vec<_>>()).unwrap_or_default();
             let batch = to_batch(spec, data.iter().copied()).map_err(storage)?;
             let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst);
             let path = self.inner.cfg.dir.join(format!("{name}.{generation}.parquet"));
@@ -381,8 +355,7 @@ impl Replica {
         });
         let path = self.inner.cfg.dir.join("manifest.json");
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&manifest).map_err(storage)?)
-            .map_err(storage)?;
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&manifest).map_err(storage)?).map_err(storage)?;
         std::fs::rename(&tmp, &path).map_err(storage)
     }
 
@@ -391,17 +364,13 @@ impl Replica {
         let colls: Vec<String> = self.inner.projection.collections().into_iter().collect();
         // Keep the event envelope (the driver needs `_id`, `operationType`, `ns`) and only the
         // bound paths of the full document.
-        let mut project =
-            doc! { "operationType": 1, "ns": 1, "documentKey": 1, "clusterTime": 1, "to": 1 };
+        let mut project = doc! { "operationType": 1, "ns": 1, "documentKey": 1, "clusterTime": 1, "to": 1 };
         for c in &colls {
             for p in self.inner.projection.bound_paths(c) {
                 project.insert(format!("fullDocument.{p}"), 1);
             }
         }
-        let pipeline = vec![
-            doc! { "$match": { "ns.coll": { "$in": &colls } } },
-            doc! { "$project": project },
-        ];
+        let pipeline = vec![doc! { "$match": { "ns.coll": { "$in": &colls } } }, doc! { "$project": project }];
         let (token, start) = {
             let st = self.inner.state.lock();
             (st.resume_token.clone(), st.last_applied)
@@ -424,9 +393,7 @@ impl Replica {
         };
         let mut stream = watch.await.map_err(|e| {
             let msg = e.to_string();
-            self.set_status(ReplicaStatus::Stale {
-                reason: msg.clone(),
-            });
+            self.set_status(ReplicaStatus::Stale { reason: msg.clone() });
             ReplicaError::Stale(msg)
         })?;
         self.set_status(ReplicaStatus::Live);
@@ -455,9 +422,7 @@ impl Replica {
                         // resume token's cluster time is reflected in Parquet.
                         let pending = me.inner.state.lock().pending_events > 0;
                         if pending && me.flush().is_err() {
-                            me.set_status(ReplicaStatus::Stale {
-                                reason: "flush failed".into(),
-                            });
+                            me.set_status(ReplicaStatus::Stale { reason: "flush failed".into() });
                             break;
                         }
                         last_flush = Instant::now();
@@ -474,9 +439,7 @@ impl Replica {
                     }
                     Err(e) => {
                         let _ = me.flush();
-                        me.set_status(ReplicaStatus::Stale {
-                            reason: format!("change stream: {e}"),
-                        });
+                        me.set_status(ReplicaStatus::Stale { reason: format!("change stream: {e}") });
                         break;
                     }
                 }
@@ -485,9 +448,7 @@ impl Replica {
                     || (pending > 0 && last_flush.elapsed() >= me.inner.cfg.flush_interval)
                 {
                     if me.flush().is_err() {
-                        me.set_status(ReplicaStatus::Stale {
-                            reason: "flush failed".into(),
-                        });
+                        me.set_status(ReplicaStatus::Stale { reason: "flush failed".into() });
                         break;
                     }
                     last_flush = Instant::now();
@@ -498,16 +459,8 @@ impl Replica {
     }
 
     /// Applies one change event. `Err(reason)` means the replica must be re-snapshotted.
-    fn apply(
-        &self,
-        ev: ChangeStreamEvent<Document>,
-        token: Option<ResumeToken>,
-    ) -> Result<(), String> {
-        let coll = ev
-            .ns
-            .as_ref()
-            .and_then(|n| n.coll.clone())
-            .unwrap_or_default();
+    fn apply(&self, ev: ChangeStreamEvent<Document>, token: Option<ResumeToken>) -> Result<(), String> {
+        let coll = ev.ns.as_ref().and_then(|n| n.coll.clone()).unwrap_or_default();
         let mut st = self.inner.state.lock();
         match ev.operation_type {
             OperationType::Insert | OperationType::Replace | OperationType::Update => {
@@ -526,14 +479,8 @@ impl Replica {
                     st.delete(&self.inner.projection, &coll, id);
                 }
             }
-            OperationType::Drop
-            | OperationType::Rename
-            | OperationType::DropDatabase
-            | OperationType::Invalidate => {
-                return Err(format!(
-                    "{:?} on '{coll}': re-snapshot required",
-                    ev.operation_type
-                ));
+            OperationType::Drop | OperationType::Rename | OperationType::DropDatabase | OperationType::Invalidate => {
+                return Err(format!("{:?} on '{coll}': re-snapshot required", ev.operation_type));
             }
             _ => {}
         }
@@ -554,17 +501,9 @@ impl Replica {
             return Err(ReplicaError::Stale(reason));
         }
         let (ctx, _guard) = self.session().await?;
-        let opts = SQLOptions::new()
-            .with_allow_ddl(false)
-            .with_allow_dml(false)
-            .with_allow_statements(false);
-        let df = ctx
-            .sql_with_options(sql, opts)
-            .await
-            .map_err(|e| ReplicaError::Query(e.to_string()))?;
-        df.collect()
-            .await
-            .map_err(|e| ReplicaError::Query(e.to_string()))
+        let opts = SQLOptions::new().with_allow_ddl(false).with_allow_dml(false).with_allow_statements(false);
+        let df = ctx.sql_with_options(sql, opts).await.map_err(|e| ReplicaError::Query(e.to_string()))?;
+        df.collect().await.map_err(|e| ReplicaError::Query(e.to_string()))
     }
 
     /// A fresh DataFusion session with every flushed table registered (files are replaced
@@ -572,8 +511,7 @@ impl Replica {
     /// A DataFusion session over a consistent set of file generations. Keep the guard alive for as
     /// long as the session is used.
     pub async fn session(&self) -> Result<(SessionContext, SnapshotGuard), ReplicaError> {
-        let ctx =
-            SessionContext::new_with_config(SessionConfig::new().with_information_schema(false));
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_information_schema(false));
         let files: Vec<(String, Arc<FileGen>)> =
             self.inner.files.lock().iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect();
         for (name, f) in &files {
@@ -635,9 +573,7 @@ impl State {
 fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<(), ReplicaError> {
     let tmp = path.with_extension("parquet.tmp");
     let file = std::fs::File::create(&tmp).map_err(storage)?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
+    let props = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
     let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).map_err(storage)?;
     if batch.num_rows() > 0 {
         w.write(batch).map_err(storage)?;
@@ -722,31 +658,22 @@ LIMIT 5"#;
         }
         r.flush().unwrap();
         let rows = batches_to_json(&r.query(sql).await.unwrap()).unwrap();
-        assert_eq!(
-            rows,
-            vec![json!({ "category": "toys", "gross_revenue": 2.0 })]
-        );
-        let n = batches_to_json(
-            &r.query(r#"SELECT COUNT(*) AS n FROM "orders__lines""#)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        assert_eq!(rows, vec![json!({ "category": "toys", "gross_revenue": 2.0 })]);
+        let n = batches_to_json(&r.query(r#"SELECT COUNT(*) AS n FROM "orders__lines""#).await.unwrap()).unwrap();
         assert_eq!(n, vec![json!({ "n": 4 })]);
         assert_eq!(r.watermark(), 43);
 
         // Read-only: DDL/DML are refused.
         assert!(r.query(r#"DROP TABLE "orders""#).await.is_err());
-        assert!(
-            r.query(r#"INSERT INTO "orders" ("_id") VALUES ('x')"#)
-                .await
-                .is_err()
-        );
+        assert!(r.query(r#"INSERT INTO "orders" ("_id") VALUES ('x')"#).await.is_err());
     }
 
     #[tokio::test]
     async fn retired_generation_survives_while_a_query_holds_it() {
-        let f = Arc::new(FileGen { path: std::env::temp_dir().join(format!("caliban-gen-{}.parquet", std::process::id())), retired: std::sync::atomic::AtomicBool::new(false) });
+        let f = Arc::new(FileGen {
+            path: std::env::temp_dir().join(format!("caliban-gen-{}.parquet", std::process::id())),
+            retired: std::sync::atomic::AtomicBool::new(false),
+        });
         std::fs::write(&f.path, b"x").unwrap();
         let reader = SnapshotGuard { _files: vec![Arc::clone(&f)] };
         let path = f.path.clone();
@@ -759,17 +686,9 @@ LIMIT 5"#;
 
     #[test]
     fn resume_token_cluster_time() {
-        let token: ResumeToken = bson::from_bson(Bson::Document(
-            doc! { "_data": "8266F1A2B3000000022B042C0100296E5A1004" },
-        ))
-        .unwrap();
-        assert_eq!(
-            resume_token_time(&token),
-            Some(Timestamp {
-                time: 0x66F1A2B3,
-                increment: 2
-            })
-        );
+        let token: ResumeToken =
+            bson::from_bson(Bson::Document(doc! { "_data": "8266F1A2B3000000022B042C0100296E5A1004" })).unwrap();
+        assert_eq!(resume_token_time(&token), Some(Timestamp { time: 0x66F1A2B3, increment: 2 }));
         let bad: ResumeToken = bson::from_bson(Bson::Document(doc! { "_data": "zz" })).unwrap();
         assert_eq!(resume_token_time(&bad), None);
     }

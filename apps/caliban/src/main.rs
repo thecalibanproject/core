@@ -116,7 +116,8 @@ async fn main() -> Result<()> {
 
     // The usage WAL: written by a background task, flushed on graceful shutdown.
     let wal: Option<Arc<JsonlSink>> = cli.usage_wal.as_ref().map(|path| {
-        let opts = WalOptions { queue: cli.usage_wal_queue.max(1), fsync: cli.usage_wal_fsync, ..WalOptions::default() };
+        let opts =
+            WalOptions { queue: cli.usage_wal_queue.max(1), fsync: cli.usage_wal_fsync, ..WalOptions::default() };
         tracing::info!(path = %path, fsync = opts.fsync.as_str(), queue = opts.queue, "usage WAL enabled");
         Arc::new(JsonlSink::with_options(path, opts))
     });
@@ -129,9 +130,13 @@ async fn main() -> Result<()> {
     };
 
     // Split mode: the router's config comes only from signed control-plane snapshots.
-    if let Cmd::Router(RouterArgs { control_plane_url: Some(url), poll_interval_secs, listen, snapshot_cache }) = &cli.cmd {
-        let token = std::env::var("CALIBAN_ROUTER_TOKEN").context("CALIBAN_ROUTER_TOKEN is required with --control-plane-url")?;
-        let keys = std::env::var("CALIBAN_SNAPSHOT_PUBLIC_KEY").context("CALIBAN_SNAPSHOT_PUBLIC_KEY is required with --control-plane-url")?;
+    if let Cmd::Router(RouterArgs { control_plane_url: Some(url), poll_interval_secs, listen, snapshot_cache }) =
+        &cli.cmd
+    {
+        let token = std::env::var("CALIBAN_ROUTER_TOKEN")
+            .context("CALIBAN_ROUTER_TOKEN is required with --control-plane-url")?;
+        let keys = std::env::var("CALIBAN_SNAPSHOT_PUBLIC_KEY")
+            .context("CALIBAN_SNAPSHOT_PUBLIC_KEY is required with --control-plane-url")?;
         let verifier = SnapshotVerifier::from_b64_list(&keys).context("CALIBAN_SNAPSHOT_PUBLIC_KEY")?;
         let every = Duration::from_secs((*poll_interval_secs).max(1));
         let mut source = split::SnapshotSource::new(url, token, verifier, snapshot_cache.clone())?;
@@ -202,7 +207,9 @@ async fn control_plane(
 ) -> Result<impl std::future::Future<Output = Result<()>>> {
     let admin_token = match &cfg.security.admin_token {
         Some(r) => r.resolve().context("resolving admin token")?.expose().to_owned(),
-        None => std::env::var("CALIBAN_ADMIN_TOKEN").context("CALIBAN_ADMIN_TOKEN is required for the control plane")?,
+        None => {
+            std::env::var("CALIBAN_ADMIN_TOKEN").context("CALIBAN_ADMIN_TOKEN is required for the control plane")?
+        }
     };
     let store = match std::env::var("CALIBAN_DATABASE_URL").ok().filter(|u| !u.trim().is_empty()) {
         Some(url) => {
@@ -213,7 +220,9 @@ async fn control_plane(
             s
         }
         None => {
-            tracing::warn!("control-plane store: in-memory (seeded from the config file; changes are lost on restart; set CALIBAN_DATABASE_URL to persist)");
+            tracing::warn!(
+                "control-plane store: in-memory (seeded from the config file; changes are lost on restart; set CALIBAN_DATABASE_URL to persist)"
+            );
             caliban_cp::store::Store::new(cfg.clone(), handle.clone(), recent.clone())
         }
     };
@@ -221,9 +230,13 @@ async fn control_plane(
     let signer = SnapshotSigner::from_env().context("CALIBAN_SNAPSHOT_SIGNING_KEY")?;
     let router_token = std::env::var("CALIBAN_ROUTER_TOKEN").ok().filter(|t| !t.is_empty());
     match (&signer, &router_token) {
-        (Some(s), Some(_)) => tracing::info!(key_id = s.key_id(), "split mode: serving signed snapshots at /api/v1/snapshot"),
+        (Some(s), Some(_)) => {
+            tracing::info!(key_id = s.key_id(), "split mode: serving signed snapshots at /api/v1/snapshot")
+        }
         (None, None) => {}
-        _ => tracing::warn!("split mode needs both CALIBAN_SNAPSHOT_SIGNING_KEY and CALIBAN_ROUTER_TOKEN; /api/v1/snapshot is disabled"),
+        _ => tracing::warn!(
+            "split mode needs both CALIBAN_SNAPSHOT_SIGNING_KEY and CALIBAN_ROUTER_TOKEN; /api/v1/snapshot is disabled"
+        ),
     }
     let cp = Arc::new(caliban_cp::ControlPlane::new(store, admin_token, mode).with_snapshots(signer, router_token));
     if postgres {
@@ -327,7 +340,9 @@ fn load_ner(dir: &str) -> Result<(caliban_pii::PiiEngine, caliban_gateway::pii_p
 
 #[cfg(not(feature = "ner"))]
 fn load_ner(_dir: &str) -> Result<(caliban_pii::PiiEngine, caliban_gateway::pii_pool::PiiPoolOptions)> {
-    anyhow::bail!("CALIBAN_PII_NER_DIR is set but this binary was built without the `ner` feature (cargo build -p caliban --features ner)")
+    anyhow::bail!(
+        "CALIBAN_PII_NER_DIR is set but this binary was built without the `ner` feature (cargo build -p caliban --features ner)"
+    )
 }
 
 /// `CALIBAN_TCP_NODELAY=1` sets `TCP_NODELAY` on accepted connections (default off). On

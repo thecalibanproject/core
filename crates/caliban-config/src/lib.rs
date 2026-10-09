@@ -12,7 +12,9 @@ pub mod signing;
 pub use secret::{Secret, SecretRef, open, process_kek, seal};
 
 use arc_swap::ArcSwap;
-use caliban_types::{ModelId, PiiMode, PiiSurrogateScope, ProviderId, ProviderKind, SemanticCacheMode, TenantId, TrustTier};
+use caliban_types::{
+    ModelId, PiiMode, PiiSurrogateScope, ProviderId, ProviderKind, SemanticCacheMode, TenantId, TrustTier,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -183,7 +185,9 @@ impl RoutingConfig {
             }
         };
         let price = |what: &str, v: Option<f64>| match v {
-            Some(p) if !p.is_finite() || p < 0.0 => Err(ConfigError::Invalid(format!("routing: {what} must be a non-negative number"))),
+            Some(p) if !p.is_finite() || p < 0.0 => {
+                Err(ConfigError::Invalid(format!("routing: {what} must be a non-negative number")))
+            }
             _ => Ok(()),
         };
         if self.budget_ms.is_some_and(|b| b == 0 || b > 10_000) {
@@ -227,7 +231,9 @@ impl RoutingConfig {
         }
         for (intent, us) in self.exemplars.iter().chain(self.tenants.values().flat_map(|t| t.exemplars.iter())) {
             if !valid_intent_id(intent) {
-                return Err(ConfigError::Invalid(format!("routing: invalid intent id {intent:?} (lower snake case, dotted for domain.action)")));
+                return Err(ConfigError::Invalid(format!(
+                    "routing: invalid intent id {intent:?} (lower snake case, dotted for domain.action)"
+                )));
             }
             if us.iter().any(|u| u.trim().is_empty()) {
                 return Err(ConfigError::Invalid(format!("routing: empty exemplar under intent {intent}")));
@@ -242,7 +248,8 @@ pub fn valid_intent_id(s: &str) -> bool {
     !s.is_empty()
         && s.split('.').all(|seg| {
             let mut c = seg.chars();
-            c.next().is_some_and(|f| f.is_ascii_lowercase()) && c.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+            c.next().is_some_and(|f| f.is_ascii_lowercase())
+                && c.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
         })
 }
 
@@ -337,19 +344,29 @@ impl LimitsConfig {
 
     fn validate(&self) -> Result<(), ConfigError> {
         if let Some(p) = &self.valkey_key_prefix
-            && (p.is_empty() || p.len() > 64 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':')))
+            && (p.is_empty()
+                || p.len() > 64
+                || !p.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':')))
         {
-            return Err(ConfigError::Invalid("limits: valkey_key_prefix must be 1-64 characters of [A-Za-z0-9_.:-]".into()));
+            return Err(ConfigError::Invalid(
+                "limits: valkey_key_prefix must be 1-64 characters of [A-Za-z0-9_.:-]".into(),
+            ));
         }
         if self.valkey_timeout_ms.is_some_and(|t| t == 0 || t > 1000) {
             return Err(ConfigError::Invalid("limits: valkey_timeout_ms must be between 1 and 1000".into()));
         }
-        for (who, l) in std::iter::once(("defaults".to_owned(), self.defaults())).chain(self.tenants.iter().map(|(t, l)| (t.to_string(), l.clone()))) {
+        for (who, l) in std::iter::once(("defaults".to_owned(), self.defaults()))
+            .chain(self.tenants.iter().map(|(t, l)| (t.to_string(), l.clone())))
+        {
             if l.requests_per_minute == Some(0) || l.key_requests_per_minute == Some(0) {
-                return Err(ConfigError::Invalid(format!("limits ({who}): requests_per_minute must be > 0 (omit it for unlimited)")));
+                return Err(ConfigError::Invalid(format!(
+                    "limits ({who}): requests_per_minute must be > 0 (omit it for unlimited)"
+                )));
             }
             if l.tokens_per_minute == Some(0) {
-                return Err(ConfigError::Invalid(format!("limits ({who}): tokens_per_minute must be > 0 (omit it for unlimited)")));
+                return Err(ConfigError::Invalid(format!(
+                    "limits ({who}): tokens_per_minute must be > 0 (omit it for unlimited)"
+                )));
             }
             if l.usd_per_day.is_some_and(|u| !u.is_finite() || u < 0.0) {
                 return Err(ConfigError::Invalid(format!("limits ({who}): usd_per_day must be a non-negative number")));
@@ -531,14 +548,21 @@ impl SemanticCacheConfig {
     /// `qdrant_api_key`, then `CALIBAN_QDRANT_API_KEY`.
     pub fn resolved_qdrant_api_key(&self) -> Result<Option<String>, ConfigError> {
         match &self.qdrant_api_key {
-            Some(r) => r.resolve().map(|s| Some(s.expose().to_owned())).map_err(|e| ConfigError::Secret("cache.semantic.qdrant_api_key".into(), e.to_string())),
+            Some(r) => r
+                .resolve()
+                .map(|s| Some(s.expose().to_owned()))
+                .map_err(|e| ConfigError::Secret("cache.semantic.qdrant_api_key".into(), e.to_string())),
             None => Ok(std::env::var("CALIBAN_QDRANT_API_KEY").ok().filter(|k| !k.is_empty())),
         }
     }
 
     fn validate(&self, models: &HashMap<&ModelId, &ModelEntry>) -> Result<(), ConfigError> {
         let unit = |name: &str, v: f32| {
-            if v.is_finite() && (0.0..=1.0).contains(&v) { Ok(()) } else { Err(ConfigError::Invalid(format!("cache.semantic.{name} must be in [0, 1]"))) }
+            if v.is_finite() && (0.0..=1.0).contains(&v) {
+                Ok(())
+            } else {
+                Err(ConfigError::Invalid(format!("cache.semantic.{name} must be in [0, 1]")))
+            }
         };
         unit("threshold", self.threshold)?;
         unit("min_threshold", self.min_threshold)?;
@@ -552,14 +576,24 @@ impl SemanticCacheConfig {
         if !self.max_temperature.is_finite() || self.max_temperature < 0.0 {
             return Err(ConfigError::Invalid("cache.semantic.max_temperature must be a non-negative number".into()));
         }
-        if self.collection_prefix.is_empty() || !self.collection_prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-            return Err(ConfigError::Invalid("cache.semantic.collection_prefix must be non-empty [A-Za-z0-9_-]".into()));
+        if self.collection_prefix.is_empty()
+            || !self.collection_prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(ConfigError::Invalid(
+                "cache.semantic.collection_prefix must be non-empty [A-Za-z0-9_-]".into(),
+            ));
         }
         if let Some(m) = &self.embedding_model {
             match models.get(m) {
                 Some(e) if e.kind == ModelKind::Embedding => {}
-                Some(_) => return Err(ConfigError::Invalid(format!("cache.semantic.embedding_model '{m}' is not an embedding model"))),
-                None => return Err(ConfigError::Invalid(format!("cache.semantic.embedding_model: unknown model '{m}'"))),
+                Some(_) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "cache.semantic.embedding_model '{m}' is not an embedding model"
+                    )));
+                }
+                None => {
+                    return Err(ConfigError::Invalid(format!("cache.semantic.embedding_model: unknown model '{m}'")));
+                }
             }
         } else if self.enabled {
             return Err(ConfigError::Invalid("cache.semantic.enabled needs cache.semantic.embedding_model".into()));
@@ -654,7 +688,9 @@ pub struct ModelEntry {
 impl ModelEntry {
     /// True when any prompt-cache price is configured.
     pub fn has_cache_prices(&self) -> bool {
-        self.price_cache_read_per_mtok.is_some() || self.price_cache_write_per_mtok.is_some() || self.price_cache_write_1h_per_mtok.is_some()
+        self.price_cache_read_per_mtok.is_some()
+            || self.price_cache_write_per_mtok.is_some()
+            || self.price_cache_write_1h_per_mtok.is_some()
     }
 
     fn validate_prices(&self) -> Result<(), ConfigError> {
@@ -809,7 +845,15 @@ impl From<SharedProviderToml> for SharedProvider {
 impl From<SharedProvider> for SharedProviderToml {
     fn from(s: SharedProvider) -> Self {
         let p = s.provider;
-        Self { id: p.id, kind: p.kind, base_url: p.base_url, trust_tier: p.trust_tier, api_key: p.api_key, cache_salt: p.cache_salt, tenants: s.tenants }
+        Self {
+            id: p.id,
+            kind: p.kind,
+            base_url: p.base_url,
+            trust_tier: p.trust_tier,
+            api_key: p.api_key,
+            cache_salt: p.cache_salt,
+            tenants: s.tenants,
+        }
     }
 }
 
@@ -868,7 +912,10 @@ impl Config {
             for r in &t.routes {
                 for m in &r.models {
                     let Some(entry) = models.get(m) else {
-                        return Err(ConfigError::Invalid(format!("tenant {} route {}: unknown model {m}", t.id, r.intent)));
+                        return Err(ConfigError::Invalid(format!(
+                            "tenant {} route {}: unknown model {m}",
+                            t.id, r.intent
+                        )));
                     };
                     let reachable = t.providers.iter().any(|p| p.id == entry.provider)
                         || self.providers.iter().any(|p| p.provider.id == entry.provider && p.allows(&t.id));
@@ -1058,7 +1105,10 @@ mod tests {
 
     #[test]
     fn surrogate_scope_defaults_to_tenant_and_session_is_opt_in() {
-        let toml = SHARED.replace("id = \"globex\"\n        name = \"Globex\"", "id = \"globex\"\n        name = \"Globex\"\n        pii_surrogate_scope = \"session\"");
+        let toml = SHARED.replace(
+            "id = \"globex\"\n        name = \"Globex\"",
+            "id = \"globex\"\n        name = \"Globex\"\n        pii_surrogate_scope = \"session\"",
+        );
         let snap = Snapshot::new(Config::from_toml_str(&toml).unwrap(), "t");
         let acme = snap.tenant(&"acme".into()).unwrap();
         let globex = snap.tenant(&"globex".into()).unwrap();
@@ -1076,20 +1126,35 @@ mod tests {
     fn semantic_cache_defaults_validation_and_tenant_switch() {
         let c = SemanticCacheConfig::default();
         assert!(!c.enabled);
-        assert_eq!((c.threshold, c.min_threshold, c.lookup_budget_ms, c.store), (0.95, 0.90, 50, SemanticStoreKind::Qdrant));
+        assert_eq!(
+            (c.threshold, c.min_threshold, c.lookup_budget_ms, c.store),
+            (0.95, 0.90, 50, SemanticStoreKind::Qdrant)
+        );
         let on = |extra: &str| format!("{SHARED}\n[cache.semantic]\nenabled = true\n{extra}");
         let cfg = Config::from_toml_str(&on("embedding_model = \"local/b\"\nstore = \"memory\"")).unwrap();
         assert_eq!(cfg.cache.semantic.store, SemanticStoreKind::Memory);
-        assert!(Config::from_toml_str(&on("")).unwrap_err().to_string().contains("needs cache.semantic.embedding_model"));
-        assert!(Config::from_toml_str(&on("embedding_model = \"local/qwen\"")).unwrap_err().to_string().contains("not an embedding model"));
-        assert!(Config::from_toml_str(&on("embedding_model = \"nope\"")).unwrap_err().to_string().contains("unknown model"));
+        assert!(
+            Config::from_toml_str(&on("")).unwrap_err().to_string().contains("needs cache.semantic.embedding_model")
+        );
+        assert!(
+            Config::from_toml_str(&on("embedding_model = \"local/qwen\""))
+                .unwrap_err()
+                .to_string()
+                .contains("not an embedding model")
+        );
+        assert!(
+            Config::from_toml_str(&on("embedding_model = \"nope\"")).unwrap_err().to_string().contains("unknown model")
+        );
         let bad = on("embedding_model = \"local/b\"\nthreshold = 0.8\nmin_threshold = 0.9");
         assert!(Config::from_toml_str(&bad).unwrap_err().to_string().contains("min_threshold"));
         assert!(Config::from_toml_str(&on("embedding_model = \"local/b\"\nthreshold = 1.5")).is_err());
         assert!(Config::from_toml_str(&on("embedding_model = \"local/b\"\ntreshold = 0.9")).is_err(), "typos rejected");
 
         // Tenant switch: off by default and left out of the snapshot; on needs the deployment switch.
-        let toml = on("embedding_model = \"local/b\"").replace("id = \"globex\"\n        name = \"Globex\"", "id = \"globex\"\n        name = \"Globex\"\n        semantic_cache = \"on\"");
+        let toml = on("embedding_model = \"local/b\"").replace(
+            "id = \"globex\"\n        name = \"Globex\"",
+            "id = \"globex\"\n        name = \"Globex\"\n        semantic_cache = \"on\"",
+        );
         let snap = Snapshot::new(Config::from_toml_str(&toml).unwrap(), "t");
         assert!(!snap.semantic_cache_for(snap.tenant(&"acme".into()).unwrap()));
         assert!(snap.semantic_cache_for(snap.tenant(&"globex".into()).unwrap()));
@@ -1099,7 +1164,8 @@ mod tests {
         assert!(cache.get("semantic").is_none(), "default section left out of snapshots");
         assert_eq!(serde_json::to_value(&snap.config.cache).unwrap()["semantic"]["enabled"], true);
         assert_eq!(json[1]["semantic_cache"], "on");
-        let off = Snapshot::new(Config::from_toml_str(&toml.replace("enabled = true", "enabled = false")).unwrap(), "t");
+        let off =
+            Snapshot::new(Config::from_toml_str(&toml.replace("enabled = true", "enabled = false")).unwrap(), "t");
         assert!(!off.semantic_cache_for(off.tenant(&"globex".into()).unwrap()), "deployment switch wins");
     }
 
@@ -1126,7 +1192,14 @@ mod tests {
         let wild = Config::from_toml_str(&format!("[routing.floors]\n\"*\" = 0.6\n{SHARED}")).unwrap();
         assert_eq!(wild.routing.floor_for(&acme, "anything"), Some(0.6));
         // Out-of-range values and bad intent ids are rejected.
-        for bad in ["[routing.floors]\ncode = 1.5", "[routing]\nbudget_ms = 0", "[routing]\nk = 0", "[routing.tenants.acme.exemplars]\n\"Bad Id\" = [\"x\"]", "[routing]\nembedder_artifact = \"nover\"", "[routing]\nauto_price_in_per_mtok = -1.0"] {
+        for bad in [
+            "[routing.floors]\ncode = 1.5",
+            "[routing]\nbudget_ms = 0",
+            "[routing]\nk = 0",
+            "[routing.tenants.acme.exemplars]\n\"Bad Id\" = [\"x\"]",
+            "[routing]\nembedder_artifact = \"nover\"",
+            "[routing]\nauto_price_in_per_mtok = -1.0",
+        ] {
             assert!(Config::from_toml_str(&format!("{bad}\n{SHARED}")).is_err(), "{bad}");
         }
         // Empty routing is left out of rendered snapshots, so older routers keep parsing them.
@@ -1175,8 +1248,14 @@ mod tests {
         let snap = Snapshot::new(Config::from_toml_str(&cfg).unwrap(), "t");
         let acme = snap.limits_for(snap.tenant(&"acme".into()).unwrap());
         let globex = snap.limits_for(snap.tenant(&"globex".into()).unwrap());
-        assert_eq!((acme.requests_per_minute, acme.tokens_per_day, acme.usd_per_day), (Some(600), Some(1_000_000), None));
-        assert_eq!((globex.requests_per_minute, globex.tokens_per_day, globex.usd_per_day), (Some(5), Some(1_000_000), Some(2.5)));
+        assert_eq!(
+            (acme.requests_per_minute, acme.tokens_per_day, acme.usd_per_day),
+            (Some(600), Some(1_000_000), None)
+        );
+        assert_eq!(
+            (globex.requests_per_minute, globex.tokens_per_day, globex.usd_per_day),
+            (Some(5), Some(1_000_000), Some(2.5))
+        );
         // Configs without [limits] still parse (unlimited).
         assert_eq!(Config::from_toml_str(SHARED).unwrap().limits, LimitsConfig::default());
         let zero = format!("{SHARED}\n[limits]\nrequests_per_minute = 0\n");
@@ -1192,12 +1271,23 @@ mod tests {
         // The defaults are not serialized, so snapshots stay readable by routers that predate them.
         assert!(!serde_json::to_string(&LimitsConfig::default()).unwrap().contains("store"));
 
-        let cfg = format!("{SHARED}\n[limits]\nstore = \"valkey\"\nvalkey_key_prefix = \"prod-eu:caliban\"\nvalkey_timeout_ms = 40\n");
+        let cfg = format!(
+            "{SHARED}\n[limits]\nstore = \"valkey\"\nvalkey_key_prefix = \"prod-eu:caliban\"\nvalkey_timeout_ms = 40\n"
+        );
         let l = Config::from_toml_str(&cfg).unwrap().limits;
-        assert_eq!((l.store, l.valkey_key_prefix.as_deref(), l.valkey_timeout_ms), (QuotaStoreKind::Valkey, Some("prod-eu:caliban"), Some(40)));
+        assert_eq!(
+            (l.store, l.valkey_key_prefix.as_deref(), l.valkey_timeout_ms),
+            (QuotaStoreKind::Valkey, Some("prod-eu:caliban"), Some(40))
+        );
         assert!(serde_json::to_string(&l).unwrap().contains(r#""store":"valkey""#));
 
-        for bad in ["store = \"redis\"", "valkey_key_prefix = \"a{b}\"", "valkey_key_prefix = \"\"", "valkey_timeout_ms = 0", "valkey_timeout_ms = 5000"] {
+        for bad in [
+            "store = \"redis\"",
+            "valkey_key_prefix = \"a{b}\"",
+            "valkey_key_prefix = \"\"",
+            "valkey_timeout_ms = 0",
+            "valkey_timeout_ms = 5000",
+        ] {
             assert!(Config::from_toml_str(&format!("{SHARED}\n[limits]\n{bad}\n")).is_err(), "{bad}");
         }
     }
@@ -1205,7 +1295,9 @@ mod tests {
     #[test]
     fn cache_prices_parse_validate_and_are_omitted_when_unset() {
         let model = |extra: &str| {
-            format!("[[models]]\nid = \"ext/m\"\nprovider = \"vllm-qwen\"\nupstream_model = \"m\"\ntrust_tier = \"t2_contracted\"\nprice_in_per_mtok = 3.0\nprice_out_per_mtok = 15.0\n{extra}\n")
+            format!(
+                "[[models]]\nid = \"ext/m\"\nprovider = \"vllm-qwen\"\nupstream_model = \"m\"\ntrust_tier = \"t2_contracted\"\nprice_in_per_mtok = 3.0\nprice_out_per_mtok = 15.0\n{extra}\n"
+            )
         };
         let cfg = Config::from_toml_str(&format!(
             "{SHARED}\n{}",
@@ -1213,16 +1305,26 @@ mod tests {
         ))
         .unwrap();
         let m = cfg.models.iter().find(|m| m.id.as_str() == "ext/m").unwrap();
-        assert_eq!((m.price_cache_read_per_mtok, m.price_cache_write_per_mtok, m.price_cache_write_1h_per_mtok), (Some(0.3), Some(3.75), Some(6.0)));
+        assert_eq!(
+            (m.price_cache_read_per_mtok, m.price_cache_write_per_mtok, m.price_cache_write_1h_per_mtok),
+            (Some(0.3), Some(3.75), Some(6.0))
+        );
         assert!(m.has_cache_prices() && m.capabilities.rejects_stream_options);
-        for bad in ["price_cache_read_per_mtok = -0.1", "price_cache_write_per_mtok = nan", "price_cache_write_1h_per_mtok = -1.0"] {
+        for bad in [
+            "price_cache_read_per_mtok = -0.1",
+            "price_cache_write_per_mtok = nan",
+            "price_cache_write_1h_per_mtok = -1.0",
+        ] {
             assert!(Config::from_toml_str(&format!("{SHARED}\n{}", model(bad))).is_err(), "{bad}");
         }
         // Unset fields stay out of the rendered snapshot, so routers that predate them still parse it.
         let cfg = Config::from_toml_str(&format!("{SHARED}\n{}", model(""))).unwrap();
         let m = cfg.models.iter().find(|m| m.id.as_str() == "ext/m").unwrap();
         let v = serde_json::to_value(m).unwrap();
-        assert!(v.get("price_cache_read_per_mtok").is_none() && v["capabilities"].get("rejects_stream_options").is_none(), "{v}");
+        assert!(
+            v.get("price_cache_read_per_mtok").is_none() && v["capabilities"].get("rejects_stream_options").is_none(),
+            "{v}"
+        );
         assert!(!m.has_cache_prices());
     }
 }

@@ -158,7 +158,13 @@ async fn setup_with(usage_wal: bool, kek: Option<String>) -> Env {
     let mock = Mock::start("127.0.0.1:0", MockConfig::default()).await.unwrap();
     let (a, a_hash) = new_key("alpha");
     let (b, b_hash) = new_key("beta");
-    let launch = Launch { config: config(&mock.base_url(), &a_hash, &b_hash), env: env_vars(), usage_wal, kek, ..Default::default() };
+    let launch = Launch {
+        config: config(&mock.base_url(), &a_hash, &b_hash),
+        env: env_vars(),
+        usage_wal,
+        kek,
+        ..Default::default()
+    };
     let gw = Caliban::start(bin(), &launch).await.unwrap();
     Env { mock, gw, a, b }
 }
@@ -190,22 +196,35 @@ async fn routes_and_models_are_tenant_scoped() {
     assert!(a_models.contains(&"alpha/private".into()) && a_models.contains(&"local/gpu-alpha".into()), "{a_models:?}");
     assert!(!a_models.contains(&"beta/private".into()), "alpha lists beta's model: {a_models:?}");
     assert!(b_models.contains(&"beta/private".into()), "{b_models:?}");
-    assert!(!b_models.contains(&"alpha/private".into()) && !b_models.contains(&"local/gpu-alpha".into()), "beta lists alpha's models: {b_models:?}");
+    assert!(
+        !b_models.contains(&"alpha/private".into()) && !b_models.contains(&"local/gpu-alpha".into()),
+        "beta lists alpha's models: {b_models:?}"
+    );
 
     // Pinning the other tenant's models (BYOK-only and restricted shared pool): 400, no upstream call.
     let before = e.mock.len();
     for (key, model) in [(&e.a, "beta/private"), (&e.b, "alpha/private"), (&e.b, "local/gpu-alpha")] {
         let r = e.gw.chat(key, &chat(model, "hello")).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{model}: {}", r.text);
-        let r = e.gw.messages(key, &json!({"model": model, "max_tokens": 16, "messages": [{"role": "user", "content": "hello"}]})).await;
+        let r =
+            e.gw.messages(
+                key,
+                &json!({"model": model, "max_tokens": 16, "messages": [{"role": "user", "content": "hello"}]}),
+            )
+            .await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{model} (messages): {}", r.text);
         assert_eq!(r.json()["type"], "error");
     }
     assert_eq!(e.mock.len(), before, "a rejected cross-tenant request reached the upstream");
 
     // caliban/auto: each tenant's own route, with its own credential, for every intent.
-    for text in ["hello there", "please write a long and detailed explanation of how our quarterly planning process works for the team"] {
-        for (key, upstream, cred) in [(&e.a, "alpha-private-model", ALPHA_PRIVATE), (&e.b, "beta-private-model", BETA_PRIVATE)] {
+    for text in [
+        "hello there",
+        "please write a long and detailed explanation of how our quarterly planning process works for the team",
+    ] {
+        for (key, upstream, cred) in
+            [(&e.a, "alpha-private-model", ALPHA_PRIVATE), (&e.b, "beta-private-model", BETA_PRIVATE)]
+        {
             ok(&e.gw.chat(key, &chat("caliban/auto", text)).await);
             let last = e.mock.last().unwrap();
             assert_eq!(last.body["model"], upstream);
@@ -231,7 +250,10 @@ async fn byok_credentials_never_cross_tenants() {
         assert_eq!(e.mock.last().unwrap().credential(), Some(openai));
         ok(&e.gw.chat(key, &chat("byok/claude", "hi")).await);
         let last = e.mock.last().unwrap();
-        assert_eq!((last.path.as_str(), last.x_api_key.as_deref(), last.auth.as_deref()), ("/v1/messages", Some(anth), None));
+        assert_eq!(
+            (last.path.as_str(), last.x_api_key.as_deref(), last.auth.as_deref()),
+            ("/v1/messages", Some(anth), None)
+        );
         let r = e.gw.messages(key, &json!({"model": "byok/claude", "max_tokens": 16, "stream": true, "messages": [{"role": "user", "content": "hi"}]})).await;
         ok(&r);
         assert_eq!(e.mock.last().unwrap().x_api_key.as_deref(), Some(anth));
@@ -259,11 +281,8 @@ async fn byok_credentials_never_cross_tenants() {
     assert_eq!(log.len(), 60);
     for entry in log {
         let text = entry.last_user_text();
-        let expected = if text.contains("alpha") {
-            [ALPHA_OPENAI, ALPHA_ANTHROPIC]
-        } else {
-            [BETA_OPENAI, BETA_ANTHROPIC]
-        };
+        let expected =
+            if text.contains("alpha") { [ALPHA_OPENAI, ALPHA_ANTHROPIC] } else { [BETA_OPENAI, BETA_ANTHROPIC] };
         assert!(expected.contains(&entry.credential().unwrap()), "{text:?} sent with {:?}", entry.credential());
     }
 }
@@ -278,17 +297,29 @@ async fn exact_cache_entries_are_tenant_scoped() {
         let n = e.mock.len();
         let r1 = e.gw.chat(&e.a, &body).await;
         let r2 = e.gw.chat(&e.a, &body).await;
-        assert_eq!((r1.header("x-caliban-cache").as_deref(), r2.header("x-caliban-cache").as_deref()), (Some("miss"), Some("hit")), "{model}");
+        assert_eq!(
+            (r1.header("x-caliban-cache").as_deref(), r2.header("x-caliban-cache").as_deref()),
+            (Some("miss"), Some("hit")),
+            "{model}"
+        );
         assert_eq!(e.mock.len(), n + 1, "{model}: alpha's repeat must be served from cache");
         let rb = e.gw.chat(&e.b, &body).await;
         assert_eq!(rb.header("x-caliban-cache").as_deref(), Some("miss"), "{model}: beta hit alpha's cache entry");
         assert_eq!(e.mock.len(), n + 2, "{model}: beta's request must go upstream");
-        assert_eq!(e.gw.chat(&e.b, &body).await.header("x-caliban-cache").as_deref(), Some("hit"), "{model}: beta's own entry");
+        assert_eq!(
+            e.gw.chat(&e.b, &body).await.header("x-caliban-cache").as_deref(),
+            Some("hit"),
+            "{model}: beta's own entry"
+        );
         // Anthropic-dialect clients share the canonical cache only within the tenant.
         let m = json!({"model": model, "max_tokens": 64, "temperature": 0, "messages": [{"role": "user", "content": "anthropic dialect probe"}]});
         assert_eq!(e.gw.messages(&e.a, &m).await.header("x-caliban-cache").as_deref(), Some("miss"));
         assert_eq!(e.gw.messages(&e.a, &m).await.header("x-caliban-cache").as_deref(), Some("hit"));
-        assert_eq!(e.gw.messages(&e.b, &m).await.header("x-caliban-cache").as_deref(), Some("miss"), "{model}: beta hit alpha's entry (messages)");
+        assert_eq!(
+            e.gw.messages(&e.b, &m).await.header("x-caliban-cache").as_deref(),
+            Some("miss"),
+            "{model}: beta hit alpha's entry (messages)"
+        );
     }
 }
 
@@ -395,7 +426,10 @@ async fn usage_is_attributed_to_the_calling_tenant() {
             *hits.entry(tenant.to_owned()).or_insert(0) += 1;
         }
     }
-    assert!(hits.get("alpha").is_some_and(|n| *n > 0) && hits.get("beta").is_some_and(|n| *n > 0), "cache hits: {hits:?}");
+    assert!(
+        hits.get("alpha").is_some_and(|n| *n > 0) && hits.get("beta").is_some_and(|n| *n > 0),
+        "cache hits: {hits:?}"
+    );
 
     for tenant in ["alpha", "beta"] {
         let (s, u) = e.gw.admin("GET", &format!("/usage?tenant_id={tenant}&limit=1000"), None).await;
@@ -408,7 +442,9 @@ async fn usage_is_attributed_to_the_calling_tenant() {
 }
 
 fn find_email(text: &str) -> Option<String> {
-    text.split(|c: char| c.is_whitespace() || c == '"' || c == ',').find(|w| w.contains('@')).map(|w| w.trim_end_matches('.').to_owned())
+    text.split(|c: char| c.is_whitespace() || c == '"' || c == ',')
+        .find(|w| w.contains('@'))
+        .map(|w| w.trim_end_matches('.').to_owned())
 }
 
 /// PII: the same value gets different surrogates for different tenants; a surrogate issued for
@@ -475,7 +511,10 @@ async fn pii_surrogates_never_cross_tenants() {
     }
     for entry in e.mock.log() {
         let t = entry.last_user_text();
-        assert!(!all_emails.iter().any(|m| t.contains(m.as_str())) && !t.contains("4111 1111 1111 1111"), "upstream saw an original: {t}");
+        assert!(
+            !all_emails.iter().any(|m| t.contains(m.as_str())) && !t.contains("4111 1111 1111 1111"),
+            "upstream saw an original: {t}"
+        );
     }
 }
 
@@ -502,21 +541,59 @@ async fn revoked_and_deleted_tenant_keys_get_401() {
             let mut codes = Vec::new();
             let chat = json!({"model": "caliban/auto", "messages": [{"role": "user", "content": "hello there"}]});
             let msg = json!({"model": "caliban/auto", "max_tokens": 16, "messages": [{"role": "user", "content": "hello there"}]});
-            codes.push(http.post(format!("{dp}/v1/chat/completions")).bearer_auth(&key).json(&chat).send().await.unwrap().status());
-            codes.push(http.post(format!("{dp}/v1/messages")).header("x-api-key", &key).json(&msg).send().await.unwrap().status());
-            codes.push(http.post(format!("{dp}/v1/messages/count_tokens")).header("x-api-key", &key).json(&msg).send().await.unwrap().status());
+            codes.push(
+                http.post(format!("{dp}/v1/chat/completions"))
+                    .bearer_auth(&key)
+                    .json(&chat)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+            );
+            codes.push(
+                http.post(format!("{dp}/v1/messages"))
+                    .header("x-api-key", &key)
+                    .json(&msg)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+            );
+            codes.push(
+                http.post(format!("{dp}/v1/messages/count_tokens"))
+                    .header("x-api-key", &key)
+                    .json(&msg)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+            );
             codes.push(http.get(format!("{dp}/v1/models")).bearer_auth(&key).send().await.unwrap().status());
-            codes.push(http.post(format!("{dp}/v1/embeddings")).bearer_auth(&key).json(&json!({"model": "local/embed", "input": "x"})).send().await.unwrap().status());
+            codes.push(
+                http.post(format!("{dp}/v1/embeddings"))
+                    .bearer_auth(&key)
+                    .json(&json!({"model": "local/embed", "input": "x"}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+            );
             codes
         }
     };
     let before = probes(&e.gw, keys[0].0.clone()).await;
     assert!(before.iter().all(|c| c.is_success()), "gamma's key works before revocation: {before:?}");
 
-    assert_eq!(e.gw.admin("DELETE", &format!("/tenants/gamma/api-keys/{}", keys[0].1), None).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        e.gw.admin("DELETE", &format!("/tenants/gamma/api-keys/{}", keys[0].1), None).await.0,
+        StatusCode::NO_CONTENT
+    );
     let revoked = probes(&e.gw, keys[0].0.clone()).await;
     assert!(revoked.iter().all(|c| *c == StatusCode::UNAUTHORIZED), "revoked key: {revoked:?}");
-    assert!(probes(&e.gw, keys[1].0.clone()).await.iter().all(|c| c.is_success()), "the tenant's other key still works");
+    assert!(
+        probes(&e.gw, keys[1].0.clone()).await.iter().all(|c| c.is_success()),
+        "the tenant's other key still works"
+    );
 
     assert_eq!(e.gw.admin("DELETE", "/tenants/gamma", None).await.0, StatusCode::NO_CONTENT);
     let deleted = probes(&e.gw, keys[1].0.clone()).await;
@@ -542,7 +619,13 @@ async fn admin_endpoints_reject_tenant_keys() {
         ("GET", "/tenants/beta/api-keys".into(), None),
         ("POST", "/tenants/beta/api-keys".into(), Some(json!({"name": "x"}))),
         ("GET", "/tenants/beta/provider-keys".into(), None),
-        ("POST", "/tenants/alpha/provider-keys".into(), Some(json!({"kind": "openai_compatible", "label": "x", "base_url": "http://x", "trust_tier": "t2_contracted"}))),
+        (
+            "POST",
+            "/tenants/alpha/provider-keys".into(),
+            Some(
+                json!({"kind": "openai_compatible", "label": "x", "base_url": "http://x", "trust_tier": "t2_contracted"}),
+            ),
+        ),
         ("GET", "/tenants/beta/routes".into(), None),
         ("PUT", "/tenants/alpha/routes".into(), Some(json!({"routes": []}))),
         ("GET", "/models".into(), None),
@@ -562,13 +645,19 @@ async fn admin_endpoints_reject_tenant_keys() {
         for key in [&e.a, &e.b] {
             let (s, _) = e.gw.cp_call(method, path, Some(key), body.clone()).await;
             assert_eq!(s, StatusCode::UNAUTHORIZED, "{method} {path} with a tenant bearer key");
-            let mut req = http.request(method.parse().unwrap(), format!("{}/api/v1{path}", e.gw.cp)).header("x-api-key", key.as_str());
+            let mut req = http
+                .request(method.parse().unwrap(), format!("{}/api/v1{path}", e.gw.cp))
+                .header("x-api-key", key.as_str());
             if let Some(b) = body {
                 req = req.json(b);
             }
             assert_eq!(req.send().await.unwrap().status(), StatusCode::UNAUTHORIZED, "{method} {path} with x-api-key");
         }
-        assert_eq!(e.gw.cp_call(method, path, None, body.clone()).await.0, StatusCode::UNAUTHORIZED, "{method} {path} without auth");
+        assert_eq!(
+            e.gw.cp_call(method, path, None, body.clone()).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} without auth"
+        );
     }
     // The datasource survived every attempt.
     let (_, list) = e.gw.admin("GET", "/datasources?tenant_id=beta", None).await;
@@ -592,7 +681,13 @@ async fn admin_endpoints_reject_tenant_keys() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn datasource_ids_from_another_tenant_are_inert_today() {
     let e = setup().await;
-    let (_, ds) = e.gw.admin("POST", "/datasources", Some(json!({"tenant_id": "beta", "kind": "postgres", "name": "erp", "connection": {}}))).await;
+    let (_, ds) =
+        e.gw.admin(
+            "POST",
+            "/datasources",
+            Some(json!({"tenant_id": "beta", "kind": "postgres", "name": "erp", "connection": {}})),
+        )
+        .await;
     let ds_id = ds["id"].as_str().unwrap();
     let mut body = chat("byok/gpt", "summarise the erp data");
     body["caliban"] = json!({"datasources": [ds_id]});
@@ -600,5 +695,8 @@ async fn datasource_ids_from_another_tenant_are_inert_today() {
     ok(&r);
     let up = e.mock.last().unwrap();
     assert_eq!(up.credential(), Some(ALPHA_OPENAI));
-    assert!(up.body.get("caliban").is_none() && !up.body.to_string().contains(ds_id), "datasource reference forwarded upstream");
+    assert!(
+        up.body.get("caliban").is_none() && !up.body.to_string().contains(ds_id),
+        "datasource reference forwarded upstream"
+    );
 }

@@ -105,7 +105,15 @@ struct Eligible {
 }
 
 /// Steps 1 and 2: the tenant's candidates for a route, filtered to those it can actually use.
-fn eligible(snap: &Snapshot, tenant: &TenantConfig, req: &ChatRequest, constraints: Constraints, health: &dyn ModelHealth, ids: &[ModelId], trace: &mut Vec<CandidateTrace>) -> Vec<Eligible> {
+fn eligible(
+    snap: &Snapshot,
+    tenant: &TenantConfig,
+    req: &ChatRequest,
+    constraints: Constraints,
+    health: &dyn ModelHealth,
+    ids: &[ModelId],
+    trace: &mut Vec<CandidateTrace>,
+) -> Vec<Eligible> {
     let mut out = Vec::new();
     let mut unhealthy = Vec::new();
     for (pos, id) in ids.iter().enumerate() {
@@ -115,7 +123,9 @@ fn eligible(snap: &Snapshot, tenant: &TenantConfig, req: &ChatRequest, constrain
             Some(m) => match snap.provider_for(tenant, &m.provider) {
                 None => Some("unreachable"),
                 Some(p) if !has_credentials(p) => Some("no_credentials"),
-                Some(p) if m.trust_tier > constraints.max_tier || p.trust_tier > constraints.max_tier => Some("trust_tier"),
+                Some(p) if m.trust_tier > constraints.max_tier || p.trust_tier > constraints.max_tier => {
+                    Some("trust_tier")
+                }
                 Some(_) if !health.is_healthy(id) => {
                     unhealthy.push(Eligible { id: id.clone(), pos });
                     Some("unhealthy")
@@ -160,7 +170,12 @@ fn route_models(snap: &Snapshot, tenant: &TenantConfig, intent: &str) -> Option<
     if let Some(r) = tenant.routes.iter().find(|r| r.intent == DEFAULT_INTENT) {
         return Some((r.intent.clone(), r.models.clone()));
     }
-    tenant.routes.is_empty().then(|| (DEFAULT_INTENT.to_owned(), snap.models_for(tenant).filter(|m| m.kind == ModelKind::Chat).map(|m| m.id.clone()).collect()))
+    tenant.routes.is_empty().then(|| {
+        (
+            DEFAULT_INTENT.to_owned(),
+            snap.models_for(tenant).filter(|m| m.kind == ModelKind::Chat).map(|m| m.id.clone()).collect(),
+        )
+    })
 }
 
 /// Steps 1 to 4 for `intent`.
@@ -183,12 +198,21 @@ pub fn select(
             Some(r) => (r.intent.clone(), r.models.clone()),
             None => (route.clone(), ids.clone()),
         };
-        let del = if droute == route && dids == ids { eligible(snap, tenant, req, constraints, health, &dids, &mut Vec::new()) } else { eligible(snap, tenant, req, constraints, health, &dids, trace) };
+        let del = if droute == route && dids == ids {
+            eligible(snap, tenant, req, constraints, health, &dids, &mut Vec::new())
+        } else {
+            eligible(snap, tenant, req, constraints, health, &dids, trace)
+        };
         if del.is_empty() {
             return Err(PolicyError::NothingEligible);
         }
         let candidates: Vec<ModelId> = del.into_iter().map(|e| e.id).collect();
-        trace.push(CandidateTrace { model: candidates[0].clone(), quality: None, est_cost_usd: None, verdict: "default_chosen" });
+        trace.push(CandidateTrace {
+            model: candidates[0].clone(),
+            quality: None,
+            est_cost_usd: None,
+            verdict: "default_chosen",
+        });
         Ok(Selection { route: droute, candidates, policy: "default_fallback", floor, trace: std::mem::take(trace) })
     };
 
@@ -200,7 +224,12 @@ pub fn select(
         let candidates: Vec<ModelId> = el.into_iter().map(|e| e.id).collect();
         for (i, id) in candidates.iter().enumerate() {
             let verdict = if i == 0 { "chosen" } else { "fallback" };
-            trace.push(CandidateTrace { model: id.clone(), quality: quality.quality(id, intent), est_cost_usd: None, verdict });
+            trace.push(CandidateTrace {
+                model: id.clone(),
+                quality: quality.quality(id, intent),
+                est_cost_usd: None,
+                verdict,
+            });
         }
         return Ok(Selection { route, candidates, policy: "route_order", floor: None, trace });
     };
@@ -217,8 +246,12 @@ pub fn select(
         let cost = snap.model(&e.id).and_then(|m| estimate_cost(m, req));
         match q {
             Some(q) if q + EPS >= floor => ok.push(Scored { id: e.id, pos: e.pos, q, cost }),
-            Some(q) => trace.push(CandidateTrace { model: e.id, quality: Some(q), est_cost_usd: cost, verdict: "below_floor" }),
-            None => trace.push(CandidateTrace { model: e.id, quality: None, est_cost_usd: cost, verdict: "no_quality" }),
+            Some(q) => {
+                trace.push(CandidateTrace { model: e.id, quality: Some(q), est_cost_usd: cost, verdict: "below_floor" })
+            }
+            None => {
+                trace.push(CandidateTrace { model: e.id, quality: None, est_cost_usd: cost, verdict: "no_quality" })
+            }
         }
     }
     if ok.is_empty() {
@@ -231,12 +264,25 @@ pub fn select(
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
         };
-        cost.then_with(|| b.q.total_cmp(&a.q)).then_with(|| a.pos.cmp(&b.pos)).then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        cost.then_with(|| b.q.total_cmp(&a.q))
+            .then_with(|| a.pos.cmp(&b.pos))
+            .then_with(|| a.id.as_str().cmp(b.id.as_str()))
     });
     for (i, s) in ok.iter().enumerate() {
-        trace.push(CandidateTrace { model: s.id.clone(), quality: Some(s.q), est_cost_usd: s.cost, verdict: if i == 0 { "chosen" } else { "fallback" } });
+        trace.push(CandidateTrace {
+            model: s.id.clone(),
+            quality: Some(s.q),
+            est_cost_usd: s.cost,
+            verdict: if i == 0 { "chosen" } else { "fallback" },
+        });
     }
-    Ok(Selection { route, candidates: ok.into_iter().map(|s| s.id).collect(), policy: "quality_floor", floor: Some(floor), trace })
+    Ok(Selection {
+        route,
+        candidates: ok.into_iter().map(|s| s.id).collect(),
+        policy: "quality_floor",
+        floor: Some(floor),
+        trace,
+    })
 }
 
 #[cfg(test)]
@@ -348,7 +394,8 @@ mod tests {
     }
 
     fn req() -> ChatRequest {
-        ChatRequest::from_openai_json(br#"{"model":"caliban/auto","messages":[{"role":"user","content":"x"}]}"#).unwrap()
+        ChatRequest::from_openai_json(br#"{"model":"caliban/auto","messages":[{"role":"user","content":"x"}]}"#)
+            .unwrap()
     }
 
     fn pick(s: &Snapshot, tenant: &str, intent: &str, health: &dyn ModelHealth) -> Result<Selection, PolicyError> {
@@ -387,7 +434,8 @@ mod tests {
         let s = snap("[routing.tenants.acme.floors]\nanalytics = 0.5\n");
         let t = s.tenant(&"acme".into()).unwrap();
         // ext/twin is cheaper and scores higher for analytics, but the analytics route does not list it.
-        let profile = RouterProfile::from_rows("p@1", &[("ext/twin", "analytics", 0.99), ("ext/big", "analytics", 0.9)]);
+        let profile =
+            RouterProfile::from_rows("p@1", &[("ext/twin", "analytics", 0.99), ("ext/big", "analytics", 0.9)]);
         let q = QualitySource { snap: &s, profile: Some(&profile) };
         let sel = select(&s, t, &req(), Constraints::default(), "analytics", &q, &AlwaysHealthy).unwrap();
         assert_eq!((sel.policy, ids(&sel)), ("quality_floor", vec!["ext/big"]));
@@ -454,14 +502,26 @@ mod tests {
     fn trust_tier_constraint_applies_before_the_floor() {
         let s = snap("");
         let t = s.tenant(&"acme".into()).unwrap();
-        let sel = select(&s, t, &req(), Constraints { max_tier: caliban_types::TrustTier::T0Sovereign }, "code", &QualitySource { snap: &s, profile: None }, &AlwaysHealthy).unwrap();
+        let sel = select(
+            &s,
+            t,
+            &req(),
+            Constraints { max_tier: caliban_types::TrustTier::T0Sovereign },
+            "code",
+            &QualitySource { snap: &s, profile: None },
+            &AlwaysHealthy,
+        )
+        .unwrap();
         assert_eq!((sel.policy, ids(&sel)), ("default_fallback", vec!["local/small"]));
     }
 
     #[test]
     fn profile_supplies_quality_and_config_overrides_it() {
         let s = snap("");
-        let profile = RouterProfile::from_rows("p@1", &[("local/small", "summarize", 0.9), ("ext/mid", "summarize", 0.95), ("local/small", "code", 0.99)]);
+        let profile = RouterProfile::from_rows(
+            "p@1",
+            &[("local/small", "summarize", 0.9), ("ext/mid", "summarize", 0.95), ("local/small", "code", 0.99)],
+        );
         let q = QualitySource { snap: &s, profile: Some(&profile) };
         assert_eq!(q.quality(&"local/small".into(), "summarize"), Some(0.9));
         // Config wins over the profile.

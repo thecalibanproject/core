@@ -26,7 +26,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use store::audit::{now_micros, verify_chain};
-use store::{ApiKeyRecord, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, Store, StoreError, Tenant, TenantStatus, new_id, slug};
+use store::{
+    ApiKeyRecord, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, Store, StoreError, Tenant, TenantStatus,
+    new_id, slug,
+};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
@@ -204,7 +207,8 @@ async fn snapshot(State(cp): State<Cp>, headers: HeaderMap) -> Response {
     let (Some(token), Some(signer)) = (cp.router_token.as_deref(), cp.signer.as_ref()) else {
         return ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
-            "split mode is not enabled: set CALIBAN_ROUTER_TOKEN and CALIBAN_SNAPSHOT_SIGNING_KEY on the control plane".into(),
+            "split mode is not enabled: set CALIBAN_ROUTER_TOKEN and CALIBAN_SNAPSHOT_SIGNING_KEY on the control plane"
+                .into(),
         )
         .into_response();
     };
@@ -336,7 +340,11 @@ struct TenantUpdate {
 
 /// Changes a tenant's PII and cache settings (absent fields are kept). Audited; routers pick it up
 /// with the next snapshot.
-async fn update_tenant(State(cp): State<Cp>, Path(tenant_id): Path<String>, Json(body): Json<TenantUpdate>) -> ApiResult<Json<Tenant>> {
+async fn update_tenant(
+    State(cp): State<Cp>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<TenantUpdate>,
+) -> ApiResult<Json<Tenant>> {
     let m = Mutation::UpdateTenant {
         id: tenant_id.clone(),
         pii_default: body.pii_default,
@@ -373,12 +381,21 @@ async fn list_api_keys(
 ) -> ApiResult<Json<Vec<ApiKeyRecord>>> {
     ensure_tenant(&cp, &tenant_id)?;
     let st = cp.store.state();
-    Ok(Json(st.api_keys.iter().filter(|k| k.tenant_id == tenant_id && (q.include_revoked || k.is_active())).cloned().collect()))
+    Ok(Json(
+        st.api_keys
+            .iter()
+            .filter(|k| k.tenant_id == tenant_id && (q.include_revoked || k.is_active()))
+            .cloned()
+            .collect(),
+    ))
 }
 
 /// Soft revoke: the row is kept with `revoked_at`, and the key's hash leaves the data-plane
 /// snapshot (standalone: immediately; split mode: on the router's next snapshot poll).
-async fn revoke_api_key(State(cp): State<Cp>, Path((tenant_id, key_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+async fn revoke_api_key(
+    State(cp): State<Cp>,
+    Path((tenant_id, key_id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
     cp.store.apply(ADMIN_ACTOR, Mutation::RevokeApiKey { tenant_id, id: key_id, at: now_micros() }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -416,7 +433,10 @@ pub fn generate_api_key() -> String {
     format!("cal_{}", hex::encode(b))
 }
 
-async fn list_provider_keys(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiResult<Json<Vec<ProviderKeyRecord>>> {
+async fn list_provider_keys(
+    State(cp): State<Cp>,
+    Path(tenant_id): Path<String>,
+) -> ApiResult<Json<Vec<ProviderKeyRecord>>> {
     ensure_tenant(&cp, &tenant_id)?;
     Ok(Json(cp.store.state().provider_keys.iter().filter(|k| k.tenant_id == tenant_id).cloned().collect()))
 }
@@ -468,7 +488,10 @@ async fn create_provider_key(
     Ok((StatusCode::CREATED, Json(rec)))
 }
 
-async fn delete_provider_key(State(cp): State<Cp>, Path((tenant_id, key_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+async fn delete_provider_key(
+    State(cp): State<Cp>,
+    Path((tenant_id, key_id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
     // The sealed ciphertext is dropped with the row; with per-tenant DEKs (TODO) deleting the DEK
     // crypto-shreds every copy.
     cp.store
@@ -489,8 +512,13 @@ struct RoutesPut {
 }
 
 /// Replaces the tenant's routes. Rejected (422) if a route names a model the tenant cannot reach.
-async fn put_routes(State(cp): State<Cp>, Path(tenant_id): Path<String>, Json(body): Json<RoutesPut>) -> ApiResult<Json<Vec<RouteConfig>>> {
-    let st = cp.store.apply(ADMIN_ACTOR, Mutation::SetRoutes { tenant_id: tenant_id.clone(), routes: body.routes }).await?;
+async fn put_routes(
+    State(cp): State<Cp>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<RoutesPut>,
+) -> ApiResult<Json<Vec<RouteConfig>>> {
+    let st =
+        cp.store.apply(ADMIN_ACTOR, Mutation::SetRoutes { tenant_id: tenant_id.clone(), routes: body.routes }).await?;
     Ok(Json(st.routes.get(&tenant_id).cloned().unwrap_or_default()))
 }
 
@@ -503,7 +531,13 @@ struct TenantFilter {
 
 async fn list_datasources(State(cp): State<Cp>, Query(f): Query<TenantFilter>) -> Json<Vec<DatasourceRecord>> {
     let st = cp.store.state();
-    Json(st.datasources.iter().filter(|d| d.is_live() && f.tenant_id.as_ref().is_none_or(|t| &d.tenant_id == t)).cloned().collect())
+    Json(
+        st.datasources
+            .iter()
+            .filter(|d| d.is_live() && f.tenant_id.as_ref().is_none_or(|t| &d.tenant_id == t))
+            .cloned()
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -515,11 +549,23 @@ struct DatasourceCreate {
 }
 
 const DATASOURCE_KINDS: &[&str] = &[
-    "mongodb", "postgres", "mysql", "sqlserver", "snowflake", "bigquery", "clickhouse", "elasticsearch", "rest_openapi",
-    "s3_parquet", "mcp",
+    "mongodb",
+    "postgres",
+    "mysql",
+    "sqlserver",
+    "snowflake",
+    "bigquery",
+    "clickhouse",
+    "elasticsearch",
+    "rest_openapi",
+    "s3_parquet",
+    "mcp",
 ];
 
-async fn create_datasource(State(cp): State<Cp>, Json(body): Json<DatasourceCreate>) -> ApiResult<(StatusCode, Json<DatasourceRecord>)> {
+async fn create_datasource(
+    State(cp): State<Cp>,
+    Json(body): Json<DatasourceCreate>,
+) -> ApiResult<(StatusCode, Json<DatasourceRecord>)> {
     if !DATASOURCE_KINDS.contains(&body.kind.as_str()) {
         return Err(bad(format!("unsupported datasource kind '{}'", body.kind)));
     }
@@ -539,7 +585,10 @@ async fn create_datasource(State(cp): State<Cp>, Json(body): Json<DatasourceCrea
 }
 
 /// Soft delete scoped to the tenant: the row is kept for audit, its stored connection is wiped.
-async fn delete_datasource(State(cp): State<Cp>, Path((tenant_id, id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+async fn delete_datasource(
+    State(cp): State<Cp>,
+    Path((tenant_id, id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
     cp.store.apply(ADMIN_ACTOR, Mutation::DeleteDatasource { tenant_id, id, at: now_micros() }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -551,7 +600,10 @@ async fn introspect_datasource(State(cp): State<Cp>, Path(id): Path<String>) -> 
     Ok((StatusCode::ACCEPTED, Json(json!({ "job_id": new_id("job") }))))
 }
 
-async fn get_ontology(State(cp): State<Cp>, Query(f): Query<TenantFilter>) -> ApiResult<Json<caliban_ontology::Ontology>> {
+async fn get_ontology(
+    State(cp): State<Cp>,
+    Query(f): Query<TenantFilter>,
+) -> ApiResult<Json<caliban_ontology::Ontology>> {
     let tenant = f.tenant_id.ok_or_else(|| bad("tenant_id is required"))?;
     ensure_tenant(&cp, &tenant)?;
     let st = cp.store.state();
@@ -588,7 +640,13 @@ async fn review_element(State(cp): State<Cp>, Path(id): Path<String>, Json(r): J
 
 async fn list_nodes(State(cp): State<Cp>, Query(f): Query<TenantFilter>) -> Json<Vec<NodeRecord>> {
     let st = cp.store.state();
-    Json(st.nodes.iter().filter(|n| n.is_live() && f.tenant_id.as_ref().is_none_or(|t| &n.tenant_id == t)).cloned().collect())
+    Json(
+        st.nodes
+            .iter()
+            .filter(|n| n.is_live() && f.tenant_id.as_ref().is_none_or(|t| &n.tenant_id == t))
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Soft-deletes one node version, scoped to the tenant. Its version number is not reused.
@@ -606,8 +664,8 @@ struct NodeCreate {
 
 async fn create_node(State(cp): State<Cp>, Json(body): Json<NodeCreate>) -> ApiResult<(StatusCode, Json<NodeRecord>)> {
     ensure_tenant(&cp, &body.tenant_id)?;
-    let spec: NodeSpec =
-        serde_json::from_value(body.spec.clone()).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid node spec: {e}")))?;
+    let spec: NodeSpec = serde_json::from_value(body.spec.clone())
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid node spec: {e}")))?;
     spec.validate().map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let id = new_id("node");
     let rec = NodeRecord {
@@ -666,7 +724,11 @@ mod tests {
     fn cp() -> Cp {
         let cfg = Config::from_toml_str(include_str!("../../../config/caliban.example.toml")).unwrap();
         let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "boot"));
-        Arc::new(ControlPlane::new(Store::new(cfg, handle, RecentUsage::default()), "admin-secret".into(), "standalone"))
+        Arc::new(ControlPlane::new(
+            Store::new(cfg, handle, RecentUsage::default()),
+            "admin-secret".into(),
+            "standalone",
+        ))
     }
 
     async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>, auth: bool) -> (StatusCode, Value) {
@@ -723,20 +785,32 @@ mod tests {
         let (s, t) = call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
         assert_eq!(s, StatusCode::CREATED);
         assert_eq!(t["pii_surrogate_scope"], "tenant", "tenant scope by default");
-        let (s, t) = call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Initech", "pii_surrogate_scope": "session"})), true).await;
+        let (s, t) = call(
+            &app,
+            "POST",
+            "/api/v1/tenants",
+            Some(json!({"name": "Initech", "pii_surrogate_scope": "session"})),
+            true,
+        )
+        .await;
         assert_eq!(s, StatusCode::CREATED);
         assert_eq!(t["pii_surrogate_scope"], "session");
 
-        let (s, t) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"pii_surrogate_scope": "session"})), true).await;
+        let (s, t) =
+            call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"pii_surrogate_scope": "session"})), true).await;
         assert_eq!(s, StatusCode::OK, "{t}");
-        assert_eq!((t["pii_surrogate_scope"].as_str(), t["pii_default"].as_str()), (Some("session"), Some("reversible")));
+        assert_eq!(
+            (t["pii_surrogate_scope"].as_str(), t["pii_default"].as_str()),
+            (Some("session"), Some("reversible"))
+        );
         let snap = c.store.config.load();
         assert_eq!(snap.pii_surrogate_scope_for(snap.tenant(&"globex".into()).unwrap()), PiiSurrogateScope::Session);
         let (_, a) = call(&app, "GET", "/api/v1/audit?limit=1", None, true).await;
         assert_eq!(a["entries"][0]["action"], "tenant.update");
         assert_eq!(a["entries"][0]["detail"]["pii_surrogate_scope"], json!({"from": "tenant", "to": "session"}));
 
-        let (s, _) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"pii_surrogate_scope": "global"})), true).await;
+        let (s, _) =
+            call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"pii_surrogate_scope": "global"})), true).await;
         assert!(s.is_client_error());
         let (s, _) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"name": "x"})), true).await;
         assert!(s.is_client_error(), "only PII settings can be patched");
@@ -751,7 +825,8 @@ mod tests {
         let (s, t) = call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
         assert_eq!(s, StatusCode::CREATED);
         assert_eq!(t["semantic_cache"], "off", "off by default");
-        let (s, t) = call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Initech", "semantic_cache": "on"})), true).await;
+        let (s, t) =
+            call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Initech", "semantic_cache": "on"})), true).await;
         assert_eq!((s, t["semantic_cache"].as_str()), (StatusCode::CREATED, Some("on")));
 
         let (s, t) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"semantic_cache": "on"})), true).await;
@@ -762,7 +837,8 @@ mod tests {
         let (_, a) = call(&app, "GET", "/api/v1/audit?limit=1", None, true).await;
         assert_eq!(a["entries"][0]["action"], "tenant.update");
         assert_eq!(a["entries"][0]["detail"]["semantic_cache"], json!({"from": "off", "to": "on"}));
-        let (s, _) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"semantic_cache": "maybe"})), true).await;
+        let (s, _) =
+            call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"semantic_cache": "maybe"})), true).await;
         assert!(s.is_client_error());
     }
 
@@ -772,7 +848,9 @@ mod tests {
         let spec = json!({"kind": "agent", "prompt": {"system": "x"}, "model_policy": {},
                           "tools": [{"ref": "mcp://erp/x", "effect": "read"}],
                           "budgets": {"steps": 3, "tokens": 100, "wall_clock_s": 10}});
-        let (s, e) = call(&app, "POST", "/api/v1/nodes", Some(json!({"tenant_id": "acme", "name": "n", "spec": spec})), true).await;
+        let (s, e) =
+            call(&app, "POST", "/api/v1/nodes", Some(json!({"tenant_id": "acme", "name": "n", "spec": spec})), true)
+                .await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
     }
 
@@ -780,8 +858,14 @@ mod tests {
     async fn routes_are_validated_and_published() {
         let c = cp();
         let app = app(Arc::clone(&c), None);
-        let (s, _) =
-            call(&app, "PUT", "/api/v1/tenants/acme/routes", Some(json!({"routes": [{"intent": "x", "models": ["nope/none"]}]})), true).await;
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/api/v1/tenants/acme/routes",
+            Some(json!({"routes": [{"intent": "x", "models": ["nope/none"]}]})),
+            true,
+        )
+        .await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
         let routes = json!({"routes": [{"intent": "default", "models": ["local/qwen3-8b"]}]});
         let (s, r) = call(&app, "PUT", "/api/v1/tenants/acme/routes", Some(routes), true).await;
@@ -817,7 +901,10 @@ mod tests {
         let (s, e) = call(&app, "DELETE", "/api/v1/tenants/globex/api-keys/key_nope", None, true).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert!(is_error(&e, "not_found"), "{e}");
-        assert_eq!(call(&app, "DELETE", &format!("/api/v1/tenants/acme/api-keys/{id}"), None, true).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            call(&app, "DELETE", &format!("/api/v1/tenants/acme/api-keys/{id}"), None, true).await.0,
+            StatusCode::NOT_FOUND
+        );
         assert!(c.store.config.load().tenant_by_key_hash(&hash).is_some(), "failed revokes change nothing");
 
         let (s, body) = call(&app, "DELETE", &uri, None, true).await;
@@ -837,7 +924,10 @@ mod tests {
         let (_, a) = call(&app, "GET", "/api/v1/audit?limit=5", None, true).await;
         assert_eq!(a["chain_verified"], true);
         let e = &a["entries"][0];
-        assert_eq!((&e["action"], &e["actor"], &e["tenant_id"], &e["target"]), (&json!("api_key.revoke"), &json!("admin"), &json!("globex"), &json!(id)));
+        assert_eq!(
+            (&e["action"], &e["actor"], &e["tenant_id"], &e["target"]),
+            (&json!("api_key.revoke"), &json!("admin"), &json!("globex"), &json!(id))
+        );
         assert_eq!(e["detail"], json!({"name": "ci", "prefix": &key[..8]}));
         assert!(!a.to_string().contains(&key[8..]));
     }
@@ -867,10 +957,16 @@ mod tests {
         assert_eq!(call(&app, "GET", "/api/v1/tenants/acme", None, true).await.0, StatusCode::NOT_FOUND);
         assert_eq!(call(&app, "GET", "/api/v1/tenants/acme/api-keys", None, true).await.0, StatusCode::NOT_FOUND);
         assert_eq!(call(&app, "GET", "/api/v1/tenants/acme/routes", None, true).await.0, StatusCode::NOT_FOUND);
-        assert_eq!(call(&app, "POST", "/api/v1/tenants/acme/api-keys", Some(json!({})), true).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            call(&app, "POST", "/api/v1/tenants/acme/api-keys", Some(json!({})), true).await.0,
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(call(&app, "GET", "/api/v1/datasources?tenant_id=acme", None, true).await.1, json!([]));
         let ds_id = ds["id"].as_str().unwrap();
-        assert_eq!(call(&app, "POST", &format!("/api/v1/datasources/{ds_id}/introspect"), None, true).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            call(&app, "POST", &format!("/api/v1/datasources/{ds_id}/introspect"), None, true).await.0,
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(call(&app, "GET", "/api/v1/tenants", None, true).await.1, json!([]));
         let (_, all) = call(&app, "GET", "/api/v1/tenants?include_deleted=true", None, true).await;
         assert_eq!((&all[0]["id"], &all[0]["status"]), (&json!("acme"), &json!("deleted")));
@@ -887,7 +983,13 @@ mod tests {
         assert_eq!((&del["actor"], &del["target"]), (&json!("admin"), &json!("acme")));
         assert_eq!(del["detail"]["datasources_deleted"], json!([ds_id]));
         // The tenant's earlier audit rows are still there.
-        assert!(a["entries"].as_array().unwrap().iter().any(|e| e["action"] == "datasource.create" && e["tenant_id"] == "acme"));
+        assert!(
+            a["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["action"] == "datasource.create" && e["tenant_id"] == "acme")
+        );
     }
 
     #[tokio::test]
@@ -895,10 +997,24 @@ mod tests {
         let c = cp();
         let app = app(Arc::clone(&c), None);
         call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
-        let (_, ds) = call(&app, "POST", "/api/v1/datasources", Some(json!({"tenant_id": "acme", "kind": "postgres", "name": "erp", "connection": {}})), true).await;
+        let (_, ds) = call(
+            &app,
+            "POST",
+            "/api/v1/datasources",
+            Some(json!({"tenant_id": "acme", "kind": "postgres", "name": "erp", "connection": {}})),
+            true,
+        )
+        .await;
         let spec = json!({"kind": "agent", "prompt": {"system": "x"}, "model_policy": {}, "tools": [],
                           "budgets": {"steps": 3, "tokens": 100, "wall_clock_s": 10}});
-        let (s, n) = call(&app, "POST", "/api/v1/nodes", Some(json!({"tenant_id": "acme", "name": "triage", "spec": spec})), true).await;
+        let (s, n) = call(
+            &app,
+            "POST",
+            "/api/v1/nodes",
+            Some(json!({"tenant_id": "acme", "name": "triage", "spec": spec})),
+            true,
+        )
+        .await;
         assert_eq!(s, StatusCode::CREATED, "{n}");
         for (kind, id) in [("datasources", ds["id"].as_str().unwrap()), ("nodes", n["id"].as_str().unwrap())] {
             let own = format!("/api/v1/tenants/acme/{kind}/{id}");
@@ -906,13 +1022,17 @@ mod tests {
             let (s, e) = call(&app, "DELETE", &format!("/api/v1/tenants/globex/{kind}/{id}"), None, true).await;
             assert_eq!(s, StatusCode::NOT_FOUND, "{kind}: another tenant's id");
             assert!(is_error(&e, "not_found"));
-            assert_eq!(call(&app, "DELETE", &format!("/api/v1/tenants/acme/{kind}/nope"), None, true).await.0, StatusCode::NOT_FOUND);
+            assert_eq!(
+                call(&app, "DELETE", &format!("/api/v1/tenants/acme/{kind}/nope"), None, true).await.0,
+                StatusCode::NOT_FOUND
+            );
             assert_eq!(call(&app, "DELETE", &own, None, true).await.0, StatusCode::NO_CONTENT);
             assert_eq!(call(&app, "DELETE", &own, None, true).await.0, StatusCode::NOT_FOUND, "{kind}: repeat delete");
             assert_eq!(call(&app, "GET", &format!("/api/v1/{kind}?tenant_id=acme"), None, true).await.1, json!([]));
         }
         let (_, a) = call(&app, "GET", "/api/v1/audit?limit=2", None, true).await;
-        let actions: Vec<&str> = a["entries"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+        let actions: Vec<&str> =
+            a["entries"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
         assert_eq!(actions, ["node.delete", "datasource.delete"]);
         assert_eq!(a["entries"][0]["detail"], json!({"name": "triage", "version": 1}));
     }

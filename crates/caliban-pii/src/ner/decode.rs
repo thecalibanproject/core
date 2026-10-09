@@ -186,7 +186,13 @@ fn argmax(row: &[f32]) -> (usize, f32) {
 /// Groups token probabilities (`[offsets.len() * classes]`) into units. Tokens with an empty
 /// offset range (e.g. a bare `▁` or special token) are dropped. Word ids come from the
 /// tokenizer's pre-tokenizer; tokens without one form their own unit.
-pub fn units(probs: &[f32], classes: usize, offsets: &[(usize, usize)], word_ids: &[Option<u32>], agg: Aggregation) -> Vec<Unit> {
+pub fn units(
+    probs: &[f32],
+    classes: usize,
+    offsets: &[(usize, usize)],
+    word_ids: &[Option<u32>],
+    agg: Aggregation,
+) -> Vec<Unit> {
     let n = offsets.len();
     let row = |i: usize| &probs[i * classes..(i + 1) * classes];
     let mut out = Vec::with_capacity(n);
@@ -207,7 +213,9 @@ pub fn units(probs: &[f32], classes: usize, offsets: &[(usize, usize)], word_ids
         };
         let (class, score) = match agg {
             Aggregation::Token | Aggregation::First => argmax(row(first)),
-            Aggregation::Max => toks.iter().map(|&t| argmax(row(t))).fold((0, f32::NEG_INFINITY), |b, x| if x.1 > b.1 { x } else { b }),
+            Aggregation::Max => {
+                toks.iter().map(|&t| argmax(row(t))).fold((0, f32::NEG_INFINITY), |b, x| if x.1 > b.1 { x } else { b })
+            }
             Aggregation::Average => {
                 let mut avg = vec![0.0f32; classes];
                 for &t in &toks {
@@ -274,7 +282,8 @@ pub fn decode(units: &[Unit], labels: &LabelSet) -> Vec<RawEntity> {
     out
 }
 
-const TRIM: &[char] = &[',', ';', ':', '!', '?', '.', '"', '\'', '«', '»', '“', '”', '‘', '’', '„', '、', '。', '，', '：', '；'];
+const TRIM: &[char] =
+    &[',', ';', ':', '!', '?', '.', '"', '\'', '«', '»', '“', '”', '‘', '’', '„', '、', '。', '，', '：', '；'];
 
 /// Byte index of the bracket closing the one that opens `span`, if any.
 fn matching_close(span: &str) -> Option<usize> {
@@ -393,7 +402,16 @@ mod tests {
     fn iob2_decoding() {
         // "John Smith works at Acme Corp in Paris"
         let l = ls(CONLL);
-        let units = [u(0, 4, 1), u(5, 10, 2), u(11, 16, 0), u(17, 19, 0), u(20, 24, 3), u(25, 29, 4), u(30, 32, 0), u(33, 38, 5)];
+        let units = [
+            u(0, 4, 1),
+            u(5, 10, 2),
+            u(11, 16, 0),
+            u(17, 19, 0),
+            u(20, 24, 3),
+            u(25, 29, 4),
+            u(30, 32, 0),
+            u(33, 38, 5),
+        ];
         let e = decode(&units, &l);
         let got: Vec<_> = e.iter().map(|e| (l.bases()[e.base].as_str(), e.start, e.end)).collect();
         assert_eq!(got, vec![("PER", 0, 10), ("ORG", 20, 29), ("LOC", 33, 38)]);
@@ -469,7 +487,20 @@ mod tests {
         let n = 10;
         let mut st = Stitcher::new(n, classes);
         let a: Vec<f32> = (0..6).flat_map(|i| onehot(classes, if i == 4 { 1 } else { 0 })).collect();
-        let b: Vec<f32> = (4..10).flat_map(|i| onehot(classes, if i == 6 { 2 } else if i == 5 { 1 } else { 0 })).collect();
+        let b: Vec<f32> = (4..10)
+            .flat_map(|i| {
+                onehot(
+                    classes,
+                    if i == 6 {
+                        2
+                    } else if i == 5 {
+                        1
+                    } else {
+                        0
+                    },
+                )
+            })
+            .collect();
         st.add(0..6, &a);
         st.add(4..10, &b);
         let probs = st.finish();
@@ -490,7 +521,15 @@ mod tests {
         let n = 8;
         let mut st = Stitcher::new(n, classes);
         // Both windows agree that tokens 3..5 are one PER entity.
-        let lab = |i: usize| if i == 3 { 1 } else if i == 4 { 2 } else { 0 };
+        let lab = |i: usize| {
+            if i == 3 {
+                1
+            } else if i == 4 {
+                2
+            } else {
+                0
+            }
+        };
         st.add(0..6, &(0..6).flat_map(|i| onehot(classes, lab(i))).collect::<Vec<_>>());
         st.add(2..8, &(2..8).flat_map(|i| onehot(classes, lab(i))).collect::<Vec<_>>());
         let probs = st.finish();
@@ -504,11 +543,15 @@ mod tests {
     fn word_aggregation() {
         let classes = 3; // O, B-PER, I-PER
         // "Johnson" = [Jo, ##hn, ##son] (word 0), "x" (word 1)
-        let probs: Vec<f32> = [vec![0.2, 0.7, 0.1], vec![0.6, 0.1, 0.3], vec![0.6, 0.1, 0.3], vec![0.9, 0.05, 0.05]].concat();
+        let probs: Vec<f32> =
+            [vec![0.2, 0.7, 0.1], vec![0.6, 0.1, 0.3], vec![0.6, 0.1, 0.3], vec![0.9, 0.05, 0.05]].concat();
         let offsets = [(0, 2), (2, 4), (4, 7), (8, 9)];
         let words = [Some(0), Some(0), Some(0), Some(1)];
         let first = units(&probs, classes, &offsets, &words, Aggregation::First);
-        assert_eq!(first, vec![Unit { start: 0, end: 7, class: 1, score: 0.7 }, Unit { start: 8, end: 9, class: 0, score: 0.9 }]);
+        assert_eq!(
+            first,
+            vec![Unit { start: 0, end: 7, class: 1, score: 0.7 }, Unit { start: 8, end: 9, class: 0, score: 0.9 }]
+        );
         let avg = units(&probs, classes, &offsets, &words, Aggregation::Average);
         assert_eq!(avg[0].class, 0, "average: O dominates");
         let max = units(&probs, classes, &offsets, &words, Aggregation::Max);
@@ -538,7 +581,13 @@ mod tests {
         assert_eq!(&text[out[0].start..out[0].end], "東京");
         // Out of range offsets are clamped; whitespace-only entities vanish.
         let sp = text.find(" visited").unwrap();
-        let out = finalize(text, vec![RawEntity { base: 0, start: sp, end: sp + 1, score: 1.0 }, RawEntity { base: 0, start: 30, end: 999, score: 1.0 }]);
+        let out = finalize(
+            text,
+            vec![
+                RawEntity { base: 0, start: sp, end: sp + 1, score: 1.0 },
+                RawEntity { base: 0, start: 30, end: 999, score: 1.0 },
+            ],
+        );
         assert_eq!(out.len(), 1);
         assert!(text.is_char_boundary(out[0].start) && text.is_char_boundary(out[0].end));
     }

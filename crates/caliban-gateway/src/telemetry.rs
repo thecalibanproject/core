@@ -148,7 +148,13 @@ pub(crate) fn request_span(op: &'static str, dialect: Dialect, request_id: &Requ
 }
 
 /// Client span for one upstream attempt.
-pub(crate) fn upstream_span(op: &'static str, model: &ModelEntry, provider: &ProviderConfig, attempt: usize, native: bool) -> Span {
+pub(crate) fn upstream_span(
+    op: &'static str,
+    model: &ModelEntry,
+    provider: &ProviderConfig,
+    attempt: usize,
+    native: bool,
+) -> Span {
     tracing::info_span!(
         target: TARGET,
         "upstream",
@@ -182,8 +188,12 @@ pub(crate) fn child(name: &'static str) -> Span {
             caliban.route.knn_us = Empty,
             caliban.route.candidates = Empty
         ),
-        "pii" => tracing::info_span!(target: TARGET, "pii", caliban.pii.mode = Empty, caliban.pii.surrogate_scope = Empty, caliban.pii.entities = Empty, caliban.pii.degraded = Empty),
-        "semantic" => tracing::info_span!(target: TARGET, "cache.semantic", caliban.cache = Empty, caliban.cache.similarity = Empty, caliban.cache.lookup_ms = Empty),
+        "pii" => {
+            tracing::info_span!(target: TARGET, "pii", caliban.pii.mode = Empty, caliban.pii.surrogate_scope = Empty, caliban.pii.entities = Empty, caliban.pii.degraded = Empty)
+        }
+        "semantic" => {
+            tracing::info_span!(target: TARGET, "cache.semantic", caliban.cache = Empty, caliban.cache.similarity = Empty, caliban.cache.lookup_ms = Empty)
+        }
         _ => tracing::info_span!(target: TARGET, "cache", caliban.cache = Empty),
     }
 }

@@ -52,9 +52,11 @@ pub fn default_label_map(base: &str) -> Option<EntityType> {
     let b = base.trim().to_ascii_uppercase();
     let b = b.strip_prefix("PRIVATE_").unwrap_or(&b);
     Some(match b {
-        "PER" | "PERSON" | "NAME" | "GIVEN_NAME" | "FIRSTNAME" | "FIRST_NAME" | "MIDDLENAME" | "MIDDLE_NAME" | "SURNAME"
-        | "LASTNAME" | "LAST_NAME" | "FULLNAME" | "FULL_NAME" | "USERNAME_PERSON" => EntityType::Person,
-        "ORG" | "ORGANIZATION" | "ORGANISATION" | "COMPANY" | "COMPANY_NAME" | "COMPANYNAME" => EntityType::Organization,
+        "PER" | "PERSON" | "NAME" | "GIVEN_NAME" | "FIRSTNAME" | "FIRST_NAME" | "MIDDLENAME" | "MIDDLE_NAME"
+        | "SURNAME" | "LASTNAME" | "LAST_NAME" | "FULLNAME" | "FULL_NAME" | "USERNAME_PERSON" => EntityType::Person,
+        "ORG" | "ORGANIZATION" | "ORGANISATION" | "COMPANY" | "COMPANY_NAME" | "COMPANYNAME" => {
+            EntityType::Organization
+        }
         "LOC" | "LOCATION" | "CITY" | "ADDRESS" | "STREET_ADDRESS" | "STREET_NAME" | "STREET" | "SECONDARY_ADDRESS"
         | "BUILDING_NUMBER" | "BUILDINGNUMBER" => EntityType::Location,
         "EMAIL" | "EMAIL_ADDRESS" => EntityType::Email,
@@ -64,10 +66,29 @@ pub fn default_label_map(base: &str) -> Option<EntityType> {
         "SSN" | "US_SSN" => EntityType::UsSsn,
         "IP" | "IP_ADDRESS" | "IPV4" | "IPV6" => EntityType::IpAddress,
         "API_KEY" | "PASSWORD" | "PIN" | "CVV" | "SECRET" => EntityType::Custom("CREDENTIAL".into()),
-        "ACCOUNT_NUMBER" | "ACCOUNTNUM" | "CUSTOMER_ID" | "EMPLOYEE_ID" | "GOVERNMENT_ID" | "IDCARDNUM" | "PASSPORT"
-        | "PASSPORT_NUMBER" | "DRIVERS_LICENSE" | "DRIVERLICENSENUM" | "TAX_ID" | "TAXNUM" | "MEDICAL_RECORD_NUMBER"
-        | "LICENSE_PLATE" | "ROUTING_NUMBER" | "SWIFT_BIC" | "MAC_ADDRESS" | "USERNAME" | "ZIP_CODE" | "ZIPCODE"
-        | "POSTCODE" | "DATE_OF_BIRTH" | "DOB" => EntityType::Custom(b.to_owned()),
+        "ACCOUNT_NUMBER"
+        | "ACCOUNTNUM"
+        | "CUSTOMER_ID"
+        | "EMPLOYEE_ID"
+        | "GOVERNMENT_ID"
+        | "IDCARDNUM"
+        | "PASSPORT"
+        | "PASSPORT_NUMBER"
+        | "DRIVERS_LICENSE"
+        | "DRIVERLICENSENUM"
+        | "TAX_ID"
+        | "TAXNUM"
+        | "MEDICAL_RECORD_NUMBER"
+        | "LICENSE_PLATE"
+        | "ROUTING_NUMBER"
+        | "SWIFT_BIC"
+        | "MAC_ADDRESS"
+        | "USERNAME"
+        | "ZIP_CODE"
+        | "ZIPCODE"
+        | "POSTCODE"
+        | "DATE_OF_BIRTH"
+        | "DOB" => EntityType::Custom(b.to_owned()),
         // MISC, DATE, TIME, AGE, GENDER, COUNTRY, STATE, URL and anything unknown.
         _ => return None,
     })

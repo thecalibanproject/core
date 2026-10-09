@@ -131,7 +131,8 @@ mod tests {
 
     #[test]
     fn push_each_matches_push_for_any_split() {
-        let input = "data: {\"a\":\"é\"}\n\nevent: x\ndata: l1\ndata:l2\nid: 3\n\n: comment\n\ndata:\n\ndata: [DONE]\r\n\r\n";
+        let input =
+            "data: {\"a\":\"é\"}\n\nevent: x\ndata: l1\ndata:l2\nid: 3\n\n: comment\n\ndata:\n\ndata: [DONE]\r\n\r\n";
         let whole = SseParser::default().push(input.as_bytes());
         assert_eq!(whole, vec!["{\"a\":\"é\"}", "l1\nl2", "", "[DONE]"]);
         let bytes = input.as_bytes();

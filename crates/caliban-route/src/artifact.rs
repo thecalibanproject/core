@@ -124,7 +124,8 @@ fn safe_rel(p: &str) -> bool {
 fn verify(dir: &Path, kind: &str) -> Result<Verified, ArtifactError> {
     let mpath = dir.join("manifest.json");
     let raw = std::fs::read(&mpath).map_err(|e| io(&mpath, e))?;
-    let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| ArtifactError::Manifest(format!("{}: {e}", mpath.display())))?;
+    let manifest: Manifest =
+        serde_json::from_slice(&raw).map_err(|e| ArtifactError::Manifest(format!("{}: {e}", mpath.display())))?;
     if manifest.manifest_version != SUPPORTED_MANIFEST_VERSION {
         return Err(ArtifactError::Manifest(format!(
             "unsupported manifest_version {} (this build understands {SUPPORTED_MANIFEST_VERSION})",
@@ -197,7 +198,9 @@ pub fn load_knn_calibration(dir: &Path, embedder: Option<&str>) -> Result<KnnCal
     let v = verify(dir, "intent_head")?;
     let m = &v.manifest;
     if m.onnx.is_some() {
-        return Err(ArtifactError::Unsupported("intent_head with an ONNX graph is a Stage-2 classifier, not a kNN calibration".into()));
+        return Err(ArtifactError::Unsupported(
+            "intent_head with an ONNX graph is a Stage-2 classifier, not a kNN calibration".into(),
+        ));
     }
     let cal = m.calibration.as_ref().ok_or_else(|| ArtifactError::Manifest("intent_head has no calibration".into()))?;
     if m.labels.is_empty() {
@@ -210,8 +213,12 @@ pub fn load_knn_calibration(dir: &Path, embedder: Option<&str>) -> Result<KnnCal
             return Err(ArtifactError::EmbedderMismatch { required, configured: configured.to_owned() });
         }
     }
-    let cfg_bytes = v.files.get("config.json").ok_or_else(|| ArtifactError::Manifest("config.json is not listed in files".into()))?;
-    let cfg: KnnConfigJson = serde_json::from_slice(cfg_bytes).map_err(|e| ArtifactError::Manifest(format!("config.json: {e}")))?;
+    let cfg_bytes = v
+        .files
+        .get("config.json")
+        .ok_or_else(|| ArtifactError::Manifest("config.json is not listed in files".into()))?;
+    let cfg: KnnConfigJson =
+        serde_json::from_slice(cfg_bytes).map_err(|e| ArtifactError::Manifest(format!("config.json: {e}")))?;
     if cfg.kind != "knn" {
         return Err(ArtifactError::Unsupported(format!("config.json type {:?}", cfg.kind)));
     }
@@ -299,8 +306,12 @@ impl RouterProfile {
 /// Loads an ml `router_profile` artifact.
 pub fn load_router_profile(dir: &Path) -> Result<RouterProfile, ArtifactError> {
     let v = verify(dir, "router_profile")?;
-    let bytes = v.files.get("profile.json").ok_or_else(|| ArtifactError::Manifest("profile.json is not listed in files".into()))?;
-    let p: ProfileJson = serde_json::from_slice(bytes).map_err(|e| ArtifactError::Manifest(format!("profile.json: {e}")))?;
+    let bytes = v
+        .files
+        .get("profile.json")
+        .ok_or_else(|| ArtifactError::Manifest("profile.json is not listed in files".into()))?;
+    let p: ProfileJson =
+        serde_json::from_slice(bytes).map_err(|e| ArtifactError::Manifest(format!("profile.json: {e}")))?;
     if p.profile_version != SUPPORTED_PROFILE_VERSION {
         return Err(ArtifactError::Unsupported(format!("profile_version {}", p.profile_version)));
     }
@@ -308,10 +319,16 @@ pub fn load_router_profile(dir: &Path) -> Result<RouterProfile, ArtifactError> {
     let mut quality: HashMap<String, HashMap<String, f64>> = HashMap::new();
     for row in &p.models {
         if row.quality.len() != n || (!row.counts.is_empty() && row.counts.len() != n) {
-            return Err(ArtifactError::Manifest(format!("profile.json: model {} vectors must have {n} entries", row.model)));
+            return Err(ArtifactError::Manifest(format!(
+                "profile.json: model {} vectors must have {n} entries",
+                row.model
+            )));
         }
         if row.quality.iter().any(|q| !q.is_finite() || !(0.0..=1.0).contains(q)) {
-            return Err(ArtifactError::Manifest(format!("profile.json: model {} has quality outside 0..=1", row.model)));
+            return Err(ArtifactError::Manifest(format!(
+                "profile.json: model {} has quality outside 0..=1",
+                row.model
+            )));
         }
         let per = quality.entry(row.model.clone()).or_default();
         for (c, q) in p.clusters.iter().zip(&row.quality) {
@@ -334,7 +351,8 @@ pub(crate) mod testutil {
             std::fs::write(dir.join(name), body).unwrap();
             entries.push(json!({"path": name, "sha256": hex::encode(Sha256::digest(body.as_bytes())), "size_bytes": body.len(), "role": "config"}));
         }
-        let mut m = json!({"manifest_version": 1, "kind": kind, "name": "test-artifact", "version": "1.0.0", "files": entries});
+        let mut m =
+            json!({"manifest_version": 1, "kind": kind, "name": "test-artifact", "version": "1.0.0", "files": entries});
         if let (Some(o), Some(e)) = (m.as_object_mut(), extra.as_object()) {
             o.extend(e.clone());
         }
@@ -372,7 +390,12 @@ mod tests {
     #[test]
     fn loads_ml_knn_calibration_and_overlays_params() {
         let d = tmp("cal");
-        write_artifact(&d, "intent_head", &[("config.json", KNN_CONFIG), ("labels.json", r#"["chat","code"]"#)], calibration_extra());
+        write_artifact(
+            &d,
+            "intent_head",
+            &[("config.json", KNN_CONFIG), ("labels.json", r#"["chat","code"]"#)],
+            calibration_extra(),
+        );
         let c = load_knn_calibration(&d, Some("bge-small@1.0.0")).unwrap();
         assert_eq!((c.id.as_str(), c.k, c.temperature), ("test-artifact@1.0.0", 7, 0.08));
         let mut p = KnnParams::default();
@@ -384,7 +407,10 @@ mod tests {
     fn calibration_for_another_embedder_is_refused() {
         let d = tmp("cal-mismatch");
         write_artifact(&d, "intent_head", &[("config.json", KNN_CONFIG)], calibration_extra());
-        assert!(matches!(load_knn_calibration(&d, Some("e5-small@2.0.0")), Err(ArtifactError::EmbedderMismatch { .. })));
+        assert!(matches!(
+            load_knn_calibration(&d, Some("e5-small@2.0.0")),
+            Err(ArtifactError::EmbedderMismatch { .. })
+        ));
         assert!(matches!(load_knn_calibration(&d, None), Err(ArtifactError::EmbedderMismatch { .. })));
     }
 

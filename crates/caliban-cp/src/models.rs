@@ -10,7 +10,9 @@ use crate::{ADMIN_ACTOR, ApiError, ApiResult, Cp, bad, not_found, still_referenc
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use caliban_config::{Capabilities, ModelEntry, ModelKind, ProviderConfig, Reasoning, ReasoningControl, SharedProvider};
+use caliban_config::{
+    Capabilities, ModelEntry, ModelKind, ProviderConfig, Reasoning, ReasoningControl, SharedProvider,
+};
 use caliban_types::{ModelId, TrustTier};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -43,7 +45,10 @@ pub(crate) async fn list_models(State(cp): State<Cp>) -> Json<Value> {
     Json(Value::Array(st.models.iter().map(|m| model_json(&cp, m)).collect()))
 }
 
-pub(crate) async fn create_model(State(cp): State<Cp>, Json(m): Json<ModelEntry>) -> ApiResult<(StatusCode, Json<Value>)> {
+pub(crate) async fn create_model(
+    State(cp): State<Cp>,
+    Json(m): Json<ModelEntry>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
     cp.store.apply(ADMIN_ACTOR, Mutation::CreateModel(m.clone())).await?;
     Ok((StatusCode::CREATED, Json(model_json(&cp, &m))))
 }
@@ -94,7 +99,10 @@ pub(crate) struct SharedProviderCreate {
     tenants: Vec<String>,
 }
 
-pub(crate) async fn create_provider(State(cp): State<Cp>, Json(b): Json<SharedProviderCreate>) -> ApiResult<(StatusCode, Json<Value>)> {
+pub(crate) async fn create_provider(
+    State(cp): State<Cp>,
+    Json(b): Json<SharedProviderCreate>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
     if b.id.trim().is_empty() || b.base_url.trim().is_empty() {
         return Err(bad("id and base_url are required"));
     }
@@ -121,7 +129,10 @@ pub(crate) async fn create_provider(State(cp): State<Cp>, Json(b): Json<SharedPr
 }
 
 pub(crate) async fn delete_provider(State(cp): State<Cp>, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    cp.store.apply(ADMIN_ACTOR, Mutation::DeleteSharedProvider(id)).await.map_err(|e| still_referenced(e, "provider"))?;
+    cp.store
+        .apply(ADMIN_ACTOR, Mutation::DeleteSharedProvider(id))
+        .await
+        .map_err(|e| still_referenced(e, "provider"))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -165,7 +176,8 @@ pub(crate) async fn provider_health(State(cp): State<Cp>, Path(id): Path<String>
 /// Suggestions are heuristics from the model name and must be reviewed (capabilities, licence).
 pub(crate) async fn discover(State(cp): State<Cp>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let p = find_provider(&cp, &id)?;
-    let (served, _) = fetch_models(&p).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("discovery failed: {e}")))?;
+    let (served, _) =
+        fetch_models(&p).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("discovery failed: {e}")))?;
     let known: Vec<(String, String)> =
         cp.store.state().models.iter().map(|m| (m.provider.to_string(), m.upstream_model.clone())).collect();
     let mut available = Vec::new();
@@ -193,11 +205,15 @@ pub(crate) fn suggest(p: &ProviderConfig, upstream: &str, context_window: Option
     } else {
         ModelKind::Chat
     };
-    let family = ["qwen3", "qwen2.5", "gpt-oss", "deepseek", "mistral", "mixtral", "gemma", "glm", "granite", "phi", "llama", "kimi"]
-        .into_iter()
-        .find(|f| lower.contains(f))
-        .map(str::to_owned);
-    let mut caps = Capabilities { vision: lower.contains("-vl") || lower.contains("vision"), ..Capabilities::default() };
+    let family = [
+        "qwen3", "qwen2.5", "gpt-oss", "deepseek", "mistral", "mixtral", "gemma", "glm", "granite", "phi", "llama",
+        "kimi",
+    ]
+    .into_iter()
+    .find(|f| lower.contains(f))
+    .map(str::to_owned);
+    let mut caps =
+        Capabilities { vision: lower.contains("-vl") || lower.contains("vision"), ..Capabilities::default() };
     if kind == ModelKind::Chat {
         caps.tools = true;
         match family.as_deref() {

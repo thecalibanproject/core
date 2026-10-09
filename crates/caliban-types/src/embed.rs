@@ -53,7 +53,12 @@ pub trait Embedder: Send + Sync {
     /// off the request path, so a long timeout applies.
     ///
     /// The default implementation has no shared path and always fails.
-    async fn embed_shared(&self, tenant: Option<&TenantId>, model: &ModelId, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    async fn embed_shared(
+        &self,
+        tenant: Option<&TenantId>,
+        model: &ModelId,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
         let _ = (tenant, texts);
         Err(EmbedError::Unavailable(format!("no shared provider path for '{model}'")))
     }

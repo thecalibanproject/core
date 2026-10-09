@@ -221,14 +221,25 @@ impl InMemoryQuota {
     }
 
     /// `reserve` with an explicit clock, for tests.
-    fn reserve_at(&self, tenant: &str, policy: &QuotaPolicy, amount: Amount, now: Instant, day: i64, secs_left: u64) -> Result<Reservation, QuotaError> {
+    fn reserve_at(
+        &self,
+        tenant: &str,
+        policy: &QuotaPolicy,
+        amount: Amount,
+        now: Instant,
+        day: i64,
+        secs_left: u64,
+    ) -> Result<Reservation, QuotaError> {
         if !policy.has_budgets() {
             return Ok(Reservation { tenant: tenant.to_owned(), amount, day, tracked: false, local: false });
         }
         let mut budgets = self.budgets.lock();
-        let b = budgets
-            .entry(tenant.to_owned())
-            .or_insert_with(|| Budget { minute: None, day, day_tokens: 0, day_usd: 0.0 });
+        let b = budgets.entry(tenant.to_owned()).or_insert_with(|| Budget {
+            minute: None,
+            day,
+            day_tokens: 0,
+            day_usd: 0.0,
+        });
         if b.day != day {
             b.day = day;
             b.day_tokens = 0;
@@ -263,7 +274,10 @@ impl InMemoryQuota {
                 let full = bucket.level >= bucket.capacity;
                 if bucket.level < need && !full {
                     let wait = (need.min(bucket.capacity) - bucket.level) / bucket.rate();
-                    return Err(QuotaError::Exceeded { scope: LimitScope::TokensPerMinute, retry_after: Duration::from_secs_f64(wait.max(0.001)) });
+                    return Err(QuotaError::Exceeded {
+                        scope: LimitScope::TokensPerMinute,
+                        retry_after: Duration::from_secs_f64(wait.max(0.001)),
+                    });
                 }
                 bucket.level -= need;
             }
@@ -387,7 +401,9 @@ mod tests {
         let p = QuotaPolicy { requests_per_minute: Some(2), ..policy() };
         q.check_rate("t", None, &p).await.unwrap();
         q.check_rate("t", None, &p).await.unwrap();
-        let Err(QuotaError::Exceeded { scope, retry_after }) = q.check_rate("t", None, &p).await else { panic!("expected 429") };
+        let Err(QuotaError::Exceeded { scope, retry_after }) = q.check_rate("t", None, &p).await else {
+            panic!("expected 429")
+        };
         assert_eq!(scope, LimitScope::Requests);
         assert!(retry_after > Duration::from_secs(20) && retry_after <= Duration::from_secs(30), "{retry_after:?}");
         assert_eq!(retry_secs(retry_after), retry_after.as_secs() + 1);
@@ -422,7 +438,11 @@ mod tests {
         let t0 = Instant::now();
         let r = q.reserve_at("t", &p, Amount { tokens: 500, usd: 0.0 }, t0, 1, 100).unwrap();
         // 100 left: a 200-token request must wait (100 missing at 10 tokens/s = 10 s).
-        let Err(QuotaError::Exceeded { scope, retry_after }) = q.reserve_at("t", &p, Amount { tokens: 200, usd: 0.0 }, t0, 1, 100) else { panic!() };
+        let Err(QuotaError::Exceeded { scope, retry_after }) =
+            q.reserve_at("t", &p, Amount { tokens: 200, usd: 0.0 }, t0, 1, 100)
+        else {
+            panic!()
+        };
         assert_eq!(scope, LimitScope::TokensPerMinute);
         assert!((retry_after.as_secs_f64() - 10.0).abs() < 0.01, "{retry_after:?}");
         // Actual usage was only 50: 450 refunded, so the 200-token request now fits.
@@ -440,7 +460,11 @@ mod tests {
         let r = q.reserve_at("t", &p, Amount { tokens: 10, usd: 0.0 }, t0, 1, 100).unwrap();
         q.settle_at(&r, Amount { tokens: 110, usd: 0.0 }, t0);
         // Level is 60 - 110 = -50; one token needs 51 s of refill at 1 token/s.
-        let Err(QuotaError::Exceeded { retry_after, .. }) = q.reserve_at("t", &p, Amount { tokens: 1, usd: 0.0 }, t0, 1, 100) else { panic!() };
+        let Err(QuotaError::Exceeded { retry_after, .. }) =
+            q.reserve_at("t", &p, Amount { tokens: 1, usd: 0.0 }, t0, 1, 100)
+        else {
+            panic!()
+        };
         assert!((retry_after.as_secs_f64() - 51.0).abs() < 0.01, "{retry_after:?}");
     }
 
@@ -459,7 +483,11 @@ mod tests {
         let p = QuotaPolicy { tokens_per_day: Some(1000), usd_per_day: Some(1.0), ..policy() };
         let t0 = Instant::now();
         let r = q.reserve_at("t", &p, Amount { tokens: 800, usd: 0.5 }, t0, 7, 3600).unwrap();
-        let Err(QuotaError::Exceeded { scope, retry_after }) = q.reserve_at("t", &p, Amount { tokens: 300, usd: 0.0 }, t0, 7, 3600) else { panic!() };
+        let Err(QuotaError::Exceeded { scope, retry_after }) =
+            q.reserve_at("t", &p, Amount { tokens: 300, usd: 0.0 }, t0, 7, 3600)
+        else {
+            panic!()
+        };
         assert_eq!((scope, retry_after), (LimitScope::TokensPerDay, Duration::from_secs(3600)));
         q.settle_at(&r, Amount { tokens: 100, usd: 0.9 }, t0);
         assert_eq!(q.day_usage("t").0, 100);

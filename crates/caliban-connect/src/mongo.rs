@@ -19,10 +19,7 @@ pub use mongodb::bson;
 use crate::explain::{GatePolicy, GateReport};
 use crate::infer::{self, InferOptions, RefCandidate, bson_to_json, doc_to_json, value_key};
 use crate::privileges::{PrivilegeReport, classify_connection_status};
-use crate::{
-    Capabilities, ConnectError, Connector, IndexInfo, ObjectInfo, Profile, ReferenceInfo,
-    SchemaSnapshot,
-};
+use crate::{Capabilities, ConnectError, Connector, IndexInfo, ObjectInfo, Profile, ReferenceInfo, SchemaSnapshot};
 use async_trait::async_trait;
 use bson::{Bson, Document, Timestamp, doc};
 use caliban_ontology::compile::mongo::{MongoQuery, lint};
@@ -48,12 +45,10 @@ impl ReadTag {
         match self {
             ReadTag::Map(m) => Ok(m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
             ReadTag::Pair(s) => {
-                let (k, v) = s.split_once([':', '=']).ok_or_else(|| {
-                    ConnectError::Connection(format!("read_tag '{s}' must look like 'key:value'"))
-                })?;
-                Ok([(k.trim().to_owned(), v.trim().to_owned())]
-                    .into_iter()
-                    .collect())
+                let (k, v) = s
+                    .split_once([':', '='])
+                    .ok_or_else(|| ConnectError::Connection(format!("read_tag '{s}' must look like 'key:value'")))?;
+                Ok([(k.trim().to_owned(), v.trim().to_owned())].into_iter().collect())
             }
         }
     }
@@ -166,10 +161,7 @@ pub fn ts_to_u64(t: Timestamp) -> u64 {
 }
 
 pub fn u64_to_ts(v: u64) -> Timestamp {
-    Timestamp {
-        time: (v >> 32) as u32,
-        increment: (v & 0xffff_ffff) as u32,
-    }
+    Timestamp { time: (v >> 32) as u32, increment: (v & 0xffff_ffff) as u32 }
 }
 
 /// Converts a compiled pipeline (JSON) to BSON. Only one Extended-JSON form is honoured:
@@ -183,10 +175,7 @@ pub fn json_to_bson(v: &J) -> Result<Bson, ConnectError> {
         J::Number(n) => match n.as_i64() {
             Some(i) if i32::try_from(i).is_ok() => Bson::Int32(i as i32),
             Some(i) => Bson::Int64(i),
-            None => Bson::Double(
-                n.as_f64()
-                    .ok_or_else(|| ConnectError::Rejected(format!("number {n}")))?,
-            ),
+            None => Bson::Double(n.as_f64().ok_or_else(|| ConnectError::Rejected(format!("number {n}")))?),
         },
         J::String(s) => Bson::String(s.clone()),
         J::Array(a) => Bson::Array(a.iter().map(json_to_bson).collect::<Result<_, _>>()?),
@@ -217,9 +206,7 @@ pub fn json_to_bson(v: &J) -> Result<Bson, ConnectError> {
                 "$date",
             ];
             if let Some(k) = o.keys().find(|k| EXTJSON.contains(&k.as_str())) {
-                return Err(ConnectError::Rejected(format!(
-                    "extended-JSON wrapper {k} is not allowed in a pipeline"
-                )));
+                return Err(ConnectError::Rejected(format!("extended-JSON wrapper {k} is not allowed in a pipeline")));
             }
             let mut d = Document::new();
             for (k, v) in o {
@@ -234,9 +221,7 @@ fn pipeline_to_bson(p: &[J]) -> Result<Vec<Document>, ConnectError> {
     p.iter()
         .map(|s| match json_to_bson(s)? {
             Bson::Document(d) => Ok(d),
-            _ => Err(ConnectError::Rejected(
-                "pipeline stage is not a document".into(),
-            )),
+            _ => Err(ConnectError::Rejected("pipeline stage is not a document".into())),
         })
         .collect()
 }
@@ -261,18 +246,14 @@ pub fn read_preference(
     Ok(match m.as_str() {
         "primary" if options.is_none() => ReadPreference::Primary,
         "primary" => {
-            return Err(ConnectError::Connection(
-                "read preference 'primary' cannot have tags".into(),
-            ));
+            return Err(ConnectError::Connection("read preference 'primary' cannot have tags".into()));
         }
         "primarypreferred" => ReadPreference::PrimaryPreferred { options },
         "secondary" => ReadPreference::Secondary { options },
         "secondarypreferred" => ReadPreference::SecondaryPreferred { options },
         "nearest" => ReadPreference::Nearest { options },
         other => {
-            return Err(ConnectError::Connection(format!(
-                "unknown read preference '{other}'"
-            )));
+            return Err(ConnectError::Connection(format!("unknown read preference '{other}'")));
         }
     })
 }
@@ -296,12 +277,7 @@ impl MongoConnector {
             sharded: hello.get_str("msg").ok() == Some("isdbgrid"),
             max_wire_version: hello.get_i32("maxWireVersion").ok(),
         };
-        let mut me = Self {
-            client,
-            db,
-            cfg,
-            topology,
-        };
+        let mut me = Self { client, db, cfg, topology };
         // Validate the configured read preference early.
         me.configured_selection()?;
         me.cfg.max_time_ms = Some(me.cfg.max_time_ms.unwrap_or(15_000));
@@ -332,17 +308,8 @@ impl MongoConnector {
         let Some(mode) = &self.cfg.read_preference else {
             return Ok(None);
         };
-        let tags = self
-            .cfg
-            .read_tag
-            .as_ref()
-            .map(ReadTag::tag_set)
-            .transpose()?
-            .into_iter()
-            .collect();
-        Ok(Some(SelectionCriteria::ReadPreference(read_preference(
-            mode, tags, None,
-        )?)))
+        let tags = self.cfg.read_tag.as_ref().map(ReadTag::tag_set).transpose()?.into_iter().collect();
+        Ok(Some(SelectionCriteria::ReadPreference(read_preference(mode, tags, None)?)))
     }
 
     /// Read preference for introspection, profiling, snapshots and change streams: the configured
@@ -351,9 +318,7 @@ impl MongoConnector {
         self.configured_selection()
             .ok()
             .flatten()
-            .unwrap_or(SelectionCriteria::ReadPreference(
-                ReadPreference::SecondaryPreferred { options: None },
-            ))
+            .unwrap_or(SelectionCriteria::ReadPreference(ReadPreference::SecondaryPreferred { options: None }))
     }
 
     /// Read preference for a compiled query: the configured one wins; otherwise the query's
@@ -365,38 +330,22 @@ impl MongoConnector {
         let Some(rp) = opt else {
             return Ok(self.selection_criteria());
         };
-        let mode = rp
-            .get("mode")
-            .and_then(J::as_str)
-            .unwrap_or("secondaryPreferred");
+        let mode = rp.get("mode").and_then(J::as_str).unwrap_or("secondaryPreferred");
         let tags = rp
             .get("tags")
             .and_then(J::as_array)
             .into_iter()
             .flatten()
             .filter_map(J::as_object)
-            .map(|o| {
-                o.iter()
-                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
-                    .collect()
-            })
+            .map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned()))).collect())
             .collect();
-        let staleness = rp
-            .get("maxStalenessSeconds")
-            .and_then(J::as_u64)
-            .map(Duration::from_secs);
-        Ok(SelectionCriteria::ReadPreference(read_preference(
-            mode, tags, staleness,
-        )?))
+        let staleness = rp.get("maxStalenessSeconds").and_then(J::as_u64).map(Duration::from_secs);
+        Ok(SelectionCriteria::ReadPreference(read_preference(mode, tags, staleness)?))
     }
 
     /// Classifies the connected principal's privileges without failing.
     pub async fn privilege_report(&self) -> Result<PrivilegeReport, ConnectError> {
-        let reply = self
-            .db
-            .run_command(doc! { "connectionStatus": 1, "showPrivileges": true })
-            .await
-            .map_err(src)?;
+        let reply = self.db.run_command(doc! { "connectionStatus": 1, "showPrivileges": true }).await.map_err(src)?;
         let mut r = classify_connection_status(&doc_to_json(&reply));
         r.replica_set = self.topology.change_streams();
         r.set_name = self.topology.set_name.clone();
@@ -407,31 +356,18 @@ impl MongoConnector {
     /// unauthenticated. The report says whether change streams (CDC) are available.
     pub async fn verify_read_only(&self) -> Result<PrivilegeReport, ConnectError> {
         let r = self.privilege_report().await?;
-        if r.read_only {
-            Ok(r)
-        } else {
-            Err(ConnectError::NotReadOnly(
-                r.reason.clone().unwrap_or_default(),
-            ))
-        }
+        if r.read_only { Ok(r) } else { Err(ConnectError::NotReadOnly(r.reason.clone().unwrap_or_default())) }
     }
 
     /// Stratified sample: `$sample` + newest-N + oldest-N by `_id`, de-duplicated by `_id`.
-    pub async fn sample(
-        &self,
-        coll: &str,
-        cfg: &SampleConfig,
-    ) -> Result<Vec<Document>, ConnectError> {
+    pub async fn sample(&self, coll: &str, cfg: &SampleConfig) -> Result<Vec<Document>, ConnectError> {
         let c: Collection<Document> = self.db.collection(coll);
         let comment = Bson::String("caliban:introspect".into());
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         let mut add = |docs: Vec<Document>, out: &mut Vec<Document>| {
             for d in docs {
-                let key = d
-                    .get("_id")
-                    .map(value_key)
-                    .unwrap_or_else(|| format!("#{}", out.len()));
+                let key = d.get("_id").map(value_key).unwrap_or_else(|| format!("#{}", out.len()));
                 if seen.insert(key) {
                     out.push(d);
                 }
@@ -474,13 +410,7 @@ impl MongoConnector {
 
     async fn indexes(&self, coll: &str) -> Result<Vec<IndexInfo>, ConnectError> {
         let c: Collection<Document> = self.db.collection(coll);
-        let models: Vec<mongodb::IndexModel> = c
-            .list_indexes()
-            .await
-            .map_err(src)?
-            .try_collect()
-            .await
-            .map_err(src)?;
+        let models: Vec<mongodb::IndexModel> = c.list_indexes().await.map_err(src)?.try_collect().await.map_err(src)?;
         Ok(models
             .into_iter()
             .map(|m| {
@@ -494,18 +424,9 @@ impl MongoConnector {
             .collect())
     }
 
-    pub async fn introspect_with(
-        &self,
-        cfg: &SampleConfig,
-    ) -> Result<SchemaSnapshot, ConnectError> {
-        let mut specs: Vec<mongodb::results::CollectionSpecification> = self
-            .db
-            .list_collections()
-            .await
-            .map_err(src)?
-            .try_collect()
-            .await
-            .map_err(src)?;
+    pub async fn introspect_with(&self, cfg: &SampleConfig) -> Result<SchemaSnapshot, ConnectError> {
+        let mut specs: Vec<mongodb::results::CollectionSpecification> =
+            self.db.list_collections().await.map_err(src)?.try_collect().await.map_err(src)?;
         specs.retain(|s| !s.name.starts_with("system."));
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs.truncate(cfg.max_collections);
@@ -519,27 +440,16 @@ impl MongoConnector {
                 _ => "collection",
             };
             let c: Collection<Document> = self.db.collection(&spec.name);
-            let est = if kind == "view" {
-                None
-            } else {
-                c.estimated_document_count().await.ok()
-            };
+            let est = if kind == "view" { None } else { c.estimated_document_count().await.ok() };
             let docs = self.sample(&spec.name, cfg).await?;
             let inf = infer::infer(&docs, est, &cfg.infer);
-            candidates.push((
-                spec.name.clone(),
-                infer::reference_candidates(&inf, cfg.reference_probe_values),
-            ));
+            candidates.push((spec.name.clone(), infer::reference_candidates(&inf, cfg.reference_probe_values)));
             let mut info = inf.into_object_info(&spec.name, kind);
             if kind != "view" {
                 info.indexes = self.indexes(&spec.name).await?;
             }
-            info.declared_schema = spec
-                .options
-                .validator
-                .as_ref()
-                .and_then(|v| v.get_document("$jsonSchema").ok())
-                .map(doc_to_json);
+            info.declared_schema =
+                spec.options.validator.as_ref().and_then(|v| v.get_document("$jsonSchema").ok()).map(doc_to_json);
             objects.push(info);
         }
 
@@ -563,11 +473,7 @@ impl MongoConnector {
                 targets.truncate(cfg.max_reference_targets);
                 for (target, name_match) in targets {
                     let (matched, probed) = self.probe(cand, &target.name).await?;
-                    let overlap = if probed == 0 {
-                        0.0
-                    } else {
-                        matched as f32 / probed as f32
-                    };
+                    let overlap = if probed == 0 { 0.0 } else { matched as f32 / probed as f32 };
                     if overlap >= cfg.min_reported_overlap {
                         references.push(ReferenceInfo {
                             from_object: from.clone(),
@@ -593,11 +499,7 @@ impl MongoConnector {
                 .then(b.name_match.cmp(&a.name_match))
                 .then(b.overlap.total_cmp(&a.overlap))
         });
-        Ok(SchemaSnapshot {
-            datasource: self.cfg.datasource_id.clone().unwrap_or_default(),
-            objects,
-            references,
-        })
+        Ok(SchemaSnapshot { datasource: self.cfg.datasource_id.clone().unwrap_or_default(), objects, references })
     }
 
     /// Containment probe: how many of the candidate's distinct values exist as `_id` in `target`.
@@ -606,9 +508,9 @@ impl MongoConnector {
             .values
             .iter()
             .map(|v| match v {
-                Bson::String(s) if s.len() == 24 => bson::oid::ObjectId::parse_str(s)
-                    .map(Bson::ObjectId)
-                    .unwrap_or_else(|_| v.clone()),
+                Bson::String(s) if s.len() == 24 => {
+                    bson::oid::ObjectId::parse_str(s).map(Bson::ObjectId).unwrap_or_else(|_| v.clone())
+                }
                 other => other.clone(),
             })
             .collect();
@@ -628,11 +530,7 @@ impl MongoConnector {
     }
 
     /// Native-lane executor: lint again, enforce options, run, cap rows.
-    pub async fn execute(
-        &self,
-        q: &MongoQuery,
-        row_cap: usize,
-    ) -> Result<NativeResult, ConnectError> {
+    pub async fn execute(&self, q: &MongoQuery, row_cap: usize) -> Result<NativeResult, ConnectError> {
         if let Some(ds) = &self.cfg.datasource_id
             && *ds != q.datasource
         {
@@ -645,18 +543,8 @@ impl MongoConnector {
         let mut pipeline = pipeline_to_bson(&q.pipeline)?;
         pipeline.push(doc! { "$limit": (row_cap as i64).saturating_add(1) });
         let cap_ms = self.cfg.max_time_ms.unwrap_or(15_000);
-        let max_ms = q
-            .options
-            .get("maxTimeMS")
-            .and_then(J::as_u64)
-            .unwrap_or(cap_ms)
-            .min(cap_ms);
-        let comment = q
-            .options
-            .get("comment")
-            .and_then(J::as_str)
-            .unwrap_or("caliban:unset")
-            .to_owned();
+        let max_ms = q.options.get("maxTimeMS").and_then(J::as_u64).unwrap_or(cap_ms).min(cap_ms);
+        let comment = q.options.get("comment").and_then(J::as_str).unwrap_or("caliban:unset").to_owned();
         let selection = self.query_selection(q.options.get("readPreference"))?;
         let c: Collection<Document> = self.db.collection(&q.collection);
         let mut cursor = c
@@ -682,46 +570,25 @@ impl MongoConnector {
     /// Raw `explain` (`queryPlanner` verbosity; the pipeline is planned, not executed).
     pub async fn explain(&self, q: &MongoQuery) -> Result<J, ConnectError> {
         lint(&q.pipeline).map_err(|e| ConnectError::Rejected(e.to_string()))?;
-        let pipeline: Vec<Bson> = pipeline_to_bson(&q.pipeline)?
-            .into_iter()
-            .map(Bson::Document)
-            .collect();
-        let comment = q
-            .options
-            .get("comment")
-            .and_then(J::as_str)
-            .unwrap_or("caliban:unset")
-            .to_owned();
+        let pipeline: Vec<Bson> = pipeline_to_bson(&q.pipeline)?.into_iter().map(Bson::Document).collect();
+        let comment = q.options.get("comment").and_then(J::as_str).unwrap_or("caliban:unset").to_owned();
         let cmd = doc! {
             "explain": { "aggregate": &q.collection, "pipeline": pipeline, "cursor": {}, "allowDiskUse": false },
             "verbosity": "queryPlanner",
             "comment": comment,
         };
         let selection = self.query_selection(q.options.get("readPreference"))?;
-        let reply = self
-            .db
-            .run_command(cmd)
-            .selection_criteria(selection)
-            .await
-            .map_err(src)?;
+        let reply = self.db.run_command(cmd).selection_criteria(selection).await.map_err(src)?;
         Ok(doc_to_json(&reply))
     }
 
     /// Dry run: explain + gate (COLLSCAN over large collections, unindexed `$lookup`). The report
     /// carries the plan summary so the planner can route to the replica.
-    pub async fn explain_gate(
-        &self,
-        q: &MongoQuery,
-        policy: &GatePolicy,
-    ) -> Result<GateReport, ConnectError> {
+    pub async fn explain_gate(&self, q: &MongoQuery, policy: &GatePolicy) -> Result<GateReport, ConnectError> {
         let reply = self.explain(q).await?;
         let c: Collection<Document> = self.db.collection(&q.collection);
         let est = c.estimated_document_count().await.ok();
-        Ok(crate::explain::gate(
-            crate::explain::summarize(&reply),
-            est,
-            policy,
-        ))
+        Ok(crate::explain::gate(crate::explain::summarize(&reply), est, policy))
     }
 
     /// Cluster `operationTime` (or `$clusterTime`) as `(seconds << 32) | increment`.
@@ -730,26 +597,16 @@ impl MongoConnector {
         if let Ok(t) = reply.get_timestamp("operationTime") {
             return Ok(t);
         }
-        if let Ok(t) = reply
-            .get_document("$clusterTime")
-            .and_then(|c| c.get_timestamp("clusterTime"))
-        {
+        if let Ok(t) = reply.get_document("$clusterTime").and_then(|c| c.get_timestamp("clusterTime")) {
             return Ok(t);
         }
-        let hello = self
-            .db
-            .run_command(doc! { "hello": 1 })
-            .await
-            .map_err(src)?;
+        let hello = self.db.run_command(doc! { "hello": 1 }).await.map_err(src)?;
         hello
             .get_document("lastWrite")
             .and_then(|w| w.get_document("opTime"))
             .and_then(|o| o.get_timestamp("ts"))
             .map_err(|_| {
-                ConnectError::Source(
-                    "no cluster time (standalone mongod?); change streams need a replica set"
-                        .into(),
-                )
+                ConnectError::Source("no cluster time (standalone mongod?); change streams need a replica set".into())
             })
     }
 
@@ -775,12 +632,7 @@ impl Connector for MongoConnector {
     }
 
     async fn profile(&self, object: &str, sample: u32) -> Result<Vec<Profile>, ConnectError> {
-        let cfg = SampleConfig {
-            sample_size: sample.max(1),
-            newest: 0,
-            oldest: 0,
-            ..Default::default()
-        };
+        let cfg = SampleConfig { sample_size: sample.max(1), newest: 0, oldest: 0, ..Default::default() };
         let docs = self.sample(object, &cfg).await?;
         let c: Collection<Document> = self.db.collection(object);
         let est = c.estimated_document_count().await.ok();
@@ -799,17 +651,14 @@ mod tests {
 
     #[test]
     fn json_to_bson_honours_only_date() {
-        let b = json_to_bson(&json!({ "createdAt": { "$gte": { "$date": "2026-07-01T00:00:00Z" } }, "qty": { "$gt": 5.0 }, "n": 3 })).unwrap();
+        let b = json_to_bson(
+            &json!({ "createdAt": { "$gte": { "$date": "2026-07-01T00:00:00Z" } }, "qty": { "$gt": 5.0 }, "n": 3 }),
+        )
+        .unwrap();
         let d = b.as_document().unwrap();
         let gte = d.get_document("createdAt").unwrap().get("$gte").unwrap();
-        assert_eq!(
-            gte,
-            &Bson::DateTime(bson::DateTime::parse_rfc3339_str("2026-07-01T00:00:00Z").unwrap())
-        );
-        assert_eq!(
-            d.get_document("qty").unwrap().get("$gt"),
-            Some(&Bson::Double(5.0))
-        );
+        assert_eq!(gte, &Bson::DateTime(bson::DateTime::parse_rfc3339_str("2026-07-01T00:00:00Z").unwrap()));
+        assert_eq!(d.get_document("qty").unwrap().get("$gt"), Some(&Bson::Double(5.0)));
         assert_eq!(d.get("n"), Some(&Bson::Int32(3)));
         assert!(json_to_bson(&json!({ "$code": "while(1){}" })).is_err());
         assert!(json_to_bson(&json!({ "x": { "$oid": "65a1f0c2e4b0a1b2c3d4e5f6" } })).is_err());
@@ -818,22 +667,12 @@ mod tests {
 
     #[test]
     fn read_preferences_and_tags() {
-        let rp = read_preference(
-            "secondary",
-            vec![
-                ReadTag::Pair("workload:analytics".into())
-                    .tag_set()
-                    .unwrap(),
-            ],
-            None,
-        )
-        .unwrap();
+        let rp =
+            read_preference("secondary", vec![ReadTag::Pair("workload:analytics".into()).tag_set().unwrap()], None)
+                .unwrap();
         match rp {
             ReadPreference::Secondary { options: Some(o) } => {
-                assert_eq!(
-                    o.tag_sets.unwrap()[0].get("workload").map(String::as_str),
-                    Some("analytics")
-                )
+                assert_eq!(o.tag_sets.unwrap()[0].get("workload").map(String::as_str), Some("analytics"))
             }
             other => panic!("{other:?}"),
         }
@@ -841,42 +680,17 @@ mod tests {
             read_preference("secondary_preferred", vec![], None).unwrap(),
             ReadPreference::SecondaryPreferred { options: None }
         ));
-        assert!(
-            read_preference(
-                "primary",
-                vec![HashMap::from([("a".into(), "b".into())])],
-                None
-            )
-            .is_err()
-        );
+        assert!(read_preference("primary", vec![HashMap::from([("a".into(), "b".into())])], None).is_err());
         assert!(read_preference("bogus", vec![], None).is_err());
         let cfg: MongoConfig = serde_json::from_value(json!({ "uri": "mongodb://h", "database": "d", "read_preference": "secondaryPreferred", "read_tag": { "workload": "analytics" } })).unwrap();
-        assert_eq!(
-            cfg.read_tag,
-            Some(ReadTag::Map(BTreeMap::from([(
-                "workload".into(),
-                "analytics".into()
-            )])))
-        );
+        assert_eq!(cfg.read_tag, Some(ReadTag::Map(BTreeMap::from([("workload".into(), "analytics".into())]))));
     }
 
     #[test]
     fn timestamp_packing_is_ordered() {
-        let a = ts_to_u64(Timestamp {
-            time: 10,
-            increment: 5,
-        });
-        let b = ts_to_u64(Timestamp {
-            time: 11,
-            increment: 1,
-        });
+        let a = ts_to_u64(Timestamp { time: 10, increment: 5 });
+        let b = ts_to_u64(Timestamp { time: 11, increment: 1 });
         assert!(a < b);
-        assert_eq!(
-            u64_to_ts(a),
-            Timestamp {
-                time: 10,
-                increment: 5
-            }
-        );
+        assert_eq!(u64_to_ts(a), Timestamp { time: 10, increment: 5 });
     }
 }

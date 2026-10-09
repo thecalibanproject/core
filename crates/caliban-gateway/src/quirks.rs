@@ -15,14 +15,20 @@
 //!   adapter drops the field itself (Anthropic streams always carry usage).
 
 use caliban_config::{ModelEntry, ProviderConfig, Reasoning, ReasoningControl};
-use caliban_types::ProviderKind;
 use caliban_ir::ReasoningPref;
+use caliban_types::ProviderKind;
 use serde_json::{Map, Value, json};
 
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
 
-pub fn shape_request(body: &mut Value, model: &ModelEntry, provider: &ProviderConfig, pref: Option<ReasoningPref>, tenant_salt: &str) {
+pub fn shape_request(
+    body: &mut Value,
+    model: &ModelEntry,
+    provider: &ProviderConfig,
+    pref: Option<ReasoningPref>,
+    tenant_salt: &str,
+) {
     let Some(obj) = body.as_object_mut() else { return };
     match model.capabilities.reasoning_control {
         ReasoningControl::EnableThinking => {
@@ -78,7 +84,9 @@ pub fn normalize_message(v: &mut Value) {
     let Some(choices) = v.get_mut("choices").and_then(Value::as_array_mut) else { return };
     for c in choices {
         let Some(msg) = c.get_mut("message").and_then(Value::as_object_mut) else { continue };
-        let Some((reasoning, answer)) = msg.get("content").and_then(Value::as_str).and_then(split_think) else { continue };
+        let Some((reasoning, answer)) = msg.get("content").and_then(Value::as_str).and_then(split_think) else {
+            continue;
+        };
         msg.insert("content".into(), Value::String(answer));
         if !reasoning.is_empty() {
             msg.insert("reasoning_content".into(), Value::String(reasoning));
@@ -144,7 +152,10 @@ impl ThinkSplitter {
                 // Hold back a suffix that could be the start of `</think>`.
                 let mut keep = 0;
                 for n in (1..CLOSE.len()).rev() {
-                    if self.buf.len() >= n && self.buf.is_char_boundary(self.buf.len() - n) && CLOSE.starts_with(&self.buf[self.buf.len() - n..]) {
+                    if self.buf.len() >= n
+                        && self.buf.is_char_boundary(self.buf.len() - n)
+                        && CLOSE.starts_with(&self.buf[self.buf.len() - n..])
+                    {
                         keep = n;
                         break;
                     }
@@ -187,7 +198,11 @@ mod tests {
             upstream_model: "Qwen/Qwen3-8B".into(),
             kind: Default::default(),
             family: Some("qwen3".into()),
-            capabilities: Capabilities { reasoning: Reasoning::Hybrid, reasoning_control: control, ..Default::default() },
+            capabilities: Capabilities {
+                reasoning: Reasoning::Hybrid,
+                reasoning_control: control,
+                ..Default::default()
+            },
             trust_tier: caliban_types::TrustTier::T0Sovereign,
             licence: None,
             context_window: None,
@@ -213,7 +228,13 @@ mod tests {
     #[test]
     fn qwen_thinking_toggle_and_salt() {
         let mut body = json!({"model": "Qwen/Qwen3-8B", "reasoning_effort": "high"});
-        shape_request(&mut body, &model(ReasoningControl::EnableThinking), &provider(true), Some(ReasoningPref::Off), "s1");
+        shape_request(
+            &mut body,
+            &model(ReasoningControl::EnableThinking),
+            &provider(true),
+            Some(ReasoningPref::Off),
+            "s1",
+        );
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert!(body.get("reasoning_effort").is_none());
         assert_eq!(body["cache_salt"], "s1");
@@ -222,7 +243,13 @@ mod tests {
     #[test]
     fn effort_models_get_reasoning_effort() {
         let mut body = json!({});
-        shape_request(&mut body, &model(ReasoningControl::ReasoningEffort), &provider(false), Some(ReasoningPref::High), "s");
+        shape_request(
+            &mut body,
+            &model(ReasoningControl::ReasoningEffort),
+            &provider(false),
+            Some(ReasoningPref::High),
+            "s",
+        );
         assert_eq!(body["reasoning_effort"], "high");
         assert!(body.get("cache_salt").is_none());
     }

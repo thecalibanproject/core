@@ -86,7 +86,11 @@ impl QdrantStore {
                 ("expires_at", json!("integer")),
             ] {
                 let idx = json!({ "field_name": field, "field_schema": schema });
-                self.ok(self.req(reqwest::Method::PUT, &format!("{path}/index?wait=true")).json(&idx), "create payload index").await?;
+                self.ok(
+                    self.req(reqwest::Method::PUT, &format!("{path}/index?wait=true")).json(&idx),
+                    "create payload index",
+                )
+                .await?;
             }
         } else if !status.is_success() {
             return Err(StoreError::Backend(format!("get {collection}: {status}")));
@@ -135,7 +139,10 @@ impl VectorStore for QdrantStore {
             };
             #[allow(clippy::cast_possible_truncation)]
             let score = p.get("score").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-            let Ok(payload) = serde_json::from_value::<EntryPayload>(p.get("payload").cloned().unwrap_or_default()) else { continue };
+            let Ok(payload) = serde_json::from_value::<EntryPayload>(p.get("payload").cloned().unwrap_or_default())
+            else {
+                continue;
+            };
             // Belt and braces: the filter already guarantees this.
             if payload.tenant_id != q.tenant {
                 continue;
@@ -145,7 +152,13 @@ impl VectorStore for QdrantStore {
         Ok(out)
     }
 
-    async fn upsert(&self, collection: &str, id: &str, vector: &[f32], payload: &EntryPayload) -> Result<(), StoreError> {
+    async fn upsert(
+        &self,
+        collection: &str,
+        id: &str,
+        vector: &[f32],
+        payload: &EntryPayload,
+    ) -> Result<(), StoreError> {
         self.ensure(collection, vector.len()).await?;
         let body = json!({ "points": [{ "id": id, "vector": vector, "payload": payload }] });
         let path = format!("/collections/{collection}/points?wait=true");
@@ -160,7 +173,14 @@ impl VectorStore for QdrantStore {
         }
     }
 
-    async fn update_stats(&self, collection: &str, tenant: &str, id: &str, stats: &EntryStats, threshold: f32) -> Result<(), StoreError> {
+    async fn update_stats(
+        &self,
+        collection: &str,
+        tenant: &str,
+        id: &str,
+        stats: &EntryStats,
+        threshold: f32,
+    ) -> Result<(), StoreError> {
         let body = json!({
             "payload": { "stats": stats, "threshold": threshold },
             "filter": { "must": [ { "has_id": [id] }, tenant_cond(tenant) ] },
@@ -173,14 +193,22 @@ impl VectorStore for QdrantStore {
         let body = json!({ "filter": { "must": [ { "key": "expires_at", "range": { "lte": now } } ] } });
         let path = format!("/collections/{collection}/points/delete");
         let (status, v) = self.send(self.req(reqwest::Method::POST, &path).json(&body)).await?;
-        if status.is_success() || status == StatusCode::NOT_FOUND { Ok(()) } else { Err(StoreError::Backend(format!("delete expired: {status}: {}", short(&v)))) }
+        if status.is_success() || status == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(StoreError::Backend(format!("delete expired: {status}: {}", short(&v))))
+        }
     }
 
     async fn delete_tenant(&self, collection: &str, tenant: &str) -> Result<(), StoreError> {
         let body = json!({ "filter": { "must": [ tenant_cond(tenant) ] } });
         let path = format!("/collections/{collection}/points/delete?wait=true");
         let (status, v) = self.send(self.req(reqwest::Method::POST, &path).json(&body)).await?;
-        if status.is_success() || status == StatusCode::NOT_FOUND { Ok(()) } else { Err(StoreError::Backend(format!("delete tenant: {status}: {}", short(&v)))) }
+        if status.is_success() || status == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(StoreError::Backend(format!("delete tenant: {status}: {}", short(&v))))
+        }
     }
 
     async fn list_collections(&self) -> Result<Vec<String>, StoreError> {

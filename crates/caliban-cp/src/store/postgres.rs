@@ -7,7 +7,10 @@
 //! rendered data-plane config → append the audit row → commit. Any error rolls everything back.
 
 use super::audit::{AuditDraft, AuditEntry, now_micros};
-use super::{ApiKeyRecord, Backend, Check, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, State, StoreError, Tenant, TenantStatus};
+use super::{
+    ApiKeyRecord, Backend, Check, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, State, StoreError, Tenant,
+    TenantStatus,
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use caliban_config::{ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider};
@@ -77,10 +80,13 @@ fn split_secret(s: Option<&SecretRef>) -> Result<SecretColumns, StoreError> {
     match s {
         None => Ok((None, None)),
         Some(SecretRef::Sealed { sealed }) => {
-            let raw = B64.decode(sealed).map_err(|e| StoreError::Invalid(format!("sealed secret is not base64: {e}")))?;
+            let raw =
+                B64.decode(sealed).map_err(|e| StoreError::Invalid(format!("sealed secret is not base64: {e}")))?;
             Ok((Some(raw), None))
         }
-        Some(other) => Ok((None, Some(Json(serde_json::to_value(other).map_err(|e| StoreError::Backend(e.to_string()))?)))),
+        Some(other) => {
+            Ok((None, Some(Json(serde_json::to_value(other).map_err(|e| StoreError::Backend(e.to_string()))?))))
+        }
     }
 }
 
@@ -94,7 +100,8 @@ fn join_secret(sealed: Option<Vec<u8>>, reference: Option<Json<Value>>) -> Resul
 
 impl PgBackend {
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
-        let opts: PgConnectOptions = url.parse().map_err(|e: sqlx::Error| StoreError::Backend(format!("CALIBAN_DATABASE_URL: {e}")))?;
+        let opts: PgConnectOptions =
+            url.parse().map_err(|e: sqlx::Error| StoreError::Backend(format!("CALIBAN_DATABASE_URL: {e}")))?;
         Self::connect_with(opts).await
     }
 
@@ -173,11 +180,12 @@ impl PgBackend {
         let mut applied = Vec::new();
         for &(version, name, sql) in MIGRATIONS {
             let checksum = hex::encode(Sha256::digest(sql.as_bytes()));
-            let existing: Option<String> = sqlx::query_scalar("SELECT checksum FROM caliban_schema_migrations WHERE version = $1")
-                .bind(version)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db)?;
+            let existing: Option<String> =
+                sqlx::query_scalar("SELECT checksum FROM caliban_schema_migrations WHERE version = $1")
+                    .bind(version)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db)?;
             match existing {
                 Some(c) if c == checksum => continue,
                 Some(_) => {
@@ -187,7 +195,10 @@ impl PgBackend {
                 }
                 None => {}
             }
-            sqlx::raw_sql(sql).execute(&mut *tx).await.map_err(|e| StoreError::Backend(format!("migration {version:04}_{name}: {e}")))?;
+            sqlx::raw_sql(sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Backend(format!("migration {version:04}_{name}: {e}")))?;
             sqlx::query("INSERT INTO caliban_schema_migrations (version, name, checksum) VALUES ($1, $2, $3)")
                 .bind(version)
                 .bind(name)
@@ -206,8 +217,10 @@ impl PgBackend {
     pub async fn seed_if_empty(&self, seed: &State) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(WRITE_LOCK).execute(&mut *tx).await.map_err(db)?;
-        let seeded: Option<String> =
-            sqlx::query_scalar("SELECT value FROM cp_meta WHERE key = 'seeded_at'").fetch_optional(&mut *tx).await.map_err(db)?;
+        let seeded: Option<String> = sqlx::query_scalar("SELECT value FROM cp_meta WHERE key = 'seeded_at'")
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
         if seeded.is_some() {
             return Ok(false);
         }
@@ -249,7 +262,10 @@ impl Backend for PgBackend {
 
     async fn load(&self) -> Result<State, StoreError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY").execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
         let st = load_state(&mut tx).await?;
         tx.commit().await.map_err(db)?;
         Ok(st)
@@ -305,16 +321,32 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
         Mutation::UpdateTenant { id, .. } => {
             let t = next.tenant(id).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
             let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3, semantic_cache = $4 WHERE id = $1 AND status = 'active'";
-            exec(c, sqlx::query(q).bind(id).bind(enum_str(&t.pii_default)).bind(t.pii_surrogate_scope.as_str()).bind(t.semantic_cache.as_str())).await
+            exec(
+                c,
+                sqlx::query(q)
+                    .bind(id)
+                    .bind(enum_str(&t.pii_default))
+                    .bind(t.pii_surrogate_scope.as_str())
+                    .bind(t.semantic_cache.as_str()),
+            )
+            .await
         }
         Mutation::CreateProviderKey(p) => insert_provider_key(c, p).await,
         Mutation::DeleteProviderKey { tenant_id, id } => {
-            exec(c, sqlx::query("DELETE FROM provider_credential WHERE tenant_id = $1 AND id = $2").bind(tenant_id).bind(id)).await
+            exec(
+                c,
+                sqlx::query("DELETE FROM provider_credential WHERE tenant_id = $1 AND id = $2")
+                    .bind(tenant_id)
+                    .bind(id),
+            )
+            .await
         }
         Mutation::CreateModel(model) => insert_model(c, model).await,
         Mutation::DeleteModel(id) => exec(c, sqlx::query("DELETE FROM model WHERE id = $1").bind(id)).await,
         Mutation::CreateSharedProvider(p) => insert_shared_provider(c, p).await,
-        Mutation::DeleteSharedProvider(id) => exec(c, sqlx::query("DELETE FROM shared_provider WHERE id = $1").bind(id)).await,
+        Mutation::DeleteSharedProvider(id) => {
+            exec(c, sqlx::query("DELETE FROM shared_provider WHERE id = $1").bind(id)).await
+        }
         Mutation::SetRoutes { tenant_id, routes } => set_routes(c, tenant_id, routes).await,
         Mutation::CreateDatasource(ds) => insert_datasource(c, ds).await,
         Mutation::SetDatasourceStatus { id, status } => {
@@ -329,7 +361,11 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
             exec(c, sqlx::query(q).bind(tenant_id).bind(id).bind(at)).await
         }
         Mutation::CreateNode(n) => {
-            let assigned = next.nodes.iter().find(|x| x.id == n.id).ok_or_else(|| StoreError::Backend("node not applied".into()))?;
+            let assigned = next
+                .nodes
+                .iter()
+                .find(|x| x.id == n.id)
+                .ok_or_else(|| StoreError::Backend("node not applied".into()))?;
             insert_node(c, assigned).await
         }
         Mutation::ProposeOntology { tenant_id, elements } => {
@@ -350,9 +386,16 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
 /// table is append-only), and the tenant row stays so its id is never reused.
 async fn delete_tenant(c: &mut PgConnection, id: &str, at: DateTime<Utc>) -> Result<(), StoreError> {
     let tenant_at = |sql: &'static str| sqlx::query(sql).bind(id).bind(at);
-    exec(c, tenant_at("UPDATE tenant SET status = 'deleted', deleted_at = $2 WHERE id = $1 AND status = 'active'")).await?;
+    exec(c, tenant_at("UPDATE tenant SET status = 'deleted', deleted_at = $2 WHERE id = $1 AND status = 'active'"))
+        .await?;
     exec(c, tenant_at("UPDATE api_key SET revoked_at = $2 WHERE tenant_id = $1 AND revoked_at IS NULL")).await?;
-    exec(c, tenant_at("UPDATE datasource SET deleted_at = $2, connection = '{}' WHERE tenant_id = $1 AND deleted_at IS NULL")).await?;
+    exec(
+        c,
+        tenant_at(
+            "UPDATE datasource SET deleted_at = $2, connection = '{}' WHERE tenant_id = $1 AND deleted_at IS NULL",
+        ),
+    )
+    .await?;
     exec(c, tenant_at("UPDATE node SET deleted_at = $2 WHERE tenant_id = $1 AND deleted_at IS NULL")).await?;
     let tenant = |sql: &'static str| sqlx::query(sql).bind(id);
     exec(c, tenant("DELETE FROM route WHERE tenant_id = $1")).await?;
@@ -362,7 +405,10 @@ async fn delete_tenant(c: &mut PgConnection, id: &str, at: DateTime<Utc>) -> Res
     exec(c, tenant("DELETE FROM tenant_dek WHERE tenant_id = $1")).await
 }
 
-async fn exec<'q>(c: &mut PgConnection, q: sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>) -> Result<(), StoreError> {
+async fn exec<'q>(
+    c: &mut PgConnection,
+    q: sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
+) -> Result<(), StoreError> {
     q.execute(&mut *c).await.map(|_| ()).map_err(db)
 }
 
@@ -526,7 +572,12 @@ async fn insert_node(c: &mut PgConnection, n: &NodeRecord) -> Result<(), StoreEr
 
 /// One ontology commit: the given elements (full bodies) on top of the current head, then the
 /// head moves. The tenant's ontology version is its number of commits.
-async fn ontology_commit(c: &mut PgConnection, tenant: &str, message: &str, elements: &[Element]) -> Result<(), StoreError> {
+async fn ontology_commit(
+    c: &mut PgConnection,
+    tenant: &str,
+    message: &str,
+    elements: &[Element],
+) -> Result<(), StoreError> {
     let commit: i64 = sqlx::query_scalar(
         "INSERT INTO ontology_commit (tenant_id, parent_id, author, message)
          VALUES ($1, (SELECT commit_id FROM ontology_head WHERE tenant_id = $1), 'control-plane', $2) RETURNING id",
@@ -617,7 +668,10 @@ fn audit_row(r: &PgRow) -> Result<AuditEntry, StoreError> {
 }
 
 async fn audit_head(c: &mut PgConnection) -> Result<u64, StoreError> {
-    let n: i64 = sqlx::query_scalar("SELECT coalesce(max(seq), 0)::BIGINT FROM audit_log").fetch_one(&mut *c).await.map_err(db)?;
+    let n: i64 = sqlx::query_scalar("SELECT coalesce(max(seq), 0)::BIGINT FROM audit_log")
+        .fetch_one(&mut *c)
+        .await
+        .map_err(db)?;
     Ok(u64::try_from(n).unwrap_or_default())
 }
 
@@ -650,7 +704,9 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     }
 
     // Revoked keys are loaded too (listed with `include_revoked`); `render` leaves them out.
-    for r in rows(c, "SELECT id, tenant_id, name, prefix, sha256, created_at, revoked_at FROM api_key ORDER BY ord").await? {
+    for r in
+        rows(c, "SELECT id, tenant_id, name, prefix, sha256, created_at, revoked_at FROM api_key ORDER BY ord").await?
+    {
         st.api_keys.push(ApiKeyRecord {
             id: get(&r, "id")?,
             tenant_id: get(&r, "tenant_id")?,
@@ -734,7 +790,10 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
         });
     }
 
-    for r in rows(c, "SELECT id, tenant_id, kind, name, status, connection, epoch, deleted_at FROM datasource ORDER BY ord").await? {
+    for r in
+        rows(c, "SELECT id, tenant_id, kind, name, status, connection, epoch, deleted_at FROM datasource ORDER BY ord")
+            .await?
+    {
         st.datasources.push(DatasourceRecord {
             id: get(&r, "id")?,
             tenant_id: get(&r, "tenant_id")?,
@@ -747,7 +806,8 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
         });
     }
 
-    for r in rows(c, "SELECT id, tenant_id, name, version, spec, created_at, deleted_at FROM node ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, tenant_id, name, version, spec, created_at, deleted_at FROM node ORDER BY ord").await?
+    {
         st.nodes.push(NodeRecord {
             id: get(&r, "id")?,
             tenant_id: get(&r, "tenant_id")?,

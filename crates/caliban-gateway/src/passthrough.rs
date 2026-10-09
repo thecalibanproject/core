@@ -267,7 +267,13 @@ pub(crate) fn scan_openai(data: &str) -> Option<OpenAiChunk<'_>> {
 
 /// Writes `data: <chunk>\n\n` with the model replaced by `model_json` (the gateway's model id
 /// as a JSON string literal) and, when `strip_null_usage`, the `"usage": null` member removed.
-pub(crate) fn write_openai(out: &mut BytesMut, data: &str, chunk: &OpenAiChunk<'_>, model_json: &str, strip_null_usage: bool) {
+pub(crate) fn write_openai(
+    out: &mut BytesMut,
+    data: &str,
+    chunk: &OpenAiChunk<'_>,
+    model_json: &str,
+    strip_null_usage: bool,
+) {
     write_openai_with(out, data, chunk, model_json, strip_null_usage, None);
 }
 
@@ -419,7 +425,10 @@ pub(crate) fn scan_openai_delta(data: &str) -> Option<DeltaChunk<'_>> {
         Choices::None => None,
         Choices::Many => return None,
         Choices::One(c) => {
-            if c.finish_reason.is_some_and(|f| f.get() != "null") || c.delta.reasoning.is_some() || c.delta.reasoning_content.is_some() {
+            if c.finish_reason.is_some_and(|f| f.get() != "null")
+                || c.delta.reasoning.is_some()
+                || c.delta.reasoning_content.is_some()
+            {
                 return None;
             }
             let content = match c.delta.content {

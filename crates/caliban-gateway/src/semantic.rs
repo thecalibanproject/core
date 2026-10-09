@@ -25,7 +25,9 @@ use crate::pipeline::{Outcome, finish, json_response, render_cached};
 use crate::{Gateway, quirks, stream, telemetry};
 use axum::body::Bytes;
 use axum::response::Response;
-use caliban_cache::semantic::{KeyParts, Lookup, Match, NewEntry, ResponseShape, SemanticCache, SemanticKey, ThresholdPolicy, VerifyKind};
+use caliban_cache::semantic::{
+    KeyParts, Lookup, Match, NewEntry, ResponseShape, SemanticCache, SemanticKey, ThresholdPolicy, VerifyKind,
+};
 use caliban_config::{ModelEntry, SemanticCacheConfig, Snapshot, TenantConfig};
 use caliban_ir::anthropic;
 use caliban_ir::{ChatRequest, Usage};
@@ -119,7 +121,12 @@ fn has_tool_traffic(body: &Value) -> bool {
             m.get("role").and_then(Value::as_str) == Some("tool")
                 || m.get("tool_calls").is_some_and(|t| !t.is_null())
                 || m.get("content").and_then(Value::as_array).is_some_and(|parts| {
-                    parts.iter().any(|p| matches!(p.get("type").and_then(Value::as_str), Some("tool_use" | "tool_result" | "server_tool_use")))
+                    parts.iter().any(|p| {
+                        matches!(
+                            p.get("type").and_then(Value::as_str),
+                            Some("tool_use" | "tool_result" | "server_tool_use")
+                        )
+                    })
                 })
         })
     });
@@ -153,7 +160,12 @@ fn context_hash(body: &Value, model_id: &str) -> blake3::Hash {
             o.remove(k);
         }
         o.insert("model".into(), Value::String(model_id.to_owned()));
-        if let Some(last) = o.get_mut("messages").and_then(Value::as_array_mut).and_then(|m| m.last_mut()).and_then(Value::as_object_mut) {
+        if let Some(last) = o
+            .get_mut("messages")
+            .and_then(Value::as_array_mut)
+            .and_then(|m| m.last_mut())
+            .and_then(Value::as_object_mut)
+        {
             last.insert("content".into(), Value::Null);
         }
     }
@@ -176,7 +188,10 @@ pub(crate) fn prepare(gw: &Gateway, snap: &Snapshot, tenant: &TenantConfig, i: I
     if ext.cache != Some(CacheMode::Semantic) && !temperature.is_some_and(|t| t <= cfg.max_temperature) {
         return None;
     }
-    if i.req.has_tools() || has_tool_traffic(i.upstream_body) || i.req.extra.get("n").and_then(Value::as_u64).is_some_and(|n| n > 1) {
+    if i.req.has_tools()
+        || has_tool_traffic(i.upstream_body)
+        || i.req.extra.get("n").and_then(Value::as_u64).is_some_and(|n| n > 1)
+    {
         return None;
     }
     let last = i.upstream_body.get("messages").and_then(Value::as_array).and_then(|m| m.last())?;
@@ -219,8 +234,10 @@ impl Semantic {
     /// later call picks up the result.
     async fn vector(&mut self, deadline: Option<tokio::time::Instant>) -> Result<Arc<Vec<f32>>, &'static str> {
         if let Emb::Idle(prompt) = &mut self.emb {
-            let (embedder, t, m, prompt) = (Arc::clone(&self.embedder), self.tenant.clone(), self.embed_model.clone(), std::mem::take(prompt));
-            self.emb = Emb::Pending(tokio::spawn(async move { embedder.embed(&t, &m, &[prompt]).await }.in_current_span()));
+            let (embedder, t, m, prompt) =
+                (Arc::clone(&self.embedder), self.tenant.clone(), self.embed_model.clone(), std::mem::take(prompt));
+            self.emb =
+                Emb::Pending(tokio::spawn(async move { embedder.embed(&t, &m, &[prompt]).await }.in_current_span()));
         }
         let res = match &mut self.emb {
             Emb::Idle(_) => return Err("embed_error"),
@@ -264,7 +281,12 @@ impl Semantic {
         let outcome: Result<Lookup, &'static str> = async {
             let v = self.vector(Some(deadline)).await?;
             let draw: f32 = rand::random();
-            match tokio::time::timeout_at(deadline, self.cache.lookup(&self.key, self.embed_model.as_str(), &v, &self.policy, draw, now_secs())).await {
+            match tokio::time::timeout_at(
+                deadline,
+                self.cache.lookup(&self.key, self.embed_model.as_str(), &v, &self.policy, draw, now_secs()),
+            )
+            .await
+            {
                 Ok(Ok(l)) => Ok(l),
                 Ok(Err(e)) => {
                     tracing::debug!(error = %e, "semantic cache: lookup failed");
@@ -298,7 +320,10 @@ impl Semantic {
                 Some(m)
             }
             Ok(Lookup::Verify(m)) => {
-                span.record("caliban.cache", if m.verify == Some(VerifyKind::Explore) { "verify_explore" } else { "verify_grey" });
+                span.record(
+                    "caliban.cache",
+                    if m.verify == Some(VerifyKind::Explore) { "verify_explore" } else { "verify_grey" },
+                );
                 span.record("caliban.cache.similarity", f64::from(m.similarity));
                 self.probe = Some(m);
                 None
@@ -333,7 +358,12 @@ impl Semantic {
             let cached = answer_text(m.payload.response.as_bytes(), m.payload.shape);
             if let Some(correct) = self.judge(cached.as_deref(), &answer).await {
                 match self.cache.record_verification(&m, correct, &self.policy).await {
-                    Ok(stats) => tracing::debug!(correct, similarity = m.similarity, threshold = stats.threshold(&self.policy), "semantic cache: verified"),
+                    Ok(stats) => tracing::debug!(
+                        correct,
+                        similarity = m.similarity,
+                        threshold = stats.threshold(&self.policy),
+                        "semantic cache: verified"
+                    ),
                     Err(e) => tracing::debug!(error = %e, "semantic cache: verification not recorded"),
                 }
             }
@@ -348,7 +378,9 @@ impl Semantic {
             completion_tokens: usage.completion_tokens,
             ttl_secs: self.cfg.ttl_secs,
         };
-        if let Err(e) = self.cache.insert(&self.key, self.embed_model.as_str(), &vector, entry, &self.policy, now_secs()).await {
+        if let Err(e) =
+            self.cache.insert(&self.key, self.embed_model.as_str(), &vector, entry, &self.policy, now_secs()).await
+        {
             tracing::debug!(error = %e, "semantic cache: insert failed");
         }
     }
@@ -362,13 +394,25 @@ impl Semantic {
             return Some(true);
         }
         let texts = [cached.to_owned(), fresh.to_owned()];
-        let vs = tokio::time::timeout(Duration::from_millis(self.cfg.embed_timeout_ms), self.embedder.embed(&self.tenant, &self.embed_model, &texts)).await.ok()?.ok()?;
+        let vs = tokio::time::timeout(
+            Duration::from_millis(self.cfg.embed_timeout_ms),
+            self.embedder.embed(&self.tenant, &self.embed_model, &texts),
+        )
+        .await
+        .ok()?
+        .ok()?;
         Some(cosine(vs.first()?, vs.get(1)?) >= self.cfg.verify_answer_similarity)
     }
 
     /// Wraps the request's T2 state for a live stream; the stream feeds it and completes it.
     pub(crate) fn into_capture(self) -> StreamCapture {
-        StreamCapture { sem: self, valid: true, done: false, openai: OpenAiAcc::default(), anthropic: AnthropicAcc::default() }
+        StreamCapture {
+            sem: self,
+            valid: true,
+            done: false,
+            openai: OpenAiAcc::default(),
+            anthropic: AnthropicAcc::default(),
+        }
     }
 }
 
@@ -380,7 +424,10 @@ fn answer_text(body: &[u8], shape: ResponseShape) -> Option<String> {
         ResponseShape::Openai => {
             let choices = v.get("choices")?.as_array()?;
             let [c] = choices.as_slice() else { return None };
-            if matches!(c.get("finish_reason").and_then(Value::as_str), Some("tool_calls" | "function_call" | "content_filter")) {
+            if matches!(
+                c.get("finish_reason").and_then(Value::as_str),
+                Some("tool_calls" | "function_call" | "content_filter")
+            ) {
                 return None;
             }
             let msg = c.get("message")?;
@@ -451,7 +498,9 @@ impl StreamCapture {
                 return;
             }
             if let Some(d) = c.get("delta") {
-                if d.get("tool_calls").is_some_and(|t| !t.is_null()) || d.get("function_call").is_some_and(|t| !t.is_null()) {
+                if d.get("tool_calls").is_some_and(|t| !t.is_null())
+                    || d.get("function_call").is_some_and(|t| !t.is_null())
+                {
                     self.valid = false;
                     return;
                 }
@@ -615,7 +664,8 @@ fn openai_replay(body: &Value) -> String {
         }
     }
     delta.insert("content".into(), msg.get("content").cloned().unwrap_or(json!("")));
-    let (id, model) = (body.get("id").cloned().unwrap_or(Value::Null), body.get("model").cloned().unwrap_or(Value::Null));
+    let (id, model) =
+        (body.get("id").cloned().unwrap_or(Value::Null), body.get("model").cloned().unwrap_or(Value::Null));
     let first = json!({"id": id, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": null}]});
     let last = json!({"id": id, "object": "chat.completion.chunk", "model": model,
         "choices": [{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason").cloned().unwrap_or(json!("stop"))}],
@@ -640,7 +690,9 @@ fn anthropic_replay(body: &Value) -> String {
     for (i, b) in body.get("content").and_then(Value::as_array).into_iter().flatten().enumerate() {
         match b.get("type").and_then(Value::as_str) {
             Some("text") => {
-                evs.push(json!({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}));
+                evs.push(
+                    json!({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}),
+                );
                 evs.push(json!({"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": b.get("text").cloned().unwrap_or(json!(""))}}));
             }
             Some("thinking") => {
@@ -692,15 +744,20 @@ mod tests {
     fn tool_traffic_is_detected_in_both_shapes() {
         assert!(has_tool_traffic(&json!({"messages": [{"role": "tool", "content": "x"}]})));
         assert!(has_tool_traffic(&json!({"messages": [{"role": "assistant", "tool_calls": [{}]}]})));
-        assert!(has_tool_traffic(&json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "content": "x"}]}]})));
-        assert!(!has_tool_traffic(&json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "x"}]}]})));
+        assert!(has_tool_traffic(
+            &json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "content": "x"}]}]})
+        ));
+        assert!(!has_tool_traffic(
+            &json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "x"}]}]})
+        ));
     }
 
     #[test]
     fn answers_with_tool_calls_or_several_choices_are_not_cached() {
         let ok = json!({"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]});
         assert_eq!(answer_text(ok.to_string().as_bytes(), ResponseShape::Openai).as_deref(), Some("hi"));
-        let tools = json!({"choices": [{"message": {"content": null, "tool_calls": [{}]}, "finish_reason": "tool_calls"}]});
+        let tools =
+            json!({"choices": [{"message": {"content": null, "tool_calls": [{}]}, "finish_reason": "tool_calls"}]});
         assert!(answer_text(tools.to_string().as_bytes(), ResponseShape::Openai).is_none());
         let two = json!({"choices": [{"message": {"content": "a"}}, {"message": {"content": "b"}}]});
         assert!(answer_text(two.to_string().as_bytes(), ResponseShape::Openai).is_none());
@@ -715,7 +772,8 @@ mod tests {
         let body = json!({"id": "c", "model": "m", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello there"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}});
         let sse = openai_replay(&body);
-        let chunks: Vec<Value> = sse.lines().filter_map(|l| l.strip_prefix("data: ")).filter_map(|d| serde_json::from_str(d).ok()).collect();
+        let chunks: Vec<Value> =
+            sse.lines().filter_map(|l| l.strip_prefix("data: ")).filter_map(|d| serde_json::from_str(d).ok()).collect();
         assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "Hello there");
         assert_eq!(chunks[1]["usage"]["completion_tokens"], 2);
         assert!(sse.ends_with("data: [DONE]\n\n"));

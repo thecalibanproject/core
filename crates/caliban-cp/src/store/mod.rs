@@ -30,7 +30,9 @@ pub mod postgres;
 mod tests;
 
 use audit::{AuditDraft, AuditEntry};
-use caliban_config::{Config, ConfigHandle, ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider, Snapshot, TenantConfig};
+use caliban_config::{
+    Config, ConfigHandle, ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider, Snapshot, TenantConfig,
+};
 use caliban_meter::RecentUsage;
 use caliban_ontology::{Element, Ontology, Status};
 use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, SemanticCacheMode, TrustTier};
@@ -163,7 +165,8 @@ impl State {
     /// Initial state from the config file (the in-memory store, or the first Postgres start).
     pub fn from_config(base: &Config) -> Self {
         let now = audit::now_micros();
-        let mut st = State { models: base.models.clone(), shared_providers: base.providers.clone(), ..State::default() };
+        let mut st =
+            State { models: base.models.clone(), shared_providers: base.providers.clone(), ..State::default() };
         for t in &base.tenants {
             st.tenants.push(Tenant {
                 id: t.id.to_string(),
@@ -261,7 +264,8 @@ impl NodeRecord {
 }
 
 /// `TenantConfig` fields the store models explicitly; anything else is kept in `settings`.
-const TENANT_FIELDS: &[&str] = &["id", "name", "pii_mode", "pii_surrogate_scope", "semantic_cache", "api_key_hashes", "providers", "routes"];
+const TENANT_FIELDS: &[&str] =
+    &["id", "name", "pii_mode", "pii_surrogate_scope", "semantic_cache", "api_key_hashes", "providers", "routes"];
 
 fn tenant_settings(t: &TenantConfig) -> Map<String, Value> {
     match serde_json::to_value(t) {
@@ -309,10 +313,19 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
             obj.insert("semantic_cache".into(), json!(t.semantic_cache));
             obj.insert(
                 "api_key_hashes".into(),
-                json!(st.api_keys.iter().filter(|k| k.tenant_id == t.id && k.is_active()).map(|k| &k.hash).collect::<Vec<_>>()),
+                json!(
+                    st.api_keys
+                        .iter()
+                        .filter(|k| k.tenant_id == t.id && k.is_active())
+                        .map(|k| &k.hash)
+                        .collect::<Vec<_>>()
+                ),
             );
             obj.insert("providers".into(), serde_json::to_value(providers).map_err(|e| e.to_string())?);
-            obj.insert("routes".into(), serde_json::to_value(st.routes.get(&t.id).cloned().unwrap_or_default()).map_err(|e| e.to_string())?);
+            obj.insert(
+                "routes".into(),
+                serde_json::to_value(st.routes.get(&t.id).cloned().unwrap_or_default()).map_err(|e| e.to_string())?,
+            );
             serde_json::from_value::<TenantConfig>(Value::Object(obj)).map_err(|e| format!("tenant {}: {e}", t.id))
         })
         .collect::<Result<_, _>>()?;
@@ -343,10 +356,17 @@ pub enum Mutation {
     CreateTenant(Tenant),
     CreateApiKey(ApiKeyRecord),
     /// Soft revoke: `revoked_at = at`, the row is kept.
-    RevokeApiKey { tenant_id: String, id: String, at: DateTime<Utc> },
+    RevokeApiKey {
+        tenant_id: String,
+        id: String,
+        at: DateTime<Utc>,
+    },
     /// Tombstones the tenant and, in the same transaction, revokes its API keys, destroys its
     /// BYOK credentials, removes its routes and soft-deletes its datasources and nodes.
-    DeleteTenant { id: String, at: DateTime<Utc> },
+    DeleteTenant {
+        id: String,
+        at: DateTime<Utc>,
+    },
     /// Changes an active tenant's settings; `None` keeps the current value.
     UpdateTenant {
         id: String,
@@ -355,23 +375,46 @@ pub enum Mutation {
         semantic_cache: Option<SemanticCacheMode>,
     },
     CreateProviderKey(ProviderKeyRecord),
-    DeleteProviderKey { tenant_id: String, id: String },
+    DeleteProviderKey {
+        tenant_id: String,
+        id: String,
+    },
     CreateModel(ModelEntry),
     DeleteModel(String),
     CreateSharedProvider(SharedProvider),
     DeleteSharedProvider(String),
-    SetRoutes { tenant_id: String, routes: Vec<RouteConfig> },
+    SetRoutes {
+        tenant_id: String,
+        routes: Vec<RouteConfig>,
+    },
     CreateDatasource(DatasourceRecord),
-    SetDatasourceStatus { id: String, status: String },
+    SetDatasourceStatus {
+        id: String,
+        status: String,
+    },
     /// Soft delete; the stored `connection` is wiped.
-    DeleteDatasource { tenant_id: String, id: String, at: DateTime<Utc> },
+    DeleteDatasource {
+        tenant_id: String,
+        id: String,
+        at: DateTime<Utc>,
+    },
     /// `version` is assigned by the store (latest version for (tenant, name) + 1).
     CreateNode(NodeRecord),
     /// Soft-deletes one node version.
-    DeleteNode { tenant_id: String, id: String, at: DateTime<Utc> },
+    DeleteNode {
+        tenant_id: String,
+        id: String,
+        at: DateTime<Utc>,
+    },
     /// Upserts elements (e.g. proposals from the bootstrap job) as one new ontology version.
-    ProposeOntology { tenant_id: String, elements: Vec<Element> },
-    ReviewOntologyElement { id: String, status: Status },
+    ProposeOntology {
+        tenant_id: String,
+        elements: Vec<Element>,
+    },
+    ReviewOntologyElement {
+        id: String,
+        status: Status,
+    },
 }
 
 impl Mutation {
@@ -404,10 +447,17 @@ impl Mutation {
                     }),
                 )
             }
-            Mutation::CreateApiKey(k) => d(Some(&k.tenant_id), "api_key.create", &k.id, json!({"name": k.name, "prefix": k.prefix})),
+            Mutation::CreateApiKey(k) => {
+                d(Some(&k.tenant_id), "api_key.create", &k.id, json!({"name": k.name, "prefix": k.prefix}))
+            }
             Mutation::RevokeApiKey { tenant_id, id, .. } => {
                 let k = before.active_api_key(tenant_id, id);
-                d(Some(tenant_id), "api_key.revoke", id, json!({"name": k.map(|k| &k.name), "prefix": k.map(|k| &k.prefix)}))
+                d(
+                    Some(tenant_id),
+                    "api_key.revoke",
+                    id,
+                    json!({"name": k.map(|k| &k.name), "prefix": k.map(|k| &k.prefix)}),
+                )
             }
             Mutation::DeleteTenant { id, .. } => {
                 let ids = |v: Vec<&String>| v.into_iter().cloned().collect::<Vec<_>>();
@@ -431,9 +481,12 @@ impl Mutation {
                 json!({"kind": p.kind, "base_url": p.base_url, "trust_tier": p.trust_tier, "last4": p.last4}),
             ),
             Mutation::DeleteProviderKey { tenant_id, id } => d(Some(tenant_id), "provider_key.delete", id, json!({})),
-            Mutation::CreateModel(m) => {
-                d(None, "model.create", m.id.as_str(), json!({"provider": m.provider, "upstream_model": m.upstream_model}))
-            }
+            Mutation::CreateModel(m) => d(
+                None,
+                "model.create",
+                m.id.as_str(),
+                json!({"provider": m.provider, "upstream_model": m.upstream_model}),
+            ),
             Mutation::DeleteModel(id) => d(None, "model.delete", id, json!({})),
             Mutation::CreateSharedProvider(p) => d(
                 None,
@@ -455,12 +508,22 @@ impl Mutation {
             Mutation::SetDatasourceStatus { id, status } => d(None, "datasource.status", id, json!({"status": status})),
             Mutation::DeleteDatasource { tenant_id, id, .. } => {
                 let ds = before.live_datasource(tenant_id, id);
-                d(Some(tenant_id), "datasource.delete", id, json!({"kind": ds.map(|x| &x.kind), "name": ds.map(|x| &x.name)}))
+                d(
+                    Some(tenant_id),
+                    "datasource.delete",
+                    id,
+                    json!({"kind": ds.map(|x| &x.kind), "name": ds.map(|x| &x.name)}),
+                )
             }
             Mutation::CreateNode(n) => d(Some(&n.tenant_id), "node.create", &n.id, json!({"name": n.name})),
             Mutation::DeleteNode { tenant_id, id, .. } => {
                 let n = before.live_node(tenant_id, id);
-                d(Some(tenant_id), "node.delete", id, json!({"name": n.map(|x| &x.name), "version": n.map(|x| x.version)}))
+                d(
+                    Some(tenant_id),
+                    "node.delete",
+                    id,
+                    json!({"name": n.map(|x| &x.name), "version": n.map(|x| x.version)}),
+                )
             }
             Mutation::ProposeOntology { tenant_id, elements } => d(
                 Some(tenant_id),
@@ -509,12 +572,22 @@ impl Store {
 
     /// Postgres store: runs migrations, seeds from the config file if the database has never been
     /// seeded, then loads the database state (which wins over the file from then on).
-    pub async fn postgres(url: &str, base: Config, config: ConfigHandle, usage: RecentUsage) -> Result<Self, StoreError> {
+    pub async fn postgres(
+        url: &str,
+        base: Config,
+        config: ConfigHandle,
+        usage: RecentUsage,
+    ) -> Result<Self, StoreError> {
         let pg = postgres::PgBackend::connect(url).await?;
         Self::open_postgres(pg, base, config, usage).await
     }
 
-    pub async fn open_postgres(pg: postgres::PgBackend, base: Config, config: ConfigHandle, usage: RecentUsage) -> Result<Self, StoreError> {
+    pub async fn open_postgres(
+        pg: postgres::PgBackend,
+        base: Config,
+        config: ConfigHandle,
+        usage: RecentUsage,
+    ) -> Result<Self, StoreError> {
         pg.migrate().await?;
         if pg.seed_if_empty(&State::from_config(&base)).await? {
             tracing::info!("postgres store was empty: seeded from the config file");
@@ -527,7 +600,13 @@ impl Store {
         Ok(Self::with_backend(Arc::new(pg), state, base, config, usage))
     }
 
-    fn with_backend(backend: Arc<dyn Backend>, state: State, base: Config, config: ConfigHandle, usage: RecentUsage) -> Self {
+    fn with_backend(
+        backend: Arc<dyn Backend>,
+        state: State,
+        base: Config,
+        config: ConfigHandle,
+        usage: RecentUsage,
+    ) -> Self {
         let s = Self { backend, cache: RwLock::new(Arc::new(State::default())), base, config, usage };
         s.install(state);
         s

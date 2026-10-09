@@ -194,7 +194,13 @@ impl TenantBudget {
 mod tests {
     use super::*;
 
-    const P: ThresholdPolicy = ThresholdPolicy { threshold: 0.95, min_threshold: 0.90, grey_band: 0.03, max_error_rate: 0.02, verify_rate: 0.0 };
+    const P: ThresholdPolicy = ThresholdPolicy {
+        threshold: 0.95,
+        min_threshold: 0.90,
+        grey_band: 0.03,
+        max_error_rate: 0.02,
+        verify_rate: 0.0,
+    };
 
     #[test]
     fn fresh_entry_uses_the_conservative_threshold() {

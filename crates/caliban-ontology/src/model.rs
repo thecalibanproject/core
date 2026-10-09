@@ -103,10 +103,21 @@ pub enum Aggregation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum MetricExpr {
-    Attr { id: String },
-    Mul { left: Box<MetricExpr>, right: Box<MetricExpr> },
-    Add { left: Box<MetricExpr>, right: Box<MetricExpr> },
-    Sub { left: Box<MetricExpr>, right: Box<MetricExpr> },
+    Attr {
+        id: String,
+    },
+    Mul {
+        left: Box<MetricExpr>,
+        right: Box<MetricExpr>,
+    },
+    Add {
+        left: Box<MetricExpr>,
+        right: Box<MetricExpr>,
+    },
+    Sub {
+        left: Box<MetricExpr>,
+        right: Box<MetricExpr>,
+    },
     /// Row count at the metric's grain.
     Rows,
 }
@@ -191,16 +202,21 @@ impl Model {
     pub fn table_of(&self, entity: &str) -> Option<String> {
         match &self.entities.get(entity)?.binding {
             EntityBinding::Root { collection, table, .. } => Some(table.clone().unwrap_or_else(|| collection.clone())),
-            EntityBinding::Embedded { parent, array_path, table } => {
-                Some(table.clone().unwrap_or_else(|| format!("{}__{}", self.table_of(parent).unwrap_or_default(), array_path)))
-            }
+            EntityBinding::Embedded { parent, array_path, table } => Some(
+                table
+                    .clone()
+                    .unwrap_or_else(|| format!("{}__{}", self.table_of(parent).unwrap_or_default(), array_path)),
+            ),
         }
     }
 
     /// Verified N:1 (or 1:1) reference from `from` to `to`.
     pub fn reference(&self, from: &str, to: &str) -> Option<&RelationDef> {
         self.relations.iter().find(|r| {
-            r.from == from && r.to == to && r.verified && matches!(r.cardinality, Cardinality::ManyToOne | Cardinality::OneToOne)
+            r.from == from
+                && r.to == to
+                && r.verified
+                && matches!(r.cardinality, Cardinality::ManyToOne | Cardinality::OneToOne)
         })
     }
 }

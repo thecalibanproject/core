@@ -142,7 +142,12 @@ mod tests {
     use super::*;
 
     fn draft(action: &'static str, n: u64) -> AuditDraft {
-        AuditDraft { tenant_id: Some("acme".into()), action, target: Some(format!("t{n}")), detail: json!({"b": n, "a": "x"}) }
+        AuditDraft {
+            tenant_id: Some("acme".into()),
+            action,
+            target: Some(format!("t{n}")),
+            detail: json!({"b": n, "a": "x"}),
+        }
     }
 
     fn chain(n: u64) -> Vec<AuditEntry> {

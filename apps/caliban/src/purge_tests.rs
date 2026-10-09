@@ -23,7 +23,8 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 const ADMIN: &str = "admin-secret";
-const P: ThresholdPolicy = ThresholdPolicy { threshold: 0.95, min_threshold: 0.90, grey_band: 0.03, max_error_rate: 0.02, verify_rate: 0.0 };
+const P: ThresholdPolicy =
+    ThresholdPolicy { threshold: 0.95, min_threshold: 0.90, grey_band: 0.03, max_error_rate: 0.02, verify_rate: 0.0 };
 
 fn config() -> Config {
     Config::from_toml_str(include_str!("../../../config/caliban.example.toml")).unwrap()
@@ -63,7 +64,13 @@ async fn seed(gw: &Gateway, tenants: &[&str]) {
             pii_mode: PiiMode::Reversible,
         });
         for (model, v) in [("emb", vec![0.6f32, 0.8]), ("emb-old", vec![1.0, 0.0, 0.0])] {
-            let e = NewEntry { model: "ext/mock".into(), response: "{}".into(), prompt_tokens: 3, completion_tokens: 4, ttl_secs: 3600 };
+            let e = NewEntry {
+                model: "ext/mock".into(),
+                response: "{}".into(),
+                prompt_tokens: 3,
+                completion_tokens: 4,
+                ttl_secs: 3600,
+            };
             cache.insert(&key, model, &v, e, &P, chrono::Utc::now().timestamp()).await.unwrap();
         }
     }
@@ -91,7 +98,11 @@ async fn standalone_tenant_delete_purges_its_semantic_entries() {
 
     assert_eq!(send(&cp, "DELETE", "/api/v1/tenants/globex", None).await, StatusCode::NO_CONTENT);
     assert_eq!(purger.tick().await, vec![TenantId::from("globex")]);
-    assert_eq!(tenants_in(&vectors), BTreeSet::from(["initech".to_owned()]), "both of globex's collections purged, initech kept");
+    assert_eq!(
+        tenants_in(&vectors),
+        BTreeSet::from(["initech".to_owned()]),
+        "both of globex's collections purged, initech kept"
+    );
     assert_eq!(vectors.len(), 2);
     assert!(purger.tick().await.is_empty() && purger.pending().is_empty(), "purged once");
 }
@@ -114,7 +125,9 @@ async fn split_router_purges_after_the_snapshot_that_drops_the_tenant() {
     create_tenant(&cp_app, "initech").await;
 
     // The control plane holds no semantic cache; the router does (its own in-memory store).
-    let mut source = SnapshotSource::new(&url, "router-secret".into(), SnapshotVerifier::from_b64_list(&public).unwrap(), None).unwrap();
+    let mut source =
+        SnapshotSource::new(&url, "router-secret".into(), SnapshotVerifier::from_b64_list(&public).unwrap(), None)
+            .unwrap();
     let first = source.fetch().await.unwrap().expect("first snapshot");
     let router_handle = ConfigHandle::new(Snapshot::new(first.config, first.version));
     let vectors = Arc::new(MemoryStore::default());

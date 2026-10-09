@@ -32,10 +32,7 @@ pub fn new_kek() -> String {
 
 /// A port that was free a moment ago.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .expect("free port")
+    std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).expect("free port")
 }
 
 /// Options for one gateway process.
@@ -82,11 +79,7 @@ impl Drop for Caliban {
 }
 
 pub fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .pool_max_idle_per_host(256)
-        .build()
-        .expect("http client")
+    reqwest::Client::builder().no_proxy().pool_max_idle_per_host(256).build().expect("http client")
 }
 
 impl Caliban {
@@ -140,15 +133,10 @@ impl Caliban {
         for (k, v) in &launch.env {
             cmd.env(k, v);
         }
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("spawning {}", bin.display()))?;
+        let child = cmd.spawn().with_context(|| format!("spawning {}", bin.display()))?;
         let mut me = Self {
             child,
-            dp: format!(
-                "http://{}:{dp_port}",
-                launch.advertise.as_deref().unwrap_or("127.0.0.1")
-            ),
+            dp: format!("http://{}:{dp_port}", launch.advertise.as_deref().unwrap_or("127.0.0.1")),
             cp: format!("http://127.0.0.1:{cp_port}"),
             work,
             wal,
@@ -161,18 +149,9 @@ impl Caliban {
                 let log = std::fs::read_to_string(me.work.join("caliban.log")).unwrap_or_default();
                 bail!("caliban exited at startup ({status}):\n{log}");
             }
-            let dp_ok = me
-                .http
-                .get(format!("{}/healthz", me.dp))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success());
-            let cp_ok = me
-                .http
-                .get(format!("{}/api/v1/health", me.cp))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success());
+            let dp_ok = me.http.get(format!("{}/healthz", me.dp)).send().await.is_ok_and(|r| r.status().is_success());
+            let cp_ok =
+                me.http.get(format!("{}/api/v1/health", me.cp)).send().await.is_ok_and(|r| r.status().is_success());
             if dp_ok && cp_ok {
                 return Ok(me);
             }
@@ -194,20 +173,11 @@ impl Caliban {
         let Some(p) = &self.wal else {
             return Vec::new();
         };
-        std::fs::read_to_string(p)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect()
+        std::fs::read_to_string(p).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
     }
 
     /// Admin API call with the admin token.
-    pub async fn admin(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
-    ) -> (StatusCode, Value) {
+    pub async fn admin(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
         self.cp_call(method, path, Some(ADMIN_TOKEN), body).await
     }
 
@@ -235,22 +205,14 @@ impl Caliban {
 
     /// Data-plane call: OpenAI-style bearer key.
     pub async fn chat(&self, key: &str, body: &Value) -> Reply {
-        self.dp_post(
-            "/v1/chat/completions",
-            &[("authorization", format!("Bearer {key}"))],
-            body,
-        )
-        .await
+        self.dp_post("/v1/chat/completions", &[("authorization", format!("Bearer {key}"))], body).await
     }
 
     /// Data-plane call: Anthropic-style `x-api-key`.
     pub async fn messages(&self, key: &str, body: &Value) -> Reply {
         self.dp_post(
             "/v1/messages",
-            &[
-                ("x-api-key", key.to_owned()),
-                ("anthropic-version", "2023-06-01".to_owned()),
-            ],
+            &[("x-api-key", key.to_owned()), ("anthropic-version", "2023-06-01".to_owned())],
             body,
         )
         .await
@@ -261,24 +223,14 @@ impl Caliban {
     }
 
     pub async fn dp_get(&self, path: &str, key: &str) -> Reply {
-        let resp = self
-            .http
-            .get(format!("{}{path}", self.dp))
-            .bearer_auth(key)
-            .send()
-            .await
-            .expect("data plane reachable");
+        let resp =
+            self.http.get(format!("{}{path}", self.dp)).bearer_auth(key).send().await.expect("data plane reachable");
         Reply::read(resp).await
     }
 }
 
 /// POSTs a JSON body to `url` and reads the whole response (panics if the server is unreachable).
-pub async fn post_json(
-    http: &reqwest::Client,
-    url: &str,
-    headers: &[(&str, String)],
-    body: &Value,
-) -> Reply {
+pub async fn post_json(http: &reqwest::Client, url: &str, headers: &[(&str, String)], body: &Value) -> Reply {
     let mut req = http.post(url).json(body);
     for (k, v) in headers {
         req = req.header(*k, v);
@@ -300,11 +252,7 @@ impl Reply {
         let status = resp.status();
         let headers = resp.headers().clone();
         let text = resp.text().await.unwrap_or_default();
-        Self {
-            status,
-            headers,
-            text,
-        }
+        Self { status, headers, text }
     }
 
     pub fn json(&self) -> Value {
@@ -312,10 +260,7 @@ impl Reply {
     }
 
     pub fn header(&self, name: &str) -> Option<String> {
-        self.headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
+        self.headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
     }
 
     pub fn request_id(&self) -> String {
@@ -325,20 +270,12 @@ impl Reply {
     /// Text of a non-streaming response in either dialect.
     pub fn content(&self) -> String {
         let v = self.json();
-        if let Some(s) = v
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-        {
+        if let Some(s) = v.pointer("/choices/0/message/content").and_then(Value::as_str) {
             return s.to_owned();
         }
         v.get("content")
             .and_then(Value::as_array)
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter_map(|b| b.get("text").and_then(Value::as_str))
-                    .collect::<String>()
-            })
+            .map(|blocks| blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<String>())
             .unwrap_or_default()
     }
 

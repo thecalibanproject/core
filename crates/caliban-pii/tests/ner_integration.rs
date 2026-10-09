@@ -59,17 +59,35 @@ fn corpus() -> Vec<(&'static str, Vec<(EntityType, &'static str)>)> {
     use EntityType::*;
     vec![
         ("My name is Sarah Johnson and I live in Denver.", vec![(Person, "Sarah Johnson"), (Location, "Denver")]),
-        ("Please forward the contract to Michael O'Brien at Globex Corporation.", vec![(Person, "Michael O'Brien"), (Organization, "Globex")]),
-        ("Dr. Priya Raman from Mercy General Hospital called about the MRI.", vec![(Person, "Priya Raman"), (Organization, "Mercy General")]),
+        (
+            "Please forward the contract to Michael O'Brien at Globex Corporation.",
+            vec![(Person, "Michael O'Brien"), (Organization, "Globex")],
+        ),
+        (
+            "Dr. Priya Raman from Mercy General Hospital called about the MRI.",
+            vec![(Person, "Priya Raman"), (Organization, "Mercy General")],
+        ),
         ("Ship it to 42 Wallaby Way, Sydney by Friday.", vec![(Location, "Wallaby Way"), (Location, "Sydney")]),
-        ("Tom met Angela Merkel in Berlin last year.", vec![(Person, "Tom"), (Person, "Angela Merkel"), (Location, "Berlin")]),
+        (
+            "Tom met Angela Merkel in Berlin last year.",
+            vec![(Person, "Tom"), (Person, "Angela Merkel"), (Location, "Berlin")],
+        ),
         ("Can you summarize the Q3 report for Initech before the board meeting?", vec![(Organization, "Initech")]),
         ("The weather in Chicago was terrible, said Kevin Park.", vec![(Location, "Chicago"), (Person, "Kevin Park")]),
         ("Explain how photosynthesis works in simple terms.", vec![]),
         ("Write a Python function that reverses a linked list.", vec![]),
-        ("Jean Dupont travaille chez Renault à Lyon depuis 2019.", vec![(Person, "Jean Dupont"), (Organization, "Renault"), (Location, "Lyon")]),
-        ("Frau Anna Schmidt aus München hat bei der Siemens AG angerufen.", vec![(Person, "Anna Schmidt"), (Location, "München"), (Organization, "Siemens")]),
-        ("María García vive en Sevilla y trabaja para Telefónica.", vec![(Person, "María García"), (Location, "Sevilla"), (Organization, "Telefónica")]),
+        (
+            "Jean Dupont travaille chez Renault à Lyon depuis 2019.",
+            vec![(Person, "Jean Dupont"), (Organization, "Renault"), (Location, "Lyon")],
+        ),
+        (
+            "Frau Anna Schmidt aus München hat bei der Siemens AG angerufen.",
+            vec![(Person, "Anna Schmidt"), (Location, "München"), (Organization, "Siemens")],
+        ),
+        (
+            "María García vive en Sevilla y trabaja para Telefónica.",
+            vec![(Person, "María García"), (Location, "Sevilla"), (Organization, "Telefónica")],
+        ),
     ]
 }
 
@@ -117,7 +135,10 @@ fn multilingual_and_multibyte_offsets() {
         assert!(text.is_char_boundary(s.start) && text.is_char_boundary(s.end));
         eprintln!("  {:<10} {:?}", s.entity.label(), &text[s.start..s.end]);
     }
-    assert!(spans.iter().any(|s| s.entity == EntityType::Person && text[s.start..s.end].contains("Çelik")), "{spans:?}");
+    assert!(
+        spans.iter().any(|s| s.entity == EntityType::Person && text[s.start..s.end].contains("Çelik")),
+        "{spans:?}"
+    );
 }
 
 #[test]
@@ -125,9 +146,12 @@ fn long_text_windows_find_entities_everywhere_once() {
     let d = need_model!();
     // ~3k tokens: names at the start, in the middle and at the end, filler in between.
     let filler = "The quarterly numbers were discussed at length and nothing else was decided. ".repeat(80);
-    let text = format!("Sarah Johnson opened the meeting. {filler} Then Kevin Park presented. {filler} Finally Angela Merkel closed it.");
+    let text = format!(
+        "Sarah Johnson opened the meeting. {filler} Then Kevin Park presented. {filler} Finally Angela Merkel closed it."
+    );
     let spans = d.try_detect(&text).unwrap();
-    let persons: Vec<&str> = spans.iter().filter(|s| s.entity == EntityType::Person).map(|s| &text[s.start..s.end]).collect();
+    let persons: Vec<&str> =
+        spans.iter().filter(|s| s.entity == EntityType::Person).map(|s| &text[s.start..s.end]).collect();
     eprintln!("persons: {persons:?}");
     for name in ["Sarah Johnson", "Kevin Park", "Angela Merkel"] {
         assert_eq!(persons.iter().filter(|p| p.contains(name)).count(), 1, "{name} exactly once in {persons:?}");

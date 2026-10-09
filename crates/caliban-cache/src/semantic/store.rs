@@ -97,9 +97,22 @@ pub trait VectorStore: Send + Sync {
     /// error (no entries yet).
     async fn search(&self, q: &SearchQuery<'_>) -> Result<Vec<Candidate>, StoreError>;
     /// Inserts or replaces an entry, creating the collection (sized to the vector) if needed.
-    async fn upsert(&self, collection: &str, id: &str, vector: &[f32], payload: &EntryPayload) -> Result<(), StoreError>;
+    async fn upsert(
+        &self,
+        collection: &str,
+        id: &str,
+        vector: &[f32],
+        payload: &EntryPayload,
+    ) -> Result<(), StoreError>;
     /// Replaces an entry's verifier stats, only if it belongs to `tenant`.
-    async fn update_stats(&self, collection: &str, tenant: &str, id: &str, stats: &EntryStats, threshold: f32) -> Result<(), StoreError>;
+    async fn update_stats(
+        &self,
+        collection: &str,
+        tenant: &str,
+        id: &str,
+        stats: &EntryStats,
+        threshold: f32,
+    ) -> Result<(), StoreError>;
     /// Deletes entries with `expires_at <= now`.
     async fn delete_expired(&self, collection: &str, now: i64) -> Result<(), StoreError>;
     /// Deletes every entry of `tenant` in `collection` (tenant offboarding).
@@ -157,7 +170,12 @@ impl VectorStore for MemoryStore {
         let Some(c) = g.get(q.collection) else { return Ok(vec![]) };
         let mut out: Vec<Candidate> = c
             .iter()
-            .filter(|(_, (v, p))| p.tenant_id == q.tenant && p.partition == q.partition && p.expires_at > q.now && v.len() == q.vector.len())
+            .filter(|(_, (v, p))| {
+                p.tenant_id == q.tenant
+                    && p.partition == q.partition
+                    && p.expires_at > q.now
+                    && v.len() == q.vector.len()
+            })
             .map(|(id, (v, p))| Candidate { id: id.clone(), score: cosine(v, q.vector), payload: p.clone() })
             .collect();
         out.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -165,13 +183,23 @@ impl VectorStore for MemoryStore {
         Ok(out)
     }
 
-    async fn upsert(&self, collection: &str, id: &str, vector: &[f32], payload: &EntryPayload) -> Result<(), StoreError> {
+    async fn upsert(
+        &self,
+        collection: &str,
+        id: &str,
+        vector: &[f32],
+        payload: &EntryPayload,
+    ) -> Result<(), StoreError> {
         let mut g = self.collections.lock();
         let c = g.entry(collection.to_owned()).or_default();
         if let Some((_, (v, _))) = c.iter().next()
             && v.len() != vector.len()
         {
-            return Err(StoreError::Backend(format!("collection {collection} holds {}-d vectors, got {}", v.len(), vector.len())));
+            return Err(StoreError::Backend(format!(
+                "collection {collection} holds {}-d vectors, got {}",
+                v.len(),
+                vector.len()
+            )));
         }
         if !c.contains_key(id) && c.len() >= self.max_per_collection {
             let victim = c.iter().min_by_key(|(_, (_, p))| p.expires_at).map(|(k, _)| k.clone());
@@ -183,7 +211,14 @@ impl VectorStore for MemoryStore {
         Ok(())
     }
 
-    async fn update_stats(&self, collection: &str, tenant: &str, id: &str, stats: &EntryStats, threshold: f32) -> Result<(), StoreError> {
+    async fn update_stats(
+        &self,
+        collection: &str,
+        tenant: &str,
+        id: &str,
+        stats: &EntryStats,
+        threshold: f32,
+    ) -> Result<(), StoreError> {
         let mut g = self.collections.lock();
         if let Some((_, p)) = g.get_mut(collection).and_then(|c| c.get_mut(id))
             && p.tenant_id == tenant

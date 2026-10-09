@@ -84,10 +84,7 @@ fn walk(v: &J, s: &mut ExplainSummary) {
 
 pub fn summarize(explain: &J) -> ExplainSummary {
     let mut s = ExplainSummary {
-        explain_version: explain
-            .get("explainVersion")
-            .and_then(J::as_str)
-            .map(str::to_owned),
+        explain_version: explain.get("explainVersion").and_then(J::as_str).map(str::to_owned),
         ..Default::default()
     };
     walk(explain, &mut s);
@@ -110,10 +107,7 @@ pub struct GatePolicy {
 
 impl Default for GatePolicy {
     fn default() -> Self {
-        Self {
-            max_collscan_docs: 100_000,
-            reject_unindexed_lookup: true,
-        }
+        Self { max_collscan_docs: 100_000, reject_unindexed_lookup: true }
     }
 }
 
@@ -126,19 +120,12 @@ pub struct GateReport {
     pub reasons: Vec<String>,
 }
 
-pub fn gate(
-    summary: ExplainSummary,
-    estimated_docs: Option<u64>,
-    policy: &GatePolicy,
-) -> GateReport {
+pub fn gate(summary: ExplainSummary, estimated_docs: Option<u64>, policy: &GatePolicy) -> GateReport {
     let mut reasons = Vec::new();
     if summary.collscan {
         match estimated_docs {
             Some(n) if n <= policy.max_collscan_docs => {}
-            Some(n) => reasons.push(format!(
-                "COLLSCAN over ~{n} documents (limit {})",
-                policy.max_collscan_docs
-            )),
+            Some(n) => reasons.push(format!("COLLSCAN over ~{n} documents (limit {})", policy.max_collscan_docs)),
             None => reasons.push("COLLSCAN over a collection of unknown size".to_owned()),
         }
     }
@@ -149,12 +136,7 @@ pub fn gate(
             }
         }
     }
-    GateReport {
-        native_ok: reasons.is_empty(),
-        reasons,
-        summary,
-        estimated_docs,
-    }
+    GateReport { native_ok: reasons.is_empty(), reasons, summary, estimated_docs }
 }
 
 #[cfg(test)]
@@ -184,10 +166,7 @@ mod tests {
     fn parses_sbe_plan_and_ignores_rejected() {
         let s = summarize(&sbe_collscan());
         assert_eq!(s.explain_version.as_deref(), Some("2"));
-        assert_eq!(
-            s.plan_stages,
-            vec!["GROUP", "UNWIND", "EQ_LOOKUP", "COLLSCAN"]
-        );
+        assert_eq!(s.plan_stages, vec!["GROUP", "UNWIND", "EQ_LOOKUP", "COLLSCAN"]);
         assert!(s.collscan);
         assert_eq!(s.index_names, vec!["_id_"]);
         assert_eq!(s.lookup_strategies, vec!["IndexedLoopJoin"]);
@@ -224,9 +203,6 @@ mod tests {
         nl["queryPlanner"]["winningPlan"]["queryPlan"]["inputStage"]["inputStage"]["strategy"] =
             json!("NestedLoopJoin");
         let r = gate(summarize(&nl), Some(10), &p);
-        assert!(
-            !r.native_ok && r.reasons[0].contains("NestedLoopJoin"),
-            "{r:?}"
-        );
+        assert!(!r.native_ok && r.reasons[0].contains("NestedLoopJoin"), "{r:?}");
     }
 }

@@ -48,9 +48,7 @@ impl ColumnType {
             ColumnType::Utf8 => ArrowType::Utf8,
             ColumnType::Float64 => ArrowType::Float64,
             ColumnType::Int64 => ArrowType::Int64,
-            ColumnType::TimestampUtc => {
-                ArrowType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-            }
+            ColumnType::TimestampUtc => ArrowType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             ColumnType::Bool => ArrowType::Boolean,
         }
     }
@@ -91,13 +89,7 @@ impl TableSpec {
         Arc::new(Schema::new(
             self.columns
                 .iter()
-                .map(|c| {
-                    Field::new(
-                        &c.name,
-                        c.ty.arrow(),
-                        !matches!(c.name.as_str(), ID | PARENT_ID | IDX),
-                    )
-                })
+                .map(|c| Field::new(&c.name, c.ty.arrow(), !matches!(c.name.as_str(), ID | PARENT_ID | IDX)))
                 .collect::<Vec<_>>(),
         ))
     }
@@ -115,24 +107,14 @@ pub struct Projection {
     pub skipped: Vec<(String, String)>,
 }
 
-fn push_col(
-    cols: &mut Vec<ColumnSpec>,
-    name: &str,
-    path: &str,
-    ty: ColumnType,
-) -> Result<(), ReplicaError> {
+fn push_col(cols: &mut Vec<ColumnSpec>, name: &str, path: &str, ty: ColumnType) -> Result<(), ReplicaError> {
     match cols.iter().find(|c| c.name == name) {
-        Some(c) if c.path != path => Err(ReplicaError::Projection(format!(
-            "column '{name}' is bound to both '{}' and '{path}'",
-            c.path
-        ))),
+        Some(c) if c.path != path => {
+            Err(ReplicaError::Projection(format!("column '{name}' is bound to both '{}' and '{path}'", c.path)))
+        }
         Some(_) => Ok(()),
         None => {
-            cols.push(ColumnSpec {
-                name: name.to_owned(),
-                path: path.to_owned(),
-                ty,
-            });
+            cols.push(ColumnSpec { name: name.to_owned(), path: path.to_owned(), ty });
             Ok(())
         }
     }
@@ -141,10 +123,7 @@ fn push_col(
 impl Projection {
     /// Builds the projection for the entities bound to `datasource` (all datasources if `None`).
     pub fn from_model(model: &Model, datasource: Option<&str>) -> Result<Self, ReplicaError> {
-        let mut p = Projection {
-            datasource: datasource.map(str::to_owned),
-            ..Default::default()
-        };
+        let mut p = Projection { datasource: datasource.map(str::to_owned), ..Default::default() };
         // Deterministic order.
         let entities: BTreeMap<&String, _> = model.entities.iter().collect();
 
@@ -152,13 +131,7 @@ impl Projection {
         let mut roots: BTreeMap<String, TableSpec> = BTreeMap::new();
         let mut discs: BTreeMap<String, Vec<Option<Discriminator>>> = BTreeMap::new();
         for (id, def) in &entities {
-            let EntityBinding::Root {
-                datasource: ds,
-                collection,
-                discriminator,
-                ..
-            } = &def.binding
-            else {
+            let EntityBinding::Root { datasource: ds, collection, discriminator, .. } = &def.binding else {
                 continue;
             };
             if datasource.is_some_and(|want| want != ds) {
@@ -169,14 +142,8 @@ impl Projection {
                 name: table.clone(),
                 collection: collection.clone(),
                 entities: vec![],
-                kind: TableKind::Root {
-                    discriminator: None,
-                },
-                columns: vec![ColumnSpec {
-                    name: ID.into(),
-                    path: ID.into(),
-                    ty: ColumnType::Utf8,
-                }],
+                kind: TableKind::Root { discriminator: None },
+                columns: vec![ColumnSpec { name: ID.into(), path: ID.into(), ty: ColumnType::Utf8 }],
             });
             if t.collection != *collection {
                 return Err(ReplicaError::Projection(format!(
@@ -193,31 +160,22 @@ impl Projection {
                 && ds.iter().all(|d| *d == first)
                 && let Some(t) = roots.get_mut(&table)
             {
-                t.kind = TableKind::Root {
-                    discriminator: first,
-                };
+                t.kind = TableKind::Root { discriminator: first };
             }
         }
 
         // Child tables for embedded entities whose parent is a projected root entity.
         let mut children: BTreeMap<String, TableSpec> = BTreeMap::new();
         for (id, def) in &entities {
-            let EntityBinding::Embedded {
-                parent, array_path, ..
-            } = &def.binding
-            else {
+            let EntityBinding::Embedded { parent, array_path, .. } = &def.binding else {
                 continue;
             };
             let Some(parent_def) = model.entities.get(parent) else {
-                p.skipped
-                    .push(((*id).clone(), format!("unknown parent '{parent}'")));
+                p.skipped.push(((*id).clone(), format!("unknown parent '{parent}'")));
                 continue;
             };
             if !matches!(parent_def.binding, EntityBinding::Root { .. }) {
-                p.skipped.push((
-                    (*id).clone(),
-                    "arrays nested in arrays are not replicated yet".into(),
-                ));
+                p.skipped.push(((*id).clone(), "arrays nested in arrays are not replicated yet".into()));
                 continue;
             }
             let parent_table = model.table_of(parent).unwrap_or_default();
@@ -231,33 +189,18 @@ impl Projection {
                     name: table,
                     collection: pt.collection.clone(),
                     entities: vec![(*id).clone()],
-                    kind: TableKind::Child {
-                        parent_table,
-                        array_path: array_path.clone(),
-                    },
+                    kind: TableKind::Child { parent_table, array_path: array_path.clone() },
                     columns: vec![
-                        ColumnSpec {
-                            name: PARENT_ID.into(),
-                            path: String::new(),
-                            ty: ColumnType::Utf8,
-                        },
-                        ColumnSpec {
-                            name: IDX.into(),
-                            path: String::new(),
-                            ty: ColumnType::Int64,
-                        },
+                        ColumnSpec { name: PARENT_ID.into(), path: String::new(), ty: ColumnType::Utf8 },
+                        ColumnSpec { name: IDX.into(), path: String::new(), ty: ColumnType::Int64 },
                     ],
                 },
             );
         }
 
-        let mut tables: Vec<TableSpec> =
-            roots.into_values().chain(children.into_values()).collect();
-        let table_of_entity: BTreeMap<String, usize> = tables
-            .iter()
-            .enumerate()
-            .flat_map(|(i, t)| t.entities.iter().map(move |e| (e.clone(), i)))
-            .collect();
+        let mut tables: Vec<TableSpec> = roots.into_values().chain(children.into_values()).collect();
+        let table_of_entity: BTreeMap<String, usize> =
+            tables.iter().enumerate().flat_map(|(i, t)| t.entities.iter().map(move |e| (e.clone(), i))).collect();
 
         // Attributes (sorted by id for a stable column order).
         let attrs: BTreeMap<&String, _> = model.attributes.iter().collect();
@@ -266,25 +209,16 @@ impl Projection {
                 continue;
             };
             if matches!(a.column.as_str(), ID | PARENT_ID | IDX) && a.path != ID {
-                return Err(ReplicaError::Projection(format!(
-                    "attribute column '{}' is reserved",
-                    a.column
-                )));
+                return Err(ReplicaError::Projection(format!("attribute column '{}' is reserved", a.column)));
             }
-            push_col(
-                &mut tables[i].columns,
-                &a.column,
-                &a.path,
-                a.data_type.into(),
-            )?;
+            push_col(&mut tables[i].columns, &a.column, &a.path, a.data_type.into())?;
         }
         // Reference columns (local and foreign side). Keys are compared as strings unless an
         // attribute already typed the column.
         for r in &model.relations {
-            for (entity, column, path) in [
-                (&r.from, &r.local_column, &r.local_path),
-                (&r.to, &r.foreign_column, &r.foreign_path),
-            ] {
+            for (entity, column, path) in
+                [(&r.from, &r.local_column, &r.local_path), (&r.to, &r.foreign_column, &r.foreign_path)]
+            {
                 let Some(&i) = table_of_entity.get(entity) else {
                     continue;
                 };
@@ -296,10 +230,7 @@ impl Projection {
         }
         // Discriminator columns.
         for t in &mut tables {
-            if let TableKind::Root {
-                discriminator: Some(d),
-            } = t.kind.clone()
-            {
+            if let TableKind::Root { discriminator: Some(d) } = t.kind.clone() {
                 push_col(&mut t.columns, &d.column, &d.path, ColumnType::Utf8)?;
             }
         }
@@ -317,9 +248,7 @@ impl Projection {
 
     /// Tables fed by one collection (roots first).
     pub fn tables_of(&self, collection: &str) -> impl Iterator<Item = &TableSpec> {
-        self.tables
-            .iter()
-            .filter(move |t| t.collection == collection)
+        self.tables.iter().filter(move |t| t.collection == collection)
     }
 
     /// Document paths (from the root) read for a collection: `_id`, root columns, discriminator
@@ -329,12 +258,7 @@ impl Projection {
         for t in self.tables_of(collection) {
             match &t.kind {
                 TableKind::Root { discriminator } => {
-                    out.extend(
-                        t.columns
-                            .iter()
-                            .filter(|c| !c.path.is_empty())
-                            .map(|c| c.path.clone()),
-                    );
+                    out.extend(t.columns.iter().filter(|c| !c.path.is_empty()).map(|c| c.path.clone()));
                     if let Some(d) = discriminator {
                         out.insert(d.path.clone());
                     }
@@ -342,10 +266,7 @@ impl Projection {
                 TableKind::Child { array_path, .. } => {
                     out.insert(array_path.clone());
                     out.extend(
-                        t.columns
-                            .iter()
-                            .filter(|c| !c.path.is_empty())
-                            .map(|c| format!("{array_path}.{}", c.path)),
+                        t.columns.iter().filter(|c| !c.path.is_empty()).map(|c| format!("{array_path}.{}", c.path)),
                     );
                 }
             }
@@ -354,9 +275,7 @@ impl Projection {
         // the narrower paths so unbound element fields are not read.
         let all = out.clone();
         out.retain(|p| {
-            !all.iter().any(|q| {
-                q != p && q.starts_with(p.as_str()) && q.as_bytes().get(p.len()) == Some(&b'.')
-            })
+            !all.iter().any(|q| q != p && q.starts_with(p.as_str()) && q.as_bytes().get(p.len()) == Some(&b'.'))
         });
         out
     }
@@ -406,11 +325,7 @@ pub(crate) mod tests {
         entities.insert(
             "OrderLine".into(),
             EntityDef {
-                binding: EntityBinding::Embedded {
-                    parent: "Order".into(),
-                    array_path: "lines".into(),
-                    table: None,
-                },
+                binding: EntityBinding::Embedded { parent: "Order".into(), array_path: "lines".into(), table: None },
                 keys: vec![],
             },
         );
@@ -428,38 +343,14 @@ pub(crate) mod tests {
         );
         let mut attributes = HashMap::new();
         for (id, a) in [
-            (
-                "Order.status",
-                attr("Order", "status", "status", DataType::String),
-            ),
-            (
-                "Order.created_at",
-                attr("Order", "createdAt", "created_at", DataType::Timestamp),
-            ),
-            (
-                "Order.sales_org",
-                attr("Order", "salesOrg", "sales_org", DataType::String),
-            ),
-            (
-                "OrderLine.category",
-                attr("OrderLine", "category", "category", DataType::String),
-            ),
-            (
-                "OrderLine.sku",
-                attr("OrderLine", "sku", "sku", DataType::String),
-            ),
-            (
-                "OrderLine.qty",
-                attr("OrderLine", "qty", "qty", DataType::Number),
-            ),
-            (
-                "OrderLine.unit_price",
-                attr("OrderLine", "unitPrice", "unit_price", DataType::Number),
-            ),
-            (
-                "Customer.region",
-                attr("Customer", "region", "region", DataType::String),
-            ),
+            ("Order.status", attr("Order", "status", "status", DataType::String)),
+            ("Order.created_at", attr("Order", "createdAt", "created_at", DataType::Timestamp)),
+            ("Order.sales_org", attr("Order", "salesOrg", "sales_org", DataType::String)),
+            ("OrderLine.category", attr("OrderLine", "category", "category", DataType::String)),
+            ("OrderLine.sku", attr("OrderLine", "sku", "sku", DataType::String)),
+            ("OrderLine.qty", attr("OrderLine", "qty", "qty", DataType::Number)),
+            ("OrderLine.unit_price", attr("OrderLine", "unitPrice", "unit_price", DataType::Number)),
+            ("Customer.region", attr("Customer", "region", "region", DataType::String)),
         ] {
             attributes.insert(id.to_string(), a);
         }
@@ -474,14 +365,7 @@ pub(crate) mod tests {
             verified: true,
             foreign_indexed: true,
         }];
-        Model {
-            version: "acme@42".into(),
-            entities,
-            attributes,
-            relations,
-            metrics: HashMap::new(),
-            policies: vec![],
-        }
+        Model { version: "acme@42".into(), entities, attributes, relations, metrics: HashMap::new(), policies: vec![] }
     }
 
     #[test]
@@ -490,11 +374,7 @@ pub(crate) mod tests {
         let names: Vec<&str> = p.tables.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["customers", "orders", "orders__lines"]);
         let orders = p.table("orders").unwrap();
-        let cols: Vec<(&str, ColumnType)> = orders
-            .columns
-            .iter()
-            .map(|c| (c.name.as_str(), c.ty))
-            .collect();
+        let cols: Vec<(&str, ColumnType)> = orders.columns.iter().map(|c| (c.name.as_str(), c.ty)).collect();
         assert_eq!(
             cols,
             vec![
@@ -506,18 +386,15 @@ pub(crate) mod tests {
             ]
         );
         let lines = p.table("orders__lines").unwrap();
-        assert_eq!(
-            lines.kind,
-            TableKind::Child {
-                parent_table: "orders".into(),
-                array_path: "lines".into()
-            }
-        );
+        assert_eq!(lines.kind, TableKind::Child { parent_table: "orders".into(), array_path: "lines".into() });
         assert_eq!(lines.columns[0].name, "_parent_id");
         assert_eq!(lines.columns[1].name, "_idx");
-        assert!(lines.columns.iter().any(|c| c.name == "unit_price"
-            && c.path == "unitPrice"
-            && c.ty == ColumnType::Float64));
+        assert!(
+            lines
+                .columns
+                .iter()
+                .any(|c| c.name == "unit_price" && c.path == "unitPrice" && c.ty == ColumnType::Float64)
+        );
         assert_eq!(
             p.bound_paths("orders").into_iter().collect::<Vec<_>>(),
             vec![
@@ -533,12 +410,7 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(lines.schema().field(1).data_type(), &ArrowType::Int64);
-        assert!(
-            Projection::from_model(&model(), Some("other"))
-                .unwrap()
-                .tables
-                .is_empty()
-        );
+        assert!(Projection::from_model(&model(), Some("other")).unwrap().tables.is_empty());
     }
 
     #[test]
@@ -562,15 +434,8 @@ pub(crate) mod tests {
         );
         let p = Projection::from_model(&m, None).unwrap();
         let vip = p.table("vip_customers").unwrap();
-        assert!(
-            matches!(&vip.kind, TableKind::Root { discriminator: Some(d) } if d.value == "vip")
-        );
+        assert!(matches!(&vip.kind, TableKind::Root { discriminator: Some(d) } if d.value == "vip"));
         assert!(vip.columns.iter().any(|c| c.name == "tier"));
-        assert!(matches!(
-            p.table("customers").unwrap().kind,
-            TableKind::Root {
-                discriminator: None
-            }
-        ));
+        assert!(matches!(p.table("customers").unwrap().kind, TableKind::Root { discriminator: None }));
     }
 }

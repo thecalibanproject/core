@@ -56,7 +56,12 @@ pub fn to_chat_request(body: &Value) -> Result<ChatRequest, ParseError> {
             }
         }
         Some(Value::Array(blocks)) => {
-            let text = blocks.iter().filter(|b| str_of(b, "type") == Some("text")).filter_map(|b| str_of(b, "text")).collect::<Vec<_>>().join("\n\n");
+            let text = blocks
+                .iter()
+                .filter(|b| str_of(b, "type") == Some("text"))
+                .filter_map(|b| str_of(b, "text"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
             if !text.is_empty() {
                 messages.push(msg("system", Value::String(text)));
             }
@@ -85,7 +90,11 @@ pub fn to_chat_request(body: &Value) -> Result<ChatRequest, ParseError> {
     if let Some(user) = obj.get("metadata").and_then(|m| str_of(m, "user_id")) {
         extra.insert("user".into(), Value::String(user.to_owned()));
     }
-    let tools: Vec<Value> = obj.get("tools").and_then(Value::as_array).map(|ts| ts.iter().filter_map(tool_to_openai).collect()).unwrap_or_default();
+    let tools: Vec<Value> = obj
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|ts| ts.iter().filter_map(tool_to_openai).collect())
+        .unwrap_or_default();
     if !tools.is_empty() {
         extra.insert("tools".into(), Value::Array(tools));
         if let Some(tc) = obj.get("tool_choice") {
@@ -129,8 +138,12 @@ fn user_message(content: Option<&Value>, i: usize, out: &mut Vec<Message>) -> Re
             let mut parts = Vec::new();
             for b in blocks {
                 match str_of(b, "type") {
-                    Some("text") => parts.push(json!({ "type": "text", "text": str_of(b, "text").unwrap_or_default() })),
-                    Some("image") => parts.push(image_to_openai(b).ok_or_else(|| err(format!("messages.{i}: unsupported image source")))?),
+                    Some("text") => {
+                        parts.push(json!({ "type": "text", "text": str_of(b, "text").unwrap_or_default() }))
+                    }
+                    Some("image") => parts.push(
+                        image_to_openai(b).ok_or_else(|| err(format!("messages.{i}: unsupported image source")))?,
+                    ),
                     Some("document") => parts.extend(document_to_openai(b)),
                     Some("tool_result") => out.push(tool_result_to_openai(b)),
                     _ => {}
@@ -341,7 +354,8 @@ pub fn to_anthropic_request(body: &Value, default_max_tokens: u64) -> Value {
                 }
                 for call in m.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
                     let args = call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}");
-                    let input = serde_json::from_str::<Value>(args).ok().filter(Value::is_object).unwrap_or_else(|| json!({}));
+                    let input =
+                        serde_json::from_str::<Value>(args).ok().filter(Value::is_object).unwrap_or_else(|| json!({}));
                     blocks.push(json!({
                         "type": "tool_use",
                         "id": str_of(call, "id").unwrap_or_default(),
@@ -353,7 +367,9 @@ pub fn to_anthropic_request(body: &Value, default_max_tokens: u64) -> Value {
             }
             Some("tool") => push(
                 "user",
-                vec![json!({ "type": "tool_result", "tool_use_id": str_of(m, "tool_call_id").unwrap_or_default(), "content": text_of(content) })],
+                vec![
+                    json!({ "type": "tool_result", "tool_use_id": str_of(m, "tool_call_id").unwrap_or_default(), "content": text_of(content) }),
+                ],
             ),
             _ => {}
         }
@@ -368,7 +384,10 @@ pub fn to_anthropic_request(body: &Value, default_max_tokens: u64) -> Value {
         "messages".into(),
         Value::Array(turns.into_iter().map(|(role, blocks)| json!({ "role": role, "content": blocks })).collect()),
     );
-    let mut max_tokens = ["max_completion_tokens", "max_tokens"].iter().find_map(|k| obj.get(*k).and_then(Value::as_u64)).unwrap_or(default_max_tokens);
+    let mut max_tokens = ["max_completion_tokens", "max_tokens"]
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(Value::as_u64))
+        .unwrap_or(default_max_tokens);
     let budget = match obj.get("reasoning_effort").and_then(Value::as_str) {
         Some("low") => Some(1024),
         Some("medium") => Some(4096),
@@ -413,7 +432,10 @@ pub fn to_anthropic_request(body: &Value, default_max_tokens: u64) -> Value {
             if let Some(d) = f.get("description") {
                 a.insert("description".into(), d.clone());
             }
-            a.insert("input_schema".into(), f.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object", "properties": {} })));
+            a.insert(
+                "input_schema".into(),
+                f.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+            );
             Some(Value::Object(a))
         })
         .collect();
@@ -548,7 +570,11 @@ mod tests {
 
     #[test]
     fn thinking_maps_to_reasoning_preference() {
-        let mk = |t: Value| to_chat_request(&json!({"model": "m", "max_tokens": 1, "messages": [], "thinking": t})).unwrap().reasoning_pref();
+        let mk = |t: Value| {
+            to_chat_request(&json!({"model": "m", "max_tokens": 1, "messages": [], "thinking": t}))
+                .unwrap()
+                .reasoning_pref()
+        };
         assert_eq!(mk(json!({"type": "enabled", "budget_tokens": 1024})), Some(ReasoningPref::Low));
         assert_eq!(mk(json!({"type": "enabled", "budget_tokens": 4000})), Some(ReasoningPref::Medium));
         assert_eq!(mk(json!({"type": "enabled", "budget_tokens": 32000})), Some(ReasoningPref::High));
@@ -562,8 +588,13 @@ mod tests {
     fn validation_errors() {
         assert!(to_chat_request(&json!({"model": "m", "messages": []})).unwrap_err().0.contains("max_tokens"));
         assert!(to_chat_request(&json!({"max_tokens": 1, "messages": []})).unwrap_err().0.contains("model"));
-        assert!(to_chat_request(&json!({"model": "m", "max_tokens": 1, "messages": [{"role": "system", "content": "x"}]})).is_err());
-        assert!(to_chat_request(&json!({"model": "m", "max_tokens": 1, "messages": [], "caliban": {"bogus": 1}})).is_err());
+        assert!(
+            to_chat_request(&json!({"model": "m", "max_tokens": 1, "messages": [{"role": "system", "content": "x"}]}))
+                .is_err()
+        );
+        assert!(
+            to_chat_request(&json!({"model": "m", "max_tokens": 1, "messages": [], "caliban": {"bogus": 1}})).is_err()
+        );
     }
 
     #[test]
@@ -614,7 +645,10 @@ mod tests {
         assert!(a.get("cache_salt").is_none() && a.get("stream_options").is_none());
         let msgs = a["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0]["content"][1]["source"], json!({"type": "base64", "media_type": "image/jpeg", "data": "/9j"}));
+        assert_eq!(
+            msgs[0]["content"][1]["source"],
+            json!({"type": "base64", "media_type": "image/jpeg", "data": "/9j"})
+        );
         assert_eq!(msgs[1]["content"][0], json!({"type": "tool_use", "id": "c1", "name": "f", "input": {"a": 1}}));
         // Both tool results merged into one user turn.
         assert_eq!(msgs[2]["content"].as_array().unwrap().len(), 2);
@@ -622,7 +656,10 @@ mod tests {
 
     #[test]
     fn reasoning_effort_becomes_thinking() {
-        let a = to_anthropic_request(&json!({"model": "m", "max_tokens": 1000, "temperature": 0.3, "reasoning_effort": "medium", "messages": [{"role": "user", "content": "x"}]}), 4096);
+        let a = to_anthropic_request(
+            &json!({"model": "m", "max_tokens": 1000, "temperature": 0.3, "reasoning_effort": "medium", "messages": [{"role": "user", "content": "x"}]}),
+            4096,
+        );
         assert_eq!(a["thinking"], json!({"type": "enabled", "budget_tokens": 4096}));
         assert_eq!(a["max_tokens"], 5096);
         assert!(a.get("temperature").is_none());

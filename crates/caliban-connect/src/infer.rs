@@ -25,13 +25,7 @@ pub struct InferOptions {
 
 impl Default for InferOptions {
     fn default() -> Self {
-        Self {
-            max_depth: 8,
-            max_paths: 2_000,
-            max_values_per_path: 5_000,
-            top_k: 10,
-            low_cardinality: 50,
-        }
+        Self { max_depth: 8, max_paths: 2_000, max_values_per_path: 5_000, top_k: 10, low_cardinality: 50 }
     }
 }
 
@@ -89,9 +83,7 @@ pub fn value_key(b: &Bson) -> String {
 /// numbers → JSON numbers, Decimal128 → number when representable (else string).
 pub fn bson_to_json(b: &Bson) -> J {
     match b {
-        Bson::Double(d) => serde_json::Number::from_f64(*d)
-            .map(J::Number)
-            .unwrap_or(J::Null),
+        Bson::Double(d) => serde_json::Number::from_f64(*d).map(J::Number).unwrap_or(J::Null),
         Bson::String(s) | Bson::Symbol(s) => J::String(s.clone()),
         Bson::Array(a) => J::Array(a.iter().map(bson_to_json).collect()),
         Bson::Document(d) => doc_to_json(d),
@@ -100,29 +92,18 @@ pub fn bson_to_json(b: &Bson) -> J {
         Bson::Int32(i) => json!(i),
         Bson::Int64(i) => json!(i),
         Bson::ObjectId(o) => J::String(o.to_hex()),
-        Bson::DateTime(d) => d
-            .try_to_rfc3339_string()
-            .map(J::String)
-            .unwrap_or_else(|_| json!(d.timestamp_millis())),
+        Bson::DateTime(d) => d.try_to_rfc3339_string().map(J::String).unwrap_or_else(|_| json!(d.timestamp_millis())),
         Bson::Timestamp(t) => json!({ "t": t.time, "i": t.increment }),
         Bson::Decimal128(d) => {
             let s = d.to_string();
-            s.parse::<f64>()
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map(J::Number)
-                .unwrap_or(J::String(s))
+            s.parse::<f64>().ok().and_then(serde_json::Number::from_f64).map(J::Number).unwrap_or(J::String(s))
         }
         other => other.clone().into_relaxed_extjson(),
     }
 }
 
 pub fn doc_to_json(d: &Document) -> J {
-    J::Object(
-        d.iter()
-            .map(|(k, v)| (k.clone(), bson_to_json(v)))
-            .collect(),
-    )
+    J::Object(d.iter().map(|(k, v)| (k.clone(), bson_to_json(v))).collect())
 }
 
 /// Numeric value of a BSON scalar, if it is a number.
@@ -226,20 +207,11 @@ struct Walker<'o> {
 }
 
 fn join(prefix: &str, k: &str) -> String {
-    if prefix.is_empty() {
-        k.to_owned()
-    } else {
-        format!("{prefix}.{k}")
-    }
+    if prefix.is_empty() { k.to_owned() } else { format!("{prefix}.{k}") }
 }
 
 impl Walker<'_> {
-    fn acc(
-        &mut self,
-        path: &str,
-        container: &str,
-        parent_array: Option<&str>,
-    ) -> Option<&mut PathAcc> {
+    fn acc(&mut self, path: &str, container: &str, parent_array: Option<&str>) -> Option<&mut PathAcc> {
         if !self.paths.contains_key(path) {
             if self.paths.len() >= self.opts.max_paths {
                 return None;
@@ -330,31 +302,21 @@ const DISCRIMINATOR_NAMES: &[&str] = &["kind", "_t", "__t", "_class", "_type", "
 
 fn discriminator_name_hint(path: &str) -> bool {
     let l = path.to_ascii_lowercase();
-    DISCRIMINATOR_NAMES.contains(&l.as_str())
-        || l.ends_with("type")
-        || l.ends_with("_kind")
-        || l.ends_with("kind")
+    DISCRIMINATOR_NAMES.contains(&l.as_str()) || l.ends_with("type") || l.ends_with("_kind") || l.ends_with("kind")
 }
 
 /// Does an object's key set look like data (dates, numbers, ObjectIds) rather than a schema?
 fn data_like_key(k: &str) -> bool {
     let b = k.as_bytes();
     let hex24 = k.len() == 24 && k.chars().all(|c| c.is_ascii_hexdigit());
-    let numeric = !k.is_empty()
-        && k.chars()
-            .all(|c| c.is_ascii_digit() || c == '-' || c == '_');
-    let date =
-        b.len() >= 7 && b[..4].iter().all(u8::is_ascii_digit) && (b[4] == b'-' || b[4] == b'/');
+    let numeric = !k.is_empty() && k.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '_');
+    let date = b.len() >= 7 && b[..4].iter().all(u8::is_ascii_digit) && (b[4] == b'-' || b[4] == b'/');
     hex24 || numeric || date
 }
 
 /// Infers per-path statistics from a sample. `estimated_rows` scales distinct estimates.
 pub fn infer(docs: &[Document], estimated_rows: Option<u64>, opts: &InferOptions) -> Inferred {
-    let mut w = Walker {
-        opts,
-        paths: BTreeMap::new(),
-        containers: HashMap::new(),
-    };
+    let mut w = Walker { opts, paths: BTreeMap::new(), containers: HashMap::new() };
     for d in docs {
         w.walk(d, "", None, 0);
     }
@@ -371,32 +333,21 @@ pub fn infer(docs: &[Document], estimated_rows: Option<u64>, opts: &InferOptions
         for (p, a) in &w.paths {
             let parent_count = w.containers.get(&a.container).copied().unwrap_or(0).max(1);
             let key = p.rsplit('.').next().unwrap_or(p);
-            children
-                .entry(a.container.as_str())
-                .or_default()
-                .push((key, a.occurrences as f64 / parent_count as f64));
+            children.entry(a.container.as_str()).or_default().push((key, a.occurrences as f64 / parent_count as f64));
         }
         for (container, kids) in &children {
-            if container.is_empty()
-                || w.paths
-                    .get(*container)
-                    .is_some_and(|a| a.types.contains_key("array"))
-            {
+            if container.is_empty() || w.paths.get(*container).is_some_and(|a| a.types.contains_key("array")) {
                 continue;
             }
             let data_keys = kids.iter().filter(|(k, _)| data_like_key(k)).count();
             let avg_presence = kids.iter().map(|(_, p)| p).sum::<f64>() / kids.len() as f64;
-            if (kids.len() >= 5 && data_keys * 10 >= kids.len() * 8)
-                || (kids.len() > 50 && avg_presence < 0.2)
-            {
+            if (kids.len() >= 5 && data_keys * 10 >= kids.len() * 8) || (kids.len() > 50 && avg_presence < 0.2) {
                 dynamic.insert((*container).to_owned());
             }
         }
     }
     let under_dynamic = |p: &str| {
-        dynamic.iter().any(|d| {
-            p.len() > d.len() && p.starts_with(d.as_str()) && p.as_bytes()[d.len()] == b'.'
-        })
+        dynamic.iter().any(|d| p.len() > d.len() && p.starts_with(d.as_str()) && p.as_bytes()[d.len()] == b'.')
     };
 
     let mut fields = Vec::new();
@@ -410,12 +361,8 @@ pub fn infer(docs: &[Document], estimated_rows: Option<u64>, opts: &InferOptions
         let containers = w.containers.get(&a.container).copied().unwrap_or(0).max(1);
         let mut types: Vec<(&str, u64)> = a.types.iter().map(|(t, n)| (*t, *n)).collect();
         types.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(y.0)));
-        let families: BTreeSet<&str> = a
-            .types
-            .keys()
-            .filter(|t| **t != "null" && **t != "undefined")
-            .map(|t| family(t))
-            .collect();
+        let families: BTreeSet<&str> =
+            a.types.keys().filter(|t| **t != "null" && **t != "undefined").map(|t| family(t)).collect();
         let polymorphic = families.len() > 1;
         if polymorphic {
             polymorphic_paths += 1;
@@ -429,13 +376,8 @@ pub fn infer(docs: &[Document], estimated_rows: Option<u64>, opts: &InferOptions
                 len_p50: percentile(&lens, 0.5),
                 len_p99: percentile(&lens, 0.99),
                 len_max: lens.last().copied().unwrap_or(0),
-                empty_fraction: lens.iter().filter(|l| **l == 0).count() as f32
-                    / lens.len().max(1) as f32,
-                element_types: a
-                    .el_types
-                    .iter()
-                    .map(|(t, n)| ((*t).to_owned(), *n))
-                    .collect(),
+                empty_fraction: lens.iter().filter(|l| **l == 0).count() as f32 / lens.len().max(1) as f32,
+                element_types: a.el_types.iter().map(|(t, n)| ((*t).to_owned(), *n)).collect(),
             }
         });
 
@@ -452,16 +394,13 @@ pub fn infer(docs: &[Document], estimated_rows: Option<u64>, opts: &InferOptions
             let population = (a.value_count as f64 * scale).round() as u64;
             gee_distinct(&counts, n, population)
         });
-        let mut top: Vec<(J, u64, String)> = counts
-            .iter()
-            .map(|(k, c)| (bson_to_json(repr[k]), *c, k.clone()))
-            .collect();
+        let mut top: Vec<(J, u64, String)> =
+            counts.iter().map(|(k, c)| (bson_to_json(repr[k]), *c, k.clone())).collect();
         top.sort_by(|x, y| y.1.cmp(&x.1).then(x.2.cmp(&y.2)));
         top.truncate(opts.top_k);
         let top: Vec<(J, u64)> = top.into_iter().map(|(v, c, _)| (v, c)).collect();
-        let low_card = !counts.is_empty()
-            && counts.len() <= opts.low_cardinality
-            && (counts.len() as u64) * 2 <= n.max(2);
+        let low_card =
+            !counts.is_empty() && counts.len() <= opts.low_cardinality && (counts.len() as u64) * 2 <= n.max(2);
 
         let presence = a.occurrences as f32 / containers as f32;
         let null_fraction = a.nulls as f32 / containers as f32;
@@ -496,16 +435,7 @@ pub fn infer(docs: &[Document], estimated_rows: Option<u64>, opts: &InferOptions
     let unstable = polymorphic_paths > 5 || top_level_keys > 200;
     let containers = w.containers;
     let discriminators = detect_discriminators(docs, &fields, &values, sampled);
-    Inferred {
-        sampled,
-        estimated_rows,
-        fields,
-        discriminators,
-        unstable,
-        values,
-        containers,
-        profiles,
-    }
+    Inferred { sampled, estimated_rows, fields, discriminators, unstable, values, containers, profiles }
 }
 
 /// A root-level, low-cardinality string field is a discriminator when its name says so
@@ -520,18 +450,11 @@ fn detect_discriminators(
     if sampled < 10 {
         return out;
     }
-    let top_level: Vec<&str> = fields
-        .iter()
-        .filter(|f| !f.path.contains('.') && f.path != "_id")
-        .map(|f| f.path.as_str())
-        .collect();
+    let top_level: Vec<&str> =
+        fields.iter().filter(|f| !f.path.contains('.') && f.path != "_id").map(|f| f.path.as_str()).collect();
     let min_group = (sampled as f64 * 0.02).ceil().max(2.0) as u64;
     for f in fields {
-        if f.path.contains('.')
-            || f.dominant_type() != Some("string")
-            || f.presence < 0.95
-            || f.is_array
-        {
+        if f.path.contains('.') || f.dominant_type() != Some("string") || f.presence < 0.95 || f.is_array {
             continue;
         }
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
@@ -540,8 +463,7 @@ fn detect_discriminators(
                 *counts.entry(s.clone()).or_default() += 1;
             }
         }
-        let groups: Vec<(&String, &u64)> =
-            counts.iter().filter(|(_, c)| **c >= min_group).collect();
+        let groups: Vec<(&String, &u64)> = counts.iter().filter(|(_, c)| **c >= min_group).collect();
         if counts.len() < 2 || counts.len() > 20 || groups.len() < 2 {
             continue;
         }
@@ -569,12 +491,7 @@ fn detect_discriminators(
             let shares: Vec<f64> = groups
                 .iter()
                 .map(|(v, c)| {
-                    per_group
-                        .get(v.as_str())
-                        .and_then(|g| g.get(p))
-                        .copied()
-                        .unwrap_or(0) as f64
-                        / **c as f64
+                    per_group.get(v.as_str()).and_then(|g| g.get(p)).copied().unwrap_or(0) as f64 / **c as f64
                 })
                 .collect();
             let max = shares.iter().copied().fold(0.0, f64::max);
@@ -592,12 +509,7 @@ fn detect_discriminators(
         };
         let mut vals: Vec<(String, u64)> = counts.into_iter().collect();
         vals.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        out.push(DiscriminatorInfo {
-            path: f.path.clone(),
-            values: vals,
-            predictive_paths: predictive,
-            confidence,
-        });
+        out.push(DiscriminatorInfo { path: f.path.clone(), values: vals, predictive_paths: predictive, confidence });
     }
     out
 }
@@ -625,9 +537,7 @@ pub fn reference_stem(path: &str) -> Option<String> {
             return Some(stem.trim_end_matches('_').to_ascii_lowercase());
         }
     }
-    if let Some(stem) = last
-        .strip_suffix("Ids")
-        .or_else(|| last.strip_suffix("_ids"))
+    if let Some(stem) = last.strip_suffix("Ids").or_else(|| last.strip_suffix("_ids"))
         && !stem.is_empty()
     {
         return Some(stem.trim_end_matches('_').to_ascii_lowercase());
@@ -652,21 +562,18 @@ pub fn reference_candidates(inf: &Inferred, max_values: usize) -> Vec<RefCandida
         for v in vals {
             *by_type.entry(bson_type_name(v)).or_default() += 1;
         }
-        let Some((ty, n)) = by_type
-            .iter()
-            .max_by_key(|(_, n)| **n)
-            .map(|(t, n)| (*t, *n))
-        else {
+        let Some((ty, n)) = by_type.iter().max_by_key(|(_, n)| **n).map(|(t, n)| (*t, *n)) else {
             continue;
         };
         if (n as f64) < 0.9 * vals.len() as f64 {
             continue;
         }
         let key_like = reference_stem(&f.path).is_some();
-        let hex24 = ty == "string" && vals.iter().all(|v| matches!(v, Bson::String(s) if s.len() == 24 && s.chars().all(|c| c.is_ascii_hexdigit())));
-        let ok = ty == "objectId"
-            || hex24
-            || (key_like && matches!(ty, "string" | "int" | "long" | "double"));
+        let hex24 = ty == "string"
+            && vals
+                .iter()
+                .all(|v| matches!(v, Bson::String(s) if s.len() == 24 && s.chars().all(|c| c.is_ascii_hexdigit())));
+        let ok = ty == "objectId" || hex24 || (key_like && matches!(ty, "string" | "int" | "long" | "double"));
         if !ok {
             continue;
         }
@@ -696,8 +603,7 @@ pub fn name_matches(candidate_path: &str, target: &str) -> bool {
     };
     let t = target.to_ascii_lowercase().replace(['_', '-'], "");
     let stem = stem.replace(['_', '-'], "");
-    !stem.is_empty()
-        && (t == stem || crate::bootstrap::singular(&t) == stem || t.starts_with(&stem))
+    !stem.is_empty() && (t == stem || crate::bootstrap::singular(&t) == stem || t.starts_with(&stem))
 }
 
 /// Are the candidate's values comparable with a target `_id` of type `target_id_type`?
@@ -753,14 +659,8 @@ mod tests {
         let total = inf.field("total").unwrap();
         assert_eq!(total.type_counts.get("int"), Some(&50));
         assert_eq!(total.type_counts.get("double"), Some(&50));
-        assert!(
-            !total.polymorphic,
-            "int/double is numeric widening, not polymorphism"
-        );
-        assert_eq!(
-            inf.field("createdAt").unwrap().dominant_type(),
-            Some("date")
-        );
+        assert!(!total.polymorphic, "int/double is numeric widening, not polymorphism");
+        assert_eq!(inf.field("createdAt").unwrap().dominant_type(), Some("date"));
         assert!((inf.field("discount").unwrap().presence - 0.8).abs() < 1e-6);
         let note = inf.field("note").unwrap();
         assert!((note.presence - 0.1).abs() < 1e-6);
@@ -785,10 +685,7 @@ mod tests {
         assert_eq!(status.top_values[0], (json!("shipped"), 66));
         assert_eq!(status.distinct_estimate, Some(2));
         let id = inf.field("_id").unwrap();
-        assert!(
-            id.top_values.is_empty(),
-            "high-cardinality paths keep no top values"
-        );
+        assert!(id.top_values.is_empty(), "high-cardinality paths keep no top values");
         assert!(id.distinct_estimate.unwrap() >= 100);
     }
 
@@ -808,10 +705,7 @@ mod tests {
         let inf = infer(&docs, None, &InferOptions::default());
         assert!(inf.field("code").unwrap().polymorphic);
         assert!(inf.field("daily").unwrap().dynamic_keys);
-        assert!(
-            inf.fields.iter().all(|f| !f.path.starts_with("daily.")),
-            "map keys are not columns"
-        );
+        assert!(inf.fields.iter().all(|f| !f.path.starts_with("daily.")), "map keys are not columns");
     }
 
     #[test]
@@ -832,14 +726,9 @@ mod tests {
         assert!(d.confidence >= 0.9);
 
         // A status field that predicts nothing is not a discriminator.
-        let docs: Vec<Document> = (0..60)
-            .map(|i| doc! { "_id": i, "status": if i % 2 == 0 { "a" } else { "b" }, "x": 1 })
-            .collect();
-        assert!(
-            infer(&docs, None, &InferOptions::default())
-                .discriminators
-                .is_empty()
-        );
+        let docs: Vec<Document> =
+            (0..60).map(|i| doc! { "_id": i, "status": if i % 2 == 0 { "a" } else { "b" }, "x": 1 }).collect();
+        assert!(infer(&docs, None, &InferOptions::default()).discriminators.is_empty());
     }
 
     #[test]
@@ -859,10 +748,7 @@ mod tests {
         assert!(!name_matches("customerId", "orders"));
         assert!(type_compatible("int", "double") && !type_compatible("objectId", "string"));
 
-        let mut target: BTreeSet<String> = customers[..9]
-            .iter()
-            .map(|o| value_key(&Bson::ObjectId(*o)))
-            .collect();
+        let mut target: BTreeSet<String> = customers[..9].iter().map(|o| value_key(&Bson::ObjectId(*o))).collect();
         assert_eq!(overlap(&c[0].values, &target), (9, 10));
         target.insert(value_key(&Bson::ObjectId(customers[9])));
         assert_eq!(overlap(&c[0].values, &target), (10, 10));
@@ -886,10 +772,7 @@ mod tests {
             doc_to_json(&d),
             json!({ "o": "65a1f0c2e4b0a1b2c3d4e5f6", "t": "1970-01-01T00:00:00Z", "n": 3, "f": 1.5, "a": [1, "x"], "z": null })
         );
-        assert_eq!(
-            get_path(&doc! { "a": { "b": 2 } }, "a.b"),
-            Some(&Bson::Int32(2))
-        );
+        assert_eq!(get_path(&doc! { "a": { "b": 2 } }, "a.b"), Some(&Bson::Int32(2)));
         assert_eq!(get_path(&doc! { "a": [{ "b": 2 }] }, "a.b"), None);
     }
 }

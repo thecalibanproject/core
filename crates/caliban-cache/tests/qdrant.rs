@@ -6,7 +6,8 @@
 //! ```
 
 use caliban_cache::semantic::{
-    EntryPayload, EntryStats, KeyParts, Lookup, NewEntry, QdrantStore, ResponseShape, SearchQuery, SemanticCache, SemanticKey, ThresholdPolicy, VectorStore,
+    EntryPayload, EntryStats, KeyParts, Lookup, NewEntry, QdrantStore, ResponseShape, SearchQuery, SemanticCache,
+    SemanticKey, ThresholdPolicy, VectorStore,
 };
 use caliban_types::{PiiMode, TenantId};
 use std::sync::Arc;
@@ -67,10 +68,17 @@ fn words(i: usize) -> String {
     i.to_string().chars().map(|d| char::from(b'a' + d.to_digit(10).unwrap() as u8)).collect()
 }
 
-const P: ThresholdPolicy = ThresholdPolicy { threshold: 0.95, min_threshold: 0.90, grey_band: 0.03, max_error_rate: 0.02, verify_rate: 0.0 };
+const P: ThresholdPolicy =
+    ThresholdPolicy { threshold: 0.95, min_threshold: 0.90, grey_band: 0.03, max_error_rate: 0.02, verify_rate: 0.0 };
 
 fn entry(text: &str) -> NewEntry {
-    NewEntry { model: "ext/mock".into(), response: format!("{{\"answer\":\"{text}\"}}"), prompt_tokens: 10, completion_tokens: 5, ttl_secs: 3600 }
+    NewEntry {
+        model: "ext/mock".into(),
+        response: format!("{{\"answer\":\"{text}\"}}"),
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        ttl_secs: 3600,
+    }
 }
 
 #[tokio::test]
@@ -90,7 +98,9 @@ async fn qdrant_store_isolates_tenants_and_learns() {
 
     let ka = key("acme", "refund policy?");
     cache.insert(&ka, "emb", &v, entry("acme answer"), &P, now).await.unwrap();
-    let Lookup::Hit(m) = cache.lookup(&ka, "emb", &v, &P, 0.5, now + 1).await.unwrap() else { panic!("identical vector hits") };
+    let Lookup::Hit(m) = cache.lookup(&ka, "emb", &v, &P, 0.5, now + 1).await.unwrap() else {
+        panic!("identical vector hits")
+    };
     assert!(m.similarity > 0.999);
     assert_eq!(m.payload.tenant_id, "acme");
     assert!(m.payload.response.contains("acme answer"));
@@ -102,7 +112,17 @@ async fn qdrant_store_isolates_tenants_and_learns() {
     let forged = SemanticKey { tenant: "globex".into(), ..ka.clone() };
     assert_eq!(cache.lookup(&forged, "emb", &v, &P, 0.5, now + 1).await.unwrap(), Lookup::Miss);
     let collection = cache.collection("emb", v.len());
-    let raw = store.search(&SearchQuery { collection: &collection, tenant: "globex", partition: &ka.partition, vector: &v, limit: 10, now }).await.unwrap();
+    let raw = store
+        .search(&SearchQuery {
+            collection: &collection,
+            tenant: "globex",
+            partition: &ka.partition,
+            vector: &v,
+            limit: 10,
+            now,
+        })
+        .await
+        .unwrap();
     assert!(raw.is_empty(), "{raw:?}");
 
     // B's own entry is separate; A still gets its own answer.
@@ -136,7 +156,9 @@ async fn qdrant_store_isolates_tenants_and_learns() {
         base_v.iter().zip(&perp).map(|(b, p)| 0.93 * b + (1.0f32 - 0.93 * 0.93).sqrt() * p).collect()
     };
     for _ in 0..2 {
-        let Lookup::Verify(m) = cache.lookup(&kg, "emb", &near, &P, 0.5, now + 1).await.unwrap() else { panic!("grey zone") };
+        let Lookup::Verify(m) = cache.lookup(&kg, "emb", &near, &P, 0.5, now + 1).await.unwrap() else {
+            panic!("grey zone")
+        };
         cache.record_verification(&m, true, &P).await.unwrap();
     }
     let Lookup::Hit(m) = cache.lookup(&kg, "emb", &near, &P, 0.5, now + 1).await.unwrap() else { panic!("learned") };
@@ -185,7 +207,8 @@ async fn qdrant_lookup_latency() {
 
     let mut samples = Vec::new();
     for i in 0..300u64 {
-        let k = key(&format!("t{}", i % tenants as u64), &format!("question {}", words((i % per_tenant as u64) as usize)));
+        let k =
+            key(&format!("t{}", i % tenants as u64), &format!("question {}", words((i % per_tenant as u64) as usize)));
         let v = unit(i + 1_000_000, dim);
         let t0 = Instant::now();
         let _ = cache.lookup(&k, "emb", &v, &P, 0.5, now + 1).await.unwrap();
@@ -193,12 +216,24 @@ async fn qdrant_lookup_latency() {
     }
     samples.sort_by(f64::total_cmp);
     let pct = |p: f64| samples[((samples.len() as f64 - 1.0) * p) as usize];
-    eprintln!("qdrant lookup (filter tenant+partition, 1024-d, {n_points} points, {per_tenant} per partition): p50 {:.2} ms, p90 {:.2} ms, p99 {:.2} ms", pct(0.5), pct(0.9), pct(0.99));
+    eprintln!(
+        "qdrant lookup (filter tenant+partition, 1024-d, {n_points} points, {per_tenant} per partition): p50 {:.2} ms, p90 {:.2} ms, p99 {:.2} ms",
+        pct(0.5),
+        pct(0.9),
+        pct(0.99)
+    );
     assert!(pct(0.5) < 50.0, "lookup p50 within the default budget");
 
     // A payload matching another tenant's partition never leaks: sanity on the bulk data.
     let probe: EntryPayload = store
-        .search(&SearchQuery { collection: &cache.collection("emb", dim), tenant: "t1", partition: &key("t1", &format!("question {}", words(1))).partition, vector: &unit(10_001, dim), limit: 1, now })
+        .search(&SearchQuery {
+            collection: &cache.collection("emb", dim),
+            tenant: "t1",
+            partition: &key("t1", &format!("question {}", words(1))).partition,
+            vector: &unit(10_001, dim),
+            limit: 1,
+            now,
+        })
         .await
         .unwrap()
         .remove(0)

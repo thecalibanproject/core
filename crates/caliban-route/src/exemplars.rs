@@ -108,24 +108,29 @@ pub struct Exemplar {
 pub fn assemble(cfg: &RoutingConfig) -> Result<Vec<Exemplar>, ExemplarError> {
     let mut out = Vec::new();
     let mut seen: HashMap<(Option<String>, String), String> = HashMap::new();
-    let mut push = |owner: Option<&str>, intent: &str, text: &str, out: &mut Vec<Exemplar>| -> Result<(), ExemplarError> {
-        let key = (owner.map(str::to_owned), norm(text));
-        if key.1.is_empty() {
-            return Ok(());
-        }
-        match seen.get(&key) {
-            Some(prev) if prev != intent => Err(ExemplarError::Invalid(format!(
-                "exemplar {text:?} is labelled both {prev} and {intent}{}",
-                owner.map(|o| format!(" (tenant {o})")).unwrap_or_default()
-            ))),
-            Some(_) => Ok(()),
-            None => {
-                seen.insert(key, intent.to_owned());
-                out.push(Exemplar { owner: owner.map(str::to_owned), intent: intent.to_owned(), text: text.trim().to_owned() });
-                Ok(())
+    let mut push =
+        |owner: Option<&str>, intent: &str, text: &str, out: &mut Vec<Exemplar>| -> Result<(), ExemplarError> {
+            let key = (owner.map(str::to_owned), norm(text));
+            if key.1.is_empty() {
+                return Ok(());
             }
-        }
-    };
+            match seen.get(&key) {
+                Some(prev) if prev != intent => Err(ExemplarError::Invalid(format!(
+                    "exemplar {text:?} is labelled both {prev} and {intent}{}",
+                    owner.map(|o| format!(" (tenant {o})")).unwrap_or_default()
+                ))),
+                Some(_) => Ok(()),
+                None => {
+                    seen.insert(key, intent.to_owned());
+                    out.push(Exemplar {
+                        owner: owner.map(str::to_owned),
+                        intent: intent.to_owned(),
+                        text: text.trim().to_owned(),
+                    });
+                    Ok(())
+                }
+            }
+        };
     let mut datasets = Vec::new();
     if cfg.default_exemplars.unwrap_or(true) {
         datasets.push(IntentDataset::builtin());
@@ -188,7 +193,10 @@ mod tests {
         let mut cfg = RoutingConfig::default();
         cfg.exemplars.insert("legal.review".into(), vec!["review this nda clause".into()]);
         let mut t = caliban_config::TenantRouting::default();
-        t.exemplars.insert("legal.review".into(), vec!["check this indemnity clause".into(), "hi there, how are you today".into()]);
+        t.exemplars.insert(
+            "legal.review".into(),
+            vec!["check this indemnity clause".into(), "hi there, how are you today".into()],
+        );
         cfg.tenants.insert("acme".into(), t);
         let ex = assemble(&cfg).unwrap();
         let builtin = IntentDataset::builtin().intents.values().map(|s| s.utterances.len()).sum::<usize>();

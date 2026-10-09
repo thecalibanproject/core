@@ -81,12 +81,21 @@ impl Metered {
 ///   (about 4 bytes per token), never below what the provider already reported. After a client
 ///   disconnect the provider may still bill more than this: it keeps generating until it notices
 ///   the cancelled connection.
-pub(crate) fn stream_end(reported: Option<Usage>, complete: bool, est_prompt_tokens: u64, streamed_bytes: u64) -> Metered {
+pub(crate) fn stream_end(
+    reported: Option<Usage>,
+    complete: bool,
+    est_prompt_tokens: u64,
+    streamed_bytes: u64,
+) -> Metered {
     let est_completion = streamed_bytes.div_ceil(4);
     match reported {
         Some(u) if complete => Metered::provider(u),
         Some(u) => Metered::estimated(Usage { completion_tokens: u.completion_tokens.max(est_completion), ..u }),
-        None => Metered::estimated(Usage { prompt_tokens: est_prompt_tokens, completion_tokens: est_completion, ..Usage::default() }),
+        None => Metered::estimated(Usage {
+            prompt_tokens: est_prompt_tokens,
+            completion_tokens: est_completion,
+            ..Usage::default()
+        }),
     }
 }
 
@@ -167,7 +176,10 @@ pub(crate) fn warn_missing_cache_prices_at_startup(snap: &Snapshot) {
 /// Runtime check, once per model per process: the provider reported cache reads or writes for a
 /// priced model without cache prices.
 pub(crate) fn warn_once_if_unpriced_cache(gw: &Gateway, m: &ModelEntry, u: Usage) {
-    if (u.cached_prompt_tokens == 0 && u.cache_write_tokens == 0) || m.has_cache_prices() || !m.price_in_per_mtok.is_some_and(|p| p > 0.0) {
+    if (u.cached_prompt_tokens == 0 && u.cache_write_tokens == 0)
+        || m.has_cache_prices()
+        || !m.price_in_per_mtok.is_some_and(|p| p > 0.0)
+    {
         return;
     }
     let first = gw.cache_price_warned.lock().map(|mut s| s.insert(m.id.to_string())).unwrap_or(false);
@@ -196,7 +208,10 @@ mod tests {
     #[test]
     fn missing_usage_is_estimated_from_the_prompt_and_streamed_bytes() {
         let m = stream_end(None, false, 42, 401);
-        assert_eq!((m.usage.prompt_tokens, m.usage.completion_tokens, m.source), (42, 101, Some(UsageSource::Estimated)));
+        assert_eq!(
+            (m.usage.prompt_tokens, m.usage.completion_tokens, m.source),
+            (42, 101, Some(UsageSource::Estimated))
+        );
     }
 
     #[test]

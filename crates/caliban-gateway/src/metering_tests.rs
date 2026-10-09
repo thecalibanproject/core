@@ -38,7 +38,8 @@ fn openai(b: &Value) -> Response {
     let model = b["model"].as_str().unwrap_or_default().to_owned();
     let include = b.pointer("/stream_options/include_usage").and_then(Value::as_bool) == Some(true);
     if model == "no-stream-options" && b.get("stream_options").is_some() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "unknown field stream_options"}}))).into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "unknown field stream_options"}})))
+            .into_response();
     }
     let n = if model == "slow" { 40 } else { 3 };
     let delay = if model == "slow" { Duration::from_millis(15) } else { Duration::ZERO };
@@ -66,14 +67,22 @@ fn anthropic(b: &Value) -> Response {
     let model = b["model"].clone();
     if b["stream"] == true {
         let ev = |e: Value| caliban_ir::anthropic::sse_event(&e);
-        let mut frames = vec![ev(json!({"type": "message_start", "message": {"id": "msg_1", "type": "message", "role": "assistant", "model": model, "content": [],
-            "usage": {"input_tokens": 30, "cache_read_input_tokens": 10, "output_tokens": 1}}}))];
-        frames.push(ev(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})));
+        let mut frames = vec![ev(
+            json!({"type": "message_start", "message": {"id": "msg_1", "type": "message", "role": "assistant", "model": model, "content": [],
+            "usage": {"input_tokens": 30, "cache_read_input_tokens": 10, "output_tokens": 1}}}),
+        )];
+        frames.push(ev(
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ));
         for _ in 0..40 {
-            frames.push(ev(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "abcd"}})));
+            frames.push(ev(
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "abcd"}}),
+            ));
         }
         frames.push(ev(json!({"type": "content_block_stop", "index": 0})));
-        frames.push(ev(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 40}})));
+        frames.push(ev(
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 40}}),
+        ));
         frames.push(ev(json!({"type": "message_stop"})));
         return sse_body(frames, Duration::from_millis(15));
     }
@@ -240,7 +249,8 @@ async fn event(env: &Env, count: usize) -> UsageEvent {
 }
 
 fn chat(model: &str, extra: Value) -> Value {
-    let mut b = json!({"model": model, "stream": true, "messages": [{"role": "user", "content": "count me in please"}]});
+    let mut b =
+        json!({"model": model, "stream": true, "messages": [{"role": "user", "content": "count me in please"}]});
     if let (Some(o), Some(e)) = (b.as_object_mut(), extra.as_object()) {
         o.extend(e.clone());
     }
@@ -263,18 +273,36 @@ async fn stream_usage_is_requested_upstream_and_shown_only_when_asked() {
         let sent = env.seen.lock().unwrap().last().cloned().unwrap();
         assert_eq!(sent["stream_options"]["include_usage"], true, "case {i}: usage always requested upstream");
 
-        let chunks: Vec<Value> = out.lines().filter_map(|l| l.strip_prefix("data: ")).filter_map(|d| serde_json::from_str(d).ok()).collect();
+        let chunks: Vec<Value> =
+            out.lines().filter_map(|l| l.strip_prefix("data: ")).filter_map(|d| serde_json::from_str(d).ok()).collect();
         assert!(out.ends_with("data: [DONE]\n\n"), "case {i}: {out}");
         if wants {
-            assert!(chunks.iter().any(|c| c["usage"]["prompt_tokens"] == 20), "case {i}: the client asked for usage: {out}");
+            assert!(
+                chunks.iter().any(|c| c["usage"]["prompt_tokens"] == 20),
+                "case {i}: the client asked for usage: {out}"
+            );
         } else {
-            assert!(chunks.iter().all(|c| c.get("usage").is_none()), "case {i}: no usage field at all, not even null: {out}");
-            assert!(chunks.iter().all(|c| !c["choices"].as_array().unwrap().is_empty()), "case {i}: the usage-only chunk is dropped");
+            assert!(
+                chunks.iter().all(|c| c.get("usage").is_none()),
+                "case {i}: no usage field at all, not even null: {out}"
+            );
+            assert!(
+                chunks.iter().all(|c| !c["choices"].as_array().unwrap().is_empty()),
+                "case {i}: the usage-only chunk is dropped"
+            );
         }
-        assert_eq!(chunks.iter().filter_map(|c| c.pointer("/choices/0/delta/content")).count(), 3, "case {i}: content intact");
+        assert_eq!(
+            chunks.iter().filter_map(|c| c.pointer("/choices/0/delta/content")).count(),
+            3,
+            "case {i}: content intact"
+        );
 
         let e = event(&env, i + 1).await;
-        assert_eq!((e.prompt_tokens, e.completion_tokens, e.cached_prompt_tokens), (20, 3, 8), "case {i}: metered from the provider's usage");
+        assert_eq!(
+            (e.prompt_tokens, e.completion_tokens, e.cached_prompt_tokens),
+            (20, 3, 8),
+            "case {i}: metered from the provider's usage"
+        );
         assert_eq!(e.usage_source, Some(UsageSource::Provider));
         // 12 uncached at 1.0, 8 cached at 0.5, 3 out at 2.0.
         assert!((e.cost_usd.unwrap() - (12.0 + 8.0 * 0.5 + 3.0 * 2.0) / 1e6).abs() < 1e-12);
@@ -290,12 +318,17 @@ async fn a_client_disconnect_is_metered_as_an_estimate() {
     let e = event(&env, 1).await;
     assert_eq!(e.usage_source, Some(UsageSource::Estimated));
     assert!(e.prompt_tokens > 0, "the prompt estimate, not 0");
-    assert!(e.completion_tokens >= 1 && e.completion_tokens < 40, "estimated from what was streamed: {}", e.completion_tokens);
+    assert!(
+        e.completion_tokens >= 1 && e.completion_tokens < 40,
+        "estimated from what was streamed: {}",
+        e.completion_tokens
+    );
     assert!(e.cost_usd.unwrap() > 0.0);
 
     // Native Anthropic stream: `message_start` gave the exact prompt (30 + 10 cached), output is
     // estimated from the deltas streamed before the disconnect.
-    let body = json!({"model": "an/slow", "max_tokens": 64, "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let body =
+        json!({"model": "an/slow", "max_tokens": 64, "stream": true, "messages": [{"role": "user", "content": "hi"}]});
     let got = call_and_disconnect(&env, "/v1/messages", body, 4).await;
     assert!(got.contains("message_start"));
     let e = event(&env, 2).await;
@@ -308,7 +341,8 @@ async fn a_client_disconnect_is_metered_as_an_estimate() {
 #[tokio::test]
 async fn complete_streams_are_metered_from_the_provider() {
     let env = setup().await;
-    let body = json!({"model": "an/slow", "max_tokens": 64, "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let body =
+        json!({"model": "an/slow", "max_tokens": 64, "stream": true, "messages": [{"role": "user", "content": "hi"}]});
     let (status, _) = call(&env, "/v1/messages", body).await;
     assert_eq!(status, StatusCode::OK);
     let e = event(&env, 1).await;
@@ -318,7 +352,8 @@ async fn complete_streams_are_metered_from_the_provider() {
 #[tokio::test]
 async fn servers_that_reject_stream_options_are_estimated_and_flagged() {
     let env = setup().await;
-    let (status, out) = call(&env, "/v1/chat/completions", chat("oa/noso", json!({"stream_options": {"include_usage": true}}))).await;
+    let (status, out) =
+        call(&env, "/v1/chat/completions", chat("oa/noso", json!({"stream_options": {"include_usage": true}}))).await;
     assert_eq!(status, StatusCode::OK, "{out}");
     let sent = env.seen.lock().unwrap().last().cloned().unwrap();
     assert!(sent.get("stream_options").is_none(), "not sent to a server that rejects it");
@@ -336,7 +371,10 @@ async fn cost_applies_prompt_cache_prices_and_the_wal_records_it() {
     assert_eq!(resp.status(), StatusCode::OK);
     let header: f64 = resp.headers()["x-caliban-cost-usd"].to_str().unwrap().parse().unwrap();
     let e = event(&env, 1).await;
-    assert_eq!((e.prompt_tokens, e.cached_prompt_tokens, e.cache_write_tokens, e.cache_write_1h_tokens), (160, 100, 50, 30));
+    assert_eq!(
+        (e.prompt_tokens, e.cached_prompt_tokens, e.cache_write_tokens, e.cache_write_1h_tokens),
+        (160, 100, 50, 30)
+    );
     // 10 uncached at 3.0, 100 reads at 0.3, 20 five-minute writes at 3.75, 30 one-hour writes at 6.0, 5 out at 15.
     let want = (10.0 * 3.0 + 100.0 * 0.3 + 20.0 * 3.75 + 30.0 * 6.0 + 5.0 * 15.0) / 1e6;
     assert!((e.cost_usd.unwrap() - want).abs() < 1e-12, "{:?} vs {want}", e.cost_usd);

@@ -121,7 +121,11 @@ impl SnapshotSigner {
         let mut msg = DOMAIN.to_vec();
         msg.extend_from_slice(&bytes);
         let sig = self.key.sign(&msg);
-        Ok(SignedSnapshot { key_id: self.key_id.clone(), payload: B64.encode(&bytes), signature: B64.encode(sig.to_bytes()) })
+        Ok(SignedSnapshot {
+            key_id: self.key_id.clone(),
+            payload: B64.encode(&bytes),
+            signature: B64.encode(sig.to_bytes()),
+        })
     }
 }
 
@@ -152,14 +156,19 @@ impl SnapshotVerifier {
     /// Verifies the signature, then parses and validates the config. Nothing in the payload is
     /// trusted before the signature checks out.
     pub fn verify(&self, s: &SignedSnapshot) -> Result<SnapshotPayload, SnapshotError> {
-        let (_, vk) = self.keys.iter().find(|(id, _)| *id == s.key_id).ok_or_else(|| SnapshotError::UnknownKey(s.key_id.clone()))?;
+        let (_, vk) = self
+            .keys
+            .iter()
+            .find(|(id, _)| *id == s.key_id)
+            .ok_or_else(|| SnapshotError::UnknownKey(s.key_id.clone()))?;
         let bytes = B64.decode(&s.payload).map_err(|e| SnapshotError::Malformed(format!("payload: {e}")))?;
         let sig = B64.decode(&s.signature).map_err(|e| SnapshotError::Malformed(format!("signature: {e}")))?;
         let sig = Signature::from_slice(&sig).map_err(|_| SnapshotError::BadSignature)?;
         let mut msg = DOMAIN.to_vec();
         msg.extend_from_slice(&bytes);
         vk.verify_strict(&msg, &sig).map_err(|_| SnapshotError::BadSignature)?;
-        let payload: SnapshotPayload = serde_json::from_slice(&bytes).map_err(|e| SnapshotError::Malformed(e.to_string()))?;
+        let payload: SnapshotPayload =
+            serde_json::from_slice(&bytes).map_err(|e| SnapshotError::Malformed(e.to_string()))?;
         payload.config.validate().map_err(|e| SnapshotError::Invalid(e.to_string()))?;
         Ok(payload)
     }

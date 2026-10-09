@@ -107,7 +107,16 @@ mod tests {
     async fn exact_cache_round_trip() {
         let c = ExactCache::new(10, Duration::from_secs(60));
         let k = [7u8; 32];
-        c.put(k, CachedResponse { body: Bytes::from_static(b"{}"), model: "m".into(), prompt_tokens: 1, completion_tokens: 2 }).await;
+        c.put(
+            k,
+            CachedResponse {
+                body: Bytes::from_static(b"{}"),
+                model: "m".into(),
+                prompt_tokens: 1,
+                completion_tokens: 2,
+            },
+        )
+        .await;
         assert_eq!(c.get(&k).await.unwrap().completion_tokens, 2);
     }
 }

@@ -34,19 +34,19 @@ pub use error::{ApiError, Dialect};
 pub use limits::quota_store;
 
 use axum::Router;
+use axum::http::{HeaderName, Method, header};
 use axum::routing::{get, post};
 use caliban_cache::ExactCache;
 use caliban_cache::semantic::{MemoryStore, QdrantStore, SemanticCache, VectorStore};
-use caliban_config::{SemanticCacheConfig, SemanticStoreKind};
-use caliban_types::Embedder;
 use caliban_config::ConfigHandle;
+use caliban_config::{SemanticCacheConfig, SemanticStoreKind};
 use caliban_meter::UsageSink;
 use caliban_meter::quota::{InMemoryQuota, QuotaStore};
 use caliban_pii::{PiiEngine, SurrogateKeys};
 use caliban_providers::Providers;
+use caliban_types::Embedder;
 use std::sync::Arc;
 use std::time::Duration;
-use axum::http::{HeaderName, Method, header};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
@@ -187,7 +187,9 @@ fn semantic_cache(c: &SemanticCacheConfig) -> Option<Arc<SemanticCache>> {
         SemanticStoreKind::Qdrant => {
             let Some(url) = c.resolved_qdrant_url() else {
                 if c.enabled {
-                    tracing::warn!("cache.semantic is enabled but no Qdrant URL is set (CALIBAN_QDRANT_URL or cache.semantic.qdrant_url); semantic cache off");
+                    tracing::warn!(
+                        "cache.semantic is enabled but no Qdrant URL is set (CALIBAN_QDRANT_URL or cache.semantic.qdrant_url); semantic cache off"
+                    );
                 }
                 return None;
             };

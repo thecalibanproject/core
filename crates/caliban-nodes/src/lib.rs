@@ -131,7 +131,8 @@ fn validate_graph(g: &Graph) -> Result<(), SpecError> {
         }
         adj.entry(e.from.as_str()).or_default().push(e.to.as_str());
     }
-    let bounded: HashSet<&str> = g.vertices.iter().filter(|v| v.max_iterations.is_some()).map(|v| v.id.as_str()).collect();
+    let bounded: HashSet<&str> =
+        g.vertices.iter().filter(|v| v.max_iterations.is_some()).map(|v| v.id.as_str()).collect();
     // DFS for cycles; every cycle must contain a bounded vertex.
     fn dfs<'a>(
         v: &'a str,

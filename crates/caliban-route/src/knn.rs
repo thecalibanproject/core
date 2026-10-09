@@ -235,16 +235,30 @@ impl KnnIndex {
         self.classify_excluding(query, tenant, p, None)
     }
 
-    fn classify_excluding(&self, query: &[f32], tenant: Option<&str>, p: &KnnParams, exclude: Option<usize>) -> Result<KnnOutcome, KnnError> {
+    fn classify_excluding(
+        &self,
+        query: &[f32],
+        tenant: Option<&str>,
+        p: &KnnParams,
+        exclude: Option<usize>,
+    ) -> Result<KnnOutcome, KnnError> {
         if query.len() != self.dim {
             return Err(KnnError::Dim { want: self.dim, got: query.len() });
         }
-        let empty = |intent: String| KnnOutcome { intent, confidence: 0.0, top1_similarity: 0.0, margin: 0.0, neighbours: 0, abstain: Some(Abstain::Empty) };
+        let empty = |intent: String| KnnOutcome {
+            intent,
+            confidence: 0.0,
+            top1_similarity: 0.0,
+            margin: 0.0,
+            neighbours: 0,
+            abstain: Some(Abstain::Empty),
+        };
         let mut q = query.to_vec();
         if !normalize(&mut q) {
             return Ok(empty(String::new()));
         }
-        let t_ix = tenant.and_then(|t| self.tenants.iter().position(|x| x == t)).map(|i| u32::try_from(i).unwrap_or(GLOBAL));
+        let t_ix =
+            tenant.and_then(|t| self.tenants.iter().position(|x| x == t)).map(|i| u32::try_from(i).unwrap_or(GLOBAL));
         let classes = t_ix.map_or(self.classes_global, |t| self.classes_tenant[t as usize]).max(1);
 
         // Top-k by similarity; ties keep the earlier exemplar (deterministic).
@@ -393,7 +407,8 @@ mod tests {
 
     /// Three 2-d clusters: a along +x, b along +y, c along -x.
     fn index() -> KnnIndex {
-        let rows = vec![vec![1.0, 0.0], vec![0.95, 0.05], vec![0.9, 0.1], vec![0.0, 1.0], vec![0.1, 0.9], vec![-1.0, 0.0]];
+        let rows =
+            vec![vec![1.0, 0.0], vec![0.95, 0.05], vec![0.9, 0.1], vec![0.0, 1.0], vec![0.1, 0.9], vec![-1.0, 0.0]];
         let intents = [s("a"), s("a"), s("a"), s("b"), s("b"), s("c")];
         KnnIndex::build(rows, &intents, &[None, None, None, None, None, None]).unwrap()
     }
@@ -414,7 +429,9 @@ mod tests {
         // Query between a and b, slightly closer to b. With k=5 there are 3 a's and 2 b's.
         let q = [0.70, 0.72];
         let sharp = index().classify(&q, None, &KnnParams { temperature: 0.01, ..KnnParams::default() }).unwrap();
-        let flat = index().classify(&q, None, &KnnParams { temperature: 100.0, default_threshold: 0.0, ..KnnParams::default() }).unwrap();
+        let flat = index()
+            .classify(&q, None, &KnnParams { temperature: 100.0, default_threshold: 0.0, ..KnnParams::default() })
+            .unwrap();
         assert_eq!(sharp.intent, "b");
         // Near-uniform weights: majority vote, so the three a's win.
         assert_eq!(flat.intent, "a");
@@ -427,10 +444,14 @@ mod tests {
         let flat = KnnParams { temperature: 100.0, ..KnnParams::default() };
         let low = index().classify(&q, None, &KnnParams { default_threshold: 0.9, ..flat.clone() }).unwrap();
         assert_eq!(low.abstain, Some(Abstain::LowConfidence));
-        let margin = index().classify(&q, None, &KnnParams { default_threshold: 0.0, margin_threshold: Some(0.5), ..flat.clone() }).unwrap();
+        let margin = index()
+            .classify(&q, None, &KnnParams { default_threshold: 0.0, margin_threshold: Some(0.5), ..flat.clone() })
+            .unwrap();
         assert_eq!(margin.abstain, Some(Abstain::LowMargin));
         // Orthogonal to everything except c's opposite: top-1 similarity is low.
-        let oos = index().classify(&[0.0, -1.0], None, &KnnParams { oos_threshold: Some(0.5), ..KnnParams::default() }).unwrap();
+        let oos = index()
+            .classify(&[0.0, -1.0], None, &KnnParams { oos_threshold: Some(0.5), ..KnnParams::default() })
+            .unwrap();
         assert_eq!(oos.abstain, Some(Abstain::OutOfScope));
         // Per-label threshold overrides the default.
         let mut th = BTreeMap::new();
@@ -477,7 +498,10 @@ mod tests {
 
     #[test]
     fn dimension_mismatch_is_an_error() {
-        assert_eq!(index().classify(&[1.0, 0.0, 0.0], None, &KnnParams::default()).unwrap_err(), KnnError::Dim { want: 2, got: 3 });
+        assert_eq!(
+            index().classify(&[1.0, 0.0, 0.0], None, &KnnParams::default()).unwrap_err(),
+            KnnError::Dim { want: 2, got: 3 }
+        );
     }
 
     #[test]

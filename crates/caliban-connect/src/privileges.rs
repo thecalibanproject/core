@@ -197,20 +197,9 @@ pub fn classify_connection_status(reply: &J) -> PrivilegeReport {
     let mut write = BTreeSet::new();
     let mut unknown = BTreeSet::new();
     let mut actions = BTreeSet::new();
-    for p in auth
-        .get("authenticatedUserPrivileges")
-        .and_then(J::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for p in auth.get("authenticatedUserPrivileges").and_then(J::as_array).into_iter().flatten() {
         let res = resource_label(p.get("resource").unwrap_or(&J::Null));
-        for a in p
-            .get("actions")
-            .and_then(J::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(J::as_str)
-        {
+        for a in p.get("actions").and_then(J::as_array).into_iter().flatten().filter_map(J::as_str) {
             actions.insert(a.to_owned());
             if WRITE_ADMIN_ACTIONS.contains(&a) {
                 write.insert(format!("{res}: {a}"));
@@ -220,12 +209,12 @@ pub fn classify_connection_status(reply: &J) -> PrivilegeReport {
         }
     }
     let reason = if users.is_empty() {
-        Some("connection is not authenticated (authentication disabled?); a dedicated read-only user is required".to_owned())
+        Some(
+            "connection is not authenticated (authentication disabled?); a dedicated read-only user is required"
+                .to_owned(),
+        )
     } else if !write.is_empty() {
-        Some(format!(
-            "user holds write/admin actions: {}",
-            write.iter().cloned().collect::<Vec<_>>().join(", ")
-        ))
+        Some(format!("user holds write/admin actions: {}", write.iter().cloned().collect::<Vec<_>>().join(", ")))
     } else if !unknown.is_empty() {
         Some(format!(
             "user holds actions outside the read-only allow-list: {}",
@@ -283,21 +272,11 @@ mod tests {
     fn read_write_role_is_refused() {
         let mut v = read_user();
         v["authInfo"]["authenticatedUserRoles"] = json!([{ "role": "readWrite", "db": "shop" }]);
-        v["authInfo"]["authenticatedUserPrivileges"][0]["actions"] = json!([
-            "find",
-            "insert",
-            "update",
-            "remove",
-            "createIndex",
-            "dropCollection",
-            "createCollection"
-        ]);
+        v["authInfo"]["authenticatedUserPrivileges"][0]["actions"] =
+            json!(["find", "insert", "update", "remove", "createIndex", "dropCollection", "createCollection"]);
         let r = classify_connection_status(&v);
         assert!(!r.read_only);
-        assert!(
-            r.write_actions.contains(&"shop.*: insert".to_string()),
-            "{r:?}"
-        );
+        assert!(r.write_actions.contains(&"shop.*: insert".to_string()), "{r:?}");
         assert!(r.write_actions.contains(&"shop.*: createIndex".to_string()));
         assert!(r.reason.unwrap().contains("write/admin"));
     }

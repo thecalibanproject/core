@@ -52,9 +52,9 @@ pub mod rehydrate;
 pub mod surrogate;
 
 pub use dictionary::DictionaryDetector;
+pub use ner::NerError;
 #[cfg(feature = "ner")]
 pub use ner::{NerDetector, NerOptions};
-pub use ner::NerError;
 pub use patterns::PatternDetector;
 pub use rehydrate::{Rehydrator, StreamingRehydrator};
 pub use surrogate::Vault;
@@ -238,12 +238,7 @@ pub fn tenant_scope_key(kek: &[u8; 32], tenant_id: &str) -> [u8; 32] {
 /// Union of spans; overlaps resolved by preferring the longer span, then the higher-risk type.
 /// Biased toward recall: a missed entity costs more than an extra one.
 pub fn merge_spans(mut spans: Vec<Span>) -> Vec<Span> {
-    spans.sort_by(|a, b| {
-        a.start
-            .cmp(&b.start)
-            .then(b.len().cmp(&a.len()))
-            .then(b.entity.risk().cmp(&a.entity.risk()))
-    });
+    spans.sort_by(|a, b| a.start.cmp(&b.start).then(b.len().cmp(&a.len())).then(b.entity.risk().cmp(&a.entity.risk())));
     let mut out: Vec<Span> = Vec::with_capacity(spans.len());
     for s in spans {
         match out.last_mut() {
@@ -338,7 +333,13 @@ impl PiiEngine {
         self.protect_tier(req, mode, scope_key, Tier::Light)
     }
 
-    fn protect_tier(&self, req: &mut ChatRequest, mode: PiiMode, scope_key: &[u8], tier: Tier) -> Result<Protected, PiiError> {
+    fn protect_tier(
+        &self,
+        req: &mut ChatRequest,
+        mode: PiiMode,
+        scope_key: &[u8],
+        tier: Tier,
+    ) -> Result<Protected, PiiError> {
         let mut out = Protected { vault: Vault::new(scope_key), entities: 0 };
         if mode == PiiMode::Off {
             return Ok(out);
@@ -453,7 +454,9 @@ mod tests {
     struct Heavy;
     impl Detector for Heavy {
         fn detect(&self, text: &str) -> Vec<Span> {
-            text.match_indices("Zed").map(|(i, m)| Span { start: i, end: i + m.len(), entity: EntityType::Person }).collect()
+            text.match_indices("Zed")
+                .map(|(i, m)| Span { start: i, end: i + m.len(), entity: EntityType::Person })
+                .collect()
         }
         fn is_heavy(&self) -> bool {
             true
@@ -472,7 +475,10 @@ mod tests {
         assert_eq!(engine.protect_light(&mut light, PiiMode::Mask, b"s").unwrap().entities, 1);
         assert_eq!(light.last_user_text().unwrap(), "Zed: [EMAIL]");
         let mut secret = chat("Zed sk-proj-abcdefghijklmnopqrstuvwxyz0123456789");
-        assert!(matches!(engine.protect_light(&mut secret, PiiMode::Mask, b"s"), Err(PiiError::SecretDetected(_))), "credentials still block");
+        assert!(
+            matches!(engine.protect_light(&mut secret, PiiMode::Mask, b"s"), Err(PiiError::SecretDetected(_))),
+            "credentials still block"
+        );
     }
 
     #[test]
@@ -524,7 +530,10 @@ mod tests {
         let ikm = [0x0b; 22];
         let salt: Vec<u8> = (0x00..=0x0c).collect();
         let info: Vec<u8> = (0xf0..=0xf9).collect();
-        assert_eq!(hex::encode(hkdf_sha256(&salt, &ikm, &info)), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf");
+        assert_eq!(
+            hex::encode(hkdf_sha256(&salt, &ikm, &info)),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+        );
         // The tenant key is that construction with the documented salt and info.
         let mut info = TENANT_INFO.to_vec();
         info.push(0);
@@ -569,7 +578,8 @@ mod tests {
         // Identical requests: identical protected text.
         assert_eq!(protect_with(&acme, "Mail jane.doe@acme.com today").0, one);
         // Another tenant: another surrogate for the same value.
-        let (globex, _) = protect_with(&keys.scope_key(PiiSurrogateScope::Tenant, "globex"), "Mail jane.doe@acme.com today");
+        let (globex, _) =
+            protect_with(&keys.scope_key(PiiSurrogateScope::Tenant, "globex"), "Mail jane.doe@acme.com today");
         assert_ne!(globex, one);
         assert!(!globex.contains(s1.as_str()));
     }

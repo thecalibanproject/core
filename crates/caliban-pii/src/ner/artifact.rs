@@ -116,7 +116,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 pub fn read_manifest(dir: &Path) -> Result<Manifest, NerError> {
     let path = dir.join(MANIFEST_FILENAME);
     let raw = std::fs::read(&path).map_err(|e| io_err(&path, e))?;
-    let m: Manifest = serde_json::from_slice(&raw).map_err(|e| NerError::Manifest(format!("{}: {e}", path.display())))?;
+    let m: Manifest =
+        serde_json::from_slice(&raw).map_err(|e| NerError::Manifest(format!("{}: {e}", path.display())))?;
     if m.manifest_version != SUPPORTED_MANIFEST_VERSION {
         return Err(NerError::Manifest(format!(
             "unsupported manifest_version {} (this build understands {SUPPORTED_MANIFEST_VERSION})",
@@ -127,7 +128,8 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, NerError> {
         return Err(NerError::Manifest(format!("artifact kind is {:?}, expected \"pii_ner\"", m.kind)));
     }
     let onnx = m.onnx.as_ref().ok_or_else(|| NerError::Manifest("pii_ner manifest has no onnx section".into()))?;
-    let tok = m.tokenizer.as_ref().ok_or_else(|| NerError::Manifest("pii_ner manifest has no tokenizer section".into()))?;
+    let tok =
+        m.tokenizer.as_ref().ok_or_else(|| NerError::Manifest("pii_ner manifest has no tokenizer section".into()))?;
     if m.labels.is_empty() {
         return Err(NerError::Manifest("pii_ner manifest has no labels".into()));
     }
@@ -153,7 +155,12 @@ fn read_checked(dir: &Path, real_dir: &Path, entry: &FileEntry) -> Result<Vec<u8
     }
     let bytes = std::fs::read(&real).map_err(|e| io_err(&path, e))?;
     if bytes.len() as u64 != entry.size_bytes {
-        return Err(NerError::Integrity(format!("{}: size {} != manifest {}", entry.path, bytes.len(), entry.size_bytes)));
+        return Err(NerError::Integrity(format!(
+            "{}: size {} != manifest {}",
+            entry.path,
+            bytes.len(),
+            entry.size_bytes
+        )));
     }
     let got = sha256_hex(&bytes);
     if got != entry.sha256 {
@@ -191,7 +198,11 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("caliban-pii-{tag}-{}-{}", std::process::id(), rand::random::<u64>()));
+            let p = std::env::temp_dir().join(format!(
+                "caliban-pii-{tag}-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
         }
@@ -205,9 +216,7 @@ mod tests {
     fn write_artifact(dir: &Path, model: &[u8], tok: &[u8], tamper: Option<&str>) {
         std::fs::write(dir.join("model.onnx"), model).unwrap();
         std::fs::write(dir.join("tokenizer.json"), tok).unwrap();
-        let entry = |p: &str, b: &[u8]| {
-            serde_json::json!({"path": p, "sha256": sha256_hex(b), "size_bytes": b.len(), "role": "model"})
-        };
+        let entry = |p: &str, b: &[u8]| serde_json::json!({"path": p, "sha256": sha256_hex(b), "size_bytes": b.len(), "role": "model"});
         let m = serde_json::json!({
             "manifest_version": 1, "kind": "pii_ner", "name": "t", "version": "1.0.0",
             "files": [entry("model.onnx", model), entry("tokenizer.json", tok)],

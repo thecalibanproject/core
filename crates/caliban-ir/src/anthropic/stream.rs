@@ -1,6 +1,8 @@
 //! Streaming translation: OpenAI `chat.completion.chunk`s ⇄ Anthropic stream events.
 
-use super::response::{anthropic_usage, finish_reason_from_anthropic, message_id, now_secs, openai_usage, stop_reason_from_openai};
+use super::response::{
+    anthropic_usage, finish_reason_from_anthropic, message_id, now_secs, openai_usage, stop_reason_from_openai,
+};
 use crate::Usage;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -38,7 +40,15 @@ pub struct OpenAiToAnthropicStream {
 
 impl OpenAiToAnthropicStream {
     pub fn new(model: impl Into<String>) -> Self {
-        Self { model: model.into(), started: false, finished: false, open: None, next_index: 0, seen_tools: HashMap::new(), stop_reason: None }
+        Self {
+            model: model.into(),
+            started: false,
+            finished: false,
+            open: None,
+            next_index: 0,
+            seen_tools: HashMap::new(),
+            stop_reason: None,
+        }
     }
 
     fn start(&mut self, id: Option<&str>, out: &mut Vec<Value>) {
@@ -86,7 +96,11 @@ impl OpenAiToAnthropicStream {
             return out;
         };
         let delta = choice.get("delta").unwrap_or(&Value::Null);
-        let reasoning = delta.get("reasoning_content").or_else(|| delta.get("reasoning")).and_then(Value::as_str).filter(|s| !s.is_empty());
+        let reasoning = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
         if let Some(r) = reasoning {
             let index = match self.open {
                 Some(Open::Thinking(i)) => i,
@@ -107,7 +121,9 @@ impl OpenAiToAnthropicStream {
                     i
                 }
             };
-            out.push(json!({ "type": "content_block_delta", "index": index, "delta": { "type": "text_delta", "text": t } }));
+            out.push(
+                json!({ "type": "content_block_delta", "index": index, "delta": { "type": "text_delta", "text": t } }),
+            );
         }
         for tc in delta.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
             let openai = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -115,9 +131,11 @@ impl OpenAiToAnthropicStream {
                 Some(Open::Tool { block, openai: o }) if o == openai => block,
                 _ if self.seen_tools.contains_key(&openai) => continue, // late fragment of a closed block
                 _ => {
-                    let id = tc.get("id").and_then(Value::as_str).map_or_else(|| format!("toolu_{openai}"), str::to_owned);
+                    let id =
+                        tc.get("id").and_then(Value::as_str).map_or_else(|| format!("toolu_{openai}"), str::to_owned);
                     let name = tc.pointer("/function/name").and_then(Value::as_str).unwrap_or_default().to_owned();
-                    let block = self.open_block(json!({ "type": "tool_use", "id": id, "name": name, "input": {} }), &mut out);
+                    let block =
+                        self.open_block(json!({ "type": "tool_use", "id": id, "name": name, "input": {} }), &mut out);
                     self.open = Some(Open::Tool { block, openai });
                     self.seen_tools.insert(openai, block);
                     block
@@ -237,7 +255,16 @@ impl Default for AnthropicToOpenAiStream {
 
 impl AnthropicToOpenAiStream {
     pub fn new() -> Self {
-        Self { id: String::new(), model: String::new(), created: now_secs(), blocks: HashMap::new(), next_tool: 0, usage: AnthropicUsage::default(), finish: None, done: false }
+        Self {
+            id: String::new(),
+            model: String::new(),
+            created: now_secs(),
+            blocks: HashMap::new(),
+            next_tool: 0,
+            usage: AnthropicUsage::default(),
+            finish: None,
+            done: false,
+        }
     }
 
     pub fn is_done(&self) -> bool {
@@ -291,9 +318,14 @@ impl AnthropicToOpenAiStream {
                 let s = |k: &str| d.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
                 match (d.get("type").and_then(Value::as_str), self.blocks.get(&index)) {
                     (Some("text_delta"), _) => out.push(self.chunk(json!({ "content": s("text") }), None)),
-                    (Some("thinking_delta"), _) => out.push(self.chunk(json!({ "reasoning_content": s("thinking") }), None)),
+                    (Some("thinking_delta"), _) => {
+                        out.push(self.chunk(json!({ "reasoning_content": s("thinking") }), None))
+                    }
                     (Some("input_json_delta"), Some(Kind::Tool(t))) => {
-                        out.push(self.chunk(json!({ "tool_calls": [{ "index": t, "function": { "arguments": s("partial_json") } }] }), None));
+                        out.push(self.chunk(
+                            json!({ "tool_calls": [{ "index": t, "function": { "arguments": s("partial_json") } }] }),
+                            None,
+                        ));
                     }
                     _ => {}
                 }
@@ -336,7 +368,12 @@ mod tests {
         evs.iter()
             .map(|e| {
                 let t = e["type"].as_str().unwrap().to_owned();
-                match e.get("content_block").or_else(|| e.get("delta")).and_then(|d| d.get("type")).and_then(Value::as_str) {
+                match e
+                    .get("content_block")
+                    .or_else(|| e.get("delta"))
+                    .and_then(|d| d.get("type"))
+                    .and_then(Value::as_str)
+                {
                     Some(sub) if t.starts_with("content_block") => format!("{t}:{sub}"),
                     _ => t,
                 }
@@ -361,18 +398,29 @@ mod tests {
         assert_eq!(
             types(&evs),
             [
-                "message_start", "ping",
-                "content_block_start:thinking", "content_block_delta:thinking_delta", "content_block_delta:thinking_delta", "content_block_stop",
-                "content_block_start:text", "content_block_delta:text_delta", "content_block_stop",
-                "content_block_start:tool_use", "content_block_delta:input_json_delta", "content_block_delta:input_json_delta", "content_block_stop",
-                "message_delta", "message_stop"
+                "message_start",
+                "ping",
+                "content_block_start:thinking",
+                "content_block_delta:thinking_delta",
+                "content_block_delta:thinking_delta",
+                "content_block_stop",
+                "content_block_start:text",
+                "content_block_delta:text_delta",
+                "content_block_stop",
+                "content_block_start:tool_use",
+                "content_block_delta:input_json_delta",
+                "content_block_delta:input_json_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
             ]
         );
         assert_eq!(evs[0]["message"]["id"], "msg_c1");
         assert_eq!(evs[0]["message"]["model"], "local/qwen");
         assert_eq!(evs[9]["content_block"], json!({"type": "tool_use", "id": "call_a", "name": "f", "input": {}}));
         assert_eq!(evs[9]["index"], 2);
-        let json: String = evs.iter().filter_map(|e| e.pointer("/delta/partial_json").and_then(Value::as_str)).collect();
+        let json: String =
+            evs.iter().filter_map(|e| e.pointer("/delta/partial_json").and_then(Value::as_str)).collect();
         assert_eq!(json, r#"{"a":1}"#);
         let md = &evs[evs.len() - 2];
         assert_eq!(md["delta"]["stop_reason"], "tool_use");
@@ -418,7 +466,10 @@ mod tests {
         assert_eq!(chunks[6]["usage"]["completion_tokens"], 20);
         assert_eq!(chunks[0]["model"], "claude-x");
         assert!(s.is_done());
-        assert_eq!(s.usage(), Usage { prompt_tokens: 15, completion_tokens: 20, cached_prompt_tokens: 3, ..Usage::default() });
+        assert_eq!(
+            s.usage(),
+            Usage { prompt_tokens: 15, completion_tokens: 20, cached_prompt_tokens: 3, ..Usage::default() }
+        );
     }
 
     #[test]
@@ -430,7 +481,16 @@ mod tests {
         assert!(u.has_input() && !u.is_complete(), "input known, output not final");
         u.observe(&json!({"type": "message_delta", "usage": {"output_tokens": 9}}));
         assert!(u.is_complete());
-        assert_eq!(u.usage(), Usage { prompt_tokens: 44, completion_tokens: 9, cached_prompt_tokens: 10, cache_write_tokens: 30, cache_write_1h_tokens: 30 });
+        assert_eq!(
+            u.usage(),
+            Usage {
+                prompt_tokens: 44,
+                completion_tokens: 9,
+                cached_prompt_tokens: 10,
+                cache_write_tokens: 30,
+                cache_write_1h_tokens: 30
+            }
+        );
         // Translated for an OpenAI client, the cache writes survive.
         assert_eq!(Usage::from_openai(&json!({"usage": openai_usage(u.usage())})), Some(u.usage()));
     }

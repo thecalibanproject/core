@@ -26,11 +26,21 @@ fn env(k: &str) -> Option<String> {
 async fn embed(client: &reqwest::Client, url: &str, model: &str, key: Option<&str>, texts: &[String]) -> Vec<Vec<f32>> {
     let mut out = Vec::with_capacity(texts.len());
     for batch in texts.chunks(32) {
-        let mut rq = client.post(format!("{}/embeddings", url.trim_end_matches('/'))).json(&json!({"model": model, "input": batch}));
+        let mut rq = client
+            .post(format!("{}/embeddings", url.trim_end_matches('/')))
+            .json(&json!({"model": model, "input": batch}));
         if let Some(k) = key {
             rq = rq.bearer_auth(k);
         }
-        let v: Value = rq.send().await.expect("embedding request").error_for_status().expect("embedding status").json().await.expect("embedding json");
+        let v: Value = rq
+            .send()
+            .await
+            .expect("embedding request")
+            .error_for_status()
+            .expect("embedding status")
+            .json()
+            .await
+            .expect("embedding json");
         let mut data: Vec<(u64, Vec<f32>)> = v["data"]
             .as_array()
             .expect("data array")
@@ -38,7 +48,13 @@ async fn embed(client: &reqwest::Client, url: &str, model: &str, key: Option<&st
             .enumerate()
             .map(|(i, d)| {
                 #[allow(clippy::cast_possible_truncation)]
-                let e = d["embedding"].as_array().expect("embedding").iter().filter_map(Value::as_f64).map(|x| x as f32).collect();
+                let e = d["embedding"]
+                    .as_array()
+                    .expect("embedding")
+                    .iter()
+                    .filter_map(Value::as_f64)
+                    .map(|x| x as f32)
+                    .collect();
                 (d["index"].as_u64().unwrap_or(i as u64), e)
             })
             .collect();
@@ -66,7 +82,9 @@ async fn knn_leave_one_out_against_a_real_embedder() {
     let key = env("CALIBAN_KNN_EVAL_API_KEY");
     let prefix = env("CALIBAN_KNN_EVAL_PREFIX").unwrap_or_default();
     let dataset = match env("CALIBAN_KNN_EVAL_DATASET") {
-        Some(p) => IntentDataset::from_json(&std::fs::read_to_string(&p).expect("dataset file")).expect("valid dataset"),
+        Some(p) => {
+            IntentDataset::from_json(&std::fs::read_to_string(&p).expect("dataset file")).expect("valid dataset")
+        }
         None => IntentDataset::builtin(),
     };
     let mut params = KnnParams::default();
@@ -92,7 +110,14 @@ async fn knn_leave_one_out_against_a_real_embedder() {
     let index = KnnIndex::build(vectors, &intents, &owners).expect("index");
     let r = index.leave_one_out(&params);
 
-    println!("kNN leave-one-out: model {model}, {} exemplars, {} intents, dim {}, k {}, T {} (embedded in {embed_ms} ms)", r.n, index.intents().len(), index.dim(), params.k, params.temperature);
+    println!(
+        "kNN leave-one-out: model {model}, {} exemplars, {} intents, dim {}, k {}, T {} (embedded in {embed_ms} ms)",
+        r.n,
+        index.intents().len(),
+        index.dim(),
+        params.k,
+        params.temperature
+    );
     println!(
         "  top-1 accuracy {:.3} | accepted precision {:.3} | abstain rate {:.3} (default_threshold {})",
         r.top1_accuracy(),
@@ -114,8 +139,11 @@ async fn knn_leave_one_out_against_a_real_embedder() {
     // OOS top-1 similarity, to seed `oos_threshold`.
     if !dataset.oos.is_empty() {
         let oos_texts: Vec<String> = dataset.oos.iter().map(|u| format!("{prefix}{u}")).collect();
-        let mut oos: Vec<f32> =
-            embed(&client, &url, &model, key.as_deref(), &oos_texts).await.iter().map(|v| index.classify(v, None, &params).expect("classify").top1_similarity).collect();
+        let mut oos: Vec<f32> = embed(&client, &url, &model, key.as_deref(), &oos_texts)
+            .await
+            .iter()
+            .map(|v| index.classify(v, None, &params).expect("classify").top1_similarity)
+            .collect();
         println!(
             "  OOS top-1 similarity: p50 {:.3}, p90 {:.3}, max {:.3} ({} examples); a starting point for oos_threshold; calibrate it with ml's knn-eval",
             percentile(&mut oos, 0.5),

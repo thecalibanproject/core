@@ -95,7 +95,10 @@ async fn suite(s: &Arc<dyn QuotaStore>) {
     let tpd = QuotaPolicy { tokens_per_day: Some(1000), ..p() };
     let r = s.reserve("t8", &tpd, amt(600, 0.0)).await.unwrap();
     drop(Settlement::new(Arc::clone(s), r));
-    eventually(|| async { s.reserve("t8", &QuotaPolicy { tokens_per_day: Some(600), ..p() }, amt(600, 0.0)).await.is_ok() }).await;
+    eventually(|| async {
+        s.reserve("t8", &QuotaPolicy { tokens_per_day: Some(600), ..p() }, amt(600, 0.0)).await.is_ok()
+    })
+    .await;
 }
 
 /// Polls `f` for up to 2 s (background settlement runs on a spawned task).
@@ -157,7 +160,11 @@ async fn unreachable_valkey_falls_back_to_local_limits() {
     assert_eq!(exceeded(s.reserve("t", &two, amt(30, 0.0)).await).0, LimitScope::TokensPerDay);
     s.settle(&r, amt(10, 0.0)).await;
     assert_eq!(store.local().day_usage("t").0, 10, "settled where it was reserved");
-    assert!(started.elapsed() < Duration::from_millis(20), "circuit open: no Valkey round trips ({:?})", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(20),
+        "circuit open: no Valkey round trips ({:?})",
+        started.elapsed()
+    );
     assert_eq!(store.fallbacks(), 5, "3 rate checks + 2 reservations served locally");
 }
 
@@ -181,7 +188,11 @@ fn prefix() -> String {
 }
 
 async fn raw(url: &str) -> redis::aio::MultiplexedConnection {
-    redis::Client::open(url).unwrap().get_multiplexed_async_connection().await.expect("CALIBAN_TEST_VALKEY_URL must be reachable")
+    redis::Client::open(url)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .expect("CALIBAN_TEST_VALKEY_URL must be reachable")
 }
 
 #[tokio::test]
@@ -281,7 +292,9 @@ async fn valkey_reserve_and_reconcile_update_shared_counters() {
     let tpm_key = format!("{prefix}:{{acme}}:tpm");
     let read = |key: String, field: &'static str| {
         let mut c = conn.clone();
-        async move { redis::cmd("HGET").arg(key).arg(field).query_async::<Option<f64>>(&mut c).await.unwrap().unwrap_or(0.0) }
+        async move {
+            redis::cmd("HGET").arg(key).arg(field).query_async::<Option<f64>>(&mut c).await.unwrap().unwrap_or(0.0)
+        }
     };
 
     let pol = QuotaPolicy { tokens_per_minute: Some(6000), tokens_per_day: Some(5000), usd_per_day: Some(2.0), ..p() };
@@ -299,7 +312,10 @@ async fn valkey_reserve_and_reconcile_update_shared_counters() {
     b.settle(&r2, amt(9000, 0.5)).await;
     assert_eq!(read(day_key.clone(), "tokens").await, 10_200.0);
     assert!(read(tpm_key.clone(), "level").await < 0.0);
-    assert_eq!(exceeded(a.reserve("acme", &QuotaPolicy { tokens_per_day: None, ..pol.clone() }, amt(1, 0.0)).await).0, LimitScope::TokensPerMinute);
+    assert_eq!(
+        exceeded(a.reserve("acme", &QuotaPolicy { tokens_per_day: None, ..pol.clone() }, amt(1, 0.0)).await).0,
+        LimitScope::TokensPerMinute
+    );
     // Settling a reservation from an earlier UTC day charges today without refunding.
     let stale = Reservation { day: r.day - 1, ..r.clone() };
     a.settle(&stale, amt(5, 0.0)).await;
@@ -314,7 +330,13 @@ async fn valkey_keys_are_namespaced_and_expire() {
     let mut conn = raw(&url).await;
 
     // 600 rpm: TAT 100 ms ahead; 6000 tpm (100 tokens/s): 50 tokens refill in 500 ms.
-    let pol = QuotaPolicy { requests_per_minute: Some(600), key_requests_per_minute: Some(600), tokens_per_minute: Some(6000), tokens_per_day: Some(1_000_000), ..p() };
+    let pol = QuotaPolicy {
+        requests_per_minute: Some(600),
+        key_requests_per_minute: Some(600),
+        tokens_per_minute: Some(6000),
+        tokens_per_day: Some(1_000_000),
+        ..p()
+    };
     v.check_rate("idle", Some("abc"), &pol).await.unwrap();
     v.reserve("idle", &pol, amt(50, 0.0)).await.unwrap();
 
@@ -442,8 +464,16 @@ async fn valkey_outage_falls_back_locally_and_recovers() {
     }
     assert!(recovered, "{:?}", store.status());
     s.check_rate("t", None, &pol).await.unwrap();
-    assert_eq!(exceeded(s.check_rate("t", None, &pol).await).0, LimitScope::Requests, "shared count survived the outage");
-    assert_eq!(exceeded(s.reserve("t", &pol, amt(601, 0.0)).await).0, LimitScope::TokensPerDay, "400 still reserved in Valkey");
+    assert_eq!(
+        exceeded(s.check_rate("t", None, &pol).await).0,
+        LimitScope::Requests,
+        "shared count survived the outage"
+    );
+    assert_eq!(
+        exceeded(s.reserve("t", &pol, amt(601, 0.0)).await).0,
+        LimitScope::TokensPerDay,
+        "400 still reserved in Valkey"
+    );
 }
 
 /// Added latency per request (check_rate + reserve + settle). Prints a table; run with
@@ -484,7 +514,9 @@ async fn valkey_added_latency() {
     for i in 0..200 {
         one(Arc::clone(&valkey), pol.clone(), i).await;
     }
-    let mut out = String::from("\nquota latency per request (check_rate + reserve + settle), ms\nstore   concurrency      p50      p99    p99.9\n");
+    let mut out = String::from(
+        "\nquota latency per request (check_rate + reserve + settle), ms\nstore   concurrency      p50      p99    p99.9\n",
+    );
     let mut p50_seq = 0.0;
     for (name, s) in [("memory", &memory), ("valkey", &valkey)] {
         for conc in [1usize, 32] {

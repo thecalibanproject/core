@@ -98,7 +98,8 @@ pub fn lower(model: &Model, plan: &Plan) -> Result<String, CompileError> {
     let mut where_: Vec<String> = Vec::new();
     // Subtype entities sharing a table are selected by their discriminator column.
     for (entity, a) in &aliases {
-        if let Some(EntityBinding::Root { discriminator: Some(d), .. }) = model.entities.get(entity).map(|e| &e.binding) {
+        if let Some(EntityBinding::Root { discriminator: Some(d), .. }) = model.entities.get(entity).map(|e| &e.binding)
+        {
             where_.push(format!("{a}.{} = {}", ident(&d.column), string_lit(&d.value)));
         }
     }

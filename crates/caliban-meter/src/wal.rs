@@ -118,7 +118,14 @@ impl JsonlSink {
     pub fn with_options(path: impl Into<PathBuf>, opts: WalOptions) -> Self {
         let (tx, rx) = mpsc::channel(opts.queue.max(1));
         let stats = Arc::new(WalStats::default());
-        let writer = Writer { path: path.into(), file: None, buf: Vec::with_capacity(opts.max_batch_bytes.min(1 << 20)), pending: 0, stats: Arc::clone(&stats), opts };
+        let writer = Writer {
+            path: path.into(),
+            file: None,
+            buf: Vec::with_capacity(opts.max_batch_bytes.min(1 << 20)),
+            pending: 0,
+            stats: Arc::clone(&stats),
+            opts,
+        };
         tokio::spawn(writer.run(rx));
         Self { tx, stats, opts }
     }
@@ -310,7 +317,9 @@ impl Writer {
     async fn check_rotation(&mut self) {
         let Some(f) = self.file.take() else { return };
         let path = self.path.clone();
-        self.file = tokio::task::spawn_blocking(move || if same_file(&f, &path) { Some(f) } else { None }).await.unwrap_or(None);
+        self.file = tokio::task::spawn_blocking(move || if same_file(&f, &path) { Some(f) } else { None })
+            .await
+            .unwrap_or(None);
     }
 }
 
@@ -397,7 +406,10 @@ mod tests {
 
         let back = read_wal(&path).unwrap();
         assert_eq!(back.len(), 501);
-        assert_eq!((back[0].request_id.as_str(), back[0].cache_tier, back[0].usage_source), ("old_1", Some(CacheTier::Exact), None));
+        assert_eq!(
+            (back[0].request_id.as_str(), back[0].cache_tier, back[0].usage_source),
+            ("old_1", Some(CacheTier::Exact), None)
+        );
         assert_eq!(&back[1..], &events[..], "same events, same order");
 
         // The format is unchanged: one JSON object per line, readable as plain JSON (the bench
@@ -431,7 +443,9 @@ mod tests {
         // The writer cannot open a path inside a missing directory: every batch fails, and with a
         // queue of 1 some events are also dropped after the enqueue timeout. Either way each one
         // is counted, and `record` returns quickly.
-        let path = std::env::temp_dir().join(format!("caliban-wal-missing-{}", uuid::Uuid::now_v7().simple())).join("usage.jsonl");
+        let path = std::env::temp_dir()
+            .join(format!("caliban-wal-missing-{}", uuid::Uuid::now_v7().simple()))
+            .join("usage.jsonl");
         let opts = WalOptions { queue: 1, enqueue_timeout: Duration::from_millis(5), ..WalOptions::default() };
         let sink = JsonlSink::with_options(&path, opts);
         let started = std::time::Instant::now();

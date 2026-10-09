@@ -134,12 +134,14 @@ impl NerDetector {
         let m = &art.manifest;
         let tok_spec = m.tokenizer.as_ref().expect("checked by read_manifest");
 
-        let mut tokenizer = Tokenizer::from_bytes(&art.tokenizer_bytes).map_err(|e| NerError::Tokenizer(e.to_string()))?;
+        let mut tokenizer =
+            Tokenizer::from_bytes(&art.tokenizer_bytes).map_err(|e| NerError::Tokenizer(e.to_string()))?;
         tokenizer.with_truncation(None).map_err(|e| NerError::Tokenizer(e.to_string()))?;
         tokenizer.with_padding(None);
-        let pad_id = tokenizer.get_padding().map(|p| i64::from(p.pad_id)).or_else(|| {
-            ["<pad>", "[PAD]", "<PAD>"].iter().find_map(|t| tokenizer.token_to_id(t)).map(i64::from)
-        });
+        let pad_id = tokenizer
+            .get_padding()
+            .map(|p| i64::from(p.pad_id))
+            .or_else(|| ["<pad>", "[PAD]", "<PAD>"].iter().find_map(|t| tokenizer.token_to_id(t)).map(i64::from));
         let aggregation = opts.aggregation.unwrap_or(match tokenizer.get_model() {
             ModelWrapper::WordPiece(_) => Aggregation::First,
             _ => Aggregation::Token,
@@ -169,7 +171,8 @@ impl NerDetector {
         let labels = LabelSet::parse(&m.labels);
         let label_map: HashMap<String, Option<EntityType>> =
             opts.label_map.iter().map(|(k, v)| (k.to_ascii_uppercase(), v.clone())).collect();
-        let thresholds: HashMap<String, f32> = opts.thresholds.iter().map(|(k, v)| (k.to_ascii_uppercase(), *v)).collect();
+        let thresholds: HashMap<String, f32> =
+            opts.thresholds.iter().map(|(k, v)| (k.to_ascii_uppercase(), *v)).collect();
         let targets = labels
             .bases()
             .iter()
@@ -231,7 +234,11 @@ impl NerDetector {
     /// Detected entities with their model label and score, before label mapping. For eval and
     /// debugging; [`Detector::try_detect`] is the request-path API.
     pub fn entities(&self, text: &str) -> Result<Vec<(String, usize, usize, f32)>, NerError> {
-        Ok(self.raw(text)?.into_iter().map(|e| (self.labels.bases()[e.base].clone(), e.start, e.end, e.score)).collect())
+        Ok(self
+            .raw(text)?
+            .into_iter()
+            .map(|e| (self.labels.bases()[e.base].clone(), e.start, e.end, e.score))
+            .collect())
     }
 
     fn raw(&self, text: &str) -> Result<Vec<decode::RawEntity>, NerError> {
@@ -311,13 +318,18 @@ impl NerDetector {
         let shape = [batch, seq];
         let mut inputs: Vec<(Cow<'_, str>, ort::session::SessionInputValue<'_>)> = Vec::with_capacity(3);
         inputs.push((Cow::Borrowed(self.input_ids.as_str()), Tensor::from_array((shape, input)).map_err(rt)?.into()));
-        inputs.push((Cow::Borrowed(self.attention_mask.as_str()), Tensor::from_array((shape, mask)).map_err(rt)?.into()));
+        inputs
+            .push((Cow::Borrowed(self.attention_mask.as_str()), Tensor::from_array((shape, mask)).map_err(rt)?.into()));
         if let Some(tt) = &self.token_type_ids {
-            inputs.push((Cow::Borrowed(tt.as_str()), Tensor::from_array((shape, vec![0i64; batch * seq])).map_err(rt)?.into()));
+            inputs.push((
+                Cow::Borrowed(tt.as_str()),
+                Tensor::from_array((shape, vec![0i64; batch * seq])).map_err(rt)?.into(),
+            ));
         }
         self.with_session(|s| {
             let out = s.run(inputs).map_err(rt)?;
-            let value = out.get(&self.logits).ok_or_else(|| NerError::Model(format!("no output named {:?}", self.logits)))?;
+            let value =
+                out.get(&self.logits).ok_or_else(|| NerError::Model(format!("no output named {:?}", self.logits)))?;
             let (_, data) = value.try_extract_tensor::<f32>().map_err(rt)?;
             Ok(data.to_vec())
         })
@@ -373,11 +385,16 @@ impl Detector for NerDetector {
 fn bind_tensors(m: &Manifest) -> Result<(String, String, Option<String>, String), NerError> {
     let onnx = m.onnx.as_ref().expect("checked");
     let find = |n: &str| onnx.inputs.iter().find(|t| t.name == n).map(|t| t.name.clone());
-    let input_ids = find("input_ids").ok_or_else(|| NerError::Model("manifest declares no `input_ids` input".into()))?;
+    let input_ids =
+        find("input_ids").ok_or_else(|| NerError::Model("manifest declares no `input_ids` input".into()))?;
     let attention_mask =
         find("attention_mask").ok_or_else(|| NerError::Model("manifest declares no `attention_mask` input".into()))?;
     let token_type_ids = find("token_type_ids");
-    if let Some(t) = onnx.inputs.iter().find(|t| ![&input_ids, &attention_mask].contains(&&t.name) && Some(&t.name) != token_type_ids.as_ref()) {
+    if let Some(t) = onnx
+        .inputs
+        .iter()
+        .find(|t| ![&input_ids, &attention_mask].contains(&&t.name) && Some(&t.name) != token_type_ids.as_ref())
+    {
         return Err(NerError::Model(format!("unsupported model input {:?}", t.name)));
     }
     if let Some(t) = onnx.inputs.iter().find(|t| t.dtype != "int64") {
@@ -388,7 +405,9 @@ fn bind_tensors(m: &Manifest) -> Result<(String, String, Option<String>, String)
         .outputs
         .iter()
         .find(|t| t.name == "logits")
-        .or_else(|| onnx.outputs.iter().find(|t| t.shape.last().and_then(serde_json::Value::as_u64) == Some(n_labels as u64)))
+        .or_else(|| {
+            onnx.outputs.iter().find(|t| t.shape.last().and_then(serde_json::Value::as_u64) == Some(n_labels as u64))
+        })
         .ok_or_else(|| NerError::Model("no `logits` output in the manifest".into()))?;
     if logits.dtype != "float32" {
         return Err(NerError::Model(format!("logits are {}, expected float32", logits.dtype)));
@@ -402,7 +421,14 @@ fn bind_tensors(m: &Manifest) -> Result<(String, String, Option<String>, String)
 }
 
 /// The graph must expose exactly the tensors the manifest declares.
-fn check_graph(s: &Session, m: &Manifest, ids: &str, mask: &str, tt: Option<&str>, logits: &str) -> Result<(), NerError> {
+fn check_graph(
+    s: &Session,
+    m: &Manifest,
+    ids: &str,
+    mask: &str,
+    tt: Option<&str>,
+    logits: &str,
+) -> Result<(), NerError> {
     let graph_inputs: Vec<&str> = s.inputs().iter().map(|o| o.name()).collect();
     let declared: Vec<&str> = m.onnx.as_ref().expect("checked").inputs.iter().map(|t| t.name.as_str()).collect();
     for want in [Some(ids), Some(mask), tt].into_iter().flatten() {

@@ -35,9 +35,13 @@ pub enum CompileError {
 pub(crate) enum Role {
     Root,
     /// Embedded array of the root, at `array_path`.
-    Child { array_path: String },
+    Child {
+        array_path: String,
+    },
     /// Joined through a verified N:1 reference from the root (or from a child).
-    Reference { via: RelationDef },
+    Reference {
+        via: RelationDef,
+    },
 }
 
 /// Validated, policy-injected query with every id resolved.
@@ -60,7 +64,8 @@ pub fn plan(model: &Model, q: &Query, policy_filters: &[Filter]) -> Result<Plan,
     if q.metrics.is_empty() {
         return Err(CompileError::Empty);
     }
-    let denied: BTreeSet<&str> = model.policies.iter().flat_map(|p| p.denied_attributes.iter().map(String::as_str)).collect();
+    let denied: BTreeSet<&str> =
+        model.policies.iter().flat_map(|p| p.denied_attributes.iter().map(String::as_str)).collect();
 
     let mut grains = BTreeSet::new();
     let mut filters: Vec<Filter> = Vec::new();
@@ -113,9 +118,10 @@ pub fn plan(model: &Model, q: &Query, policy_filters: &[Filter]) -> Result<Plan,
 fn role_for(model: &Model, root: &str, entity: &str) -> Result<Role, CompileError> {
     let def = model.entities.get(entity).ok_or_else(|| CompileError::Unknown("entity", entity.to_owned()))?;
     if let EntityBinding::Embedded { parent, array_path, .. } = &def.binding
-        && parent == root {
-            return Ok(Role::Child { array_path: array_path.clone() });
-        }
+        && parent == root
+    {
+        return Ok(Role::Child { array_path: array_path.clone() });
+    }
     if let Some(r) = model.reference(root, entity) {
         return Ok(Role::Reference { via: r.clone() });
     }
@@ -193,7 +199,14 @@ pub(crate) mod fixtures {
     use std::collections::HashMap;
 
     fn attr(entity: &str, path: &str, column: &str, ty: DataType) -> AttributeDef {
-        AttributeDef { entity: entity.into(), path: path.into(), column: column.into(), data_type: ty, pii_class: None, unit: None }
+        AttributeDef {
+            entity: entity.into(),
+            path: path.into(),
+            column: column.into(),
+            data_type: ty,
+            pii_class: None,
+            unit: None,
+        }
     }
 
     pub fn model() -> Model {
@@ -201,18 +214,31 @@ pub(crate) mod fixtures {
         entities.insert(
             "Order".into(),
             EntityDef {
-                binding: EntityBinding::Root { datasource: "dw".into(), collection: "orders".into(), table: None, discriminator: None },
+                binding: EntityBinding::Root {
+                    datasource: "dw".into(),
+                    collection: "orders".into(),
+                    table: None,
+                    discriminator: None,
+                },
                 keys: vec!["_id".into()],
             },
         );
         entities.insert(
             "OrderLine".into(),
-            EntityDef { binding: EntityBinding::Embedded { parent: "Order".into(), array_path: "lines".into(), table: None }, keys: vec![] },
+            EntityDef {
+                binding: EntityBinding::Embedded { parent: "Order".into(), array_path: "lines".into(), table: None },
+                keys: vec![],
+            },
         );
         entities.insert(
             "Customer".into(),
             EntityDef {
-                binding: EntityBinding::Root { datasource: "dw".into(), collection: "customers".into(), table: None, discriminator: None },
+                binding: EntityBinding::Root {
+                    datasource: "dw".into(),
+                    collection: "customers".into(),
+                    table: None,
+                    discriminator: None,
+                },
                 keys: vec!["_id".into()],
             },
         );
@@ -261,7 +287,12 @@ pub(crate) mod fixtures {
         );
         metrics.insert(
             "metric.order_count".into(),
-            MetricDef { grain: "Order".into(), aggregation: Aggregation::Count, expr: MetricExpr::Rows, filters: vec![] },
+            MetricDef {
+                grain: "Order".into(),
+                aggregation: Aggregation::Count,
+                expr: MetricExpr::Rows,
+                filters: vec![],
+            },
         );
         Model { version: "acme@42".into(), entities, attributes, relations, metrics, policies: vec![] }
     }
@@ -334,7 +365,11 @@ mod tests {
     #[test]
     fn denied_attribute_is_blocked() {
         let mut m = model();
-        m.policies.push(crate::model::PolicyDef { entity: "Customer".into(), row_filter: None, denied_attributes: vec!["Customer.region".into()] });
+        m.policies.push(crate::model::PolicyDef {
+            entity: "Customer".into(),
+            row_filter: None,
+            denied_attributes: vec!["Customer.region".into()],
+        });
         assert_eq!(plan(&m, &query(), &[]).unwrap_err(), CompileError::Denied("Customer.region".into()));
     }
 }

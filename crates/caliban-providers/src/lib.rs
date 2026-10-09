@@ -75,20 +75,39 @@ pub struct NativeOptions {
 pub trait Provider: Send + Sync {
     /// `body` is an OpenAI-format request for the upstream model. Responses (and streams) are
     /// OpenAI-shaped whatever the upstream speaks.
-    async fn chat(&self, provider: &ProviderConfig, body: serde_json::Value, stream: bool) -> Result<ProviderResponse, ProviderError>;
+    async fn chat(
+        &self,
+        provider: &ProviderConfig,
+        body: serde_json::Value,
+        stream: bool,
+    ) -> Result<ProviderResponse, ProviderError>;
 
     /// OpenAI `/embeddings` (also served by vLLM, TEI, Infinity, llama.cpp, Ollama).
-    async fn embeddings(&self, provider: &ProviderConfig, body: serde_json::Value) -> Result<serde_json::Value, ProviderError>;
+    async fn embeddings(
+        &self,
+        provider: &ProviderConfig,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError>;
 
     /// `{base_url}/rerank` (vLLM `/v1/rerank`, TEI `/rerank`). The raw upstream JSON is returned;
     /// the gateway normalizes the shapes.
-    async fn rerank(&self, provider: &ProviderConfig, _body: serde_json::Value) -> Result<serde_json::Value, ProviderError> {
+    async fn rerank(
+        &self,
+        provider: &ProviderConfig,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
         Err(ProviderError::Unsupported(provider.kind))
     }
 
     /// Native Anthropic Messages call: `body` is an Anthropic request; the response is an
     /// Anthropic message (JSON) or the raw Anthropic SSE stream.
-    async fn messages(&self, provider: &ProviderConfig, _body: serde_json::Value, _stream: bool, _opts: &NativeOptions) -> Result<ProviderResponse, ProviderError> {
+    async fn messages(
+        &self,
+        provider: &ProviderConfig,
+        _body: serde_json::Value,
+        _stream: bool,
+        _opts: &NativeOptions,
+    ) -> Result<ProviderResponse, ProviderError> {
         Err(ProviderError::Unsupported(provider.kind))
     }
 }
@@ -138,7 +157,12 @@ impl Default for OpenAiCompatible {
 }
 
 impl OpenAiCompatible {
-    async fn post(&self, provider: &ProviderConfig, path: &str, body: &serde_json::Value) -> Result<reqwest::Response, ProviderError> {
+    async fn post(
+        &self,
+        provider: &ProviderConfig,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, ProviderError> {
         let url = format!("{}/{path}", provider.base_url.trim_end_matches('/'));
         let mut req = self.http.post(&url).json(body);
         if let Some(secret_ref) = &provider.api_key {
@@ -151,17 +175,30 @@ impl OpenAiCompatible {
 
 #[async_trait]
 impl Provider for OpenAiCompatible {
-    async fn rerank(&self, provider: &ProviderConfig, body: serde_json::Value) -> Result<serde_json::Value, ProviderError> {
+    async fn rerank(
+        &self,
+        provider: &ProviderConfig,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
         let resp = self.post(provider, "rerank", &body).await?;
         resp.json().await.map_err(|e| ProviderError::Transport(e.to_string()))
     }
 
-    async fn embeddings(&self, provider: &ProviderConfig, body: serde_json::Value) -> Result<serde_json::Value, ProviderError> {
+    async fn embeddings(
+        &self,
+        provider: &ProviderConfig,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
         let resp = self.post(provider, "embeddings", &body).await?;
         resp.json().await.map_err(|e| ProviderError::Transport(e.to_string()))
     }
 
-    async fn chat(&self, provider: &ProviderConfig, body: serde_json::Value, stream: bool) -> Result<ProviderResponse, ProviderError> {
+    async fn chat(
+        &self,
+        provider: &ProviderConfig,
+        body: serde_json::Value,
+        stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
         let resp = self.post(provider, "chat/completions", &body).await?;
         if stream {
             Ok(ProviderResponse::Stream(byte_stream(resp)))
@@ -184,7 +221,12 @@ impl Anthropic {
         Self { http: http_client() }
     }
 
-    async fn post(&self, provider: &ProviderConfig, body: &serde_json::Value, opts: &NativeOptions) -> Result<reqwest::Response, ProviderError> {
+    async fn post(
+        &self,
+        provider: &ProviderConfig,
+        body: &serde_json::Value,
+        opts: &NativeOptions,
+    ) -> Result<reqwest::Response, ProviderError> {
         let url = format!("{}/messages", provider.base_url.trim_end_matches('/'));
         let mut req = self
             .http
@@ -209,7 +251,9 @@ impl Default for Anthropic {
 }
 
 /// Re-frames an Anthropic SSE stream as OpenAI `chat.completion.chunk` SSE.
-fn anthropic_stream_as_openai(upstream: BoxStream<'static, Result<Bytes, ProviderError>>) -> BoxStream<'static, Result<Bytes, ProviderError>> {
+fn anthropic_stream_as_openai(
+    upstream: BoxStream<'static, Result<Bytes, ProviderError>>,
+) -> BoxStream<'static, Result<Bytes, ProviderError>> {
     let mut parser = SseParser::default();
     let mut tr = AnthropicToOpenAiStream::new();
     upstream
@@ -232,7 +276,12 @@ fn anthropic_stream_as_openai(upstream: BoxStream<'static, Result<Bytes, Provide
 
 #[async_trait]
 impl Provider for Anthropic {
-    async fn chat(&self, provider: &ProviderConfig, body: serde_json::Value, stream: bool) -> Result<ProviderResponse, ProviderError> {
+    async fn chat(
+        &self,
+        provider: &ProviderConfig,
+        body: serde_json::Value,
+        stream: bool,
+    ) -> Result<ProviderResponse, ProviderError> {
         let req = anth::to_anthropic_request(&body, anth::DEFAULT_MAX_TOKENS);
         let resp = self.post(provider, &req, &NativeOptions::default()).await?;
         if stream {
@@ -243,11 +292,21 @@ impl Provider for Anthropic {
         }
     }
 
-    async fn embeddings(&self, provider: &ProviderConfig, _body: serde_json::Value) -> Result<serde_json::Value, ProviderError> {
+    async fn embeddings(
+        &self,
+        provider: &ProviderConfig,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
         Err(ProviderError::Unsupported(provider.kind))
     }
 
-    async fn messages(&self, provider: &ProviderConfig, body: serde_json::Value, stream: bool, opts: &NativeOptions) -> Result<ProviderResponse, ProviderError> {
+    async fn messages(
+        &self,
+        provider: &ProviderConfig,
+        body: serde_json::Value,
+        stream: bool,
+        opts: &NativeOptions,
+    ) -> Result<ProviderResponse, ProviderError> {
         let resp = self.post(provider, &body, opts).await?;
         if stream {
             Ok(ProviderResponse::Stream(byte_stream(resp)))
@@ -325,7 +384,14 @@ mod tests {
         let path = std::env::temp_dir().join(format!("caliban-test-anthropic-key-{}", std::process::id()));
         std::fs::write(&path, "sk-ant-test").unwrap();
         let api_key = caliban_config::SecretRef::File { file: path.display().to_string() };
-        ProviderConfig { id: "anth".into(), kind: ProviderKind::Anthropic, base_url: base, trust_tier: caliban_types::TrustTier::T2Contracted, api_key: Some(api_key), cache_salt: false }
+        ProviderConfig {
+            id: "anth".into(),
+            kind: ProviderKind::Anthropic,
+            base_url: base,
+            trust_tier: caliban_types::TrustTier::T2Contracted,
+            api_key: Some(api_key),
+            cache_salt: false,
+        }
     }
 
     #[tokio::test]
@@ -334,7 +400,11 @@ mod tests {
         let p = provider(base);
         let a = Providers::default();
         let body = json!({"model": "claude-up", "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hello"}], "stream_options": {"include_usage": true}});
-        let ProviderResponse::Json(v) = a.adapter(ProviderKind::Anthropic).unwrap().chat(&p, body, false).await.unwrap() else { panic!() };
+        let ProviderResponse::Json(v) =
+            a.adapter(ProviderKind::Anthropic).unwrap().chat(&p, body, false).await.unwrap()
+        else {
+            panic!()
+        };
         assert_eq!(v["choices"][0]["message"]["content"], "Hi there");
         assert_eq!(v["usage"]["completion_tokens"], 3);
         let (h, sent) = seen.lock().unwrap()[0].clone();
@@ -346,7 +416,11 @@ mod tests {
         assert!(sent.get("stream_options").is_none());
 
         let body = json!({"model": "claude-up", "stream": true, "messages": [{"role": "user", "content": "hello"}]});
-        let ProviderResponse::Stream(mut s) = a.adapter(ProviderKind::Anthropic).unwrap().chat(&p, body, true).await.unwrap() else { panic!() };
+        let ProviderResponse::Stream(mut s) =
+            a.adapter(ProviderKind::Anthropic).unwrap().chat(&p, body, true).await.unwrap()
+        else {
+            panic!()
+        };
         let mut text = String::new();
         while let Some(b) = s.next().await {
             text.push_str(std::str::from_utf8(&b.unwrap()).unwrap());
@@ -362,7 +436,9 @@ mod tests {
         let p = provider(base);
         let body = json!({"model": "claude-up", "max_tokens": 10, "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}], "messages": [{"role": "user", "content": "x"}]});
         let opts = NativeOptions { anthropic_version: None, anthropic_beta: Some("some-beta-2025".into()) };
-        let ProviderResponse::Json(v) = Anthropic::new().messages(&p, body.clone(), false, &opts).await.unwrap() else { panic!() };
+        let ProviderResponse::Json(v) = Anthropic::new().messages(&p, body.clone(), false, &opts).await.unwrap() else {
+            panic!()
+        };
         assert_eq!(v["type"], "message");
         let (h, sent) = seen.lock().unwrap()[0].clone();
         assert_eq!(sent, body);

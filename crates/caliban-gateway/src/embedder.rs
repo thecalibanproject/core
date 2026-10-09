@@ -46,12 +46,31 @@ pub struct ProviderEmbedder {
 }
 
 impl ProviderEmbedder {
-    pub fn new(config: ConfigHandle, providers: Arc<Providers>, lru_entries: u64, timeout: Duration, max_batch: usize) -> Self {
-        Self { config, providers, lru: moka::future::Cache::builder().max_capacity(lru_entries).build(), timeout, max_batch: max_batch.max(1) }
+    pub fn new(
+        config: ConfigHandle,
+        providers: Arc<Providers>,
+        lru_entries: u64,
+        timeout: Duration,
+        max_batch: usize,
+    ) -> Self {
+        Self {
+            config,
+            providers,
+            lru: moka::future::Cache::builder().max_capacity(lru_entries).build(),
+            timeout,
+            max_batch: max_batch.max(1),
+        }
     }
 
     /// Embeds `texts` with `entry` through `provider`: LRU first, then batched upstream calls.
-    async fn run(&self, scope: Option<&TenantId>, entry: &ModelEntry, provider: &ProviderConfig, texts: &[String], timeout: Duration) -> Result<Vec<Vec<f32>>, EmbedError> {
+    async fn run(
+        &self,
+        scope: Option<&TenantId>,
+        entry: &ModelEntry,
+        provider: &ProviderConfig,
+        texts: &[String],
+        timeout: Duration,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
         if entry.kind != ModelKind::Embedding {
             return Err(EmbedError::Unavailable(format!("model '{}' is not an embedding model", entry.id)));
         }
@@ -70,7 +89,9 @@ impl ProviderEmbedder {
                     parse_vectors(&v, chunk.len())
                 }
             });
-            let batches = tokio::time::timeout(timeout, futures::future::try_join_all(calls)).await.map_err(|_| EmbedError::Timeout)??;
+            let batches = tokio::time::timeout(timeout, futures::future::try_join_all(calls))
+                .await
+                .map_err(|_| EmbedError::Timeout)??;
             for (chunk, vectors) in missing.chunks(self.max_batch).zip(batches) {
                 for (&i, v) in chunk.iter().zip(vectors) {
                     let v = Arc::new(v);
@@ -132,7 +153,8 @@ fn parse_vectors(v: &Value, n: usize) -> Result<Vec<Vec<f32>>, EmbedError> {
         let slot = out.get_mut(idx).ok_or_else(|| EmbedError::Invalid(format!("index {idx} out of range")))?;
         *slot = Some(vec);
     }
-    let out: Vec<Vec<f32>> = out.into_iter().collect::<Option<_>>().ok_or_else(|| EmbedError::Invalid(format!("expected {n} vectors")))?;
+    let out: Vec<Vec<f32>> =
+        out.into_iter().collect::<Option<_>>().ok_or_else(|| EmbedError::Invalid(format!("expected {n} vectors")))?;
     if out.iter().any(|v| v.is_empty() || v.len() != out[0].len()) {
         return Err(EmbedError::Invalid("empty or mixed-dimension vectors".into()));
     }
@@ -147,28 +169,35 @@ impl Embedder for ProviderEmbedder {
         }
         let snap = self.config.load();
         let t = snap.tenant(tenant).ok_or_else(|| EmbedError::Unavailable(format!("unknown tenant '{tenant}'")))?;
-        let (entry, provider) = resolve(&snap, t, model).ok_or_else(|| EmbedError::Unavailable(format!("model '{model}' is not available to tenant '{tenant}'")))?;
+        let (entry, provider) = resolve(&snap, t, model)
+            .ok_or_else(|| EmbedError::Unavailable(format!("model '{model}' is not available to tenant '{tenant}'")))?;
         self.run(Some(tenant), &entry, &provider, texts, self.timeout).await
     }
 
-    async fn embed_shared(&self, tenant: Option<&TenantId>, model: &ModelId, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    async fn embed_shared(
+        &self,
+        tenant: Option<&TenantId>,
+        model: &ModelId,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
         let snap = self.config.load();
         let entry = snap.model(model).ok_or_else(|| EmbedError::Unavailable(format!("unknown model '{model}'")))?;
-        let shared = snap
-            .config
-            .providers
-            .iter()
-            .find(|p| p.provider.id == entry.provider)
-            .ok_or_else(|| EmbedError::Unavailable(format!("model '{model}' is not served by a shared provider")))?;
+        let shared =
+            snap.config.providers.iter().find(|p| p.provider.id == entry.provider).ok_or_else(|| {
+                EmbedError::Unavailable(format!("model '{model}' is not served by a shared provider"))
+            })?;
         if let Some(t) = tenant {
             if snap.tenant(t).is_none() {
                 return Err(EmbedError::Unavailable(format!("unknown tenant '{t}'")));
             }
             if !shared.allows(t) {
-                return Err(EmbedError::Unavailable(format!("shared provider '{}' does not serve tenant '{t}'", shared.provider.id)));
+                return Err(EmbedError::Unavailable(format!(
+                    "shared provider '{}' does not serve tenant '{t}'",
+                    shared.provider.id
+                )));
             }
         }
         let timeout = if tenant.is_some() { self.timeout } else { BULK_TIMEOUT.max(self.timeout) };
@@ -278,8 +307,14 @@ name = "Other"
         let t0 = std::time::Instant::now();
         assert_eq!(e.embed(&"acme".into(), &m, &texts(&["x"])).await, Err(EmbedError::Timeout));
         assert!(t0.elapsed() < Duration::from_millis(250));
-        assert!(matches!(e.embed(&"other".into(), &m, &texts(&["x"])).await, Err(EmbedError::Unavailable(_))), "shared pool restricted to acme");
-        assert!(matches!(e.embed(&"acme".into(), &"local/chat".into(), &texts(&["x"])).await, Err(EmbedError::Unavailable(_))));
+        assert!(
+            matches!(e.embed(&"other".into(), &m, &texts(&["x"])).await, Err(EmbedError::Unavailable(_))),
+            "shared pool restricted to acme"
+        );
+        assert!(matches!(
+            e.embed(&"acme".into(), &"local/chat".into(), &texts(&["x"])).await,
+            Err(EmbedError::Unavailable(_))
+        ));
         assert!(matches!(e.embed(&"nobody".into(), &m, &texts(&["x"])).await, Err(EmbedError::Unavailable(_))));
     }
 
@@ -330,7 +365,11 @@ name = "Other"
         e.embed_shared(Some(&acme), &m, &texts(&["route me"])).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         e.embed(&acme, &m, &texts(&["route me"])).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "T2 reuses the routing vector (same tenant, model, endpoint, text)");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "T2 reuses the routing vector (same tenant, model, endpoint, text)"
+        );
 
         // The shared path never uses a tenant's own provider with the same id.
         assert!(e.embed(&own, &m, &texts(&["x"])).await.is_err(), "tenant path goes to the (dead) BYOK endpoint");
@@ -338,7 +377,10 @@ name = "Other"
 
         // Tenants the shared provider does not serve are refused; deployment text needs no tenant.
         assert!(matches!(e.embed_shared(Some(&other), &m, &texts(&["x"])).await, Err(EmbedError::Unavailable(_))));
-        assert!(matches!(e.embed_shared(Some(&"nobody".into()), &m, &texts(&["x"])).await, Err(EmbedError::Unavailable(_))));
+        assert!(matches!(
+            e.embed_shared(Some(&"nobody".into()), &m, &texts(&["x"])).await,
+            Err(EmbedError::Unavailable(_))
+        ));
         let before = inputs.load(Ordering::SeqCst);
         e.embed_shared(None, &m, &texts(&["route me"])).await.unwrap();
         assert_eq!(inputs.load(Ordering::SeqCst), before + 1, "deployment scope does not read tenant vectors");
@@ -352,9 +394,14 @@ name = "Other"
             eprintln!("CALIBAN_TEST_EMBED_URL not set; skipping");
             return;
         };
-        let e = ProviderEmbedder::new(handle(&base), Arc::default(), 10_000, Duration::from_secs(10), DEFAULT_MAX_BATCH);
+        let e =
+            ProviderEmbedder::new(handle(&base), Arc::default(), 10_000, Duration::from_secs(10), DEFAULT_MAX_BATCH);
         let (acme, m): (TenantId, ModelId) = ("acme".into(), "local/embed".into());
-        let questions = ["What is our refund policy for enterprise customers", "How do I rotate the API key for the billing service", "Summarise last quarter's churn by region"];
+        let questions = [
+            "What is our refund policy for enterprise customers",
+            "How do I rotate the API key for the billing service",
+            "Summarise last quarter's churn by region",
+        ];
         for i in 0..5 {
             e.embed(&acme, &m, &texts(&[&format!("warm up {i}")])).await.unwrap();
         }
@@ -369,7 +416,12 @@ name = "Other"
         }
         ms.sort_by(f64::total_cmp);
         let p = |q: f64| ms[((ms.len() as f64 - 1.0) * q) as usize];
-        eprintln!("embedding one prompt (dim {dim}, LRU cold): p50 {:.1} ms, p90 {:.1} ms, p99 {:.1} ms", p(0.5), p(0.9), p(0.99));
+        eprintln!(
+            "embedding one prompt (dim {dim}, LRU cold): p50 {:.1} ms, p90 {:.1} ms, p99 {:.1} ms",
+            p(0.5),
+            p(0.9),
+            p(0.99)
+        );
         e.embed(&acme, &m, &[questions[0].to_owned()]).await.unwrap();
         let t0 = std::time::Instant::now();
         e.embed(&acme, &m, &[questions[0].to_owned()]).await.unwrap();
@@ -380,7 +432,16 @@ name = "Other"
     fn parse_rejects_bad_shapes() {
         assert!(parse_vectors(&json!({"data": [{"index": 0, "embedding": [1.0]}]}), 2).is_err());
         assert!(parse_vectors(&json!({"data": [{"index": 0, "embedding": "base64"}]}), 1).is_err());
-        assert!(parse_vectors(&json!({"data": [{"index": 0, "embedding": [1.0]}, {"index": 1, "embedding": [1.0, 2.0]}]}), 2).is_err());
-        assert_eq!(parse_vectors(&json!({"data": [{"embedding": [1.0]}, {"embedding": [2.0]}]}), 2).unwrap(), vec![vec![1.0], vec![2.0]]);
+        assert!(
+            parse_vectors(
+                &json!({"data": [{"index": 0, "embedding": [1.0]}, {"index": 1, "embedding": [1.0, 2.0]}]}),
+                2
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse_vectors(&json!({"data": [{"embedding": [1.0]}, {"embedding": [2.0]}]}), 2).unwrap(),
+            vec![vec![1.0], vec![2.0]]
+        );
     }
 }

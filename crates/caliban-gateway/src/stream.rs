@@ -222,7 +222,14 @@ fn transform_chunk(v: &mut Value, choices: &mut BTreeMap<u64, ChoiceState>, rh: 
 
 /// Writes the transformed texts back into a delta: a field is set when the upstream sent it or
 /// when there is text for it (released hold-back).
-fn set_delta_text(delta: &mut Map<String, Value>, reasoning_key: Option<&'static str>, had_content: bool, had_reasoning: bool, r: String, content: String) {
+fn set_delta_text(
+    delta: &mut Map<String, Value>,
+    reasoning_key: Option<&'static str>,
+    had_content: bool,
+    had_reasoning: bool,
+    r: String,
+    content: String,
+) {
     if had_content || !content.is_empty() {
         delta.insert("content".into(), Value::String(content));
     }
@@ -247,7 +254,13 @@ fn delta_bytes(v: &Value) -> u64 {
 }
 
 /// Flushes held-back text of every choice, then ends the stream in the client's dialect.
-fn tail(choices: &mut BTreeMap<u64, ChoiceState>, last_id: &Value, model_id: &str, enc: &mut Encoder, usage: Usage) -> String {
+fn tail(
+    choices: &mut BTreeMap<u64, ChoiceState>,
+    last_id: &Value,
+    model_id: &str,
+    enc: &mut Encoder,
+    usage: Usage,
+) -> String {
     let mut out = String::new();
     for (idx, st) in choices.iter_mut() {
         let (r, c) = st.flush();
@@ -303,7 +316,11 @@ pub(crate) fn openai_shaped(
         let fast = !transform && capture.is_none() && matches!(enc, Encoder::OpenAi) && passthrough_enabled();
         // With surrogates to restore (no `<think>` splitting), single-choice content deltas are
         // edited in place: only the `content` string is rewritten, and only when it changes.
-        let fast_rehydrate = rehydrator.is_some() && !think && capture.is_none() && matches!(enc, Encoder::OpenAi) && passthrough_enabled();
+        let fast_rehydrate = rehydrator.is_some()
+            && !think
+            && capture.is_none()
+            && matches!(enc, Encoder::OpenAi)
+            && passthrough_enabled();
         // Raw `id` of the last chunk handled in place (`last_chunk_id` is parsed only on change).
         let mut last_id_raw: Option<String> = None;
         let model_json = serde_json::to_string(&model_id).unwrap_or_default();
@@ -336,7 +353,9 @@ pub(crate) fn openai_shaped(
                     }
                     if data == "[DONE]" {
                         ended = true;
-                        out.extend_from_slice(tail(&mut choices, &last_chunk_id, &model_id, &mut enc, usage).as_bytes());
+                        out.extend_from_slice(
+                            tail(&mut choices, &last_chunk_id, &model_id, &mut enc, usage).as_bytes(),
+                        );
                         return;
                     }
                     // Usage chunks take the general path, which owns usage extraction and
@@ -347,9 +366,7 @@ pub(crate) fn openai_shaped(
                         && !c.usage
                         && (outcome.client_usage || !c.has_usage_key || c.null_usage_member.is_some())
                     {
-                        if !model_recorded
-                            && let Some(Ok(m)) = c.model_raw.map(serde_json::from_str::<Cow<'_, str>>)
-                        {
+                        if !model_recorded && let Some(Ok(m)) = c.model_raw.map(serde_json::from_str::<Cow<'_, str>>) {
                             upstream_span.record("gen_ai.response.model", m.as_ref());
                             model_recorded = true;
                         }
@@ -377,16 +394,26 @@ pub(crate) fn openai_shaped(
                             passthrough::write_openai(&mut out, data, &d.chunk, &model_json, !outcome.client_usage);
                             return;
                         };
-                        let st = choices.entry(ch.index).or_insert_with(|| ChoiceState::new(rehydrator.as_ref(), think));
+                        let st =
+                            choices.entry(ch.index).or_insert_with(|| ChoiceState::new(rehydrator.as_ref(), think));
                         let content_in = ch.content.as_ref().map(|(_, s)| s.as_ref());
                         let (r, content) = st.push(None, content_in, false);
                         streamed += ch.tool_bytes + content.len() as u64;
                         if r.is_empty() && (content_in.is_some() || content.is_empty()) {
                             let replaced = match &ch.content {
-                                Some((range, s)) if *s != content => Some((range.clone(), serde_json::to_string(&content).unwrap_or_default())),
+                                Some((range, s)) if *s != content => {
+                                    Some((range.clone(), serde_json::to_string(&content).unwrap_or_default()))
+                                }
                                 _ => None,
                             };
-                            passthrough::write_openai_with(&mut out, data, &d.chunk, &model_json, !outcome.client_usage, replaced);
+                            passthrough::write_openai_with(
+                                &mut out,
+                                data,
+                                &d.chunk,
+                                &model_json,
+                                !outcome.client_usage,
+                                replaced,
+                            );
                         } else if let Ok(mut v) = serde_json::from_str::<Value>(data) {
                             // Held-back text released without a field to carry it (never seen in
                             // practice): add the field, as `transform_chunk` would.
@@ -559,7 +586,8 @@ pub(crate) fn native_anthropic(
                             }
                         }
                         Some("content_block_delta") => {
-                            let delta_type = ev.pointer("/delta/type").and_then(Value::as_str).unwrap_or_default().to_owned();
+                            let delta_type =
+                                ev.pointer("/delta/type").and_then(Value::as_str).unwrap_or_default().to_owned();
                             let field = match delta_type.as_str() {
                                 "text_delta" => Some("text"),
                                 "thinking_delta" => Some("thinking"),
@@ -571,9 +599,11 @@ pub(crate) fn native_anthropic(
                             {
                                 streamed += s.len() as u64;
                                 if let Some(rh) = &rehydrator {
-                                    let st = blocks
-                                        .entry(index)
-                                        .or_insert_with(|| BlockState { delta_type: delta_type.clone(), field, rehydrator: rh.streaming() });
+                                    let st = blocks.entry(index).or_insert_with(|| BlockState {
+                                        delta_type: delta_type.clone(),
+                                        field,
+                                        rehydrator: rh.streaming(),
+                                    });
                                     *s = st.rehydrator.push(s);
                                     if s.is_empty() {
                                         return; // everything held back for now
@@ -588,7 +618,10 @@ pub(crate) fn native_anthropic(
                                     let mut delta = Map::new();
                                     delta.insert("type".into(), Value::String(st.delta_type));
                                     delta.insert(st.field.into(), Value::String(rest));
-                                    write_sse_event(&mut out, &json!({"type": "content_block_delta", "index": index, "delta": delta}));
+                                    write_sse_event(
+                                        &mut out,
+                                        &json!({"type": "content_block_delta", "index": index, "delta": delta}),
+                                    );
                                 }
                             }
                         }
@@ -621,7 +654,12 @@ pub(crate) fn native_anthropic(
         drop(upstream);
         // `message_start` gives the provider's input and cache tokens, `message_delta` the final
         // output tokens; without the latter (disconnect, error) output is estimated.
-        let metered = metering::stream_end(usage.has_input().then(|| usage.usage()), usage.is_complete(), outcome.est_prompt_tokens, streamed);
+        let metered = metering::stream_end(
+            usage.has_input().then(|| usage.usage()),
+            usage.is_complete(),
+            outcome.est_prompt_tokens,
+            streamed,
+        );
         let usage = usage.usage();
         telemetry::record_usage(&upstream_span, metered.usage);
         drop(upstream_span);
@@ -684,18 +722,45 @@ mod tests {
     }
 
     const ANTHROPIC: &[(&str, &str)] = &[
-        ("message_start", r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-up","content":[],"usage":{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":3}}}"#),
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-up","content":[],"usage":{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":3}}}"#,
+        ),
         ("ping", r#"{"type":"ping"}"#),
-        ("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#),
-        ("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm \"quoted\" é"}}"#),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm \"quoted\" é"}}"#,
+        ),
         ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
-        ("content_block_start", r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#),
-        ("content_block_delta", r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"héllo 世界 🎉\n\u00e9"}}"#),
-        ("content_block_delta", r#"{"index":1,"delta":{"text":"keys reordered","type":"text_delta"},"type":"content_block_delta"}"#),
-        ("content_block_delta", r#"{"type":"content\u005fblock_delta","index":1,"delta":{"type":"text_delta","text":"escaped type"}}"#),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"héllo 世界 🎉\n\u00e9"}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"index":1,"delta":{"text":"keys reordered","type":"text_delta"},"type":"content_block_delta"}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content\u005fblock_delta","index":1,"delta":{"type":"text_delta","text":"escaped type"}}"#,
+        ),
         ("content_block_stop", r#"{"type":"content_block_stop","index":1}"#),
-        ("content_block_start", r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"f","input":{}}}"#),
-        ("content_block_delta", r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"q\": 1"}}"#),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"f","input":{}}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"q\": 1"}}"#,
+        ),
         ("content_block_stop", r#"{"type":"content_block_stop","index":2}"#),
         ("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#),
         ("message_stop", r#"{"type":"message_stop"}"#),
@@ -715,7 +780,8 @@ mod tests {
     /// (which also cuts multi-byte characters).
     fn splits(bytes: &str) -> Vec<Vec<Bytes>> {
         let b = bytes.as_bytes();
-        let per_event: Vec<Bytes> = bytes.split_inclusive("\n\n").map(|e| Bytes::copy_from_slice(e.as_bytes())).collect();
+        let per_event: Vec<Bytes> =
+            bytes.split_inclusive("\n\n").map(|e| Bytes::copy_from_slice(e.as_bytes())).collect();
         vec![vec![Bytes::copy_from_slice(b)], per_event, b.chunks(7).map(Bytes::copy_from_slice).collect()]
     }
 
@@ -777,14 +843,37 @@ trust_tier = "t2_contracted"
         run_with(native, general, client_usage, None, reads).await
     }
 
-    async fn run_with(native: bool, general: bool, client_usage: bool, rh: Option<Arc<Rehydrator>>, reads: Vec<Bytes>) -> (String, (u64, u64, u64)) {
+    async fn run_with(
+        native: bool,
+        general: bool,
+        client_usage: bool,
+        rh: Option<Arc<Rehydrator>>,
+        reads: Vec<Bytes>,
+    ) -> (String, (u64, u64, u64)) {
         FORCE_GENERAL.with(|f| f.set(general));
         let (gw, usage) = gateway();
         let upstream: Upstream = futures::stream::iter(reads.into_iter().map(Ok)).boxed();
         let resp = if native {
-            native_anthropic(Arc::clone(&gw), outcome(&gw, Dialect::Anthropic, true), upstream, rh, Settlement::none(), Span::none(), None)
+            native_anthropic(
+                Arc::clone(&gw),
+                outcome(&gw, Dialect::Anthropic, true),
+                upstream,
+                rh,
+                Settlement::none(),
+                Span::none(),
+                None,
+            )
         } else {
-            openai_shaped(Arc::clone(&gw), outcome(&gw, Dialect::OpenAi, client_usage), upstream, rh, false, Settlement::none(), Span::none(), None)
+            openai_shaped(
+                Arc::clone(&gw),
+                outcome(&gw, Dialect::OpenAi, client_usage),
+                upstream,
+                rh,
+                false,
+                Settlement::none(),
+                Span::none(),
+                None,
+            )
         };
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         // The usage event is recorded after the body ends.
@@ -856,7 +945,11 @@ trust_tier = "t2_contracted"
         let rh = Arc::new(Rehydrator::new(&vault));
         let j = |s: &str| serde_json::to_string(s).unwrap();
         let (a, b) = sur.split_at(sur.len() / 2);
-        let chunk = |delta: String| format!(r#"{{"id":"c1","model":"up","choices":[{{"index":0,"delta":{delta},"finish_reason":null}}],"usage":null}}"#);
+        let chunk = |delta: String| {
+            format!(
+                r#"{{"id":"c1","model":"up","choices":[{{"index":0,"delta":{delta},"finish_reason":null}}],"usage":null}}"#
+            )
+        };
         let events = vec![
             chunk(r#"{"role":"assistant","content":""}"#.into()),
             chunk(format!(r#"{{"content":{}}}"#, j(&format!("Write to {a}")))),
@@ -878,7 +971,11 @@ trust_tier = "t2_contracted"
             for reads in splits(&body) {
                 let (fast, fu) = run_with(false, false, client_usage, Some(Arc::clone(&rh)), reads.clone()).await;
                 let (general, gu) = run_with(false, true, client_usage, Some(Arc::clone(&rh)), reads).await;
-                assert_eq!(client_events(&fast), client_events(&general), "client_usage={client_usage}\nfast:\n{fast}\ngeneral:\n{general}");
+                assert_eq!(
+                    client_events(&fast),
+                    client_events(&general),
+                    "client_usage={client_usage}\nfast:\n{fast}\ngeneral:\n{general}"
+                );
                 assert_eq!(fu, gu);
                 assert!(!fast.contains(&sur), "every surrogate restored:\n{fast}");
                 assert!(fast.contains("Write to "), "{fast}");
@@ -909,7 +1006,9 @@ trust_tier = "t2_contracted"
                     let mut out = BytesMut::new();
                     passthrough::write_openai(&mut out, data, &c, &model_json, !client_usage);
                     let out = std::str::from_utf8(&out).unwrap();
-                    let got: Value = serde_json::from_str(out.strip_prefix("data: ").unwrap().strip_suffix("\n\n").unwrap()).unwrap();
+                    let got: Value =
+                        serde_json::from_str(out.strip_prefix("data: ").unwrap().strip_suffix("\n\n").unwrap())
+                            .unwrap();
                     let mut want: Value = serde_json::from_str(data).unwrap();
                     if want.get("model").is_some() {
                         want["model"] = Value::String(model_id.to_owned());

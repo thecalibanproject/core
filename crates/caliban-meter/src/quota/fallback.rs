@@ -78,7 +78,10 @@ impl FallbackQuota {
     }
 
     /// Runs `shared` unless the circuit is open; returns `None` when the caller must go local.
-    async fn try_shared<T>(&self, shared: impl Future<Output = Result<T, QuotaError>>) -> Option<Result<T, QuotaError>> {
+    async fn try_shared<T>(
+        &self,
+        shared: impl Future<Output = Result<T, QuotaError>>,
+    ) -> Option<Result<T, QuotaError>> {
         if !self.breaker.allow() {
             self.fell_back();
             return None;
@@ -208,7 +211,11 @@ impl Breaker {
     fn success(&self, endpoint: &str) {
         if self.degraded.swap(false, Ordering::AcqRel) {
             let served = self.fallbacks.load(Ordering::Relaxed);
-            tracing::info!(valkey = endpoint, local_fallbacks = served, "valkey quota store reachable again; shared limits restored");
+            tracing::info!(
+                valkey = endpoint,
+                local_fallbacks = served,
+                "valkey quota store reachable again; shared limits restored"
+            );
             *self.last_warn.lock() = None;
         }
     }

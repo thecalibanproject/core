@@ -31,13 +31,19 @@ impl Log {
 fn text_of(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
-        Value::Array(parts) => parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(" "),
+        Value::Array(parts) => {
+            parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(" ")
+        }
         _ => String::new(),
     }
 }
 
 fn last_user_text(b: &Value) -> String {
-    b["messages"].as_array().and_then(|m| m.iter().rev().find(|m| m["role"] == "user")).map(|m| text_of(&m["content"])).unwrap_or_default()
+    b["messages"]
+        .as_array()
+        .and_then(|m| m.iter().rev().find(|m| m["role"] == "user"))
+        .map(|m| text_of(&m["content"]))
+        .unwrap_or_default()
 }
 
 fn pieces(text: &str) -> Vec<String> {
@@ -79,7 +85,11 @@ fn anthropic_reply(b: &Value) -> Response {
             json!({"type": "message_start", "message": {"id": "msg_up", "type": "message", "role": "assistant", "model": b["model"], "content": [], "usage": {"input_tokens": 12, "output_tokens": 1}}}),
             json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
         ];
-        evs.extend(pieces(&text).into_iter().map(|p| json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": p}})));
+        evs.extend(
+            pieces(&text).into_iter().map(
+                |p| json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": p}}),
+            ),
+        );
         evs.push(json!({"type": "content_block_stop", "index": 0}));
         evs.push(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 7}}));
         evs.push(json!({"type": "message_stop"}));
@@ -240,7 +250,8 @@ tokens_per_day = 2000
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     let quota = Arc::new(InMemoryQuota::new());
-    let mut gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(RecentUsage::default())).with_quota(quota.clone());
+    let mut gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(RecentUsage::default()))
+        .with_quota(quota.clone());
     if let Some(k) = keys {
         gw.pii_keys = k;
     }
@@ -327,7 +338,10 @@ async fn anthropic_tool_use_through_openai_upstream() {
     assert_eq!(status, StatusCode::OK, "{out}");
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["stop_reason"], "tool_use");
-    assert_eq!(v["content"][0], json!({"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}}));
+    assert_eq!(
+        v["content"][0],
+        json!({"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}})
+    );
     let (_, _, sent) = log.last();
     assert_eq!(sent["tools"][0]["function"]["name"], "get_weather");
     assert_eq!(sent["tool_choice"], "auto");
@@ -390,11 +404,22 @@ async fn openai_client_on_anthropic_provider() {
 #[tokio::test]
 async fn errors_are_anthropic_shaped_on_messages() {
     let (app, _, _) = setup().await;
-    let (status, _, out) = call(&app, "/v1/messages", ("x-api-key", "cal_wrong"), json!({"model": "ext/mock", "max_tokens": 1, "messages": []})).await;
+    let (status, _, out) = call(
+        &app,
+        "/v1/messages",
+        ("x-api-key", "cal_wrong"),
+        json!({"model": "ext/mock", "max_tokens": 1, "messages": []}),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v, json!({"type": "error", "error": {"type": "authentication_error", "message": "invalid or missing API key"}}));
-    let (status, _, out) = call(&app, "/v1/messages", ANTH, json!({"model": "ext/mock", "messages": [{"role": "user", "content": "x"}]})).await;
+    assert_eq!(
+        v,
+        json!({"type": "error", "error": {"type": "authentication_error", "message": "invalid or missing API key"}})
+    );
+    let (status, _, out) =
+        call(&app, "/v1/messages", ANTH, json!({"model": "ext/mock", "messages": [{"role": "user", "content": "x"}]}))
+            .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["error"]["type"], "invalid_request_error");
     let (status, _, out) = call(&app, "/v1/messages", ANTH, json!({"model": "ext/mock", "max_tokens": 5, "messages": [{"role": "user", "content": "key AKIAIOSFODNN7EXAMPLE"}]})).await;
@@ -405,7 +430,13 @@ async fn errors_are_anthropic_shaped_on_messages() {
 #[tokio::test]
 async fn count_tokens_is_approximate() {
     let (app, _, _) = setup().await;
-    let (status, _, out) = call(&app, "/v1/messages/count_tokens", ANTH, json!({"model": "ext/mock", "system": "abcd", "messages": [{"role": "user", "content": "abcdefgh"}]})).await;
+    let (status, _, out) = call(
+        &app,
+        "/v1/messages/count_tokens",
+        ANTH,
+        json!({"model": "ext/mock", "system": "abcd", "messages": [{"role": "user", "content": "abcdefgh"}]}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{out}");
     assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), json!({"input_tokens": 3 + 4 + 1 + 4 + 2}));
 }
@@ -414,7 +445,8 @@ async fn count_tokens_is_approximate() {
 async fn request_rate_limit_returns_429_in_both_dialects() {
     let (app, _, _) = setup().await;
     let chat = json!({"model": "local/mock", "messages": [{"role": "user", "content": "hi"}]});
-    let (status, _, _) = call(&app, "/v1/chat/completions", ("authorization", "Bearer cal_limited"), chat.clone()).await;
+    let (status, _, _) =
+        call(&app, "/v1/chat/completions", ("authorization", "Bearer cal_limited"), chat.clone()).await;
     assert_eq!(status, StatusCode::OK);
     let (status, h, out) = call(&app, "/v1/chat/completions", ("authorization", "Bearer cal_limited"), chat).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
@@ -425,7 +457,13 @@ async fn request_rate_limit_returns_429_in_both_dialects() {
     assert_eq!(v["error"]["type"], "rate_limited");
     assert_eq!(v["error"]["code"], "requests_per_minute");
 
-    let (status, h, out) = call(&app, "/v1/messages", ("x-api-key", "cal_limited"), json!({"model": "local/mock", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})).await;
+    let (status, h, out) = call(
+        &app,
+        "/v1/messages",
+        ("x-api-key", "cal_limited"),
+        json!({"model": "local/mock", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert!(h.contains_key("retry-after"));
     assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["error"]["type"], "rate_limit_error");
@@ -436,7 +474,13 @@ async fn token_budget_reserves_then_settles_actual_usage() {
     let (app, _, quota) = setup().await;
     let auth = ("authorization", "Bearer cal_budget");
     // Reserves ~1500 + prompt estimate, settles to the 19 tokens the upstream reported.
-    let (status, _, _) = call(&app, "/v1/chat/completions", auth, json!({"model": "local/mock", "max_tokens": 1500, "messages": [{"role": "user", "content": "hi"}]})).await;
+    let (status, _, _) = call(
+        &app,
+        "/v1/chat/completions",
+        auth,
+        json!({"model": "local/mock", "max_tokens": 1500, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(quota.day_usage("budget").0, 19);
     // Streams settle too (usage from the final chunk).
@@ -444,7 +488,13 @@ async fn token_budget_reserves_then_settles_actual_usage() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(quota.day_usage("budget").0, 38);
     // 38 used + 1990 requested + prompt > 2000.
-    let (status, h, out) = call(&app, "/v1/chat/completions", auth, json!({"model": "local/mock", "max_tokens": 1990, "messages": [{"role": "user", "content": "hi"}]})).await;
+    let (status, h, out) = call(
+        &app,
+        "/v1/chat/completions",
+        auth,
+        json!({"model": "local/mock", "max_tokens": 1990, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{out}");
     assert_eq!(h["x-caliban-ratelimit-scope"], "tokens_per_day");
     assert_eq!(quota.day_usage("budget").0, 38, "a rejected request reserves nothing");
@@ -468,7 +518,11 @@ mod capture {
 
     impl Visit for V<'_> {
         fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
-            self.0.0.lock().unwrap().push((self.1.clone(), f.name().to_owned(), format!("{v:?}").trim_matches('"').to_owned()));
+            self.0.0.lock().unwrap().push((
+                self.1.clone(),
+                f.name().to_owned(),
+                format!("{v:?}").trim_matches('"').to_owned(),
+            ));
         }
         fn record_str(&mut self, f: &Field, v: &str) {
             self.0.0.lock().unwrap().push((self.1.clone(), f.name().to_owned(), v.to_owned()));
@@ -508,13 +562,25 @@ fn global_capture() -> &'static capture::Capture {
 async fn genai_spans_carry_attributes_but_never_content() {
     let cap = global_capture();
     let (app, log, _) = setup().await;
-    let (status, _, _) = call(&app, "/v1/chat/completions", BEARER, json!({"model": "ext/mock", "messages": [{"role": "user", "content": PII}]})).await;
+    let (status, _, _) = call(
+        &app,
+        "/v1/chat/completions",
+        BEARER,
+        json!({"model": "ext/mock", "messages": [{"role": "user", "content": PII}]}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let upstream_text = last_user_text(&log.last().2);
     let (status, _, _) = call(&app, "/v1/messages", ANTH, json!({"model": "anth/claude", "max_tokens": 9, "stream": true, "messages": [{"role": "user", "content": PII}]})).await;
     assert_eq!(status, StatusCode::OK);
     // A failing request too (error attributes, no content).
-    call(&app, "/v1/chat/completions", BEARER, json!({"model": "ext/mock", "messages": [{"role": "user", "content": "key AKIAIOSFODNN7EXAMPLE"}]})).await;
+    call(
+        &app,
+        "/v1/chat/completions",
+        BEARER,
+        json!({"model": "ext/mock", "messages": [{"role": "user", "content": "key AKIAIOSFODNN7EXAMPLE"}]}),
+    )
+    .await;
 
     let seen = cap.0.lock().unwrap().clone();
     assert!(!seen.is_empty(), "spans were captured");
@@ -970,7 +1036,8 @@ api_key_hashes = ["{limited}"]
             (None, Some(url)) => Arc::new(caliban_cache::semantic::QdrantStore::new(url, None).unwrap()),
             (None, None) => store.clone(),
         };
-        let mut gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(usage.clone())).with_semantic_store(vs);
+        let mut gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(usage.clone()))
+            .with_semantic_store(vs);
         let embedder = Arc::new(o.embedder);
         if !o.real_embedder {
             gw.embedder = embedder.clone();
@@ -1044,7 +1111,8 @@ api_key_hashes = ["{limited}"]
         assert_eq!(h["x-caliban-cache"], "miss", "identical prompt, other tenant");
         assert_eq!(upstream_calls(&s.log), calls + 1);
         wait_entries(&s.store, 2).await;
-        let tenants: std::collections::BTreeSet<String> = s.store.entries().into_iter().map(|(_, _, p)| p.tenant_id).collect();
+        let tenants: std::collections::BTreeSet<String> =
+            s.store.entries().into_iter().map(|(_, _, p)| p.tenant_id).collect();
         assert_eq!(tenants.into_iter().collect::<Vec<_>>(), ["acme", "globex"]);
         // Each tenant now hits only its own entry.
         let (_, h, _) = call(&s.app, "/v1/chat/completions", GLOBEX, q("what is our refund policy")).await;
@@ -1128,7 +1196,8 @@ api_key_hashes = ["{limited}"]
         }
         // Tools, or a tool result in the history.
         let mut tools = q("Weather in Paris?");
-        tools["tools"] = json!([{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]);
+        tools["tools"] =
+            json!([{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]);
         let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, tools).await;
         assert_eq!(h["x-caliban-cache"], "bypass");
         let mut tool_result = q("thanks");
@@ -1184,7 +1253,11 @@ api_key_hashes = ["{limited}"]
         assert_eq!(upstream_calls(&s.log), calls);
         settle().await;
         let e = last_event(&s.usage);
-        assert_eq!((e.cache_tier, e.prompt_tokens, e.tokens_saved), (Some(CacheTier::Semantic), 0, 19), "replayed stream is metered as a hit");
+        assert_eq!(
+            (e.cache_tier, e.prompt_tokens, e.tokens_saved),
+            (Some(CacheTier::Semantic), 0, 19),
+            "replayed stream is metered as a hit"
+        );
 
         // Anthropic client on an OpenAI-shaped upstream: stream replay as Anthropic events.
         let ab = json!({"model": "ext/mock", "max_tokens": 64, "temperature": 0, "messages": [{"role": "user", "content": "Name three primary colours"}]});
@@ -1194,7 +1267,8 @@ api_key_hashes = ["{limited}"]
         ab["stream"] = json!(true);
         ab["messages"][0]["content"] = json!("name three primary colours.");
         let (_, h, out) = call(&s.app, "/v1/messages", ANTH, ab).await;
-        let entries: Vec<_> = s.store.entries().into_iter().map(|(_, id, p)| (id, p.route, p.partition, p.stats)).collect();
+        let entries: Vec<_> =
+            s.store.entries().into_iter().map(|(_, id, p)| (id, p.route, p.partition, p.stats)).collect();
         assert_eq!(h.get("x-caliban-cache-tier").map(|v| v.to_str().unwrap()), Some("semantic"), "{h:?} {entries:?}");
         let evs = events(&out);
         assert_eq!(streamed_text(&evs), "You said: Name three primary colours");
@@ -1234,7 +1308,10 @@ api_key_hashes = ["{limited}"]
         wait_entries(&s.store, 1).await;
         assert_eq!(s.embedder.calls.load(Ordering::SeqCst), 1, "one embedding serves the T2 lookup and the insert");
         let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, b).await;
-        assert_eq!((h["x-caliban-cache"].to_str().unwrap(), h["x-caliban-cache-tier"].to_str().unwrap()), ("hit", "exact"));
+        assert_eq!(
+            (h["x-caliban-cache"].to_str().unwrap(), h["x-caliban-cache-tier"].to_str().unwrap()),
+            ("hit", "exact")
+        );
         assert_eq!(last_event(&s.usage).cache_tier, Some(CacheTier::Exact));
         settle().await;
         assert_eq!(s.embedder.calls.load(Ordering::SeqCst), 1, "a T1 hit embeds nothing");
@@ -1243,7 +1320,12 @@ api_key_hashes = ["{limited}"]
     #[tokio::test]
     async fn slow_or_failing_dependencies_are_a_miss_within_the_budget() {
         // Embedder slower than the 60 ms budget.
-        let s = setup(Opts { budget_ms: 60, embedder: FakeEmbedder { delay: Duration::from_millis(400), ..Default::default() }, ..Default::default() }).await;
+        let s = setup(Opts {
+            budget_ms: 60,
+            embedder: FakeEmbedder { delay: Duration::from_millis(400), ..Default::default() },
+            ..Default::default()
+        })
+        .await;
         let t0 = Instant::now();
         let (status, h, _) = call(&s.app, "/v1/chat/completions", BEARER, q("Explain HNSW")).await;
         let took = t0.elapsed();
@@ -1347,12 +1429,27 @@ async fn semantic_miss_latency_against_qdrant() {
     let prefix = format!("calgw_{}", uuid::Uuid::new_v4().simple());
     let embed_base = std::env::var("CALIBAN_TEST_EMBED_URL").ok().filter(|u| !u.is_empty());
     eprintln!("embedding server: {}", embed_base.as_deref().unwrap_or("mock (bag of words)"));
-    let s = setup(Opts { qdrant: Some(url.clone()), real_embedder: true, embed_base, budget_ms: 50, prefix: prefix.clone(), ..Default::default() }).await;
+    let s = setup(Opts {
+        qdrant: Some(url.clone()),
+        real_embedder: true,
+        embed_base,
+        budget_ms: 50,
+        prefix: prefix.clone(),
+        ..Default::default()
+    })
+    .await;
     // Eight pseudo-random words and a unique number per prompt: the numeric-slot guard keeps every
     // measured request a miss (a real model may still find gibberish prompts similar), while the
     // embedding and the filtered search run in full.
     let words = |i: usize, tag: &str| -> String {
-        let w: Vec<String> = (0..8).map(|j| blake3::hash(format!("{tag}-{i}-{j}").as_bytes()).as_bytes()[..6].iter().map(|b| char::from(b'a' + b % 26)).collect()).collect();
+        let w: Vec<String> = (0..8)
+            .map(|j| {
+                blake3::hash(format!("{tag}-{i}-{j}").as_bytes()).as_bytes()[..6]
+                    .iter()
+                    .map(|b| char::from(b'a' + b % 26))
+                    .collect()
+            })
+            .collect();
         format!("{} {i}", w.join(" "))
     };
     let body = |i: usize, tag: &str| json!({"model": "ext/mock", "temperature": 0.2, "messages": [{"role": "user", "content": words(i, tag)}]});
@@ -1371,7 +1468,8 @@ async fn semantic_miss_latency_against_qdrant() {
         on.push(t0.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(h["x-caliban-cache"], "miss");
         let t0 = Instant::now();
-        let (_, h, _) = call(&s.app, "/v1/chat/completions", ("authorization", "Bearer cal_limited"), body(i, "measure")).await;
+        let (_, h, _) =
+            call(&s.app, "/v1/chat/completions", ("authorization", "Bearer cal_limited"), body(i, "measure")).await;
         off.push(t0.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(h["x-caliban-cache"], "bypass");
     }
@@ -1523,7 +1621,11 @@ api_key_hashes = ["{acme}"]
         let usage = RecentUsage::default();
         let store = Arc::new(MemoryStore::default());
         let gw = Arc::new(
-            Gateway::new(ConfigHandle::new(Snapshot::new(Config::from_toml_str(&toml).unwrap(), "test")), Arc::new(usage.clone())).with_semantic_store(store.clone()),
+            Gateway::new(
+                ConfigHandle::new(Snapshot::new(Config::from_toml_str(&toml).unwrap(), "test")),
+                Arc::new(usage.clone()),
+            )
+            .with_semantic_store(store.clone()),
         );
         gw.warm_router().await;
         assert!(gw.router.knn_ready(), "kNN index built from the mock embedder");
@@ -1547,7 +1649,10 @@ api_key_hashes = ["{acme}"]
         assert_eq!(h["x-caliban-routed-model"], "ext/mock");
 
         let ev = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
-        assert_eq!((ev.intent.as_str(), ev.requested_model.as_deref(), ev.route_stage.as_deref()), ("translate", Some("caliban/auto"), Some("knn")));
+        assert_eq!(
+            (ev.intent.as_str(), ev.requested_model.as_deref(), ev.route_stage.as_deref()),
+            ("translate", Some("caliban/auto"), Some("knn"))
+        );
         // Mock usage: 12 prompt + 7 completion tokens.
         let routed = (12.0 * 1.0 + 7.0 * 2.0) / 1e6;
         let flat = (12.0 * 10.0 + 7.0 * 20.0) / 1e6;
@@ -1565,7 +1670,13 @@ api_key_hashes = ["{acme}"]
         let ev = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
         assert!(ev.flat_price_usd.is_some() && ev.routed_model_cost_usd.is_some());
         // Anthropic dialect too.
-        let (status, h, _) = call(&env.app, "/v1/messages", ANTH, json!({"model": "caliban/auto", "max_tokens": 64, "messages": [{"role": "user", "content": TRANSLATE}]})).await;
+        let (status, h, _) = call(
+            &env.app,
+            "/v1/messages",
+            ANTH,
+            json!({"model": "caliban/auto", "max_tokens": 64, "messages": [{"role": "user", "content": TRANSLATE}]}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert!(h.contains_key("x-caliban-intent"));
     }
@@ -1575,9 +1686,14 @@ api_key_hashes = ["{acme}"]
         let env = setup("budget_ms = 20").await;
         env.delay.store(300, Ordering::SeqCst);
         let started = Instant::now();
-        let (status, h, _) = call(&env.app, "/v1/chat/completions", BEARER, auto("summarize this email thread for me", false)).await;
+        let (status, h, _) =
+            call(&env.app, "/v1/chat/completions", BEARER, auto("summarize this email thread for me", false)).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(started.elapsed() < Duration::from_millis(300), "request waited for the slow embedder: {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "request waited for the slow embedder: {:?}",
+            started.elapsed()
+        );
         let intent = h["x-caliban-intent"].to_str().unwrap();
         assert!(intent.starts_with("summarize;") && intent.ends_with(";stage=keyword;knn=timeout"), "{intent}");
         let ev = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
@@ -1588,7 +1704,13 @@ api_key_hashes = ["{acme}"]
     #[tokio::test]
     async fn pinned_models_are_not_metered_against_the_flat_price() {
         let env = setup("").await;
-        let (status, h, _) = call(&env.app, "/v1/chat/completions", BEARER, json!({"model": "ext/mock", "messages": [{"role": "user", "content": TRANSLATE}]})).await;
+        let (status, h, _) = call(
+            &env.app,
+            "/v1/chat/completions",
+            BEARER,
+            json!({"model": "ext/mock", "messages": [{"role": "user", "content": TRANSLATE}]}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(h["x-caliban-intent"], "pinned;confidence=1.000;stage=rules");
         let ev = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
@@ -1608,7 +1730,8 @@ api_key_hashes = ["{acme}"]
     async fn routing_and_semantic_cache_embed_a_prompt_once() {
         let env = setup(WITH_T2).await;
         let prompt = "please translate the quarterly roadmap memo into german";
-        let body = json!({"model": "caliban/auto", "temperature": 0.2, "messages": [{"role": "user", "content": prompt}]});
+        let body =
+            json!({"model": "caliban/auto", "temperature": 0.2, "messages": [{"role": "user", "content": prompt}]});
         let (status, h, _) = call(&env.app, "/v1/chat/completions", BEARER, body).await;
         assert_eq!(status, StatusCode::OK);
         assert!(h["x-caliban-intent"].to_str().unwrap().contains(";stage=knn"), "kNN embedded the prompt");
@@ -1648,8 +1771,16 @@ api_key_hashes = ["{acme}"]
             assert_eq!((hit.cache, hit.cache_tier), (CacheStatus::Hit, Some(tier)), "{tier:?}");
             assert_eq!(hit.requested_model.as_deref(), Some("caliban/auto"));
             assert_eq!((hit.prompt_tokens, hit.completion_tokens), (0, 0), "{tier:?}");
-            assert_eq!(hit.tokens_saved, miss.prompt_tokens + miss.completion_tokens, "{tier:?}: saved tokens recorded");
-            assert_eq!((hit.cost_usd, hit.routed_model_cost_usd, hit.flat_price_usd), (Some(0.0), Some(0.0), Some(0.0)), "{tier:?}");
+            assert_eq!(
+                hit.tokens_saved,
+                miss.prompt_tokens + miss.completion_tokens,
+                "{tier:?}: saved tokens recorded"
+            );
+            assert_eq!(
+                (hit.cost_usd, hit.routed_model_cost_usd, hit.flat_price_usd),
+                (Some(0.0), Some(0.0), Some(0.0)),
+                "{tier:?}"
+            );
             assert_eq!(hit.margin_usd(), Some(0.0));
         }
     }
@@ -1661,14 +1792,22 @@ api_key_hashes = ["{acme}"]
         let env = setup("").await;
         let snap = env.gw.config.load();
         let tenant = snap.tenant(&"acme".into()).unwrap().clone();
-        let prompts = [TRANSLATE, "write a python function to parse dates", "top customers by revenue last quarter", "hello there"];
+        let prompts = [
+            TRANSLATE,
+            "write a python function to parse dates",
+            "top customers by revenue last quarter",
+            "hello there",
+        ];
         let n = 200;
         let measure = |knn: bool| {
             let (gw, snap, tenant) = (Arc::clone(&env.gw), Arc::clone(&snap), tenant.clone());
             async move {
                 let mut t = Vec::with_capacity(n);
                 for i in 0..n {
-                    let req = caliban_ir::ChatRequest::from_openai_json(auto(prompts[i % prompts.len()], false).to_string().as_bytes()).unwrap();
+                    let req = caliban_ir::ChatRequest::from_openai_json(
+                        auto(prompts[i % prompts.len()], false).to_string().as_bytes(),
+                    )
+                    .unwrap();
                     let started = Instant::now();
                     let d = if knn {
                         route_embed::route(&gw, &snap, &tenant, &req).await.unwrap()

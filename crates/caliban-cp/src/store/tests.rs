@@ -108,7 +108,15 @@ fn element(id: &str) -> Element {
 }
 
 fn node(id: &str, tenant: &str, name: &str) -> NodeRecord {
-    NodeRecord { id: id.into(), tenant_id: tenant.into(), name: name.into(), version: 0, spec: json!({"k": 1}), created_at: ts(), deleted_at: None }
+    NodeRecord {
+        id: id.into(),
+        tenant_id: tenant.into(),
+        name: name.into(),
+        version: 0,
+        spec: json!({"k": 1}),
+        created_at: ts(),
+        deleted_at: None,
+    }
 }
 
 async fn pg_backend() -> Option<PgBackend> {
@@ -154,7 +162,12 @@ async fn suite(s: &Store) {
         StoreError::Conflict("tenant 'globex' already exists".into())
     );
     // PII settings: session scope is a per-tenant opt-in, shipped in the snapshot.
-    let to_session = Mutation::UpdateTenant { id: "globex".into(), pii_default: None, pii_surrogate_scope: Some(PiiSurrogateScope::Session), semantic_cache: None };
+    let to_session = Mutation::UpdateTenant {
+        id: "globex".into(),
+        pii_default: None,
+        pii_surrogate_scope: Some(PiiSurrogateScope::Session),
+        semantic_cache: None,
+    };
     s.apply(A, to_session).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
     assert_eq!((g.pii_default, g.pii_surrogate_scope), (PiiMode::Off, PiiSurrogateScope::Session));
@@ -163,14 +176,28 @@ async fn suite(s: &Store) {
     assert_eq!(snap.pii_surrogate_scope_for(snap.tenant(&"acme".into()).unwrap()), PiiSurrogateScope::Tenant);
     // Semantic cache: off by default, switched on per tenant, shipped in the snapshot.
     assert_eq!(s.state().tenant("globex").unwrap().semantic_cache, SemanticCacheMode::Off);
-    let on = Mutation::UpdateTenant { id: "globex".into(), pii_default: None, pii_surrogate_scope: None, semantic_cache: Some(SemanticCacheMode::On) };
+    let on = Mutation::UpdateTenant {
+        id: "globex".into(),
+        pii_default: None,
+        pii_surrogate_scope: None,
+        semantic_cache: Some(SemanticCacheMode::On),
+    };
     s.apply(A, on).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
-    assert_eq!((g.semantic_cache, g.pii_surrogate_scope), (SemanticCacheMode::On, PiiSurrogateScope::Session), "other settings kept");
+    assert_eq!(
+        (g.semantic_cache, g.pii_surrogate_scope),
+        (SemanticCacheMode::On, PiiSurrogateScope::Session),
+        "other settings kept"
+    );
     let snap = s.config.load();
     assert_eq!(snap.tenant(&"globex".into()).unwrap().semantic_cache, SemanticCacheMode::On);
     assert_eq!(snap.tenant(&"acme".into()).unwrap().semantic_cache, SemanticCacheMode::Off);
-    let ghost = Mutation::UpdateTenant { id: "nobody".into(), pii_default: Some(PiiMode::Mask), pii_surrogate_scope: None, semantic_cache: None };
+    let ghost = Mutation::UpdateTenant {
+        id: "nobody".into(),
+        pii_default: Some(PiiMode::Mask),
+        pii_surrogate_scope: None,
+        semantic_cache: None,
+    };
     assert_eq!(s.apply(A, ghost).await.unwrap_err(), StoreError::NotFound("tenant".into()));
     let key = ApiKeyRecord {
         id: "key_g1".into(),
@@ -216,7 +243,10 @@ async fn suite(s: &Store) {
     s.apply(A, Mutation::SetRoutes { tenant_id: "globex".into(), routes: routes.clone() }).await.unwrap();
     let head = s.state().audit_head;
     let bad = vec![RouteConfig { intent: "default".into(), models: vec!["nope".into()] }];
-    assert!(matches!(s.apply(A, Mutation::SetRoutes { tenant_id: "globex".into(), routes: bad }).await, Err(StoreError::Invalid(_))));
+    assert!(matches!(
+        s.apply(A, Mutation::SetRoutes { tenant_id: "globex".into(), routes: bad }).await,
+        Err(StoreError::Invalid(_))
+    ));
     assert_eq!(s.state().routes["globex"][0].models[0].as_str(), "ext/gpt");
     assert!(matches!(
         s.apply(A, Mutation::DeleteProviderKey { tenant_id: "globex".into(), id: "openai".into() }).await,
@@ -229,9 +259,14 @@ async fn suite(s: &Store) {
 
     // ── models ──
     assert_eq!(
-        s.apply(A, Mutation::CreateModel(model(json!({"id": "local/qwen", "provider": "pool", "upstream_model": "x", "trust_tier": "t0_sovereign"}))))
-            .await
-            .unwrap_err(),
+        s.apply(
+            A,
+            Mutation::CreateModel(model(
+                json!({"id": "local/qwen", "provider": "pool", "upstream_model": "x", "trust_tier": "t0_sovereign"})
+            ))
+        )
+        .await
+        .unwrap_err(),
         StoreError::Conflict("model 'local/qwen' already exists".into())
     );
     let emb = model(json!({"id": "local/embed", "provider": "pool", "upstream_model": "Qwen/Qwen3-Embedding-0.6B",
@@ -239,9 +274,15 @@ async fn suite(s: &Store) {
                            "capabilities": {"vision": true}}));
     s.apply(A, Mutation::CreateModel(emb)).await.unwrap();
     let m = s.state().models.iter().find(|m| m.id.as_str() == "local/embed").cloned().unwrap();
-    assert_eq!((m.kind, m.capabilities.vision, m.licence.as_deref()), (caliban_config::ModelKind::Embedding, true, Some("apache-2.0")));
+    assert_eq!(
+        (m.kind, m.capabilities.vision, m.licence.as_deref()),
+        (caliban_config::ModelKind::Embedding, true, Some("apache-2.0"))
+    );
     s.apply(A, Mutation::DeleteModel("local/embed".into())).await.unwrap();
-    assert_eq!(s.apply(A, Mutation::DeleteModel("local/embed".into())).await.unwrap_err(), StoreError::NotFound("model".into()));
+    assert_eq!(
+        s.apply(A, Mutation::DeleteModel("local/embed".into())).await.unwrap_err(),
+        StoreError::NotFound("model".into())
+    );
 
     // ── shared providers ──
     let gpu: SharedProvider = serde_json::from_value(json!({
@@ -270,7 +311,10 @@ async fn suite(s: &Store) {
         deleted_at: None,
     };
     s.apply(A, Mutation::CreateDatasource(ds.clone())).await.unwrap();
-    assert!(matches!(s.apply(A, Mutation::CreateDatasource(DatasourceRecord { id: "ds_2".into(), ..ds })).await, Err(StoreError::Conflict(_))));
+    assert!(matches!(
+        s.apply(A, Mutation::CreateDatasource(DatasourceRecord { id: "ds_2".into(), ..ds })).await,
+        Err(StoreError::Conflict(_))
+    ));
     s.apply(A, Mutation::SetDatasourceStatus { id: "ds_1".into(), status: "introspecting".into() }).await.unwrap();
     assert_eq!(s.state().datasources[0].status, "introspecting");
     assert_eq!(
@@ -286,7 +330,12 @@ async fn suite(s: &Store) {
     assert_eq!(s.state().nodes.iter().map(|n| n.version).collect::<Vec<_>>(), [1, 2]);
 
     // ── ontology ──
-    s.apply(A, Mutation::ProposeOntology { tenant_id: "globex".into(), elements: vec![element("e_b"), element("e_a")] }).await.unwrap();
+    s.apply(
+        A,
+        Mutation::ProposeOntology { tenant_id: "globex".into(), elements: vec![element("e_b"), element("e_a")] },
+    )
+    .await
+    .unwrap();
     s.apply(A, Mutation::ReviewOntologyElement { id: "e_b".into(), status: Status::Approved }).await.unwrap();
     assert_eq!(
         s.apply(A, Mutation::ReviewOntologyElement { id: "zzz".into(), status: Status::Approved }).await.unwrap_err(),
@@ -295,7 +344,10 @@ async fn suite(s: &Store) {
     let st = s.state();
     let o = &st.ontologies["globex"];
     assert_eq!(o.version, 2);
-    assert_eq!(o.elements.iter().map(|e| (e.id.as_str(), e.status)).collect::<Vec<_>>(), [("e_b", Status::Approved), ("e_a", Status::Proposed)]);
+    assert_eq!(
+        o.elements.iter().map(|e| (e.id.as_str(), e.status)).collect::<Vec<_>>(),
+        [("e_b", Status::Approved), ("e_a", Status::Proposed)]
+    );
 
     deletes(s).await;
 
@@ -323,7 +375,8 @@ async fn suite(s: &Store) {
 /// Revoke and delete semantics (run inside `suite`, so on both backends).
 async fn deletes(s: &Store) {
     let not_found = |what: &str| StoreError::NotFound(what.into());
-    let revoke = |tenant: &str, id: &str| Mutation::RevokeApiKey { tenant_id: tenant.into(), id: id.into(), at: del_ts() };
+    let revoke =
+        |tenant: &str, id: &str| Mutation::RevokeApiKey { tenant_id: tenant.into(), id: id.into(), at: del_ts() };
 
     // ── API key revoke: soft, the row stays, the hash leaves the snapshot ──
     let head = s.state().audit_head;
@@ -354,15 +407,26 @@ async fn deletes(s: &Store) {
     assert_eq!(audit[0].tenant_id.as_deref(), Some("acme"));
 
     // ── datasource delete: tenant-scoped, soft, connection wiped, name freed ──
-    let del_ds = |tenant: &str, id: &str| Mutation::DeleteDatasource { tenant_id: tenant.into(), id: id.into(), at: del_ts() };
-    assert_eq!(s.apply(A, del_ds("acme", "ds_1")).await.unwrap_err(), not_found("datasource"), "other tenant's datasource");
+    let del_ds =
+        |tenant: &str, id: &str| Mutation::DeleteDatasource { tenant_id: tenant.into(), id: id.into(), at: del_ts() };
+    assert_eq!(
+        s.apply(A, del_ds("acme", "ds_1")).await.unwrap_err(),
+        not_found("datasource"),
+        "other tenant's datasource"
+    );
     s.apply(A, del_ds("globex", "ds_1")).await.unwrap();
     let st = s.state();
     let ds = st.datasources.iter().find(|d| d.id == "ds_1").unwrap();
     assert_eq!((ds.deleted_at, &ds.connection), (Some(del_ts()), &json!({})));
-    assert_eq!(s.apply(A, del_ds("globex", "ds_1")).await.unwrap_err(), not_found("datasource"), "repeat delete is 404");
     assert_eq!(
-        s.apply(A, Mutation::SetDatasourceStatus { id: "ds_1".into(), status: "introspecting".into() }).await.unwrap_err(),
+        s.apply(A, del_ds("globex", "ds_1")).await.unwrap_err(),
+        not_found("datasource"),
+        "repeat delete is 404"
+    );
+    assert_eq!(
+        s.apply(A, Mutation::SetDatasourceStatus { id: "ds_1".into(), status: "introspecting".into() })
+            .await
+            .unwrap_err(),
         not_found("datasource")
     );
     let again = DatasourceRecord {
@@ -378,7 +442,8 @@ async fn deletes(s: &Store) {
     s.apply(A, Mutation::CreateDatasource(again)).await.unwrap();
 
     // ── node delete: one version, tenant-scoped; versions are not reused ──
-    let del_node = |tenant: &str, id: &str| Mutation::DeleteNode { tenant_id: tenant.into(), id: id.into(), at: del_ts() };
+    let del_node =
+        |tenant: &str, id: &str| Mutation::DeleteNode { tenant_id: tenant.into(), id: id.into(), at: del_ts() };
     assert_eq!(s.apply(A, del_node("acme", "node_2")).await.unwrap_err(), not_found("node"));
     s.apply(A, del_node("globex", "node_2")).await.unwrap();
     assert_eq!(s.apply(A, del_node("globex", "node_2")).await.unwrap_err(), not_found("node"));
@@ -458,7 +523,12 @@ async fn deletes(s: &Store) {
     // Everything tenant-scoped now 404s; the id cannot be reused; a repeat delete is 404.
     assert_eq!(s.apply(A, del_tenant("doomed")).await.unwrap_err(), not_found("tenant"));
     assert_eq!(s.apply(A, revoke("doomed", "key_d1")).await.unwrap_err(), not_found("tenant"));
-    let k5 = ApiKeyRecord { id: "key_d2".into(), tenant_id: "doomed".into(), hash: "5".repeat(64), ..ApiKeyRecord::clone(&st.api_keys[0]) };
+    let k5 = ApiKeyRecord {
+        id: "key_d2".into(),
+        tenant_id: "doomed".into(),
+        hash: "5".repeat(64),
+        ..ApiKeyRecord::clone(&st.api_keys[0])
+    };
     assert_eq!(s.apply(A, Mutation::CreateApiKey(k5)).await.unwrap_err(), not_found("tenant"));
     assert_eq!(s.apply(A, Mutation::CreateNode(node("node_x", "doomed", "x"))).await.unwrap_err(), not_found("tenant"));
     assert_eq!(
@@ -525,7 +595,10 @@ async fn modelled_tenant_fields_win_over_settings() {
 
 #[test]
 fn surrogate_scope_from_the_config_file_is_seeded() {
-    let cfg = Config::from_toml_str(&BASE.replace("pii_mode = \"mask\"", "pii_mode = \"mask\"\npii_surrogate_scope = \"session\"")).unwrap();
+    let cfg = Config::from_toml_str(
+        &BASE.replace("pii_mode = \"mask\"", "pii_mode = \"mask\"\npii_surrogate_scope = \"session\""),
+    )
+    .unwrap();
     let st = State::from_config(&cfg);
     assert_eq!(st.tenants[0].pii_surrogate_scope, PiiSurrogateScope::Session);
     assert!(st.tenants[0].settings.get("pii_surrogate_scope").is_none(), "modelled, not passed through");
@@ -534,7 +607,9 @@ fn surrogate_scope_from_the_config_file_is_seeded() {
 
 #[test]
 fn semantic_cache_from_the_config_file_is_seeded() {
-    let cfg = Config::from_toml_str(&BASE.replace("pii_mode = \"mask\"", "pii_mode = \"mask\"\nsemantic_cache = \"on\"")).unwrap();
+    let cfg =
+        Config::from_toml_str(&BASE.replace("pii_mode = \"mask\"", "pii_mode = \"mask\"\nsemantic_cache = \"on\""))
+            .unwrap();
     let st = State::from_config(&cfg);
     assert_eq!(st.tenants[0].semantic_cache, SemanticCacheMode::On);
     assert!(st.tenants[0].settings.get("semantic_cache").is_none(), "modelled, not passed through");
@@ -593,10 +668,12 @@ async fn postgres_backend_matches_memory_and_persists() {
     assert!(sqlx::query("DELETE FROM audit_log WHERE seq = 2").execute(&pool).await.is_err());
 
     // Secrets at rest: sealed_key holds ciphertext only.
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM provider_credential WHERE sealed_key IS NOT NULL AND secret_ref IS NULL")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM provider_credential WHERE sealed_key IS NOT NULL AND secret_ref IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(n, 1);
 
     // Deletes at rest: rows kept for audit, secrets gone, tombstones final.
@@ -604,15 +681,41 @@ async fn postgres_backend_matches_memory_and_persists() {
         let pool = pool.clone();
         async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(&pool).await.unwrap() }
     };
-    assert_eq!(scalar("SELECT count(*) FROM api_key WHERE id IN ('key_g1', 'key_d1', 'key_cfg_acme_0') AND revoked_at IS NOT NULL").await, 3);
-    assert_eq!(scalar("SELECT count(*) FROM tenant WHERE id = 'doomed' AND status = 'deleted' AND deleted_at IS NOT NULL").await, 1);
-    assert_eq!(scalar("SELECT count(*) FROM provider_credential WHERE tenant_id = 'doomed'").await, 0, "BYOK ciphertext destroyed");
+    assert_eq!(
+        scalar(
+            "SELECT count(*) FROM api_key WHERE id IN ('key_g1', 'key_d1', 'key_cfg_acme_0') AND revoked_at IS NOT NULL"
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        scalar("SELECT count(*) FROM tenant WHERE id = 'doomed' AND status = 'deleted' AND deleted_at IS NOT NULL")
+            .await,
+        1
+    );
+    assert_eq!(
+        scalar("SELECT count(*) FROM provider_credential WHERE tenant_id = 'doomed'").await,
+        0,
+        "BYOK ciphertext destroyed"
+    );
     assert_eq!(scalar("SELECT count(*) FROM route WHERE tenant_id = 'doomed'").await, 0);
     assert_eq!(scalar("SELECT count(*) FROM datasource WHERE id IN ('ds_1', 'ds_d') AND deleted_at IS NOT NULL AND connection = '{}'").await, 2);
-    assert_eq!(scalar("SELECT count(*) FROM node WHERE id IN ('node_2', 'node_d') AND deleted_at IS NOT NULL").await, 2);
-    assert_eq!(scalar("SELECT count(*) FROM audit_log WHERE tenant_id = 'doomed'").await, 8, "audit rows of a deleted tenant are kept");
+    assert_eq!(
+        scalar("SELECT count(*) FROM node WHERE id IN ('node_2', 'node_d') AND deleted_at IS NOT NULL").await,
+        2
+    );
+    assert_eq!(
+        scalar("SELECT count(*) FROM audit_log WHERE tenant_id = 'doomed'").await,
+        8,
+        "audit rows of a deleted tenant are kept"
+    );
     assert!(sqlx::query("UPDATE api_key SET revoked_at = NULL WHERE id = 'key_g1'").execute(&pool).await.is_err());
-    assert!(sqlx::query("UPDATE tenant SET status = 'active', deleted_at = NULL WHERE id = 'doomed'").execute(&pool).await.is_err());
+    assert!(
+        sqlx::query("UPDATE tenant SET status = 'active', deleted_at = NULL WHERE id = 'doomed'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
     assert!(sqlx::query("UPDATE datasource SET deleted_at = NULL WHERE id = 'ds_1'").execute(&pool).await.is_err());
     assert!(sqlx::query("UPDATE node SET deleted_at = NULL WHERE id = 'node_2'").execute(&pool).await.is_err());
     // Live datasource names stay unique per tenant at the database level too.
@@ -651,19 +754,35 @@ async fn postgres_usage_events_carry_cache_tier_and_usage_source() {
     .fetch_all(pg.pool())
     .await
     .unwrap();
-    assert_eq!(rows, vec![
-        ("req_1".into(), None, Some("provider".into()), 50, 30, 160),
-        ("req_2".into(), Some("semantic".into()), None, 50, 30, 160),
-    ]);
+    assert_eq!(
+        rows,
+        vec![
+            ("req_1".into(), None, Some("provider".into()), 50, 30, 160),
+            ("req_2".into(), Some("semantic".into()), None, 50, 30, 160),
+        ]
+    );
     // The CHECK constraints reject unknown values.
-    assert!(sqlx::query("UPDATE usage_event SET usage_source = 'guess' WHERE request_id = 'req_1'").execute(pg.pool()).await.is_err());
-    assert!(sqlx::query("UPDATE usage_event SET cache_tier = 'other' WHERE request_id = 'req_1'").execute(pg.pool()).await.is_err());
+    assert!(
+        sqlx::query("UPDATE usage_event SET usage_source = 'guess' WHERE request_id = 'req_1'")
+            .execute(pg.pool())
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE usage_event SET cache_tier = 'other' WHERE request_id = 'req_1'")
+            .execute(pg.pool())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
 async fn postgres_rejects_edited_migrations() {
     let Some(pg) = pg_backend().await else { return };
     pg.migrate().await.unwrap();
-    sqlx::query("UPDATE caliban_schema_migrations SET checksum = 'x' WHERE version = 2").execute(pg.pool()).await.unwrap();
+    sqlx::query("UPDATE caliban_schema_migrations SET checksum = 'x' WHERE version = 2")
+        .execute(pg.pool())
+        .await
+        .unwrap();
     assert!(pg.migrate().await.unwrap_err().to_string().contains("modified"));
 }

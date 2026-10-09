@@ -74,7 +74,10 @@ mod tests {
     use super::*;
 
     fn sc(id: &str, score: f32, tokens: u32) -> Scored {
-        Scored { chunk: Chunk { id: id.into(), doc_id: "d".into(), doc_version: 1, text: String::new(), tokens }, score }
+        Scored {
+            chunk: Chunk { id: id.into(), doc_id: "d".into(), doc_version: 1, text: String::new(), tokens },
+            score,
+        }
     }
 
     #[test]
@@ -85,7 +88,11 @@ mod tests {
 
     #[test]
     fn budget_stops_at_cliff_and_puts_best_at_edges() {
-        let out = budget_context(vec![sc("a", 0.9, 100), sc("b", 0.85, 100), sc("c", 0.8, 100), sc("d", 0.2, 100)], 1000, 0.3);
+        let out = budget_context(
+            vec![sc("a", 0.9, 100), sc("b", 0.85, 100), sc("c", 0.8, 100), sc("d", 0.2, 100)],
+            1000,
+            0.3,
+        );
         let ids: Vec<&str> = out.iter().map(|s| s.chunk.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "c", "b"]);
     }
