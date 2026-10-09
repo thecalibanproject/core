@@ -29,7 +29,7 @@ use caliban_cache::ExactCache;
 use caliban_config::ConfigHandle;
 use caliban_meter::UsageSink;
 use caliban_meter::quota::{InMemoryQuota, QuotaStore};
-use caliban_pii::PiiEngine;
+use caliban_pii::{PiiEngine, SurrogateKeys};
 use caliban_providers::Providers;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +53,9 @@ pub struct Gateway {
     /// Derives per-tenant `cache_salt` values. Derived from `CALIBAN_KEK` when set so all routers
     /// of a deployment agree; otherwise random per process.
     pub salt_key: [u8; 32],
+    /// Derives per-tenant PII surrogate keys (HKDF over `CALIBAN_KEK`, tenant id as info), so all
+    /// routers of a deployment produce the same surrogates; random per process without a KEK.
+    pub pii_keys: SurrogateKeys,
 }
 
 impl Gateway {
@@ -67,6 +70,7 @@ impl Gateway {
             usage,
             quota: Arc::new(InMemoryQuota::new()),
             salt_key: salt_key(),
+            pii_keys: pii_keys(),
         }
     }
 
@@ -112,6 +116,13 @@ fn salt_key() -> [u8; 32] {
             rand::RngCore::fill_bytes(&mut rand::rng(), &mut k);
             k
         }
+    }
+}
+
+fn pii_keys() -> SurrogateKeys {
+    match caliban_config::process_kek() {
+        Ok(kek) => SurrogateKeys::from_kek(kek),
+        Err(_) => SurrogateKeys::random(),
     }
 }
 

@@ -321,6 +321,26 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Tenant' }
         '404': { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [tenants]
+      summary: Change a tenant's PII settings
+      description: |
+        Absent fields keep their value; other fields are rejected. Audited as `tenant.update`
+        (old and new values). Routers apply the change with their next snapshot.
+        `pii_surrogate_scope: session` opts the tenant out of per-tenant surrogates: every request
+        gets fresh surrogates (unlinkable), and requests carrying PII bypass the exact cache.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TenantUpdate' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+        '404': { $ref: '#/components/responses/Error' }
     delete:
       tags: [tenants]
       summary: Delete a tenant (tombstone)
@@ -1003,6 +1023,7 @@ components:
         name: { type: string }
         region: { type: [string, 'null'] }
         pii_default: { type: string, enum: [off, mask, reversible] }
+        pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant, description: 'Surrogate consistency for reversible PII. `tenant`: the same value always gets the same surrogate in this tenant (keyed HMAC per tenant, derived from CALIBAN_KEK), so pseudonymised requests can hit the exact cache; sessions of the tenant become linkable through their surrogates. `session`: fresh surrogates per request. Surrogates never cross tenants.' }
         created_at: { type: string, format: date-time }
         status: { type: string, enum: [active, deleted], description: '`deleted` only appears with `include_deleted=true`.' }
         deleted_at: { type: [string, 'null'], format: date-time }
@@ -1013,6 +1034,13 @@ components:
         name: { type: string }
         region: { type: string }
         pii_default: { type: string, enum: [off, mask, reversible], default: reversible }
+        pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant }
+    TenantUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        pii_default: { type: string, enum: [off, mask, reversible] }
+        pii_surrogate_scope: { type: string, enum: [tenant, session] }
 
     ApiKeyInfo:
       type: object

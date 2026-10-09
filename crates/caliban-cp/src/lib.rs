@@ -18,7 +18,7 @@ use caliban_config::signing::{SnapshotPayload, SnapshotSigner, config_digest};
 use caliban_config::{RouteConfig, SecretRef, process_kek, seal};
 use caliban_nodes::NodeSpec;
 use caliban_ontology::Status;
-use caliban_types::{PiiMode, ProviderKind, TrustTier, hash_api_key};
+use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, TrustTier, hash_api_key};
 use parking_lot::Mutex;
 use rand::RngCore;
 use serde::Deserialize;
@@ -133,7 +133,7 @@ pub(crate) type ApiResult<T> = Result<T, ApiError>;
 pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
     let api = Router::new()
         .route("/tenants", get(list_tenants).post(create_tenant))
-        .route("/tenants/{tenant_id}", get(get_tenant).delete(delete_tenant))
+        .route("/tenants/{tenant_id}", get(get_tenant).patch(update_tenant).delete(delete_tenant))
         .route("/tenants/{tenant_id}/api-keys", get(list_api_keys).post(create_api_key))
         .route("/tenants/{tenant_id}/api-keys/{key_id}", delete(revoke_api_key))
         .route("/tenants/{tenant_id}/provider-keys", get(list_provider_keys).post(create_provider_key))
@@ -297,6 +297,7 @@ struct TenantCreate {
     name: String,
     region: Option<String>,
     pii_default: Option<PiiMode>,
+    pii_surrogate_scope: Option<PiiSurrogateScope>,
 }
 
 async fn create_tenant(State(cp): State<Cp>, Json(body): Json<TenantCreate>) -> ApiResult<(StatusCode, Json<Tenant>)> {
@@ -309,6 +310,7 @@ async fn create_tenant(State(cp): State<Cp>, Json(body): Json<TenantCreate>) -> 
         name: body.name,
         region: body.region,
         pii_default: body.pii_default.unwrap_or(cp.store.base().pii.default_mode),
+        pii_surrogate_scope: body.pii_surrogate_scope.unwrap_or_default(),
         created_at: now_micros(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -320,6 +322,21 @@ async fn create_tenant(State(cp): State<Cp>, Json(body): Json<TenantCreate>) -> 
 
 async fn get_tenant(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiResult<Json<Tenant>> {
     cp.store.state().tenant(&tenant_id).cloned().map(Json).ok_or_else(|| not_found("tenant"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantUpdate {
+    pii_default: Option<PiiMode>,
+    pii_surrogate_scope: Option<PiiSurrogateScope>,
+}
+
+/// Changes a tenant's PII settings (absent fields are kept). Audited; routers pick it up with the
+/// next snapshot.
+async fn update_tenant(State(cp): State<Cp>, Path(tenant_id): Path<String>, Json(body): Json<TenantUpdate>) -> ApiResult<Json<Tenant>> {
+    let m = Mutation::UpdateTenantPii { id: tenant_id.clone(), pii_default: body.pii_default, pii_surrogate_scope: body.pii_surrogate_scope };
+    let st = cp.store.apply(ADMIN_ACTOR, m).await?;
+    st.tenant(&tenant_id).cloned().map(Json).ok_or_else(|| not_found("tenant"))
 }
 
 /// Tombstones the tenant: revokes its API keys, destroys its BYOK credentials, removes its routes
@@ -679,6 +696,34 @@ mod tests {
         assert_eq!(a["entries"][0]["action"], "api_key.create");
         assert_eq!(a["entries"][1]["action"], "tenant.create");
         assert!(!a.to_string().contains(&key[4..]));
+    }
+
+    #[tokio::test]
+    async fn surrogate_scope_is_a_per_tenant_opt_in() {
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        let (s, t) = call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert_eq!(t["pii_surrogate_scope"], "tenant", "tenant scope by default");
+        let (s, t) = call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Initech", "pii_surrogate_scope": "session"})), true).await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert_eq!(t["pii_surrogate_scope"], "session");
+
+        let (s, t) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"pii_surrogate_scope": "session"})), true).await;
+        assert_eq!(s, StatusCode::OK, "{t}");
+        assert_eq!((t["pii_surrogate_scope"].as_str(), t["pii_default"].as_str()), (Some("session"), Some("reversible")));
+        let snap = c.store.config.load();
+        assert_eq!(snap.pii_surrogate_scope_for(snap.tenant(&"globex".into()).unwrap()), PiiSurrogateScope::Session);
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=1", None, true).await;
+        assert_eq!(a["entries"][0]["action"], "tenant.update");
+        assert_eq!(a["entries"][0]["detail"]["pii_surrogate_scope"], json!({"from": "tenant", "to": "session"}));
+
+        let (s, _) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"pii_surrogate_scope": "global"})), true).await;
+        assert!(s.is_client_error());
+        let (s, _) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"name": "x"})), true).await;
+        assert!(s.is_client_error(), "only PII settings can be patched");
+        let (s, _) = call(&app, "PATCH", "/api/v1/tenants/nobody", Some(json!({"pii_default": "mask"})), true).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

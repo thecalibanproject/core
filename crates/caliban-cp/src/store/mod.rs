@@ -33,7 +33,7 @@ use audit::{AuditDraft, AuditEntry};
 use caliban_config::{Config, ConfigHandle, ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider, Snapshot, TenantConfig};
 use caliban_meter::RecentUsage;
 use caliban_ontology::{Element, Ontology, Status};
-use caliban_types::{PiiMode, ProviderKind, TrustTier};
+use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, TrustTier};
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::Serialize;
@@ -66,6 +66,9 @@ pub struct Tenant {
     pub name: String,
     pub region: Option<String>,
     pub pii_default: PiiMode,
+    /// `tenant` (default): the same value always gets the same surrogate in this tenant, so
+    /// pseudonymised requests can hit the cache. `session`: fresh surrogates per request.
+    pub pii_surrogate_scope: PiiSurrogateScope,
     pub created_at: DateTime<Utc>,
     pub status: TenantStatus,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -165,6 +168,7 @@ impl State {
                 name: t.name.clone(),
                 region: None,
                 pii_default: t.pii_mode.unwrap_or(base.pii.default_mode),
+                pii_surrogate_scope: t.pii_surrogate_scope,
                 created_at: now,
                 status: TenantStatus::Active,
                 deleted_at: None,
@@ -254,7 +258,7 @@ impl NodeRecord {
 }
 
 /// `TenantConfig` fields the store models explicitly; anything else is kept in `settings`.
-const TENANT_FIELDS: &[&str] = &["id", "name", "pii_mode", "api_key_hashes", "providers", "routes"];
+const TENANT_FIELDS: &[&str] = &["id", "name", "pii_mode", "pii_surrogate_scope", "api_key_hashes", "providers", "routes"];
 
 fn tenant_settings(t: &TenantConfig) -> Map<String, Value> {
     match serde_json::to_value(t) {
@@ -298,6 +302,7 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
             obj.insert("id".into(), json!(t.id));
             obj.insert("name".into(), json!(t.name));
             obj.insert("pii_mode".into(), json!(t.pii_default));
+            obj.insert("pii_surrogate_scope".into(), json!(t.pii_surrogate_scope));
             obj.insert(
                 "api_key_hashes".into(),
                 json!(st.api_keys.iter().filter(|k| k.tenant_id == t.id && k.is_active()).map(|k| &k.hash).collect::<Vec<_>>()),
@@ -338,6 +343,8 @@ pub enum Mutation {
     /// Tombstones the tenant and, in the same transaction, revokes its API keys, destroys its
     /// BYOK credentials, removes its routes and soft-deletes its datasources and nodes.
     DeleteTenant { id: String, at: DateTime<Utc> },
+    /// Changes an active tenant's PII settings; `None` keeps the current value.
+    UpdateTenantPii { id: String, pii_default: Option<PiiMode>, pii_surrogate_scope: Option<PiiSurrogateScope> },
     CreateProviderKey(ProviderKeyRecord),
     DeleteProviderKey { tenant_id: String, id: String },
     CreateModel(ModelEntry),
@@ -369,7 +376,24 @@ impl Mutation {
             detail,
         };
         match self {
-            Mutation::CreateTenant(t) => d(Some(&t.id), "tenant.create", &t.id, json!({"name": t.name})),
+            Mutation::CreateTenant(t) => d(
+                Some(&t.id),
+                "tenant.create",
+                &t.id,
+                json!({"name": t.name, "pii_default": t.pii_default, "pii_surrogate_scope": t.pii_surrogate_scope}),
+            ),
+            Mutation::UpdateTenantPii { id, pii_default, pii_surrogate_scope } => {
+                let t = before.tenant(id);
+                d(
+                    Some(id),
+                    "tenant.update",
+                    id,
+                    json!({
+                        "pii_default": {"from": t.map(|t| t.pii_default), "to": pii_default},
+                        "pii_surrogate_scope": {"from": t.map(|t| t.pii_surrogate_scope), "to": pii_surrogate_scope},
+                    }),
+                )
+            }
             Mutation::CreateApiKey(k) => d(Some(&k.tenant_id), "api_key.create", &k.id, json!({"name": k.name, "prefix": k.prefix})),
             Mutation::RevokeApiKey { tenant_id, id, .. } => {
                 let k = before.active_api_key(tenant_id, id);

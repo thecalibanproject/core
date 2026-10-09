@@ -15,31 +15,35 @@
 //! [`PiiError::DetectorFailed`]: the request fails closed rather than going out half-scrubbed.
 //!
 //! Detected spans are replaced with realistic, type-consistent **surrogates** ([`surrogate`]),
-//! consistent within a scope, and recorded in a [`Vault`]. Responses (including streams) are
-//! restored with [`Rehydrator`] / [`StreamingRehydrator`].
+//! consistent within a scope, and recorded in a per-request [`Vault`]. Responses (including
+//! streams) are restored with [`Rehydrator`] / [`StreamingRehydrator`].
 //!
 //! # Surrogate scopes and the exact cache
 //!
-//! Surrogates are a pure function of `(scope_key, entity type, normalized value)` (an HMAC, see
-//! [`surrogate`]), so no shared state is needed to keep them consistent. The caller picks the
-//! scope by choosing `scope_key` for [`PiiEngine::protect`]:
+//! Surrogates are a pure function of `(scope key, entity type, normalised value)` (an HMAC, see
+//! [`surrogate`]), so no shared state is needed to keep them consistent. The scope is a
+//! per-tenant setting ([`PiiSurrogateScope`], `pii_surrogate_scope` in the tenant config) and
+//! [`SurrogateKeys::scope_key`] turns it into the key for [`PiiEngine::protect`]:
 //!
-//! - **request** (default today): 32 random bytes per request. Nothing links two requests.
-//! - **tenant**: [`tenant_scope_key`]`(server_secret, tenant_id)` =
-//!   `HMAC-SHA256(server_secret, "caliban-pii/scope/tenant/v1" ‖ 0 ‖ tenant_id)`. Identical
-//!   requests from one tenant then produce byte-identical protected requests, so the exact
-//!   cache (keyed on the *protected* request) can hit, and a cached response rehydrates with
-//!   the new request's own vault because the surrogates are the same.
-//! - **session**: [`session_scope_key`]`(server_secret, tenant_id, session_id)`, for agent
-//!   memory / multi-turn consistency without cross-session linkability.
+//! - **tenant** (default, docs/architecture §9): the tenant's surrogate key,
+//!   `HKDF-SHA256(ikm = CALIBAN_KEK, salt = "caliban 2026 pii surrogate v1",
+//!   info = "caliban/pii/surrogate/tenant/v1" ‖ 0 ‖ tenant_id)`. The same value in the same
+//!   tenant always gets the same surrogate, so identical requests produce byte-identical
+//!   protected requests and the exact cache (keyed on the *protected* request and the tenant)
+//!   can hit. Every router of a deployment shares `CALIBAN_KEK`, so in split mode they all derive
+//!   the same keys and the same surrogates. Different tenants get unrelated keys, so surrogates
+//!   never cross tenants.
+//! - **session** (per-tenant opt-in): 32 random bytes per request. Nothing links two requests,
+//!   and requests carrying PII cannot hit the exact cache.
 //!
-//! `server_secret` is a per-deployment secret (≥ 32 random bytes, from the KMS / secret store,
-//! never from config files in plain text), so surrogates cannot be precomputed by anyone who
-//! does not hold it, and rotating it re-keys every scope. Trade-off: in a tenant scope the
-//! upstream provider sees the same surrogate for the same person across requests (linkable, but
-//! not identifiable). The collision guard can still bump a surrogate when it already occurs in
-//! the request text, which is deterministic for identical requests but may differ between two
-//! different requests that mention the same entity; that only costs a cache miss.
+//! Without `CALIBAN_KEK` the gateway derives from a random per-process secret instead
+//! ([`SurrogateKeys::random`]): surrogates are then stable within one process only.
+//!
+//! Trade-off of tenant scope: the upstream provider sees the same surrogate for the same value
+//! across sessions of the tenant (linkable, not identifiable). Nobody without the KEK can compute
+//! or invert a surrogate, rotating the KEK re-keys every tenant, and no plaintext table is kept:
+//! the reverse map of a request is built from the values seen in that request and dropped with
+//! it. Collision handling and its probabilities are documented in [`surrogate`].
 
 pub mod dictionary;
 pub mod ner;
@@ -57,6 +61,7 @@ pub use surrogate::Vault;
 
 use caliban_ir::ChatRequest;
 use caliban_types::PiiMode;
+pub use caliban_types::PiiSurrogateScope;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -150,29 +155,77 @@ pub enum PiiError {
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn derive_scope_key(server_secret: &[u8], label: &str, parts: &[&str]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(server_secret).expect("hmac accepts any key length");
-    mac.update(label.as_bytes());
+/// HKDF salt for surrogate keys (RFC 5869 extract step), next to the `cache_salt` key label in
+/// the gateway. Changing it re-keys every tenant.
+const SURROGATE_HKDF_SALT: &[u8] = b"caliban 2026 pii surrogate v1";
+const TENANT_INFO: &[u8] = b"caliban/pii/surrogate/tenant/v1";
+
+fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("hmac accepts any key length");
     for p in parts {
-        mac.update(&[0]);
-        // Length-prefix each part so ("ab","c") and ("a","bc") differ.
-        mac.update(&(p.len() as u64).to_le_bytes());
-        mac.update(p.as_bytes());
+        mac.update(p);
     }
     mac.finalize().into_bytes().into()
 }
 
-/// Scope key for **tenant-scoped** surrogates: the same value gets the same surrogate in every
-/// request of `tenant_id`, so identical requests produce identical protected requests (exact
-/// cache hits). `server_secret` is the deployment's secret; see the crate docs.
-pub fn tenant_scope_key(server_secret: &[u8], tenant_id: &str) -> [u8; 32] {
-    derive_scope_key(server_secret, "caliban-pii/scope/tenant/v1", &[tenant_id])
+/// HKDF-SHA256 (RFC 5869) with a 32-byte output, i.e. one expand block:
+/// `PRK = HMAC(salt, ikm)`, `OKM = HMAC(PRK, info ‖ 0x01)`.
+pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8]) -> [u8; 32] {
+    let prk = hmac_sha256(salt, &[ikm]);
+    hmac_sha256(&prk, &[info, &[1]])
 }
 
-/// Scope key for **session-scoped** surrogates (consistent across the turns of one
-/// conversation, unlinkable across sessions).
-pub fn session_scope_key(server_secret: &[u8], tenant_id: &str, session_id: &str) -> [u8; 32] {
-    derive_scope_key(server_secret, "caliban-pii/scope/session/v1", &[tenant_id, session_id])
+/// Derives the surrogate scope keys of a deployment from its key-encryption key.
+///
+/// Holds only the HKDF pseudo-random key (the extract step over `CALIBAN_KEK`); the per-tenant
+/// key is one HMAC away. `Debug` never prints key material.
+#[derive(Clone)]
+pub struct SurrogateKeys {
+    prk: [u8; 32],
+}
+
+impl std::fmt::Debug for SurrogateKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SurrogateKeys(..)")
+    }
+}
+
+impl SurrogateKeys {
+    /// From the process KEK (`CALIBAN_KEK`). Every router with the same KEK derives the same keys.
+    pub fn from_kek(kek: &[u8; 32]) -> Self {
+        Self { prk: hmac_sha256(SURROGATE_HKDF_SALT, &[kek]) }
+    }
+
+    /// Random per process, for deployments without a KEK: tenant-scope surrogates are then only
+    /// stable within this process.
+    pub fn random() -> Self {
+        let mut ikm = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut ikm);
+        Self::from_kek(&ikm)
+    }
+
+    /// The tenant's surrogate key: HKDF-Expand with `info = TENANT_INFO ‖ 0 ‖ tenant_id`.
+    pub fn tenant_key(&self, tenant_id: &str) -> [u8; 32] {
+        hmac_sha256(&self.prk, &[TENANT_INFO, &[0], tenant_id.as_bytes(), &[1]])
+    }
+
+    /// The scope key for one request of `tenant_id`: the tenant key, or fresh random bytes for
+    /// session scope.
+    pub fn scope_key(&self, scope: PiiSurrogateScope, tenant_id: &str) -> [u8; 32] {
+        match scope {
+            PiiSurrogateScope::Tenant => self.tenant_key(tenant_id),
+            PiiSurrogateScope::Session => {
+                let mut k = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rng(), &mut k);
+                k
+            }
+        }
+    }
+}
+
+/// Tenant surrogate key straight from a KEK: `SurrogateKeys::from_kek(kek).tenant_key(tenant_id)`.
+pub fn tenant_scope_key(kek: &[u8; 32], tenant_id: &str) -> [u8; 32] {
+    SurrogateKeys::from_kek(kek).tenant_key(tenant_id)
 }
 
 /// Union of spans; overlaps resolved by preferring the longer span, then the higher-risk type.
@@ -243,22 +296,20 @@ impl PiiEngine {
     }
 
     /// Protects every text segment of the request. `scope_key` makes surrogates consistent within
-    /// a scope: random per request, or [`tenant_scope_key`] / [`session_scope_key`] (see the
-    /// crate docs). The reverse map ([`Vault`]) is still per call; persisting it for session or
-    /// tenant scopes (encrypted, TTL) is TODO.
+    /// a scope: a tenant key or a random per-request key, see [`SurrogateKeys::scope_key`] and
+    /// the crate docs. The returned [`Vault`] only knows the values of this request.
+    ///
+    /// Three passes: detect in every segment (a failing detector or a credential stops the
+    /// request before anything is rewritten), assign surrogates to all values at once in
+    /// canonical order (so collision handling does not depend on text order), then rewrite.
     pub fn protect(&self, req: &mut ChatRequest, mode: PiiMode, scope_key: &[u8]) -> Result<Protected, PiiError> {
         let mut out = Protected { vault: Vault::new(scope_key), entities: 0 };
         if mode == PiiMode::Off {
             return Ok(out);
         }
-        // Collect originals first so the collision guard can reject surrogates that already occur.
         let mut all_text = String::new();
-        req.for_each_text_mut(|_, s| {
-            all_text.push_str(s);
-            all_text.push('\n');
-        });
-        out.vault.set_collision_corpus(&all_text);
-
+        let mut found: Vec<Vec<Span>> = Vec::new();
+        let mut values: Vec<(EntityType, String)> = Vec::new();
         let mut err = None;
         req.for_each_text_mut(|_, s| {
             if err.is_some() {
@@ -275,13 +326,26 @@ impl PiiEngine {
                 err = Some(PiiError::SecretDetected(redact_preview(&s[sec.start..sec.end])));
                 return;
             }
+            all_text.push_str(s);
+            all_text.push('\n');
+            values.extend(spans.iter().map(|sp| (sp.entity.clone(), s[sp.start..sp.end].to_owned())));
+            found.push(spans);
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        // The collision guard rejects surrogates that already occur in the original text.
+        out.vault.set_collision_corpus(&all_text);
+        if mode == PiiMode::Reversible {
+            out.vault.assign(values.iter().map(|(e, o)| (e, o.as_str())));
+        }
+        let mut found = found.into_iter();
+        req.for_each_text_mut(|_, s| {
+            let spans = found.next().unwrap_or_default();
             out.entities += spans.len();
             *s = rewrite(s, &spans, mode, &mut out.vault);
         });
-        match err {
-            Some(e) => Err(e),
-            None => Ok(out),
-        }
+        Ok(out)
     }
 }
 
@@ -385,28 +449,101 @@ mod tests {
         assert!(engine.protect(&mut chat("x"), PiiMode::Off, b"s").is_ok());
     }
 
-    #[test]
-    fn tenant_scope_keys_are_stable_and_separated() {
-        let secret = b"0123456789abcdef0123456789abcdef";
-        assert_eq!(tenant_scope_key(secret, "acme"), tenant_scope_key(secret, "acme"));
-        assert_ne!(tenant_scope_key(secret, "acme"), tenant_scope_key(secret, "globex"));
-        assert_ne!(tenant_scope_key(secret, "acme"), tenant_scope_key(b"another-secret", "acme"));
-        assert_ne!(session_scope_key(secret, "acme", "s1"), session_scope_key(secret, "acme", "s2"));
-        // Domain separation and length prefixes.
-        assert_ne!(session_scope_key(secret, "ab", "c"), session_scope_key(secret, "a", "bc"));
-        assert_ne!(tenant_scope_key(secret, "acme").to_vec(), session_scope_key(secret, "acme", "").to_vec());
+    const KEK: [u8; 32] = *b"0123456789abcdef0123456789abcdef";
 
-        // Identical requests in one tenant scope → identical protected text; other tenants differ.
-        let engine = PiiEngine::default();
+    fn protect_with(key: &[u8], text: &str) -> (String, Protected) {
+        let mut r = chat(text);
+        let p = PiiEngine::default().protect(&mut r, PiiMode::Reversible, key).unwrap();
+        (r.last_user_text().unwrap(), p)
+    }
+
+    #[test]
+    fn hkdf_matches_rfc5869_test_case_1() {
+        let ikm = [0x0b; 22];
+        let salt: Vec<u8> = (0x00..=0x0c).collect();
+        let info: Vec<u8> = (0xf0..=0xf9).collect();
+        assert_eq!(hex::encode(hkdf_sha256(&salt, &ikm, &info)), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf");
+        // The tenant key is that construction with the documented salt and info.
+        let mut info = TENANT_INFO.to_vec();
+        info.push(0);
+        info.extend_from_slice(b"acme");
+        assert_eq!(hkdf_sha256(SURROGATE_HKDF_SALT, &KEK, &info), tenant_scope_key(&KEK, "acme"));
+    }
+
+    #[test]
+    fn tenant_keys_are_stable_and_separated() {
+        let keys = SurrogateKeys::from_kek(&KEK);
+        assert_eq!(keys.tenant_key("acme"), tenant_scope_key(&KEK, "acme"));
+        assert_ne!(keys.tenant_key("acme"), keys.tenant_key("globex"));
+        assert_ne!(keys.tenant_key("acme"), keys.tenant_key("acme2"));
+        assert_ne!(keys.tenant_key("acme"), SurrogateKeys::from_kek(&[9; 32]).tenant_key("acme"));
+        assert_eq!(keys.scope_key(PiiSurrogateScope::Tenant, "acme"), keys.tenant_key("acme"));
+        assert!(!format!("{keys:?}").contains(&hex::encode(keys.prk)));
+    }
+
+    /// Split mode: two routers that only share `CALIBAN_KEK` derive the same keys and therefore
+    /// send byte-identical protected requests.
+    #[test]
+    fn routers_with_the_same_kek_derive_identical_surrogates() {
+        let router_a = SurrogateKeys::from_kek(&KEK);
+        let router_b = SurrogateKeys::from_kek(&KEK.clone());
+        assert_eq!(router_a.tenant_key("acme"), router_b.tenant_key("acme"));
         let text = "Mail jane.doe@acme.com, card 4111 1111 1111 1111";
-        let protect = |key: &[u8]| {
-            let mut r = chat(text);
-            engine.protect(&mut r, PiiMode::Reversible, key).unwrap();
-            r.last_user_text().unwrap()
-        };
-        let k = tenant_scope_key(secret, "acme");
-        assert_eq!(protect(&k), protect(&k));
-        assert_ne!(protect(&k), protect(&tenant_scope_key(secret, "globex")));
+        let (a, _) = protect_with(&router_a.tenant_key("acme"), text);
+        let (b, _) = protect_with(&router_b.tenant_key("acme"), text);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tenant_scope_is_stable_across_requests_and_separated_between_tenants() {
+        let keys = SurrogateKeys::from_kek(&KEK);
+        let acme = keys.scope_key(PiiSurrogateScope::Tenant, "acme");
+        // Same value, different requests and surrounding text: same surrogate.
+        let (one, p1) = protect_with(&acme, "Mail jane.doe@acme.com today");
+        let (two, p2) = protect_with(&acme, "Is jane.doe@acme.com still the contact? Card 4111 1111 1111 1111.");
+        let s1 = &p1.vault.pairs()[0].0;
+        assert!(one.contains(s1.as_str()) && two.contains(s1.as_str()), "{one} / {two}");
+        assert_eq!(p2.vault.pairs().iter().find(|(_, o)| o == "jane.doe@acme.com").map(|(s, _)| s), Some(s1));
+        // Identical requests: identical protected text.
+        assert_eq!(protect_with(&acme, "Mail jane.doe@acme.com today").0, one);
+        // Another tenant: another surrogate for the same value.
+        let (globex, _) = protect_with(&keys.scope_key(PiiSurrogateScope::Tenant, "globex"), "Mail jane.doe@acme.com today");
+        assert_ne!(globex, one);
+        assert!(!globex.contains(s1.as_str()));
+    }
+
+    #[test]
+    fn session_scope_differs_per_request() {
+        let keys = SurrogateKeys::from_kek(&KEK);
+        let text = "Mail jane.doe@acme.com today";
+        let a = protect_with(&keys.scope_key(PiiSurrogateScope::Session, "acme"), text).0;
+        let b = protect_with(&keys.scope_key(PiiSurrogateScope::Session, "acme"), text).0;
+        assert_ne!(a, b);
+        assert_ne!(a, protect_with(&keys.tenant_key("acme"), text).0);
+    }
+
+    /// A response may carry a surrogate this request never produced (e.g. a cached answer
+    /// computed for another request, or another tenant's surrogate). Only values of the current
+    /// request are restored; anything else is left as it is.
+    #[test]
+    fn only_surrogates_of_the_current_request_are_rehydrated() {
+        let keys = SurrogateKeys::from_kek(&KEK);
+        let acme = keys.tenant_key("acme");
+        let (_, other) = protect_with(&acme, "Write to bob@corp.io");
+        let foreign = other.vault.pairs()[0].0.clone();
+        let (_, mine) = protect_with(&acme, "Write to jane.doe@acme.com");
+        let mine_s = mine.vault.pairs()[0].0.clone();
+        let answer = format!("Cc {foreign} and {mine_s}.");
+        assert_eq!(Rehydrator::new(&mine.vault).rehydrate(&answer), format!("Cc {foreign} and jane.doe@acme.com."));
+    }
+
+    #[test]
+    fn text_order_does_not_change_the_surrogates() {
+        let key = SurrogateKeys::from_kek(&KEK).tenant_key("acme");
+        let (_, p1) = protect_with(&key, "a@x.io then b@y.io");
+        let (_, p2) = protect_with(&key, "b@y.io then a@x.io");
+        let map = |p: &Protected| p.vault.pairs().iter().cloned().collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(map(&p1), map(&p2));
     }
 
     #[test]

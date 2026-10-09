@@ -108,6 +108,15 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 n.deleted_at = Some(*at);
             }
         }
+        Mutation::UpdateTenantPii { id, pii_default, pii_surrogate_scope } => {
+            let t = st.tenants.iter_mut().find(|t| &t.id == id && t.is_active()).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
+            if let Some(m) = pii_default {
+                t.pii_default = *m;
+            }
+            if let Some(s) = pii_surrogate_scope {
+                t.pii_surrogate_scope = *s;
+            }
+        }
         Mutation::CreateApiKey(k) => {
             need_tenant(st, &k.tenant_id)?;
             if st.api_keys.iter().any(|x| x.hash == k.hash || x.id == k.id) {

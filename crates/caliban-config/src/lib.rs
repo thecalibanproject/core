@@ -12,7 +12,7 @@ pub mod signing;
 pub use secret::{Secret, SecretRef, open, process_kek, seal};
 
 use arc_swap::ArcSwap;
-use caliban_types::{ModelId, PiiMode, ProviderId, ProviderKind, TenantId, TrustTier};
+use caliban_types::{ModelId, PiiMode, PiiSurrogateScope, ProviderId, ProviderKind, TenantId, TrustTier};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -227,6 +227,12 @@ pub struct TenantConfig {
     pub id: TenantId,
     pub name: String,
     pub pii_mode: Option<PiiMode>,
+    /// How far reversible surrogates stay the same: `tenant` (default; same value, same
+    /// surrogate in every request of the tenant, so pseudonymised requests can hit the cache) or
+    /// `session` (fresh surrogates per request, unlinkable, no cache hits for PII requests).
+    /// Omitted from the rendered snapshot when it is the default.
+    #[serde(default, skip_serializing_if = "PiiSurrogateScope::is_default")]
+    pub pii_surrogate_scope: PiiSurrogateScope,
     #[serde(default)]
     pub api_key_hashes: Vec<String>,
     #[serde(default)]
@@ -470,6 +476,10 @@ impl Snapshot {
         tenant.pii_mode.unwrap_or(self.config.pii.default_mode)
     }
 
+    pub fn pii_surrogate_scope_for(&self, tenant: &TenantConfig) -> PiiSurrogateScope {
+        tenant.pii_surrogate_scope
+    }
+
     /// Effective rate limits / budgets for a tenant (`[limits]` overlaid with its override).
     pub fn limits_for(&self, tenant: &TenantConfig) -> Limits {
         self.config.limits.for_tenant(&tenant.id)
@@ -575,6 +585,22 @@ mod tests {
         let t = &snap.config.tenants[0];
         assert!(snap.models_for(t).any(|m| m.kind == ModelKind::Embedding));
         assert!(snap.models_for(t).any(|m| m.capabilities.reasoning_control != ReasoningControl::None));
+    }
+
+    #[test]
+    fn surrogate_scope_defaults_to_tenant_and_session_is_opt_in() {
+        let toml = SHARED.replace("id = \"globex\"\n        name = \"Globex\"", "id = \"globex\"\n        name = \"Globex\"\n        pii_surrogate_scope = \"session\"");
+        let snap = Snapshot::new(Config::from_toml_str(&toml).unwrap(), "t");
+        let acme = snap.tenant(&"acme".into()).unwrap();
+        let globex = snap.tenant(&"globex".into()).unwrap();
+        assert_eq!(snap.pii_surrogate_scope_for(acme), PiiSurrogateScope::Tenant);
+        assert_eq!(snap.pii_surrogate_scope_for(globex), PiiSurrogateScope::Session);
+        // The default is left out of the rendered snapshot (older routers keep parsing it).
+        let json = serde_json::to_value(&snap.config.tenants).unwrap();
+        assert!(json[0].get("pii_surrogate_scope").is_none());
+        assert_eq!(json[1]["pii_surrogate_scope"], "session");
+        let bad = toml.replace("pii_surrogate_scope = \"session\"", "pii_surrogate_scope = \"global\"");
+        assert!(Config::from_toml_str(&bad).is_err());
     }
 
     #[test]

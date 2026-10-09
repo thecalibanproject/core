@@ -21,11 +21,10 @@ use caliban_ir::anthropic;
 use caliban_ir::{ChatRequest, Message, Usage};
 use caliban_meter::quota::{Amount, Settlement};
 use caliban_meter::{UsageEvent, cost_usd};
-use caliban_pii::Rehydrator;
+use caliban_pii::{PiiSurrogateScope, Rehydrator};
 use caliban_providers::{NativeOptions, ProviderResponse};
 use caliban_route::RouteError;
 use caliban_types::{CacheMode, CacheStatus, CalibanError, PiiMode, ProviderKind, RequestId};
-use rand::RngCore;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::time::Instant;
@@ -109,14 +108,17 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
     span.record("caliban.route.intent", decision.intent.as_str());
     span.record("caliban.route.stage", decision.stage);
 
-    // Pseudonymize once with a fresh per-request scope; the protected copy is only sent to
-    // destinations outside the trust boundary. Credentials block the request regardless.
+    // Pseudonymize once; the protected copy is only sent to destinations outside the trust
+    // boundary. Credentials block the request regardless. Tenant scope (default) uses the
+    // tenant's surrogate key, so the same value always gets the same surrogate in this tenant
+    // and the protected request is cacheable; session scope uses a fresh random key.
+    let surrogate_scope = snap.pii_surrogate_scope_for(&tenant);
+    let scope_key = gw.pii_keys.scope_key(surrogate_scope, tenant.id.as_str());
     let (protected_req, protected) = {
         let s = telemetry::child("pii");
         let _g = s.enter();
         s.record("caliban.pii.mode", pii_mode_str(pii_mode));
-        let mut scope_key = [0u8; 32];
-        rand::rng().fill_bytes(&mut scope_key);
+        s.record("caliban.pii.surrogate_scope", surrogate_scope.as_str());
         let mut pr = req.clone();
         let p = gw.pii.protect(&mut pr, pii_mode, &scope_key).map_err(|e| CalibanError::PolicyViolation(e.to_string()))?;
         s.record("caliban.pii.entities", p.entities);
@@ -154,7 +156,7 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
             Some(nb) => {
                 let (mut b, entities, rh) = if use_protected {
                     if native_protected.is_none() {
-                        native_protected = Some(protect_native(&gw, nb, pii_mode)?);
+                        native_protected = Some(protect_native(&gw, nb, pii_mode, &scope_key)?);
                     }
                     let np = native_protected.as_ref().expect("initialized above");
                     (np.body.clone(), np.entities, Some(Arc::clone(&np.rehydrator)))
@@ -177,9 +179,13 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
         span.record("caliban.pii.entities", pii_entities);
         span.record("gen_ai.provider.name", telemetry::provider_name(provider.kind));
 
-        // T1 exact cache, keyed on the exact upstream body (so native Anthropic and OpenAI-shaped
-        // entries never mix). Requests whose surrogates are request-scoped cannot hit (their
-        // text differs every time), so they bypass the cache until tenant-scoped surrogates land.
+        // T1 exact cache, keyed on the tenant and the exact upstream body, i.e. the *protected*
+        // request (so native Anthropic and OpenAI-shaped entries never mix, and no key is ever
+        // computed over raw PII sent outside). With tenant-scoped surrogates the same PII in the
+        // same tenant gives the same body, so repeats hit; other tenants have other surrogates and
+        // the tenant is in the key anyway. Session-scoped surrogates differ on every request, so
+        // such requests bypass the cache (they could never hit). Masking is deterministic.
+        let deterministic_pii = pii_entities == 0 || surrogate_scope == PiiSurrogateScope::Tenant || pii_mode == PiiMode::Mask;
         let native_tools = native_body.is_some_and(|b| b.get("tools").and_then(Value::as_array).is_some_and(|a| !a.is_empty()));
         let cacheable = attempt == 0
             && ext.cache.unwrap_or_default() != CacheMode::Off
@@ -189,7 +195,7 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
             && req.is_deterministic()
             && !req.has_tools()
             && !native_tools
-            && pii_entities == 0;
+            && deterministic_pii;
         let key = cacheable.then(|| {
             cache_key(&CacheKeyParts {
                 tenant: &tenant.id,
@@ -219,13 +225,20 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
             cs.record("caliban.cache", if hit.is_some() { "hit" } else { "miss" });
             if let Some(hit) = hit {
                 let outcome = Outcome { cache: CacheStatus::Hit, ..outcome };
-                // Cached bodies are upstream-shaped; OpenAI-shaped ones are translated for
-                // Anthropic clients.
-                let body = if dialect == Dialect::Anthropic && !is_native {
-                    let v: Value = serde_json::from_slice(&hit.body).unwrap_or_default();
-                    Bytes::from(serde_json::to_vec(&anthropic::from_openai_response(&v)).unwrap_or_default())
-                } else {
+                // Cached bodies are upstream-shaped and still pseudonymised: rehydrate with this
+                // request's own vault (only its values are restored), then translate
+                // OpenAI-shaped ones for Anthropic clients.
+                let body = if rh.is_none() && (is_native || dialect == Dialect::OpenAi) {
                     hit.body.clone()
+                } else {
+                    let mut v: Value = serde_json::from_slice(&hit.body).unwrap_or_default();
+                    if let Some(r) = &rh {
+                        if is_native { rehydrate_anthropic(&mut v, r) } else { rehydrate_message(&mut v, r) }
+                    }
+                    if dialect == Dialect::Anthropic && !is_native {
+                        v = anthropic::from_openai_response(&v);
+                    }
+                    Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
                 };
                 finish(&gw, &outcome, Usage::default(), hit.prompt_tokens + hit.completion_tokens, settlement, 0).await;
                 return Ok(json_response(&outcome, body, Some(0.0)));
@@ -245,31 +258,34 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
                 if let Some(m) = v.get("model").and_then(Value::as_str) {
                     us.record("gen_ai.response.model", m);
                 }
+                // The cache keeps the pseudonymised body (before rehydration): a hit is restored with
+                // the vault of the request that hits, never with this one's originals.
+                let cache_bytes = |v: &Value| key.is_some().then(|| Bytes::from(serde_json::to_vec(v).unwrap_or_default()));
                 let (client_body, cache_body, usage) = if is_native {
+                    set_model(&mut v, &model);
+                    let usage = Usage::from_anthropic_usage(v.get("usage").unwrap_or(&Value::Null));
+                    let cache_body = cache_bytes(&v);
                     if let Some(r) = &rh {
                         rehydrate_anthropic(&mut v, r);
                     }
-                    set_model(&mut v, &model);
-                    let usage = Usage::from_anthropic_usage(v.get("usage").unwrap_or(&Value::Null));
-                    let bytes = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
-                    (bytes.clone(), bytes, usage)
+                    (Bytes::from(serde_json::to_vec(&v).unwrap_or_default()), cache_body, usage)
                 } else {
                     if model.capabilities.inline_think_tags {
                         quirks::normalize_message(&mut v);
                     }
+                    set_model(&mut v, &model);
+                    let usage = Usage::from_openai(&v).unwrap_or_default();
+                    let cache_body = cache_bytes(&v);
                     if let Some(r) = &rh {
                         rehydrate_message(&mut v, r);
                     }
-                    set_model(&mut v, &model);
-                    let usage = Usage::from_openai(&v).unwrap_or_default();
-                    let bytes = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
                     let client = match dialect {
-                        Dialect::OpenAi => bytes.clone(),
+                        Dialect::OpenAi => Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
                         Dialect::Anthropic => Bytes::from(serde_json::to_vec(&anthropic::from_openai_response(&v)).unwrap_or_default()),
                     };
-                    (client, bytes, usage)
+                    (client, cache_body, usage)
                 };
-                if let Some(k) = key {
+                if let (Some(k), Some(cache_body)) = (key, cache_body) {
                     gw.cache
                         .put(k, CachedResponse {
                             body: cache_body,
@@ -331,8 +347,9 @@ struct NativeProtected {
 }
 
 /// Applies the PII engine to every client-written text segment of a native Anthropic body
-/// (system, text blocks, tool results) in one scope, leaving all other fields untouched.
-fn protect_native(gw: &Gateway, native: &Value, mode: PiiMode) -> Result<NativeProtected, CalibanError> {
+/// (system, text blocks, tool results) with the request's scope key, leaving all other fields
+/// untouched.
+fn protect_native(gw: &Gateway, native: &Value, mode: PiiMode, scope_key: &[u8]) -> Result<NativeProtected, CalibanError> {
     let mut body = native.clone();
     let mut texts = Vec::new();
     anthropic::for_each_text_mut(&mut body, |s| texts.push(std::mem::take(s)));
@@ -343,9 +360,7 @@ fn protect_native(gw: &Gateway, native: &Value, mode: PiiMode) -> Result<NativeP
         caliban: None,
         extra: Map::new(),
     };
-    let mut scope_key = [0u8; 32];
-    rand::rng().fill_bytes(&mut scope_key);
-    let p = gw.pii.protect(&mut tmp, mode, &scope_key).map_err(|e| CalibanError::PolicyViolation(e.to_string()))?;
+    let p = gw.pii.protect(&mut tmp, mode, scope_key).map_err(|e| CalibanError::PolicyViolation(e.to_string()))?;
     let mut rewritten = tmp.messages.into_iter().map(|m| match m.content {
         Value::String(s) => s,
         _ => String::new(),

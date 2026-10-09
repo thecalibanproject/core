@@ -95,6 +95,33 @@ pub enum PiiMode {
     Reversible,
 }
 
+/// How far a reversible surrogate stays the same (docs/architecture §9, "Surrogate scope").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PiiSurrogateScope {
+    /// The same value in the same tenant always gets the same surrogate (keyed HMAC per tenant),
+    /// so pseudonymised requests can hit the exact cache. Sessions within the tenant become
+    /// linkable through their surrogates. Surrogates never cross tenants.
+    #[default]
+    Tenant,
+    /// Fresh random surrogates for every request: nothing links two requests, and requests that
+    /// carry PII bypass the exact cache.
+    Session,
+}
+
+impl PiiSurrogateScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PiiSurrogateScope::Tenant => "tenant",
+            PiiSurrogateScope::Session => "session",
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == PiiSurrogateScope::Tenant
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {

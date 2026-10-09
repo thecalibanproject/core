@@ -172,7 +172,7 @@ pub(crate) fn upstream_span(op: &'static str, model: &ModelEntry, provider: &Pro
 pub(crate) fn child(name: &'static str) -> Span {
     match name {
         "route" => tracing::info_span!(target: TARGET, "route", caliban.route.intent = Empty, caliban.route.stage = Empty, caliban.route.candidates = Empty),
-        "pii" => tracing::info_span!(target: TARGET, "pii", caliban.pii.mode = Empty, caliban.pii.entities = Empty),
+        "pii" => tracing::info_span!(target: TARGET, "pii", caliban.pii.mode = Empty, caliban.pii.surrogate_scope = Empty, caliban.pii.entities = Empty),
         _ => tracing::info_span!(target: TARGET, "cache", caliban.cache = Empty),
     }
 }

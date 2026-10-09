@@ -135,6 +135,16 @@ REQ='{"model":"local/mock","temperature":0,"messages":[{"role":"user","content":
 chat "$REQ" >/dev/null; chat "$REQ" >/dev/null
 grep -qi 'x-caliban-cache: hit' "$WORK/h" && pass "exact cache hit on repeat" || fail "cache"
 
+# Tenant-scoped surrogates (default): the same PII in the same tenant gives the same protected
+# request, so a repeat hits the exact cache and is rehydrated with the new request's own values.
+REQ="{\"model\":\"ext/mock\",\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"$PII\"}]}"
+chat "$REQ" >/dev/null; SENT1=$(tail -1 "$MOCK_LOG"); N1=$(wc -l <"$MOCK_LOG")
+OUT=$(chat "$REQ")
+grep -qi 'x-caliban-cache: hit' "$WORK/h" && [[ $(wc -l <"$MOCK_LOG") == "$N1" ]] && pass "tenant-scope surrogates: repeated PII prompt hits the cache" || fail "pii cache: $(grep -i x-caliban-cache "$WORK/h")"
+python3 -c 'import sys,json;m=json.loads(sys.argv[1]);assert m["choices"][0]["message"]["content"]=="You said: "+sys.argv[2],m' "$OUT" "$PII" \
+  && pass "cached answer rehydrated" || fail "cached rehydration: $OUT"
+grep -q 'jane.doe@acme.com' <<<"$SENT1" && fail "cached request leaked raw PII upstream" || true
+
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DP/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"model":"ext/mock","messages":[{"role":"user","content":"key AKIAIOSFODNN7EXAMPLE"}]}')
 [[ "$CODE" == 403 ]] && pass "credentials in prompt are blocked (403)" || fail "secret block: $CODE"

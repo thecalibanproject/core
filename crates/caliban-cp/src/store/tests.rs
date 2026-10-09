@@ -82,6 +82,7 @@ fn tenant(id: &str) -> Tenant {
         name: id.to_uppercase(),
         region: Some("eu".into()),
         pii_default: PiiMode::Off,
+        pii_surrogate_scope: PiiSurrogateScope::Tenant,
         created_at: ts(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -130,6 +131,7 @@ async fn suite(s: &Store) {
     let st = s.state();
     assert_eq!(st.tenants.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["acme"]);
     assert_eq!(st.tenants[0].pii_default, PiiMode::Mask);
+    assert_eq!(st.tenants[0].pii_surrogate_scope, PiiSurrogateScope::Tenant, "tenant scope by default");
     assert_eq!(st.routes["acme"].iter().map(|r| r.intent.as_str()).collect::<Vec<_>>(), ["default", "code"]);
     assert_eq!(st.routes["acme"][0].models.iter().map(|m| m.as_str()).collect::<Vec<_>>(), ["local/qwen", "ext/gpt"]);
     assert_eq!(st.provider_keys[0].secret, Some(SecretRef::Env { env: "ACME_OPENAI_API_KEY".into() }));
@@ -147,6 +149,16 @@ async fn suite(s: &Store) {
         s.apply(A, Mutation::CreateTenant(tenant("globex"))).await.unwrap_err(),
         StoreError::Conflict("tenant 'globex' already exists".into())
     );
+    // PII settings: session scope is a per-tenant opt-in, shipped in the snapshot.
+    let to_session = Mutation::UpdateTenantPii { id: "globex".into(), pii_default: None, pii_surrogate_scope: Some(PiiSurrogateScope::Session) };
+    s.apply(A, to_session).await.unwrap();
+    let g = s.state().tenant("globex").cloned().unwrap();
+    assert_eq!((g.pii_default, g.pii_surrogate_scope), (PiiMode::Off, PiiSurrogateScope::Session));
+    let snap = s.config.load();
+    assert_eq!(snap.pii_surrogate_scope_for(snap.tenant(&"globex".into()).unwrap()), PiiSurrogateScope::Session);
+    assert_eq!(snap.pii_surrogate_scope_for(snap.tenant(&"acme".into()).unwrap()), PiiSurrogateScope::Tenant);
+    let ghost = Mutation::UpdateTenantPii { id: "nobody".into(), pii_default: Some(PiiMode::Mask), pii_surrogate_scope: None };
+    assert_eq!(s.apply(A, ghost).await.unwrap_err(), StoreError::NotFound("tenant".into()));
     let key = ApiKeyRecord {
         id: "key_g1".into(),
         tenant_id: "globex".into(),
@@ -287,7 +299,7 @@ async fn suite(s: &Store) {
     assert!(verify_chain(&log).is_ok());
     let actions: Vec<&str> = log.iter().map(|e| e.action.as_str()).collect();
     assert_eq!(actions.iter().filter(|a| **a == "tenant.create").count(), 10);
-    for a in ["api_key.revoke", "datasource.delete", "node.delete", "tenant.delete"] {
+    for a in ["api_key.revoke", "datasource.delete", "node.delete", "tenant.delete", "tenant.update"] {
         assert!(actions.contains(&a), "{a} is audited");
     }
     assert!(!serde_json::to_string(&log).unwrap().contains("sk-test"));
@@ -492,8 +504,19 @@ async fn modelled_tenant_fields_win_over_settings() {
     let cfg = base();
     let mut st = State::from_config(&cfg);
     st.tenants[0].settings.insert("pii_mode".into(), json!("off")); // modelled fields win
+    st.tenants[0].settings.insert("pii_surrogate_scope".into(), json!("session"));
     let out = render(&cfg, &st).unwrap();
     assert_eq!(out.tenants[0].pii_mode, Some(PiiMode::Mask));
+    assert_eq!(out.tenants[0].pii_surrogate_scope, PiiSurrogateScope::Tenant);
+}
+
+#[test]
+fn surrogate_scope_from_the_config_file_is_seeded() {
+    let cfg = Config::from_toml_str(&BASE.replace("pii_mode = \"mask\"", "pii_mode = \"mask\"\npii_surrogate_scope = \"session\"")).unwrap();
+    let st = State::from_config(&cfg);
+    assert_eq!(st.tenants[0].pii_surrogate_scope, PiiSurrogateScope::Session);
+    assert!(st.tenants[0].settings.get("pii_surrogate_scope").is_none(), "modelled, not passed through");
+    assert_eq!(render(&cfg, &st).unwrap().tenants[0].pii_surrogate_scope, PiiSurrogateScope::Session);
 }
 
 #[test]
