@@ -39,7 +39,13 @@ fn hist() -> Histogram<u64> {
 
 impl Stats {
     pub fn empty() -> Self {
-        Self { total: hist(), ttfb: hist(), ok: 0, errors: 0, wall: Duration::ZERO }
+        Self {
+            total: hist(),
+            ttfb: hist(),
+            ok: 0,
+            errors: 0,
+            wall: Duration::ZERO,
+        }
     }
 
     pub fn merge(&mut self, o: &Stats) {
@@ -51,7 +57,11 @@ impl Stats {
     }
 
     pub fn throughput(&self) -> f64 {
-        if self.wall.is_zero() { 0.0 } else { self.ok as f64 / self.wall.as_secs_f64() }
+        if self.wall.is_zero() {
+            0.0
+        } else {
+            self.ok as f64 / self.wall.as_secs_f64()
+        }
     }
 }
 
@@ -65,7 +75,10 @@ async fn one(client: &reqwest::Client, t: &Target) -> Result<(Duration, Option<D
     if !resp.status().is_success() {
         let s = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("{s}: {}", body.chars().take(300).collect::<String>()));
+        return Err(format!(
+            "{s}: {}",
+            body.chars().take(300).collect::<String>()
+        ));
     }
     let mut ttfb = None;
     let mut body = Vec::new();
@@ -83,24 +96,39 @@ async fn one(client: &reqwest::Client, t: &Target) -> Result<(Duration, Option<D
     if let Some(exp) = &t.expect
         && !body.windows(exp.len()).any(|w| w == exp.as_bytes())
     {
-        return Err(format!("response lacks {exp:?}: {}", String::from_utf8_lossy(&body).chars().take(300).collect::<String>()));
+        return Err(format!(
+            "response lacks {exp:?}: {}",
+            String::from_utf8_lossy(&body)
+                .chars()
+                .take(300)
+                .collect::<String>()
+        ));
     }
     Ok((total, ttfb))
 }
 
 /// Runs `requests` requests at `concurrency` and returns the merged stats. The first error
 /// message is printed once.
-pub async fn run(client: &reqwest::Client, target: &Target, concurrency: usize, requests: usize) -> Stats {
+pub async fn run(
+    client: &reqwest::Client,
+    target: &Target,
+    concurrency: usize,
+    requests: usize,
+) -> Stats {
     let remaining = Arc::new(AtomicUsize::new(requests));
     let target = Arc::new(target.clone());
     let started = Instant::now();
     let mut tasks = Vec::new();
     for _ in 0..concurrency.max(1) {
-        let (client, target, remaining) = (client.clone(), Arc::clone(&target), Arc::clone(&remaining));
+        let (client, target, remaining) =
+            (client.clone(), Arc::clone(&target), Arc::clone(&remaining));
         tasks.push(tokio::spawn(async move {
             let mut s = Stats::empty();
             let mut first_err: Option<String> = None;
-            while remaining.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok() {
+            while remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+            {
                 match one(&client, &target).await {
                     Ok((total, ttfb)) => {
                         let _ = s.total.record(total.as_nanos() as u64);
@@ -140,6 +168,10 @@ pub fn ms(h: &Histogram<u64>, q: f64) -> f64 {
     if h.is_empty() {
         return f64::NAN;
     }
-    let ns = if q >= 1.0 { h.max() } else { h.value_at_quantile(q) };
+    let ns = if q >= 1.0 {
+        h.max()
+    } else {
+        h.value_at_quantile(q)
+    };
     ns as f64 / 1e6
 }

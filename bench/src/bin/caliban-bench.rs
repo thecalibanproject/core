@@ -101,6 +101,8 @@ struct Scenario {
     cache_hit: bool,
     /// Use the paced mock (delay between stream chunks).
     paced: bool,
+    /// Keep 16 NER requests in flight on the same gateway while measuring.
+    ner_background: bool,
 }
 
 fn messages() -> Value {
@@ -139,6 +141,7 @@ fn scenarios() -> Vec<Scenario> {
         direct_body: direct_openai(stream, false),
         cache_hit: false,
         paced: false,
+        ner_background: false,
     };
     let paced = |name, what, pii_tenant| Scenario {
         paced: true,
@@ -151,10 +154,34 @@ fn scenarios() -> Vec<Scenario> {
         ..s(name, what, Profile::Default, true, pii_tenant)
     };
     vec![
-        s("chat", "OpenAI chat, non-streaming, PII off", Profile::Default, false, false),
-        s("chat+pii", "OpenAI chat, non-streaming, PII reversible (regex tier), 2 entities", Profile::Default, false, true),
-        s("stream", "OpenAI chat, streaming, PII off", Profile::Default, true, false),
-        s("stream+pii", "OpenAI chat, streaming, PII reversible (regex tier), 2 entities, streaming rehydration", Profile::Default, true, true),
+        s(
+            "chat",
+            "OpenAI chat, non-streaming, PII off",
+            Profile::Default,
+            false,
+            false,
+        ),
+        s(
+            "chat+pii",
+            "OpenAI chat, non-streaming, PII reversible (regex tier), 2 entities",
+            Profile::Default,
+            false,
+            true,
+        ),
+        s(
+            "stream",
+            "OpenAI chat, streaming, PII off",
+            Profile::Default,
+            true,
+            false,
+        ),
+        s(
+            "stream+pii",
+            "OpenAI chat, streaming, PII reversible (regex tier), 2 entities, streaming rehydration",
+            Profile::Default,
+            true,
+            true,
+        ),
         Scenario {
             name: "cache-hit",
             what: "OpenAI chat, non-streaming, temperature 0, exact-cache hit (no upstream call)",
@@ -173,11 +200,47 @@ fn scenarios() -> Vec<Scenario> {
             direct_body: json!({"model": "claude-mock", "max_tokens": 256, "messages": messages()}),
             ..s("", "", Profile::Default, false, false)
         },
-        paced("stream-paced", "OpenAI chat, streaming with a delay between upstream chunks (see the paced chunk delay), PII off", false),
-        paced("stream-paced+pii", "As `stream-paced`, PII reversible (regex tier), streaming rehydration", true),
-        s("chat+wal", "OpenAI chat, non-streaming, PII off, usage JSONL WAL on", Profile::Wal, false, false),
-        s("chat+pii+ner", "OpenAI chat, non-streaming, PII reversible with the L1 NER model", Profile::Ner, false, true),
-        s("stream+pii+ner", "OpenAI chat, streaming, PII reversible with the L1 NER model", Profile::Ner, true, true),
+        paced(
+            "stream-paced",
+            "OpenAI chat, streaming with a delay between upstream chunks (see the paced chunk delay), PII off",
+            false,
+        ),
+        paced(
+            "stream-paced+pii",
+            "As `stream-paced`, PII reversible (regex tier), streaming rehydration",
+            true,
+        ),
+        s(
+            "chat+wal",
+            "OpenAI chat, non-streaming, PII off, usage JSONL WAL on",
+            Profile::Wal,
+            false,
+            false,
+        ),
+        s(
+            "chat+pii+ner",
+            "OpenAI chat, non-streaming, PII reversible with the L1 NER model",
+            Profile::Ner,
+            false,
+            true,
+        ),
+        s(
+            "stream+pii+ner",
+            "OpenAI chat, streaming, PII reversible with the L1 NER model",
+            Profile::Ner,
+            true,
+            true,
+        ),
+        Scenario {
+            ner_background: true,
+            ..s(
+                "chat-during-ner",
+                "OpenAI chat, non-streaming, PII off, on the NER gateway while 16 NER requests from another tenant are in flight (collateral impact)",
+                Profile::Ner,
+                false,
+                false,
+            )
+        },
     ]
 }
 
@@ -261,10 +324,21 @@ impl Drop for MockProc {
     }
 }
 
-async fn start_mock(bin: &PathBuf, latency_ms: f64, chunk_delay_ms: f64) -> Result<(MockProc, String)> {
+async fn start_mock(
+    bin: &PathBuf,
+    latency_ms: f64,
+    chunk_delay_ms: f64,
+) -> Result<(MockProc, String)> {
     let port = free_port();
     let child = Command::new(bin)
-        .args(["--addr", &format!("127.0.0.1:{port}"), "--latency-ms", &latency_ms.to_string(), "--chunk-delay-ms", &chunk_delay_ms.to_string()])
+        .args([
+            "--addr",
+            &format!("127.0.0.1:{port}"),
+            "--latency-ms",
+            &latency_ms.to_string(),
+            "--chunk-delay-ms",
+            &chunk_delay_ms.to_string(),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -291,7 +365,11 @@ struct Row {
 const QS: [(f64, &str); 4] = [(0.5, "p50"), (0.9, "p90"), (0.99, "p99"), (1.0, "max")];
 
 fn fmt_ms(v: f64) -> String {
-    if v.is_nan() { "n/a".into() } else { format!("{v:.3}") }
+    if v.is_nan() {
+        "n/a".into()
+    } else {
+        format!("{v:.3}")
+    }
 }
 
 fn overhead(g: &hdrhistogram::Histogram<u64>, d: &hdrhistogram::Histogram<u64>, q: f64) -> f64 {
@@ -305,23 +383,51 @@ async fn main() -> Result<()> {
         Some(p) => p.clone(),
         None => std::env::current_exe()?.with_file_name("mock-upstream"),
     };
-    let ner_dir = std::env::var("CALIBAN_PII_NER_DIR").ok().filter(|d| !d.trim().is_empty());
+    let ner_dir = std::env::var("CALIBAN_PII_NER_DIR")
+        .ok()
+        .filter(|d| !d.trim().is_empty());
     let (mock, mock_base) = start_mock(&mock_bin, args.mock_latency_ms, 0.0).await?;
-    let (paced_mock, paced_base) = start_mock(&mock_bin, args.mock_latency_ms, args.paced_chunk_delay_ms).await?;
+    let (paced_mock, paced_base) =
+        start_mock(&mock_bin, args.mock_latency_ms, args.paced_chunk_delay_ms).await?;
     let base_url = format!("{mock_base}/v1");
     let (plain_key, plain_hash) = new_key("benchplain");
     let (pii_key, pii_hash) = new_key("benchpii");
-    let cfg = config(&base_url, &format!("{paced_base}/v1"), &plain_hash, &pii_hash);
+    let cfg = config(
+        &base_url,
+        &format!("{paced_base}/v1"),
+        &plain_hash,
+        &pii_hash,
+    );
     let env = vec![("BENCH_UPSTREAM_KEY".to_owned(), UPSTREAM_KEY.to_owned())];
 
-    let wanted = |name: &str| args.only.is_empty() || args.only.iter().any(|o| name.contains(o.as_str()));
+    let wanted =
+        |name: &str| args.only.is_empty() || args.only.iter().any(|o| name.contains(o.as_str()));
     let all = scenarios();
     let needs = |p: Profile| all.iter().any(|s| s.profile == p && wanted(s.name));
 
     let mut skipped: Vec<String> = Vec::new();
-    let default_gw = Caliban::start(&args.caliban, &Launch { config: cfg.clone(), env: env.clone(), ..Default::default() }).await?;
+    let default_gw = Caliban::start(
+        &args.caliban,
+        &Launch {
+            config: cfg.clone(),
+            env: env.clone(),
+            ..Default::default()
+        },
+    )
+    .await?;
     let wal_gw = if needs(Profile::Wal) {
-        Some(Caliban::start(&args.caliban, &Launch { config: cfg.clone(), env: env.clone(), usage_wal: true, ..Default::default() }).await?)
+        Some(
+            Caliban::start(
+                &args.caliban,
+                &Launch {
+                    config: cfg.clone(),
+                    env: env.clone(),
+                    usage_wal: true,
+                    ..Default::default()
+                },
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -330,11 +436,19 @@ async fn main() -> Result<()> {
         (Some(bin), Some(dir)) => {
             let mut e = env.clone();
             e.push(("CALIBAN_PII_NER_DIR".into(), dir.clone()));
-            let launch = Launch { config: cfg.clone(), env: e, startup_timeout: Some(Duration::from_secs(180)), ..Default::default() };
+            let launch = Launch {
+                config: cfg.clone(),
+                env: e,
+                startup_timeout: Some(Duration::from_secs(180)),
+                ..Default::default()
+            };
             match Caliban::start(bin, &launch).await {
                 Ok(c) => Some(c),
                 Err(e) => {
-                    skipped.push(format!("NER rows: the `ner` build did not start: {}", e.to_string().lines().next().unwrap_or_default()));
+                    skipped.push(format!(
+                        "NER rows: the `ner` build did not start: {}",
+                        e.to_string().lines().next().unwrap_or_default()
+                    ));
                     None
                 }
             }
@@ -373,7 +487,13 @@ async fn main() -> Result<()> {
             headers.push(("authorization".into(), format!("Bearer {key}")));
         }
         let expect = sc.stream.then(|| "[DONE]".to_owned());
-        let gw_t = Target { url: format!("{}{}", gw.dp, sc.gw_path), headers, body: Bytes::from(sc.gw_body.to_string()), stream: sc.stream, expect: expect.clone() };
+        let gw_t = Target {
+            url: format!("{}{}", gw.dp, sc.gw_path),
+            headers,
+            body: Bytes::from(sc.gw_body.to_string()),
+            stream: sc.stream,
+            expect: expect.clone(),
+        };
         let mut dh = vec![("content-type".to_owned(), "application/json".to_owned())];
         if sc.anthropic_client {
             dh.push(("x-api-key".into(), UPSTREAM_KEY.into()));
@@ -381,32 +501,97 @@ async fn main() -> Result<()> {
             dh.push(("authorization".into(), format!("Bearer {UPSTREAM_KEY}")));
         }
         let direct_base = if sc.paced { &paced_base } else { &mock_base };
-        let direct_t = Target { url: format!("{direct_base}{}", sc.direct_path), headers: dh, body: Bytes::from(sc.direct_body.to_string()), stream: sc.stream, expect };
+        let direct_t = Target {
+            url: format!("{direct_base}{}", sc.direct_path),
+            headers: dh,
+            body: Bytes::from(sc.direct_body.to_string()),
+            stream: sc.stream,
+            expect,
+        };
 
         // Pre-flight: the gateway handles the scenario the way it claims to.
-        let pre = gw.dp_post(sc.gw_path, &gw_t.headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>(), &sc.gw_body).await;
+        let pre = gw
+            .dp_post(
+                sc.gw_path,
+                &gw_t
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.clone()))
+                    .collect::<Vec<_>>(),
+                &sc.gw_body,
+            )
+            .await;
         if !pre.status.is_success() {
-            bail!("{}: pre-flight failed: {} {}", sc.name, pre.status, pre.text);
+            bail!(
+                "{}: pre-flight failed: {} {}",
+                sc.name,
+                pre.status,
+                pre.text
+            );
         }
-        let text = if sc.stream { pre.stream_text() } else { pre.content() };
+        let text = if sc.stream {
+            pre.stream_text()
+        } else {
+            pre.content()
+        };
         let rehydrated = text.contains("jane.doe@acme.com") && text.contains("4111 1111 1111 1111");
         let pii = pre.header("x-caliban-pii-entities").unwrap_or_default();
         let mut cache = pre.header("x-caliban-cache").unwrap_or_default();
         if sc.cache_hit {
-            let again = gw.dp_post(sc.gw_path, &gw_t.headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>(), &sc.gw_body).await;
+            let again = gw
+                .dp_post(
+                    sc.gw_path,
+                    &gw_t
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.clone()))
+                        .collect::<Vec<_>>(),
+                    &sc.gw_body,
+                )
+                .await;
             cache = again.header("x-caliban-cache").unwrap_or_default();
             if cache != "hit" {
                 bail!("{}: expected a cache hit, got {cache:?}", sc.name);
             }
         }
         if sc.pii_tenant && (pii.parse::<u32>().unwrap_or(0) < 2 || !rehydrated) {
-            bail!("{}: expected >= 2 PII entities and a rehydrated reply, got {pii} entities: {text}", sc.name);
+            bail!(
+                "{}: expected >= 2 PII entities and a rehydrated reply, got {pii} entities: {text}",
+                sc.name
+            );
         }
         checks.push(format!("`{}`: status {}, x-caliban-cache `{cache}`, x-caliban-pii-entities `{pii}`, reply rehydrated: {rehydrated}", sc.name, pre.status.as_u16()));
 
+        // Background NER load from the PII tenant, for `chat-during-ner`.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let background = sc.ner_background.then(|| {
+            let t = Target {
+                url: format!("{}/v1/chat/completions", gw.dp),
+                headers: vec![
+                    ("content-type".into(), "application/json".into()),
+                    ("authorization".into(), format!("Bearer {pii_key}")),
+                ],
+                body: Bytes::from(json!({"model": "ext/mock", "messages": messages()}).to_string()),
+                stream: false,
+                expect: None,
+            };
+            let (http, stop) = (http.clone(), std::sync::Arc::clone(&stop));
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    load::run(&http, &t, 16, 64).await;
+                }
+            })
+        });
+        if background.is_some() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
         for &c in &args.concurrency {
             eprintln!("{} @ c={c}", sc.name);
-            let (requests, warmup) = if sc.paced { (args.paced_requests, (args.warmup / 10).max(c)) } else { (args.requests, args.warmup) };
+            let (requests, warmup) = if sc.paced {
+                (args.paced_requests, (args.warmup / 10).max(c))
+            } else {
+                (args.requests, args.warmup)
+            };
             load::run(&http, &direct_t, c, warmup).await;
             load::run(&http, &gw_t, c, warmup).await;
             let (mut d, mut g) = (Stats::empty(), Stats::empty());
@@ -423,7 +608,16 @@ async fn main() -> Result<()> {
                 d.errors,
                 g.errors
             );
-            rows.push(Row { scenario: sc.name, concurrency: c, direct: d, gateway: g });
+            rows.push(Row {
+                scenario: sc.name,
+                concurrency: c,
+                direct: d,
+                gateway: g,
+            });
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(b) = background {
+            let _ = b.await;
         }
     }
     drop(mock);
@@ -456,7 +650,14 @@ fn raw(rows: &[Row]) -> Value {
     )
 }
 
-fn render(args: &Args, all: &[Scenario], rows: &[Row], checks: &[String], skipped: &[String], ner_dir: Option<&str>) -> String {
+fn render(
+    args: &Args,
+    all: &[Scenario],
+    rows: &[Row],
+    checks: &[String],
+    skipped: &[String],
+    ner_dir: Option<&str>,
+) -> String {
     let mut o = String::new();
     let _ = writeln!(o, "# Gateway overhead\n");
     for n in &args.note {
@@ -465,20 +666,34 @@ fn render(args: &Args, all: &[Scenario], rows: &[Row], checks: &[String], skippe
     let _ = writeln!(
         o,
         "- Requests per side per row: {} measured ({} for paced streams) in {} interleaved rounds, after {} warm-up; mock latency {} ms; paced chunk delay {} ms.",
-        args.requests, args.paced_requests, args.rounds, args.warmup, args.mock_latency_ms, args.paced_chunk_delay_ms
+        args.requests,
+        args.paced_requests,
+        args.rounds,
+        args.warmup,
+        args.mock_latency_ms,
+        args.paced_chunk_delay_ms
     );
-    let _ = writeln!(o, "- Overhead at quantile q = gateway latency at q minus direct latency at q, in milliseconds.");
+    let _ = writeln!(
+        o,
+        "- Overhead at quantile q = gateway latency at q minus direct latency at q, in milliseconds."
+    );
     if let Some(d) = ner_dir {
         let _ = writeln!(o, "- NER artifact: `{d}`");
     }
     let _ = writeln!(o);
 
-    // Summary.
+    // Summary. The P0 budget covers the gateway itself: NER rows (model inference, which the
+    // budget excludes) are reported separately, and paced streams count by TTFB only (their total
+    // is dominated by the timer jitter of ~60 sleeps on both sides).
     let mut worst = (f64::MIN, "", 0usize);
     let mut worst99 = (f64::MIN, "", 0usize);
-    for r in rows {
-        for (h_g, h_d) in [(&r.gateway.total, &r.direct.total), (&r.gateway.ttfb, &r.direct.ttfb)] {
-            if h_g.is_empty() {
+    for r in rows.iter().filter(|r| !r.scenario.contains("ner")) {
+        let paced = r.scenario.contains("paced");
+        for (h_g, h_d) in [
+            (&r.gateway.total, &r.direct.total),
+            (&r.gateway.ttfb, &r.direct.ttfb),
+        ] {
+            if h_g.is_empty() || (paced && std::ptr::eq(h_g, &r.gateway.total)) {
                 continue;
             }
             let p50 = overhead(h_g, h_d, 0.5);
@@ -494,21 +709,56 @@ fn render(args: &Args, all: &[Scenario], rows: &[Row], checks: &[String], skippe
     let _ = writeln!(o, "## Summary\n");
     let _ = writeln!(
         o,
-        "- Worst p50 overhead: **{:.3} ms** (`{}`, concurrency {}). P0 target: under 3 ms. {}",
-        worst.0,
-        worst.1,
-        worst.2,
-        if worst.0 < 3.0 { "**Pass.**" } else { "**Fail.**" }
+        "Gateway rows (NER rows and paced-stream totals excluded; see the comment in `render`):\n"
     );
-    let _ = writeln!(
-        o,
-        "- Worst p99 overhead: **{:.3} ms** (`{}`, concurrency {}). Design budget (architecture section 4): under 10 ms.\n",
-        worst99.0, worst99.1, worst99.2
-    );
+    if worst.1.is_empty() {
+        let _ = writeln!(o, "- No gateway rows in this run.\n");
+    } else {
+        let _ = writeln!(
+            o,
+            "- Worst p50 overhead: **{:.3} ms** (`{}`, concurrency {}). P0 target: under 3 ms. {}",
+            worst.0,
+            worst.1,
+            worst.2,
+            if worst.0 < 3.0 {
+                "**Pass.**"
+            } else {
+                "**Fail.**"
+            }
+        );
+        let _ = writeln!(
+            o,
+            "- Worst p99 overhead: **{:.3} ms** (`{}`, concurrency {}). Design budget (architecture section 4): under 10 ms.\n",
+            worst99.0, worst99.1, worst99.2
+        );
+    }
+    let ner: Vec<&Row> = rows.iter().filter(|r| r.scenario.contains("ner")).collect();
+    if !ner.is_empty() {
+        let _ = writeln!(
+            o,
+            "NER tier (L1 model inference; outside the 3 ms budget, design target 5 to 30 ms per 1k tokens):\n"
+        );
+        for r in ner {
+            let _ = writeln!(
+                o,
+                "- `{}` at concurrency {}: p50 overhead {:.3} ms, p99 {:.3} ms, {:.0} req/s",
+                r.scenario,
+                r.concurrency,
+                overhead(&r.gateway.total, &r.direct.total, 0.5),
+                overhead(&r.gateway.total, &r.direct.total, 0.99),
+                r.gateway.throughput()
+            );
+        }
+        let _ = writeln!(o);
+    }
 
     let _ = writeln!(o, "## Scenarios\n");
     for s in all {
-        let status = if rows.iter().any(|r| r.scenario == s.name) { "" } else { " (not run)" };
+        let status = if rows.iter().any(|r| r.scenario == s.name) {
+            ""
+        } else {
+            " (not run)"
+        };
         let _ = writeln!(o, "- `{}`: {}{status}", s.name, s.what);
     }
     let _ = writeln!(o);
@@ -519,7 +769,10 @@ fn render(args: &Args, all: &[Scenario], rows: &[Row], checks: &[String], skippe
         }
         let _ = writeln!(o);
     }
-    let _ = writeln!(o, "Pre-flight checks (one request each, before measuring):\n");
+    let _ = writeln!(
+        o,
+        "Pre-flight checks (one request each, before measuring):\n"
+    );
     for c in checks {
         let _ = writeln!(o, "- {c}");
     }
@@ -533,7 +786,11 @@ fn render(args: &Args, all: &[Scenario], rows: &[Row], checks: &[String], skippe
         );
         let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
         for r in rows {
-            let (g, d) = if ttfb { (&r.gateway.ttfb, &r.direct.ttfb) } else { (&r.gateway.total, &r.direct.total) };
+            let (g, d) = if ttfb {
+                (&r.gateway.ttfb, &r.direct.ttfb)
+            } else {
+                (&r.gateway.total, &r.direct.total)
+            };
             if g.is_empty() {
                 continue;
             }
@@ -559,12 +816,25 @@ fn render(args: &Args, all: &[Scenario], rows: &[Row], checks: &[String], skippe
     table(&mut o, "Streaming: time-to-first-byte overhead (ms)", true);
 
     let _ = writeln!(o, "## Absolute latencies (ms)\n");
-    let _ = writeln!(o, "| Scenario | Conc. | Side | p50 | p90 | p99 | max | req/s |");
+    let _ = writeln!(
+        o,
+        "| Scenario | Conc. | Side | p50 | p90 | p99 | max | req/s |"
+    );
     let _ = writeln!(o, "|---|---:|---|---:|---:|---:|---:|---:|");
     for r in rows {
         for (side, s) in [("direct", &r.direct), ("gateway", &r.gateway)] {
             let q: Vec<String> = QS.iter().map(|(q, _)| fmt_ms(ms(&s.total, *q))).collect();
-            let _ = writeln!(o, "| `{}` | {} | {side} | {} | {} | {} | {} | {:.0} |", r.scenario, r.concurrency, q[0], q[1], q[2], q[3], s.throughput());
+            let _ = writeln!(
+                o,
+                "| `{}` | {} | {side} | {} | {} | {} | {} | {:.0} |",
+                r.scenario,
+                r.concurrency,
+                q[0],
+                q[1],
+                q[2],
+                q[3],
+                s.throughput()
+            );
         }
     }
     o
