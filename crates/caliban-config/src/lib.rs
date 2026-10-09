@@ -127,6 +127,11 @@ pub struct RoutingConfig {
     pub auto_price_in_per_mtok: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_price_out_per_mtok: Option<f64>,
+    /// Fraction of the flat `caliban/auto` price billed when a cache tier (T1 exact or T2
+    /// semantic) answers: no model is called. In 0..=1; unset means
+    /// [`DEFAULT_AUTO_CACHE_HIT_FRACTION`]. A tenant's `auto_cache_hit_fraction` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_cache_hit_fraction: Option<f64>,
     /// Per-tenant overrides and exemplars.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tenants: BTreeMap<TenantId, TenantRouting>,
@@ -225,6 +230,9 @@ impl RoutingConfig {
         }
         price("auto_price_in_per_mtok", self.auto_price_in_per_mtok)?;
         price("auto_price_out_per_mtok", self.auto_price_out_per_mtok)?;
+        if let Some(f) = self.auto_cache_hit_fraction {
+            unit("auto_cache_hit_fraction".into(), f)?;
+        }
         for (tenant, t) in &self.tenants {
             for (intent, f) in &t.floors {
                 unit(format!("tenants.{tenant}.floors.{intent}"), *f)?;
@@ -245,6 +253,11 @@ impl RoutingConfig {
         Ok(())
     }
 }
+
+/// Fraction of the flat `caliban/auto` price billed for a cache hit when neither the deployment
+/// (`[routing] auto_cache_hit_fraction`) nor the tenant sets one. The pricing decision (reference
+/// architecture, section 9) put it in the 10 to 25% range; config accepts 0..=1.
+pub const DEFAULT_AUTO_CACHE_HIT_FRACTION: f64 = 0.20;
 
 /// Intent ids follow ml's route-registry convention: `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`.
 pub fn valid_intent_id(s: &str) -> bool {
@@ -736,6 +749,10 @@ pub struct TenantConfig {
     /// `[cache.semantic] enabled`. Omitted from the rendered snapshot when it is the default.
     #[serde(default, skip_serializing_if = "SemanticCacheMode::is_default")]
     pub semantic_cache: SemanticCacheMode,
+    /// Overrides `[routing] auto_cache_hit_fraction` for this tenant: the fraction of the flat
+    /// `caliban/auto` price billed for a cache hit, in 0..=1. Omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_cache_hit_fraction: Option<f64>,
     #[serde(default)]
     pub api_key_hashes: Vec<String>,
     #[serde(default)]
@@ -914,6 +931,9 @@ impl Config {
         }
         let mut seen_hashes = std::collections::HashSet::new();
         for t in &self.tenants {
+            if t.auto_cache_hit_fraction.is_some_and(|f| !f.is_finite() || !(0.0..=1.0).contains(&f)) {
+                return Err(ConfigError::Invalid(format!("tenant {}: auto_cache_hit_fraction must be in 0..=1", t.id)));
+            }
             for h in &t.api_key_hashes {
                 if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
                     return Err(ConfigError::Invalid(format!("tenant {}: api_key_hashes must be sha256 hex", t.id)));
@@ -1007,6 +1027,15 @@ impl Snapshot {
     /// Whether the T2 semantic cache applies to this tenant (deployment switch and tenant opt-in).
     pub fn semantic_cache_for(&self, tenant: &TenantConfig) -> bool {
         self.config.cache.semantic.enabled && tenant.semantic_cache == SemanticCacheMode::On
+    }
+
+    /// Fraction of the flat `caliban/auto` price billed for a cache hit: the tenant's override,
+    /// else `[routing] auto_cache_hit_fraction`, else [`DEFAULT_AUTO_CACHE_HIT_FRACTION`].
+    pub fn auto_cache_hit_fraction_for(&self, tenant: &TenantConfig) -> f64 {
+        tenant
+            .auto_cache_hit_fraction
+            .or(self.config.routing.auto_cache_hit_fraction)
+            .unwrap_or(DEFAULT_AUTO_CACHE_HIT_FRACTION)
     }
 
     /// Effective rate limits / budgets for a tenant (`[limits]` overlaid with its override).
@@ -1251,6 +1280,45 @@ mod tests {
         let json = serde_json::to_value(Config::from_toml_str(SHARED).unwrap()).unwrap();
         assert!(json.get("routing").is_none());
         assert!(valid_intent_id("finance.invoice_triage") && !valid_intent_id("Finance") && !valid_intent_id("a..b"));
+    }
+
+    #[test]
+    fn auto_cache_hit_fraction_defaults_overrides_and_validation() {
+        let globex = |extra: &str| {
+            SHARED.replace(
+                "id = \"globex\"\n        name = \"Globex\"",
+                &format!("id = \"globex\"\n        name = \"Globex\"\n        {extra}"),
+            )
+        };
+        let fraction = |toml: &str, tenant: &str| {
+            let snap = Snapshot::new(Config::from_toml_str(toml).unwrap(), "t");
+            snap.auto_cache_hit_fraction_for(snap.tenant(&tenant.into()).unwrap())
+        };
+        // Built-in default, then the deployment value, then the tenant override.
+        assert!((fraction(SHARED, "acme") - DEFAULT_AUTO_CACHE_HIT_FRACTION).abs() < f64::EPSILON);
+        assert!((DEFAULT_AUTO_CACHE_HIT_FRACTION - 0.2).abs() < f64::EPSILON);
+        let deployment =
+            format!("[routing]\nauto_cache_hit_fraction = 0.25\n{}", globex("auto_cache_hit_fraction = 0.1"));
+        assert!((fraction(&deployment, "acme") - 0.25).abs() < f64::EPSILON);
+        assert!((fraction(&deployment, "globex") - 0.1).abs() < f64::EPSILON);
+        // Zero (hits are free) and one (hits cost the full flat price) are allowed.
+        assert!(fraction(&globex("auto_cache_hit_fraction = 0.0"), "globex").abs() < f64::EPSILON);
+        assert!((fraction(&globex("auto_cache_hit_fraction = 1.0"), "globex") - 1.0).abs() < f64::EPSILON);
+        // Out of range, deployment-wide or per tenant, is rejected.
+        for bad in [
+            format!("[routing]\nauto_cache_hit_fraction = 1.5\n{SHARED}"),
+            format!("[routing]\nauto_cache_hit_fraction = -0.1\n{SHARED}"),
+            globex("auto_cache_hit_fraction = 2.0"),
+            globex("auto_cache_hit_fraction = -1.0"),
+        ] {
+            assert!(Config::from_toml_str(&bad).unwrap_err().to_string().contains("auto_cache_hit_fraction"), "{bad}");
+        }
+        // Unset is left out of rendered snapshots (older routers keep parsing them).
+        let json =
+            serde_json::to_value(Config::from_toml_str(&globex("auto_cache_hit_fraction = 0.1")).unwrap()).unwrap();
+        assert!(json.get("routing").is_none());
+        assert!(json["tenants"][0].get("auto_cache_hit_fraction").is_none());
+        assert_eq!(json["tenants"][1]["auto_cache_hit_fraction"], 0.1);
     }
 
     #[test]

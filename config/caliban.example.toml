@@ -82,6 +82,9 @@ default_mode = "reversible"
 # exemplar_cache_dir = "/var/lib/caliban/knn"
 # auto_price_in_per_mtok = 3.0              # flat caliban/auto price, metered next to the real cost
 # auto_price_out_per_mtok = 12.0
+# auto_cache_hit_fraction = 0.2             # share of the flat price billed for a cache hit (T1 or
+#                                           # T2; no model is called). 0..1, default 0.2; the pricing
+#                                           # decision was 10 to 25%. Tenants can override it.
 # [routing.floors]                          # quality floor per intent (0..1); "*" covers the rest
 # code = 0.8
 # [routing.quality."openai/gpt-5-mini"]     # per-model quality per intent (overrides the profile)
@@ -147,6 +150,9 @@ pii_mode = "reversible"
 # pii_surrogate_scope = "tenant"
 # T2 semantic cache for this tenant: "off" (default) or "on" (also needs [cache.semantic] enabled).
 # semantic_cache = "off"
+# Share of the flat caliban/auto price billed for this tenant's cache hits, overriding [routing]
+# auto_cache_hit_fraction (0..1). Also settable with PATCH /api/v1/tenants/{id}.
+# auto_cache_hit_fraction = 0.2
 # SHA-256 hex of each API key. Generate a key with `caliban keygen`.
 api_key_hashes = [
   # "3f5c…",
