@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
         let handle = ConfigHandle::new(Snapshot::new(first.config, first.version));
         tokio::spawn(source.run(handle.clone(), every));
         let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default()))?);
+        spawn_router_warmup(&gw);
         return serve("router", listen.clone(), caliban_gateway::app(gw)).await;
     }
 
@@ -138,6 +139,7 @@ async fn main() -> Result<()> {
     let usage = usage_sinks(&recent);
 
     let gw = Arc::new(new_gateway(handle.clone(), Arc::clone(&usage))?);
+    spawn_router_warmup(&gw);
     let router_addr = cfg.server.router_addr.clone();
     let router_task = move || serve("router", router_addr.clone(), caliban_gateway::app(Arc::clone(&gw)));
 
@@ -215,6 +217,13 @@ async fn healthcheck(addr: &str, path: &str) -> bool {
         Some(line.starts_with("HTTP/1.1 2"))
     };
     matches!(tokio::time::timeout(std::time::Duration::from_secs(3), probe).await, Ok(Some(true)))
+}
+
+/// Builds the `caliban/auto` routing assets (exemplar embeddings, kNN calibration, router profile)
+/// in the background; until they are ready, `caliban/auto` routes by the keyword rules.
+fn spawn_router_warmup(gw: &Arc<caliban_gateway::Gateway>) {
+    let gw = Arc::clone(gw);
+    tokio::spawn(async move { gw.warm_router().await });
 }
 
 /// Builds the data plane. With `CALIBAN_PII_NER_DIR` set, the L1 NER detector is loaded (and its

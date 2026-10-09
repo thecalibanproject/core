@@ -33,6 +33,25 @@ default_mode = "reversible"
 # [limits.tenants.acme]            # per-tenant overrides
 # requests_per_minute = 1200
 
+# caliban/auto routing (all optional). Without [routing], intents come from keyword rules and each
+# tenant's route order is kept. Stage-1 kNN needs an embedding model on a shared [[providers]] entry.
+# [routing]
+# embedding_model = "local/bge-small"       # catalogue model with kind = "embedding"
+# embedder_artifact = "bge-small@1.0.0"     # ml embedder artifact; a calibration must require the same
+# budget_ms = 25                            # embed + kNN; over budget = keyword rules
+# calibration_dir = "/opt/caliban/artifacts/intent_head/knn-default/1.0.0"
+# profile_dir = "/opt/caliban/artifacts/router_profile/core/1.0.0"
+# exemplar_cache_dir = "/var/lib/caliban/knn"
+# auto_price_in_per_mtok = 3.0              # flat caliban/auto price, metered next to the real cost
+# auto_price_out_per_mtok = 12.0
+# [routing.floors]                          # quality floor per intent (0..1); "*" covers the rest
+# code = 0.8
+# [routing.quality."openai/gpt-5-mini"]     # per-model quality per intent (overrides the profile)
+# code = 0.86
+# [routing.tenants.acme]
+# floors = { code = 0.9 }
+# exemplars = { "legal.review" = ["review this NDA clause for risky terms"] }
+
 # ─────────────── Model catalogue ───────────────
 # `provider` names a provider id that each tenant must define (BYOK). A tenant only sees
 # models whose provider it has configured.

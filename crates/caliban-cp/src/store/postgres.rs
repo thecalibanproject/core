@@ -28,6 +28,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (2, "control_plane_store", include_str!("../../../../migrations/0002_control_plane_store.sql")),
     (3, "soft_delete", include_str!("../../../../migrations/0003_soft_delete.sql")),
     (4, "pii_surrogate_scope", include_str!("../../../../migrations/0004_pii_surrogate_scope.sql")),
+    (5, "usage_routing", include_str!("../../../../migrations/0005_usage_routing.sql")),
 ];
 
 /// Advisory lock keys ("calibn" + n).

@@ -14,7 +14,7 @@ pub use secret::{Secret, SecretRef, open, process_kek, seal};
 use arc_swap::ArcSwap;
 use caliban_types::{ModelId, PiiMode, PiiSurrogateScope, ProviderId, ProviderKind, TenantId, TrustTier};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -51,6 +51,199 @@ pub struct Config {
     /// Rate limits and token budgets: deployment defaults plus per-tenant overrides.
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// `caliban/auto` routing: Stage-1 kNN, per-intent quality floors, the flat auto price.
+    /// Omitted from the rendered snapshot when empty, so older routers keep parsing it.
+    #[serde(default, skip_serializing_if = "RoutingConfig::is_empty")]
+    pub routing: RoutingConfig,
+}
+
+/// `[routing]`: how `caliban/auto` picks a model (see `caliban-route`).
+///
+/// Stage 1 (embedding kNN over labelled exemplars) is on when `embedding_model` names a catalogue
+/// embedding model reachable through a shared (deployment) provider. Without it, or when kNN
+/// abstains, times out or fails, the keyword rules decide the intent. A floor for an intent turns on
+/// cheapest-above-floor selection for that intent; without one the tenant's route order is kept.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingConfig {
+    /// Catalogue embedding model used to embed prompts and exemplars (same vector space).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<ModelId>,
+    /// `name@version` of the ml `embedder` artifact this model corresponds to. A calibration
+    /// artifact that `requires` an embedder is only applied when this matches it exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedder_artifact: Option<String>,
+    /// Prefix added to every text before embedding (e.g. `"query: "` for E5-family models).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_prefix: Option<String>,
+    /// Latency budget for embed + kNN, in ms (default 25). Over budget = rules fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_ms: Option<u64>,
+    /// kNN overrides. Precedence: these, then the calibration artifact, then built-in defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Minimum calibrated vote share of the winning intent; below it kNN abstains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abstain_threshold: Option<f64>,
+    /// Minimum gap between the top two intents' vote shares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_threshold: Option<f64>,
+    /// Minimum top-1 cosine similarity; below it the prompt is out of scope (abstain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oos_threshold: Option<f64>,
+    /// Ship the built-in exemplar set (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_exemplars: Option<bool>,
+    /// Extra exemplar files in the ml intent dataset format (JSON encoding).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exemplar_files: Vec<String>,
+    /// Extra deployment-wide exemplars: intent → utterances.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exemplars: BTreeMap<String, Vec<String>>,
+    /// ml `intent_head` artifact directory (kNN calibration: temperature, thresholds, OOS gate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_dir: Option<String>,
+    /// ml `router_profile` artifact directory (UniRoute per-cluster model quality; cluster = intent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_dir: Option<String>,
+    /// Directory for cached exemplar embeddings, keyed by embedding model and exemplar set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exemplar_cache_dir: Option<String>,
+    /// Quality floor per intent, in 0..=1. `"*"` applies to intents without their own floor.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub floors: BTreeMap<String, f64>,
+    /// Quality per model per intent, in 0..=1 (overrides the router profile).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quality: BTreeMap<ModelId, BTreeMap<String, f64>>,
+    /// Flat price of `caliban/auto`, metered next to the routed model's real cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_price_in_per_mtok: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_price_out_per_mtok: Option<f64>,
+    /// Per-tenant overrides and exemplars.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenants: BTreeMap<TenantId, TenantRouting>,
+}
+
+/// `[routing.tenants.<tenant_id>]`.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TenantRouting {
+    /// Floors that override `[routing.floors]` for this tenant.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub floors: BTreeMap<String, f64>,
+    /// The tenant's own exemplars (intent → utterances); only this tenant's requests see them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exemplars: BTreeMap<String, Vec<String>>,
+    /// `false` turns Stage-1 kNN off for this tenant (rules only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_price_in_per_mtok: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_price_out_per_mtok: Option<f64>,
+}
+
+impl RoutingConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &RoutingConfig::default()
+    }
+
+    /// Quality floor for an intent: tenant intent, tenant `*`, global intent, global `*`.
+    pub fn floor_for(&self, tenant: &TenantId, intent: &str) -> Option<f64> {
+        let t = self.tenants.get(tenant);
+        t.and_then(|t| t.floors.get(intent))
+            .or_else(|| t.and_then(|t| t.floors.get("*")))
+            .or_else(|| self.floors.get(intent))
+            .or_else(|| self.floors.get("*"))
+            .copied()
+    }
+
+    /// Flat `caliban/auto` price (in, out per million tokens) for a tenant, if any.
+    pub fn auto_price_for(&self, tenant: &TenantId) -> (Option<f64>, Option<f64>) {
+        let t = self.tenants.get(tenant);
+        (
+            t.and_then(|t| t.auto_price_in_per_mtok).or(self.auto_price_in_per_mtok),
+            t.and_then(|t| t.auto_price_out_per_mtok).or(self.auto_price_out_per_mtok),
+        )
+    }
+
+    pub fn knn_enabled_for(&self, tenant: &TenantId) -> bool {
+        self.embedding_model.is_some() && self.tenants.get(tenant).and_then(|t| t.knn).unwrap_or(true)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let unit = |what: String, v: f64| {
+            if v.is_finite() && (0.0..=1.0).contains(&v) {
+                Ok(())
+            } else {
+                Err(ConfigError::Invalid(format!("routing: {what} must be in 0..=1")))
+            }
+        };
+        let price = |what: &str, v: Option<f64>| match v {
+            Some(p) if !p.is_finite() || p < 0.0 => Err(ConfigError::Invalid(format!("routing: {what} must be a non-negative number"))),
+            _ => Ok(()),
+        };
+        if self.budget_ms.is_some_and(|b| b == 0 || b > 10_000) {
+            return Err(ConfigError::Invalid("routing: budget_ms must be in 1..=10000".into()));
+        }
+        if self.k == Some(0) {
+            return Err(ConfigError::Invalid("routing: k must be >= 1".into()));
+        }
+        if self.temperature.is_some_and(|t| !t.is_finite() || t <= 0.0) {
+            return Err(ConfigError::Invalid("routing: temperature must be > 0".into()));
+        }
+        for (what, v) in [("abstain_threshold", self.abstain_threshold), ("margin_threshold", self.margin_threshold)] {
+            if let Some(v) = v {
+                unit(what.into(), v)?;
+            }
+        }
+        if self.oos_threshold.is_some_and(|v| !v.is_finite() || !(-1.0..=1.0).contains(&v)) {
+            return Err(ConfigError::Invalid("routing: oos_threshold is a cosine similarity in -1..=1".into()));
+        }
+        if let Some(e) = &self.embedder_artifact
+            && e.split_once('@').is_none_or(|(n, v)| n.is_empty() || v.is_empty())
+        {
+            return Err(ConfigError::Invalid("routing: embedder_artifact must be name@version".into()));
+        }
+        for (intent, f) in &self.floors {
+            unit(format!("floors.{intent}"), *f)?;
+        }
+        for (model, per_intent) in &self.quality {
+            for (intent, q) in per_intent {
+                unit(format!("quality.{model}.{intent}"), *q)?;
+            }
+        }
+        price("auto_price_in_per_mtok", self.auto_price_in_per_mtok)?;
+        price("auto_price_out_per_mtok", self.auto_price_out_per_mtok)?;
+        for (tenant, t) in &self.tenants {
+            for (intent, f) in &t.floors {
+                unit(format!("tenants.{tenant}.floors.{intent}"), *f)?;
+            }
+            price("auto_price_in_per_mtok", t.auto_price_in_per_mtok)?;
+            price("auto_price_out_per_mtok", t.auto_price_out_per_mtok)?;
+        }
+        for (intent, us) in self.exemplars.iter().chain(self.tenants.values().flat_map(|t| t.exemplars.iter())) {
+            if !valid_intent_id(intent) {
+                return Err(ConfigError::Invalid(format!("routing: invalid intent id {intent:?} (lower snake case, dotted for domain.action)")));
+            }
+            if us.iter().any(|u| u.trim().is_empty()) {
+                return Err(ConfigError::Invalid(format!("routing: empty exemplar under intent {intent}")));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Intent ids follow ml's route-registry convention: `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`.
+pub fn valid_intent_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('.').all(|seg| {
+            let mut c = seg.chars();
+            c.next().is_some_and(|f| f.is_ascii_lowercase()) && c.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        })
 }
 
 /// Request-rate and token-budget limits. Every field is optional (`None` = unlimited).
@@ -419,7 +612,8 @@ impl Config {
                 }
             }
         }
-        self.limits.validate()
+        self.limits.validate()?;
+        self.routing.validate()
     }
 }
 
@@ -601,6 +795,38 @@ mod tests {
         assert_eq!(json[1]["pii_surrogate_scope"], "session");
         let bad = toml.replace("pii_surrogate_scope = \"session\"", "pii_surrogate_scope = \"global\"");
         assert!(Config::from_toml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn routing_section_parses_validates_and_is_omitted_when_empty() {
+        // The commented [routing] block of the example config, uncommented, must stay valid.
+        let block: String = EXAMPLE
+            .lines()
+            .skip_while(|l| !l.starts_with("# [routing]"))
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| format!("{}\n", l.trim_start_matches('#').trim_start()))
+            .collect();
+        assert!(block.contains("embedding_model"));
+        let cfg = Config::from_toml_str(&format!("{block}\n{SHARED}")).unwrap();
+        let r = &cfg.routing;
+        assert_eq!(r.budget_ms, Some(25));
+        let acme: TenantId = "acme".into();
+        assert_eq!(r.floor_for(&acme, "code"), Some(0.9));
+        assert_eq!(r.floor_for(&"globex".into(), "code"), Some(0.8));
+        assert_eq!(r.floor_for(&"globex".into(), "chat"), None);
+        assert_eq!(r.auto_price_for(&acme), (Some(3.0), Some(12.0)));
+        assert!(r.knn_enabled_for(&acme));
+        // Wildcard floor.
+        let wild = Config::from_toml_str(&format!("[routing.floors]\n\"*\" = 0.6\n{SHARED}")).unwrap();
+        assert_eq!(wild.routing.floor_for(&acme, "anything"), Some(0.6));
+        // Out-of-range values and bad intent ids are rejected.
+        for bad in ["[routing.floors]\ncode = 1.5", "[routing]\nbudget_ms = 0", "[routing]\nk = 0", "[routing.tenants.acme.exemplars]\n\"Bad Id\" = [\"x\"]", "[routing]\nembedder_artifact = \"nover\"", "[routing]\nauto_price_in_per_mtok = -1.0"] {
+            assert!(Config::from_toml_str(&format!("{bad}\n{SHARED}")).is_err(), "{bad}");
+        }
+        // Empty routing is left out of rendered snapshots, so older routers keep parsing them.
+        let json = serde_json::to_value(Config::from_toml_str(SHARED).unwrap()).unwrap();
+        assert!(json.get("routing").is_none());
+        assert!(valid_intent_id("finance.invoice_triage") && !valid_intent_id("Finance") && !valid_intent_id("a..b"));
     }
 
     #[test]

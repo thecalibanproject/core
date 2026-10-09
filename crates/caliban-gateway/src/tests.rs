@@ -721,3 +721,224 @@ async fn native_anthropic_cache_hit_is_rehydrated() {
     assert_eq!(v["content"][0]["text"], format!("You said: {PII}"));
     assert_eq!(v["model"], "anth/claude");
 }
+
+// ─────────────── caliban/auto: Stage-1 kNN, quality floors, metering ───────────────
+
+mod auto_routing {
+    use super::*;
+    use crate::route_embed;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// OpenAI-compatible `/v1/embeddings` returning `caliban_route::hash_embed` vectors after
+    /// `delay_ms` (shared, so a test can slow the embedder down after warm-up).
+    async fn mock_embedder(delay_ms: Arc<AtomicU64>) -> String {
+        let app = Router::new().route(
+            "/v1/embeddings",
+            post(move |Json(b): Json<Value>| {
+                let delay = Duration::from_millis(delay_ms.load(Ordering::SeqCst));
+                async move {
+                    tokio::time::sleep(delay).await;
+                    let inputs: Vec<String> = match &b["input"] {
+                        Value::String(s) => vec![s.clone()],
+                        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
+                        _ => vec![],
+                    };
+                    let data: Vec<Value> =
+                        inputs.iter().enumerate().map(|(i, t)| json!({"object": "embedding", "index": i, "embedding": caliban_route::hash_embed(t, 256)})).collect();
+                    Json(json!({"object": "list", "data": data, "model": b["model"], "usage": {"prompt_tokens": 1, "total_tokens": 1}}))
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}/v1")
+    }
+
+    struct Env {
+        app: Router,
+        gw: Arc<Gateway>,
+        usage: RecentUsage,
+        delay: Arc<AtomicU64>,
+    }
+
+    async fn setup(routing: &str) -> Env {
+        let (base, _log) = mock_upstream().await;
+        let delay = Arc::new(AtomicU64::new(0));
+        let emb = mock_embedder(delay.clone()).await;
+        let toml = format!(
+            r#"
+[routing]
+embedding_model = "emb/mock"
+auto_price_in_per_mtok = 10.0
+auto_price_out_per_mtok = 20.0
+{routing}
+[routing.floors]
+translate = 0.5
+[routing.quality."ext/mock"]
+translate = 0.9
+[routing.quality."local/mock"]
+translate = 0.4
+
+[[providers]]
+id = "embedder"
+kind = "openai_compatible"
+base_url = "{emb}"
+trust_tier = "t0_sovereign"
+
+[[models]]
+id = "emb/mock"
+provider = "embedder"
+upstream_model = "hash-256"
+kind = "embedding"
+trust_tier = "t0_sovereign"
+
+[[models]]
+id = "ext/mock"
+provider = "mockext"
+upstream_model = "mock-external"
+trust_tier = "t2_contracted"
+price_in_per_mtok = 1.0
+price_out_per_mtok = 2.0
+
+[[models]]
+id = "local/mock"
+provider = "mocklocal"
+upstream_model = "mock-local"
+trust_tier = "t0_sovereign"
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+
+[[tenants]]
+id = "acme"
+name = "Acme"
+api_key_hashes = ["{acme}"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t2_contracted"
+  [[tenants.providers]]
+  id = "mocklocal"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t0_sovereign"
+  [[tenants.routes]]
+  intent = "default"
+  models = ["local/mock", "ext/mock"]
+  [[tenants.routes]]
+  intent = "translate"
+  models = ["local/mock", "ext/mock"]
+"#,
+            acme = hash("cal_acme"),
+        );
+        let usage = RecentUsage::default();
+        let gw = Arc::new(Gateway::new(ConfigHandle::new(Snapshot::new(Config::from_toml_str(&toml).unwrap(), "test")), Arc::new(usage.clone())));
+        gw.warm_router().await;
+        assert!(gw.router.knn_ready(), "kNN index built from the mock embedder");
+        Env { app: app(Arc::clone(&gw)), gw, usage, delay }
+    }
+
+    const TRANSLATE: &str = "please translate this paragraph into french for me";
+
+    fn auto(text: &str, stream: bool) -> Value {
+        json!({"model": "caliban/auto", "stream": stream, "messages": [{"role": "user", "content": text}]})
+    }
+
+    #[tokio::test]
+    async fn auto_reports_intent_and_meters_routed_cost_next_to_flat_price() {
+        let env = setup("").await;
+        let (status, h, _) = call(&env.app, "/v1/chat/completions", BEARER, auto(TRANSLATE, false)).await;
+        assert_eq!(status, StatusCode::OK);
+        let intent = h["x-caliban-intent"].to_str().unwrap();
+        assert!(intent.starts_with("translate;confidence=") && intent.ends_with(";stage=knn"), "{intent}");
+        // local/mock (0.4) is below the translate floor (0.5): the cheapest qualifying model.
+        assert_eq!(h["x-caliban-routed-model"], "ext/mock");
+
+        let ev = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
+        assert_eq!((ev.intent.as_str(), ev.requested_model.as_deref(), ev.route_stage.as_deref()), ("translate", Some("caliban/auto"), Some("knn")));
+        // Mock usage: 12 prompt + 7 completion tokens.
+        let routed = (12.0 * 1.0 + 7.0 * 2.0) / 1e6;
+        let flat = (12.0 * 10.0 + 7.0 * 20.0) / 1e6;
+        assert!((ev.routed_model_cost_usd.unwrap() - routed).abs() < 1e-12);
+        assert!((ev.flat_price_usd.unwrap() - flat).abs() < 1e-12);
+        assert!((ev.margin_usd().unwrap() - (flat - routed)).abs() < 1e-12);
+        assert_eq!(ev.cost_usd, ev.routed_model_cost_usd);
+        let json = serde_json::to_value(&ev).unwrap();
+        assert!(json.get("flat_price_usd").is_some() && json.get("routed_model_cost_usd").is_some());
+
+        // Streams carry the header too, and settle the same fields.
+        let (status, h, _) = call(&env.app, "/v1/chat/completions", BEARER, auto(TRANSLATE, true)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(h["x-caliban-intent"].to_str().unwrap().starts_with("translate;"));
+        let ev = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
+        assert!(ev.flat_price_usd.is_some() && ev.routed_model_cost_usd.is_some());
+        // Anthropic dialect too.
+        let (status, h, _) = call(&env.app, "/v1/messages", ANTH, json!({"model": "caliban/auto", "max_tokens": 64, "messages": [{"role": "user", "content": TRANSLATE}]})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(h.contains_key("x-caliban-intent"));
+    }
+
+    #[tokio::test]
+    async fn embedder_timeout_falls_back_to_the_rules_router() {
+        let env = setup("budget_ms = 20").await;
+        env.delay.store(300, Ordering::SeqCst);
+        let started = Instant::now();
+        let (status, h, _) = call(&env.app, "/v1/chat/completions", BEARER, auto("summarize this email thread for me", false)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(started.elapsed() < Duration::from_millis(300), "request waited for the slow embedder: {:?}", started.elapsed());
+        let intent = h["x-caliban-intent"].to_str().unwrap();
+        assert!(intent.starts_with("summarize;") && intent.ends_with(";stage=keyword;knn=timeout"), "{intent}");
+        let ev = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
+        assert_eq!(ev.route_stage.as_deref(), Some("keyword"));
+        assert!(ev.flat_price_usd.is_some());
+    }
+
+    #[tokio::test]
+    async fn pinned_models_are_not_metered_against_the_flat_price() {
+        let env = setup("").await;
+        let (status, h, _) = call(&env.app, "/v1/chat/completions", BEARER, json!({"model": "ext/mock", "messages": [{"role": "user", "content": TRANSLATE}]})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h["x-caliban-intent"], "pinned;confidence=1.000;stage=rules");
+        let ev = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
+        assert_eq!((ev.requested_model.as_deref(), ev.route_stage.as_deref()), (Some("ext/mock"), Some("rules")));
+        assert!(ev.routed_model_cost_usd.is_none() && ev.flat_price_usd.is_none() && ev.cost_usd.is_some());
+        let json = serde_json::to_value(&ev).unwrap();
+        assert!(json.get("flat_price_usd").is_none(), "absent, not null, for older consumers");
+    }
+
+    /// Added routing latency through the real adapter (HTTP to a local mock embedder) versus the
+    /// keyword rules alone. `cargo test --release -p caliban-gateway knn_latency -- --nocapture`.
+    #[tokio::test]
+    async fn knn_latency_over_http_report() {
+        let env = setup("").await;
+        let snap = env.gw.config.load();
+        let tenant = snap.tenant(&"acme".into()).unwrap().clone();
+        let prompts = [TRANSLATE, "write a python function to parse dates", "top customers by revenue last quarter", "hello there"];
+        let n = 200;
+        let measure = |knn: bool| {
+            let (gw, snap, tenant) = (Arc::clone(&env.gw), Arc::clone(&snap), tenant.clone());
+            async move {
+                let mut t = Vec::with_capacity(n);
+                for i in 0..n {
+                    let req = caliban_ir::ChatRequest::from_openai_json(auto(prompts[i % prompts.len()], false).to_string().as_bytes()).unwrap();
+                    let started = Instant::now();
+                    let d = if knn {
+                        route_embed::route(&gw, &snap, &tenant, &req).await.unwrap()
+                    } else {
+                        gw.router.route(&snap, &tenant, &req, caliban_route::Constraints::default()).unwrap()
+                    };
+                    t.push(started.elapsed());
+                    assert_eq!(d.stage == "knn", knn);
+                }
+                t.sort();
+                (t[n / 2], t[n * 99 / 100])
+            }
+        };
+        let (k50, k99) = measure(true).await;
+        let (r50, r99) = measure(false).await;
+        println!("routing over HTTP mock embedder: knn p50 {k50:?} p99 {k99:?}; rules only p50 {r50:?} p99 {r99:?}");
+        assert!(k99 < Duration::from_millis(25), "p99 {k99:?}");
+    }
+}
