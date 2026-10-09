@@ -40,6 +40,22 @@ impl Rehydrator {
         }
     }
 
+    /// The same matcher with each original JSON-escaped (no surrounding quotes), for text that is
+    /// itself JSON, such as streamed tool-call arguments (`function.arguments`,
+    /// `input_json_delta.partial_json`): an original with a quote, backslash or line break must
+    /// not break the JSON it is restored into.
+    pub fn for_json(&self) -> Self {
+        let originals = self
+            .originals
+            .iter()
+            .map(|o| {
+                let quoted = serde_json::to_string(o).unwrap_or_default();
+                quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or_default().to_owned()
+            })
+            .collect();
+        Self { ac: self.ac.clone(), originals, surrogates_lower: self.surrogates_lower.clone() }
+    }
+
     pub fn is_noop(&self) -> bool {
         self.ac.is_none()
     }
@@ -127,6 +143,17 @@ mod tests {
         let r = Arc::new(Rehydrator::new(&v));
         let mut st = r.streaming();
         assert_eq!(st.push("hello world "), "hello world ");
+    }
+
+    #[test]
+    fn json_variant_escapes_originals() {
+        let mut v = Vault::new(b"k");
+        let s = v.surrogate_for(&EntityType::Person, "Jane \"JJ\" O\\Neil");
+        let r = Rehydrator::new(&v).for_json();
+        let args = format!("{{\"name\": \"{s}\"}}");
+        let restored = r.rehydrate(&args);
+        let parsed: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(parsed["name"], "Jane \"JJ\" O\\Neil");
     }
 
     #[test]

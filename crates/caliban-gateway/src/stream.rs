@@ -168,23 +168,71 @@ impl Encoder {
     }
 }
 
-/// Per-choice streaming state: optional `<think>` splitter and one rehydrator per text field.
+/// A request's rehydrators: for text, and with JSON-escaped originals for tool-call arguments
+/// (which are JSON text themselves).
+#[derive(Clone)]
+struct Restore {
+    text: Arc<Rehydrator>,
+    json: Arc<Rehydrator>,
+}
+
+impl Restore {
+    fn new(rh: Option<&Arc<Rehydrator>>) -> Option<Self> {
+        rh.map(|r| Self { text: Arc::clone(r), json: Arc::new(r.for_json()) })
+    }
+}
+
+/// Per-choice streaming state: optional `<think>` splitter, one rehydrator per text field and one
+/// per tool call (by tool-call index) for its argument deltas.
 #[derive(Default)]
 struct ChoiceState {
     think: Option<ThinkSplitter>,
     content: Option<StreamingRehydrator>,
     reasoning: Option<StreamingRehydrator>,
     reasoning_key: Option<&'static str>,
+    json: Option<Arc<Rehydrator>>,
+    tools: BTreeMap<u64, StreamingRehydrator>,
 }
 
 impl ChoiceState {
-    fn new(rh: Option<&Arc<Rehydrator>>, think: bool) -> Self {
+    fn new(rh: Option<&Restore>, think: bool) -> Self {
         Self {
             think: think.then(ThinkSplitter::default),
-            content: rh.map(|r| r.streaming()),
-            reasoning: rh.map(|r| r.streaming()),
+            content: rh.map(|r| r.text.streaming()),
+            reasoning: rh.map(|r| r.text.streaming()),
             reasoning_key: None,
+            json: rh.map(|r| Arc::clone(&r.json)),
+            tools: BTreeMap::new(),
         }
+    }
+
+    /// Restores surrogates in the tool-call argument deltas of `delta`, holding back what may be
+    /// the start of a surrogate (a surrogate split across deltas is restored whole). When the
+    /// choice finishes, what is still held back is appended to this delta's tool calls.
+    fn push_tool_args(&mut self, delta: &mut Map<String, Value>, finished: bool) {
+        let Some(json) = &self.json else { return };
+        if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for (pos, tc) in calls.iter_mut().enumerate() {
+                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(pos as u64);
+                if let Some(Value::String(a)) = tc.pointer_mut("/function/arguments") {
+                    *a = self.tools.entry(idx).or_insert_with(|| json.streaming()).push(a);
+                }
+            }
+        }
+        if finished {
+            for (idx, rest) in self.flush_tools() {
+                append_tool_args(delta, idx, rest);
+            }
+        }
+    }
+
+    /// Held-back argument text of every tool call, by tool-call index (non-empty only).
+    fn flush_tools(&mut self) -> Vec<(u64, String)> {
+        std::mem::take(&mut self.tools)
+            .into_iter()
+            .map(|(idx, mut st)| (idx, st.finish()))
+            .filter(|(_, rest)| !rest.is_empty())
+            .collect()
     }
 
     /// Processes one delta; returns `(reasoning, content)` to emit.
@@ -221,9 +269,35 @@ impl ChoiceState {
     }
 }
 
-/// Splits inline `<think>` and restores surrogates in streamed deltas, holding back text that may
-/// be a partial tag or surrogate. TODO: tool-call argument deltas.
-fn transform_chunk(v: &mut Value, choices: &mut BTreeMap<u64, ChoiceState>, rh: Option<&Arc<Rehydrator>>, think: bool) {
+/// Appends `rest` to the arguments of tool call `idx` in `delta` (adding the entry if needed).
+fn append_tool_args(delta: &mut Map<String, Value>, idx: u64, rest: String) {
+    let calls = delta.entry("tool_calls").or_insert_with(|| Value::Array(Vec::new()));
+    if !calls.is_array() {
+        *calls = Value::Array(Vec::new());
+    }
+    let Some(calls) = calls.as_array_mut() else { return };
+    let pos = calls.iter().position(|tc| tc.get("index").and_then(Value::as_u64) == Some(idx));
+    match pos.map(|p| &mut calls[p]) {
+        Some(tc) => {
+            if let Some(o) = tc.as_object_mut() {
+                let f = o.entry("function").or_insert_with(|| json!({}));
+                if let Some(f) = f.as_object_mut() {
+                    match f.get_mut("arguments") {
+                        Some(Value::String(a)) => a.push_str(&rest),
+                        _ => {
+                            f.insert("arguments".into(), Value::String(rest));
+                        }
+                    }
+                }
+            }
+        }
+        None => calls.push(json!({"index": idx, "function": {"arguments": rest}})),
+    }
+}
+
+/// Splits inline `<think>` and restores surrogates in streamed deltas (content, reasoning and
+/// tool-call arguments), holding back text that may be a partial tag or surrogate.
+fn transform_chunk(v: &mut Value, choices: &mut BTreeMap<u64, ChoiceState>, rh: Option<&Restore>, think: bool) {
     let Some(list) = v.get_mut("choices").and_then(Value::as_array_mut) else { return };
     for c in list {
         let idx = c.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -239,6 +313,7 @@ fn transform_chunk(v: &mut Value, choices: &mut BTreeMap<u64, ChoiceState>, rh: 
         let reasoning_in = delta.get(rkey).and_then(Value::as_str).map(str::to_owned);
         let (r, content) = st.push(reasoning_in.as_deref(), content_in.as_deref(), finished);
         set_delta_text(delta, st.reasoning_key, content_in.is_some(), reasoning_in.is_some(), r, content);
+        st.push_tool_args(delta, finished);
     }
 }
 
@@ -286,10 +361,14 @@ fn tail(
     let mut out = String::new();
     for (idx, st) in choices.iter_mut() {
         let (r, c) = st.flush();
-        if r.is_empty() && c.is_empty() {
+        let tools = st.flush_tools();
+        if r.is_empty() && c.is_empty() && tools.is_empty() {
             continue;
         }
         let mut delta = Map::new();
+        for (i, rest) in tools {
+            append_tool_args(&mut delta, i, rest);
+        }
         if !r.is_empty() {
             delta.insert(st.reasoning_key.unwrap_or("reasoning_content").into(), Value::String(r));
         }
@@ -321,6 +400,7 @@ pub(crate) async fn openai_shaped(
     let headers = sse_headers(&outcome);
     let model_id = outcome.model.id.to_string();
     let transform = rehydrator.is_some() || think;
+    let restore = Restore::new(rehydrator.as_ref());
     let span = outcome.span.clone();
     settlement.set_in_flight(true);
 
@@ -398,6 +478,7 @@ pub(crate) async fn openai_shaped(
                     }
                     if fast_rehydrate
                         && let Some(d) = passthrough::scan_openai_delta(data)
+                        && d.choice.as_ref().is_none_or(|c| c.tool_bytes == 0)
                         && !d.chunk.usage
                         && (outcome.client_usage || !d.chunk.has_usage_key || d.chunk.null_usage_member.is_some())
                     {
@@ -416,8 +497,7 @@ pub(crate) async fn openai_shaped(
                             passthrough::write_openai(&mut out, data, &d.chunk, &model_json, !outcome.client_usage);
                             return;
                         };
-                        let st =
-                            choices.entry(ch.index).or_insert_with(|| ChoiceState::new(rehydrator.as_ref(), think));
+                        let st = choices.entry(ch.index).or_insert_with(|| ChoiceState::new(restore.as_ref(), think));
                         let content_in = ch.content.as_ref().map(|(_, s)| s.as_ref());
                         let (r, content) = st.push(None, content_in, false);
                         streamed += ch.tool_bytes + content.len() as u64;
@@ -473,7 +553,7 @@ pub(crate) async fn openai_shaped(
                             // Usage is always requested upstream; a client that did not ask gets none.
                             let usage_only = !outcome.client_usage && metering::strip_usage(&mut v);
                             if transform {
-                                transform_chunk(&mut v, &mut choices, rehydrator.as_ref(), think);
+                                transform_chunk(&mut v, &mut choices, restore.as_ref(), think);
                             }
                             streamed += delta_bytes(&v);
                             if !usage_only {
@@ -559,6 +639,7 @@ pub(crate) async fn native_anthropic(
         // Passthrough (see `passthrough`): without surrogates to restore or a capture, content
         // block events go out as received.
         let fast = rehydrator.is_none() && capture.is_none() && passthrough_enabled();
+        let restore = Restore::new(rehydrator.as_ref());
         let mut out = BytesMut::with_capacity(BATCH_CAPACITY);
         let (mut upstream_done, mut sent_any) = (false, false);
         'outer: while let Some(item) = upstream.next().await {
@@ -620,7 +701,9 @@ pub(crate) async fn native_anthropic(
                                 && let Some(Value::String(s)) = ev.get_mut("delta").and_then(|d| d.get_mut(field))
                             {
                                 streamed += s.len() as u64;
-                                if let Some(rh) = &rehydrator {
+                                if let Some(rh) = &restore {
+                                    // `partial_json` is JSON text: originals go in JSON-escaped.
+                                    let rh = if field == "partial_json" { &rh.json } else { &rh.text };
                                     let st = blocks.entry(index).or_insert_with(|| BlockState {
                                         delta_type: delta_type.clone(),
                                         field,
@@ -1050,6 +1133,136 @@ trust_tier = "t2_contracted"
                 assert!(fast.contains(restored), "content rewritten in place:\n{fast}");
             }
         }
+    }
+
+    /// Runs an OpenAI-shaped upstream for a client of `dialect` and returns the client body.
+    async fn run_openai_for(dialect: Dialect, general: bool, rh: Arc<Rehydrator>, reads: Vec<Bytes>) -> String {
+        FORCE_GENERAL.with(|f| f.set(general));
+        let (gw, _) = gateway();
+        let upstream: Upstream = futures::stream::iter(reads.into_iter().map(Ok)).boxed();
+        let resp = openai_shaped(
+            Arc::clone(&gw),
+            outcome(&gw, dialect, true),
+            upstream,
+            Some(rh),
+            false,
+            Settlement::none(),
+            Span::none(),
+            None,
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        FORCE_GENERAL.with(|f| f.set(false));
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    /// Surrogates in streamed tool-call arguments are restored like content, also when split
+    /// across argument deltas, and originals that need JSON escaping keep the arguments valid JSON.
+    #[tokio::test]
+    async fn tool_call_argument_deltas_are_rehydrated() {
+        let mut vault = caliban_pii::Vault::new(b"k");
+        let email = vault.surrogate_for(&caliban_pii::EntityType::Email, "jane@acme.com");
+        let name = vault.surrogate_for(&caliban_pii::EntityType::Person, "Jane \"JJ\" O'Neil");
+        let rh = Arc::new(Rehydrator::new(&vault));
+        let j = |s: &str| serde_json::to_string(s).unwrap();
+        // The arguments as the model writes them, in surrogate form.
+        let args = format!(r#"{{"to": "{email}", "name": "{name}", "cc": ["{email}"]}}"#);
+        let want = json!({"to": "jane@acme.com", "name": "Jane \"JJ\" O'Neil", "cc": ["jane@acme.com"]});
+        let start = args.find(&email).unwrap();
+        let mut cuts: Vec<(usize, usize)> = (1..email.len()).map(|k| (start + k, start + email.len() + 3)).collect();
+        cuts.push((5, args.len() - 2));
+        for (c1, c2) in cuts {
+            let (p1, rest) = args.split_at(c1);
+            let (p2, p3) = rest.split_at(c2 - c1);
+            let chunk = |delta: String, finish: &str| {
+                format!(
+                    r#"{{"id":"c1","model":"up","choices":[{{"index":0,"delta":{delta},"finish_reason":{finish}}}]}}"#
+                )
+            };
+            let tc = |args: &str, head: bool| {
+                let prefix = if head { r#""id":"call_1","type":"function","# } else { "" };
+                let f = if head {
+                    format!(r#"{{"name":"send","arguments":{}}}"#, j(args))
+                } else {
+                    format!(r#"{{"arguments":{}}}"#, j(args))
+                };
+                format!(r#"{{"tool_calls":[{{"index":0,{prefix}"function":{f}}}]}}"#)
+            };
+            let events = [
+                chunk(r#"{"role":"assistant","content":null}"#.into(), "null"),
+                chunk(tc(p1, true), "null"),
+                chunk(tc(p2, false), "null"),
+                chunk(tc(p3, false), "null"),
+                chunk("{}".into(), r#""tool_calls""#),
+            ];
+            let mut body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+            body.push_str("data: [DONE]\n\n");
+            for reads in splits(&body) {
+                for general in [false, true] {
+                    let out = run_openai_for(Dialect::OpenAi, general, Arc::clone(&rh), reads.clone()).await;
+                    let got: String = events_json(&out)
+                        .iter()
+                        .flat_map(|v| {
+                            v.pointer("/choices/0/delta/tool_calls")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default()
+                        })
+                        .filter_map(|tc| tc.pointer("/function/arguments").and_then(Value::as_str).map(str::to_owned))
+                        .collect();
+                    let parsed: Value = serde_json::from_str(&got).unwrap_or_else(|e| panic!("{e}: {got}\n{out}"));
+                    assert_eq!(parsed, want, "cuts {c1},{c2}, general={general}\n{out}");
+                    assert!(!out.contains(&email), "{out}");
+                }
+                // Anthropic client: the same arguments as `input_json_delta` events.
+                let out = run_openai_for(Dialect::Anthropic, true, Arc::clone(&rh), reads.clone()).await;
+                let got: String = events_json(&out)
+                    .iter()
+                    .filter(|v| v.pointer("/delta/type").and_then(Value::as_str) == Some("input_json_delta"))
+                    .filter_map(|v| v.pointer("/delta/partial_json").and_then(Value::as_str).map(str::to_owned))
+                    .collect();
+                assert_eq!(serde_json::from_str::<Value>(&got).unwrap(), want, "{out}");
+            }
+        }
+    }
+
+    /// Native Anthropic streams: `input_json_delta` pieces get the same treatment.
+    #[tokio::test]
+    async fn native_anthropic_input_json_deltas_are_rehydrated() {
+        let mut vault = caliban_pii::Vault::new(b"k");
+        let email = vault.surrogate_for(&caliban_pii::EntityType::Email, "jane@acme.com");
+        let name = vault.surrogate_for(&caliban_pii::EntityType::Person, "Jane \"JJ\" O'Neil");
+        let rh = Arc::new(Rehydrator::new(&vault));
+        let args = format!(r#"{{"to": "{email}", "name": "{name}"}}"#);
+        let start = args.find(&email).unwrap();
+        for cut in [start + 1, start + email.len() / 2, start + email.len() - 1] {
+            let ev = |v: Value| anthropic::sse_event(&v);
+            let mut body = ev(
+                json!({"type": "message_start", "message": {"id": "m", "type": "message", "role": "assistant", "model": "up", "content": [], "usage": {"input_tokens": 3, "output_tokens": 1}}}),
+            );
+            body.push_str(&ev(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t", "name": "send", "input": {}}})));
+            for piece in [&args[..cut], &args[cut..]] {
+                body.push_str(&ev(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": piece}})));
+            }
+            body.push_str(&ev(json!({"type": "content_block_stop", "index": 0})));
+            body.push_str(&ev(
+                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 9}}),
+            ));
+            body.push_str(&ev(json!({"type": "message_stop"})));
+            for reads in splits(&body) {
+                let (out, _) = run_with(true, true, true, Some(Arc::clone(&rh)), reads).await;
+                let got: String = events_json(&out)
+                    .iter()
+                    .filter_map(|v| v.pointer("/delta/partial_json").and_then(Value::as_str).map(str::to_owned))
+                    .collect();
+                let parsed: Value = serde_json::from_str(&got).unwrap_or_else(|e| panic!("{e}: {got}"));
+                assert_eq!(parsed, json!({"to": "jane@acme.com", "name": "Jane \"JJ\" O'Neil"}), "cut {cut}");
+            }
+        }
+    }
+
+    fn events_json(body: &str) -> Vec<Value> {
+        body.lines().filter_map(|l| l.strip_prefix("data: ")).filter_map(|d| serde_json::from_str(d).ok()).collect()
     }
 
     /// Per chunk: the passthrough's output and byte count equal the general path's, for any

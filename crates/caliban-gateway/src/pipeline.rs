@@ -497,9 +497,11 @@ fn rehydrate_message(v: &mut Value, rh: &Rehydrator) {
             }
         }
         if let Some(calls) = c.pointer_mut("/message/tool_calls").and_then(Value::as_array_mut) {
+            // Arguments are JSON text: originals go in JSON-escaped.
+            let json = rh.for_json();
             for call in calls {
                 if let Some(Value::String(a)) = call.pointer_mut("/function/arguments") {
-                    *a = rh.rehydrate(a);
+                    *a = json.rehydrate(a);
                 }
             }
         }
