@@ -73,7 +73,7 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
     if external && snap.pii_mode_for(&tenant) != PiiMode::Off {
         let mut all = vec![query];
         all.extend(docs);
-        let (masked, n) = mask_texts(&gw, all)?;
+        let (masked, n) = mask_texts(&gw, all).await?;
         entities = n;
         let mut it = masked.into_iter();
         query = it.next().unwrap_or_default();

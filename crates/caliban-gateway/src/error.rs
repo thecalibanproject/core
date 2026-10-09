@@ -42,6 +42,11 @@ impl ApiError {
         }
     }
 
+    /// 503 with `retry-after`: over capacity, retry later.
+    pub fn overloaded(message: impl Into<String>, scope: &'static str, retry_after: Duration) -> Self {
+        Self { error: CalibanError::Overloaded(message.into()), retry_after: Some(retry_after), code: Some(scope), dialect: Dialect::OpenAi }
+    }
+
     pub fn with_dialect(mut self, dialect: Dialect) -> Self {
         self.dialect = dialect;
         self
@@ -55,6 +60,7 @@ impl ApiError {
             CalibanError::PolicyViolation(_) => "permission_error",
             CalibanError::RateLimited(_) => "rate_limit_error",
             CalibanError::Upstream(_) | CalibanError::Internal(_) => "api_error",
+            CalibanError::Overloaded(_) => "overloaded_error",
         }
     }
 }
@@ -80,7 +86,7 @@ impl IntoResponse for ApiError {
         {
             resp.headers_mut().insert(header::RETRY_AFTER, v);
         }
-        if let Some(code) = self.code.filter(|_| self.retry_after.is_some()) {
+        if let Some(code) = self.code.filter(|_| self.retry_after.is_some() && matches!(self.error, CalibanError::RateLimited(_))) {
             resp.headers_mut().insert("x-caliban-ratelimit-scope", HeaderValue::from_static(code));
         }
         resp

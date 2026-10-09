@@ -17,6 +17,8 @@ mod messages;
 mod metering;
 #[cfg(test)]
 mod metering_tests;
+mod passthrough;
+pub mod pii_pool;
 mod pipeline;
 pub mod purge;
 mod quirks;
@@ -55,7 +57,11 @@ const MAX_BODY: usize = 32 * 1024 * 1024;
 pub struct Gateway {
     pub config: ConfigHandle,
     pub router: caliban_route::Router,
-    pub pii: PiiEngine,
+    /// PII detectors. Set with [`Gateway::with_pii`], which also starts the worker pool when the
+    /// engine has a heavy detector (the NER model).
+    pub pii: Arc<PiiEngine>,
+    /// Dedicated workers for heavy PII engines (see [`pii_pool`]); `None` runs PII inline.
+    pub pii_pool: Option<pii_pool::PiiPool>,
     pub cache: ExactCache,
     /// T2 semantic cache; `None` when no store is configured (`[cache.semantic]`).
     pub semantic: Option<Arc<SemanticCache>>,
@@ -93,7 +99,8 @@ impl Gateway {
         Self {
             config,
             router: caliban_route::Router::default(),
-            pii: PiiEngine::default(),
+            pii: Arc::new(PiiEngine::default()),
+            pii_pool: None,
             cache: ExactCache::new(c.exact_max_entries, Duration::from_secs(c.exact_ttl_secs)),
             semantic: semantic_cache(&c.semantic),
             embedder,
@@ -121,6 +128,15 @@ impl Gateway {
         if self.router.needs_refresh(&snap) {
             route_embed::refresh(self, &snap).await;
         }
+    }
+
+    /// Replaces the PII engine. An engine with a heavy detector ([`PiiEngine::is_heavy`], the
+    /// NER model) runs on a dedicated worker pool sized by `pool`, with its bounded queue and
+    /// overflow policy; a light engine runs inline and `pool` is ignored.
+    pub fn with_pii(mut self, engine: PiiEngine, pool: pii_pool::PiiPoolOptions) -> Self {
+        self.pii_pool = engine.is_heavy().then(|| pii_pool::PiiPool::new(pool));
+        self.pii = Arc::new(engine);
+        self
     }
 
     /// Replaces the quota store (e.g. a shared Valkey store for multi-router deployments).

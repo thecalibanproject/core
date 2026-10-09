@@ -88,7 +88,7 @@ impl PromptEmbedder for RouteEmbedder<'_> {
     }
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        let input = if self.mask { mask_texts(self.gw, texts.to_vec()).map_err(|e| EmbedError::Unavailable(e.to_string()))?.0 } else { texts.to_vec() };
+        let input = if self.mask { mask_texts(self.gw, texts.to_vec()).await.map_err(|e| EmbedError::Unavailable(e.error.to_string()))?.0 } else { texts.to_vec() };
         let out = self.gw.embedder.embed_shared(self.tenant.as_ref(), &self.model, &input).await.map_err(route_error)?;
         if out.len() != texts.len() {
             return Err(EmbedError::Count { want: texts.len(), got: out.len() });

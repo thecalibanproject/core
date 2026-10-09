@@ -18,10 +18,15 @@ use tokenizers::models::ModelWrapper;
 /// Runtime options for [`NerDetector::load`].
 #[derive(Debug, Clone)]
 pub struct NerOptions {
-    /// ONNX Runtime intra-op threads per session (default: `min(4, available cores)`).
+    /// ONNX Runtime intra-op threads per session (default: [`NerOptions::default_intra_threads`]).
     pub intra_threads: usize,
+    /// Let idle intra-op threads spin-wait for the next run (ONNX Runtime's default). Off by
+    /// default: spinning shaves a little latency off back-to-back runs but burns whole cores that
+    /// the gateway's async workers need.
+    pub intra_spinning: bool,
     /// Independent sessions in the pool; concurrent requests run in parallel up to this many
-    /// (default 1). Each session holds its own copy of the weights.
+    /// (default: [`NerOptions::default_sessions`]). Each session holds its own copy of the weights
+    /// (about 100 MB for the int8 models).
     pub sessions: usize,
     /// Window length in tokens, special tokens included (default and maximum: the manifest's
     /// `tokenizer.max_length`, 512 for the shipped models).
@@ -41,12 +46,34 @@ pub struct NerOptions {
     pub aggregation: Option<Aggregation>,
 }
 
+fn available_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+impl NerOptions {
+    /// Default session count for `cores` CPUs: `min(cores / 2, 4)`, at least 1. Half the cores at
+    /// most, so inference never takes the whole machine from the async runtime; 4 at most,
+    /// because each session holds its own copy of the weights.
+    pub fn default_sessions(cores: usize) -> usize {
+        (cores / 2).clamp(1, 4)
+    }
+
+    /// Default intra-op threads per session for `cores` CPUs and `sessions` sessions: the half of
+    /// the cores given to inference, shared between the sessions, between 1 and 4. With every
+    /// session busy, inference then uses at most about half of the cores.
+    pub fn default_intra_threads(cores: usize, sessions: usize) -> usize {
+        (cores / (2 * sessions.max(1))).clamp(1, 4)
+    }
+}
+
 impl Default for NerOptions {
     fn default() -> Self {
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let cores = available_cores();
+        let sessions = Self::default_sessions(cores);
         Self {
-            intra_threads: cores.min(4),
-            sessions: 1,
+            intra_threads: Self::default_intra_threads(cores, sessions),
+            intra_spinning: false,
+            sessions,
             max_tokens: None,
             overlap: 128,
             batch_size: 4,
@@ -131,6 +158,8 @@ impl NerDetector {
                 .map_err(rt)?
                 .with_inter_threads(1)
                 .map_err(rt)?
+                .with_intra_op_spinning(opts.intra_spinning)
+                .map_err(rt)?
                 .commit_from_memory(&art.model_bytes)
                 .map_err(rt)?;
             check_graph(&session, m, &input_ids, &attention_mask, token_type_ids.as_deref(), &logits)?;
@@ -187,6 +216,11 @@ impl NerDetector {
     /// Model label bases, in model order.
     pub fn label_bases(&self) -> &[String] {
         self.labels.bases()
+    }
+
+    /// Number of sessions in the pool (requests that can run inference at the same time).
+    pub fn sessions(&self) -> usize {
+        self.sessions.len()
     }
 
     /// Inference failures so far (each one also failed its request via `try_detect`).
@@ -328,6 +362,10 @@ impl Detector for NerDetector {
             self.failures.fetch_add(1, Ordering::Relaxed);
             DetectError { detector: "ner", message: e.to_string() }
         })
+    }
+
+    fn is_heavy(&self) -> bool {
+        true
     }
 }
 

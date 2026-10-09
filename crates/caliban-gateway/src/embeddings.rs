@@ -56,9 +56,8 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
     let external = model.trust_tier.is_external() || provider.trust_tier.is_external();
     if external && snap.pii_mode_for(&tenant) != PiiMode::Off {
         let s = telemetry::child("pii");
-        let _g = s.enter();
         s.record("caliban.pii.mode", "mask");
-        entities = mask_inputs(&gw, &mut v)?;
+        entities = mask_inputs(&gw, &mut v).instrument(s.clone()).await?;
         s.record("caliban.pii.entities", entities);
     }
     v["model"] = Value::String(model.upstream_model.clone());
@@ -106,29 +105,29 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
 }
 
 /// Masks PII in `input` (string or array of strings) in place; returns the entity count.
-fn mask_inputs(gw: &Gateway, v: &mut Value) -> Result<usize, CalibanError> {
+async fn mask_inputs(gw: &Gateway, v: &mut Value) -> Result<usize, ApiError> {
     let texts: Vec<String> = match v.get("input") {
         Some(Value::String(s)) => vec![s.clone()],
         Some(Value::Array(a)) if a.iter().all(Value::is_string) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
         // Token-id inputs carry no text to scan.
         _ => return Ok(0),
     };
-    let (masked, entities) = mask_texts(gw, texts)?;
+    let (masked, entities) = mask_texts(gw, texts).await?;
     let masked: Vec<Value> = masked.into_iter().map(Value::String).collect();
     v["input"] = if v.get("input").is_some_and(Value::is_string) { masked.into_iter().next().unwrap_or(Value::Null) } else { Value::Array(masked) };
     Ok(entities)
 }
 
 /// Masks PII in each text (`[EMAIL]`, `[PERSON]`, …); credentials still block the request.
-pub(crate) fn mask_texts(gw: &Gateway, texts: Vec<String>) -> Result<(Vec<String>, usize), CalibanError> {
-    let mut req = ChatRequest {
+pub(crate) async fn mask_texts(gw: &Gateway, texts: Vec<String>) -> Result<(Vec<String>, usize), ApiError> {
+    let req = ChatRequest {
         model: String::new(),
         messages: texts.into_iter().map(|t| Message { role: "user".into(), content: Value::String(t), extra: Default::default() }).collect(),
         stream: false,
         caliban: None,
         extra: Default::default(),
     };
-    let p = gw.pii.protect(&mut req, PiiMode::Mask, b"embeddings").map_err(|e| CalibanError::PolicyViolation(e.to_string()))?;
+    let (req, p) = gw.protect(req, PiiMode::Mask, b"embeddings").await?;
     let masked = req.messages.into_iter().map(|m| m.content.as_str().unwrap_or_default().to_owned()).collect();
     Ok((masked, p.entities))
 }

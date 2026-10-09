@@ -265,38 +265,89 @@ fn spawn_router_warmup(gw: &Arc<caliban_gateway::Gateway>) {
 }
 
 /// Builds the data plane. With `CALIBAN_PII_NER_DIR` set, the L1 NER detector is loaded (and its
-/// artifact hashes verified); a failure refuses to start rather than silently running without it.
-/// The quota store follows `[limits] store` (`valkey` needs `CALIBAN_VALKEY_URL`).
+/// artifact hashes verified) and run on a dedicated worker pool; a failure refuses to start rather
+/// than silently running without it. The quota store follows `[limits] store` (`valkey` needs
+/// `CALIBAN_VALKEY_URL`).
 fn new_gateway(handle: ConfigHandle, usage: Arc<dyn UsageSink>) -> Result<caliban_gateway::Gateway> {
     let quota = caliban_gateway::quota_store(&handle.load().config.limits).map_err(anyhow::Error::msg)?;
     let mut gw = caliban_gateway::Gateway::new(handle, usage).with_quota(quota);
     if let Some(dir) = std::env::var("CALIBAN_PII_NER_DIR").ok().filter(|d| !d.trim().is_empty()) {
-        gw.pii = load_ner(&dir)?;
+        let (engine, pool) = load_ner(&dir)?;
+        gw = gw.with_pii(engine, pool);
     }
     Ok(gw)
 }
 
+/// A positive integer from the environment; unset or empty is `None`, anything else an error.
 #[cfg(feature = "ner")]
-fn load_ner(dir: &str) -> Result<caliban_pii::PiiEngine> {
-    let mut opts = caliban_pii::ner::NerOptions::default();
-    if let Some(n) = std::env::var("CALIBAN_PII_NER_SESSIONS").ok().and_then(|v| v.parse().ok()) {
+fn env_count(name: &str) -> Result<Option<usize>> {
+    match std::env::var(name).ok().filter(|v| !v.trim().is_empty()) {
+        None => Ok(None),
+        Some(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n > 0 => Ok(Some(n)),
+            _ => anyhow::bail!("{name} must be a positive integer, got {v:?}"),
+        },
+    }
+}
+
+/// Loads the NER model with `CALIBAN_PII_NER_SESSIONS` sessions (default `min(cores / 2, 4)`) of
+/// `CALIBAN_PII_NER_THREADS` intra-op threads each (default: half the cores shared between the
+/// sessions, 1 to 4), and the pool's queue and overflow policy (`CALIBAN_PII_NER_QUEUE`,
+/// `CALIBAN_PII_NER_QUEUE_WAIT_MS`, `CALIBAN_PII_NER_OVERFLOW`).
+#[cfg(feature = "ner")]
+fn load_ner(dir: &str) -> Result<(caliban_pii::PiiEngine, caliban_gateway::pii_pool::PiiPoolOptions)> {
+    use caliban_pii::ner::NerOptions;
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut opts = NerOptions::default();
+    if let Some(n) = env_count("CALIBAN_PII_NER_SESSIONS")? {
         opts.sessions = n;
+        opts.intra_threads = NerOptions::default_intra_threads(cores, n);
+    }
+    if let Some(n) = env_count("CALIBAN_PII_NER_THREADS")? {
+        opts.intra_threads = n;
     }
     let started = std::time::Instant::now();
-    let ner = caliban_pii::ner::NerDetector::load(std::path::Path::new(dir), opts)
+    let ner = caliban_pii::ner::NerDetector::load(std::path::Path::new(dir), opts.clone())
         .with_context(|| format!("loading PII NER model from {dir}"))?;
-    tracing::info!(dir, ms = started.elapsed().as_millis() as u64, "PII NER model loaded (L1)");
-    Ok(caliban_pii::PiiEngine::default().with_detector(ner))
+    let pool = caliban_gateway::pii_pool::PiiPoolOptions::new(ner.sessions())
+        .with_env(|k| std::env::var(k).ok())
+        .map_err(anyhow::Error::msg)?;
+    tracing::info!(
+        dir,
+        ms = started.elapsed().as_millis() as u64,
+        sessions = opts.sessions,
+        intra_threads = opts.intra_threads,
+        queue = pool.queue,
+        queue_wait_ms = pool.queue_wait.as_millis() as u64,
+        overflow = ?pool.overflow,
+        "PII NER model loaded (L1)"
+    );
+    Ok((caliban_pii::PiiEngine::default().with_detector(ner), pool))
 }
 
 #[cfg(not(feature = "ner"))]
-fn load_ner(_dir: &str) -> Result<caliban_pii::PiiEngine> {
+fn load_ner(_dir: &str) -> Result<(caliban_pii::PiiEngine, caliban_gateway::pii_pool::PiiPoolOptions)> {
     anyhow::bail!("CALIBAN_PII_NER_DIR is set but this binary was built without the `ner` feature (cargo build -p caliban --features ner)")
 }
 
+/// `CALIBAN_TCP_NODELAY=1` sets `TCP_NODELAY` on accepted connections (default off). On
+/// loopback it made streaming slower in the P0 bench (Nagle coalesced small frames); over a real
+/// network it can save a delayed-ACK wait per token frame. Measure before turning it on; see
+/// `bench/RESULTS.md`.
+fn tcp_nodelay() -> bool {
+    std::env::var("CALIBAN_TCP_NODELAY").is_ok_and(|v| matches!(v.trim(), "1" | "true"))
+}
+
 async fn serve(name: &'static str, addr: String, app: axum::Router) -> Result<()> {
+    use axum::serve::ListenerExt;
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("{name}: binding {addr}"))?;
-    tracing::info!(%addr, "{name} listening");
+    let nodelay = tcp_nodelay();
+    tracing::info!(%addr, nodelay, "{name} listening");
+    let listener = listener.tap_io(move |tcp| {
+        if nodelay && let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!(error = %e, "TCP_NODELAY not set");
+        }
+    });
     axum::serve(listener, app).with_graceful_shutdown(shutdown()).await.with_context(|| format!("{name} server"))
 }
 

@@ -135,6 +135,13 @@ pub trait Detector: Send + Sync {
     fn try_detect(&self, text: &str) -> Result<Vec<Span>, DetectError> {
         Ok(self.detect(text))
     }
+
+    /// `true` for detectors whose cost (model inference, milliseconds of CPU) means they must not
+    /// run on an async runtime's worker threads. The gateway runs engines with a heavy detector on
+    /// its dedicated PII worker pool; regex and dictionary detectors are cheap and run inline.
+    fn is_heavy(&self) -> bool {
+        false
+    }
 }
 
 /// A detector could not run (e.g. ONNX Runtime error). The request must not be forwarded.
@@ -252,6 +259,14 @@ pub fn merge_spans(mut spans: Vec<Span>) -> Vec<Span> {
     out
 }
 
+/// Which detectors a protect call runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    All,
+    /// Non-heavy detectors only.
+    Light,
+}
+
 /// Runs a set of detectors and rewrites a request in place.
 pub struct PiiEngine {
     detectors: Vec<Box<dyn Detector>>,
@@ -288,11 +303,21 @@ impl PiiEngine {
 
     /// Detection that fails if any detector fails.
     pub fn try_detect(&self, text: &str) -> Result<Vec<Span>, DetectError> {
+        self.try_detect_tier(text, Tier::All)
+    }
+
+    fn try_detect_tier(&self, text: &str, tier: Tier) -> Result<Vec<Span>, DetectError> {
         let mut all = Vec::new();
-        for d in &self.detectors {
+        for d in self.detectors.iter().filter(|d| tier == Tier::All || !d.is_heavy()) {
             all.extend(d.try_detect(text)?);
         }
         Ok(merge_spans(all))
+    }
+
+    /// Whether any detector is heavy ([`Detector::is_heavy`]): such an engine should run off the
+    /// async runtime.
+    pub fn is_heavy(&self) -> bool {
+        self.detectors.iter().any(|d| d.is_heavy())
     }
 
     /// Protects every text segment of the request. `scope_key` makes surrogates consistent within
@@ -303,6 +328,17 @@ impl PiiEngine {
     /// request before anything is rewritten), assign surrogates to all values at once in
     /// canonical order (so collision handling does not depend on text order), then rewrite.
     pub fn protect(&self, req: &mut ChatRequest, mode: PiiMode, scope_key: &[u8]) -> Result<Protected, PiiError> {
+        self.protect_tier(req, mode, scope_key, Tier::All)
+    }
+
+    /// [`Self::protect`] with the cheap detectors only (regex patterns, dictionaries), skipping
+    /// heavy ones such as the NER model. Detects less (names, organisations and places are found
+    /// by the model), so callers must only use it as an explicit, operator-chosen degradation.
+    pub fn protect_light(&self, req: &mut ChatRequest, mode: PiiMode, scope_key: &[u8]) -> Result<Protected, PiiError> {
+        self.protect_tier(req, mode, scope_key, Tier::Light)
+    }
+
+    fn protect_tier(&self, req: &mut ChatRequest, mode: PiiMode, scope_key: &[u8], tier: Tier) -> Result<Protected, PiiError> {
         let mut out = Protected { vault: Vault::new(scope_key), entities: 0 };
         if mode == PiiMode::Off {
             return Ok(out);
@@ -315,7 +351,7 @@ impl PiiEngine {
             if err.is_some() {
                 return;
             }
-            let spans = match self.try_detect(s) {
+            let spans = match self.try_detect_tier(s, tier) {
                 Ok(spans) => spans,
                 Err(e) => {
                     err = Some(PiiError::DetectorFailed(e));
@@ -411,6 +447,32 @@ mod tests {
         let words: Vec<&str> = sent.split_whitespace().collect();
         assert_eq!(words[0], words[5].trim_end_matches(','));
         assert_ne!(words[0], words[3].trim_end_matches(','));
+    }
+
+    /// A stand-in for the NER model: marks "Zed" as a person.
+    struct Heavy;
+    impl Detector for Heavy {
+        fn detect(&self, text: &str) -> Vec<Span> {
+            text.match_indices("Zed").map(|(i, m)| Span { start: i, end: i + m.len(), entity: EntityType::Person }).collect()
+        }
+        fn is_heavy(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn protect_light_skips_heavy_detectors_only() {
+        let engine = PiiEngine::default().with_detector(Heavy);
+        assert!(engine.is_heavy());
+        assert!(!PiiEngine::default().is_heavy());
+        let mut full = chat("Zed: zed@acme.com");
+        assert_eq!(engine.protect(&mut full, PiiMode::Mask, b"s").unwrap().entities, 2);
+        assert_eq!(full.last_user_text().unwrap(), "[PERSON]: [EMAIL]");
+        let mut light = chat("Zed: zed@acme.com");
+        assert_eq!(engine.protect_light(&mut light, PiiMode::Mask, b"s").unwrap().entities, 1);
+        assert_eq!(light.last_user_text().unwrap(), "Zed: [EMAIL]");
+        let mut secret = chat("Zed sk-proj-abcdefghijklmnopqrstuvwxyz0123456789");
+        assert!(matches!(engine.protect_light(&mut secret, PiiMode::Mask, b"s"), Err(PiiError::SecretDetected(_))), "credentials still block");
     }
 
     #[test]

@@ -810,6 +810,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "caliban-types",
+ "memchr",
  "serde",
  "serde_json",
 ]

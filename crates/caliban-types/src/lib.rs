@@ -223,6 +223,9 @@ pub enum CalibanError {
     Upstream(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// Temporarily over capacity (e.g. the PII model's queue is full); retry later. 503.
+    #[error("overloaded: {0}")]
+    Overloaded(String),
 }
 
 impl CalibanError {
@@ -234,6 +237,7 @@ impl CalibanError {
             CalibanError::RateLimited(_) => "rate_limited",
             CalibanError::Upstream(_) => "upstream_error",
             CalibanError::Internal(_) => "internal_error",
+            CalibanError::Overloaded(_) => "overloaded",
         }
     }
 
@@ -245,6 +249,7 @@ impl CalibanError {
             CalibanError::RateLimited(_) => 429,
             CalibanError::Upstream(_) => 502,
             CalibanError::Internal(_) => 500,
+            CalibanError::Overloaded(_) => 503,
         }
     }
 }

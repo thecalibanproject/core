@@ -125,11 +125,10 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
     let scope_key = gw.pii_keys.scope_key(surrogate_scope, tenant.id.as_str());
     let (protected_req, protected) = {
         let s = telemetry::child("pii");
-        let _g = s.enter();
         s.record("caliban.pii.mode", pii_mode_str(pii_mode));
         s.record("caliban.pii.surrogate_scope", surrogate_scope.as_str());
-        let mut pr = req.clone();
-        let p = gw.pii.protect(&mut pr, pii_mode, &scope_key).map_err(|e| CalibanError::PolicyViolation(e.to_string()))?;
+        // Off the async runtime when the engine runs the NER model (see `pii_pool`).
+        let (pr, p) = gw.protect(req.clone(), pii_mode, &scope_key).instrument(s.clone()).await?;
         s.record("caliban.pii.entities", p.entities);
         (pr, p)
     };
@@ -165,7 +164,7 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
             Some(nb) => {
                 let (mut b, entities, rh) = if use_protected {
                     if native_protected.is_none() {
-                        native_protected = Some(protect_native(&gw, nb, pii_mode, &scope_key)?);
+                        native_protected = Some(protect_native(&gw, nb, pii_mode, &scope_key).await?);
                     }
                     let np = native_protected.as_ref().expect("initialized above");
                     (np.body.clone(), np.entities, Some(Arc::clone(&np.rehydrator)))
@@ -376,18 +375,18 @@ struct NativeProtected {
 /// Applies the PII engine to every client-written text segment of a native Anthropic body
 /// (system, text blocks, tool results) with the request's scope key, leaving all other fields
 /// untouched.
-fn protect_native(gw: &Gateway, native: &Value, mode: PiiMode, scope_key: &[u8]) -> Result<NativeProtected, CalibanError> {
+async fn protect_native(gw: &Gateway, native: &Value, mode: PiiMode, scope_key: &[u8]) -> Result<NativeProtected, ApiError> {
     let mut body = native.clone();
     let mut texts = Vec::new();
     anthropic::for_each_text_mut(&mut body, |s| texts.push(std::mem::take(s)));
-    let mut tmp = ChatRequest {
+    let tmp = ChatRequest {
         model: String::new(),
         messages: texts.into_iter().map(|t| Message { role: "user".into(), content: Value::String(t), extra: Map::new() }).collect(),
         stream: false,
         caliban: None,
         extra: Map::new(),
     };
-    let p = gw.pii.protect(&mut tmp, mode, scope_key).map_err(|e| CalibanError::PolicyViolation(e.to_string()))?;
+    let (tmp, p) = gw.protect(tmp, mode, scope_key).await?;
     let mut rewritten = tmp.messages.into_iter().map(|m| match m.content {
         Value::String(s) => s,
         _ => String::new(),

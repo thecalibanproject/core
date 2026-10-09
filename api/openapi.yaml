@@ -67,6 +67,7 @@ paths:
         '403': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '502': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Overloaded' }
   /v1/messages:
     post:
       tags: [inference]
@@ -114,6 +115,7 @@ paths:
         '403': { $ref: '#/components/responses/AnthropicError' }
         '429': { $ref: '#/components/responses/AnthropicRateLimited' }
         '502': { $ref: '#/components/responses/AnthropicError' }
+        '503': { $ref: '#/components/responses/AnthropicOverloaded' }
   /v1/messages/count_tokens:
     post:
       tags: [inference]
@@ -852,6 +854,22 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     AnthropicError:
       description: Error (Anthropic shape)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AnthropicError' }
+    Overloaded:
+      description: |
+        The PII model's queue is full (`CALIBAN_PII_NER_OVERFLOW=reject`, the default). The request
+        was not sent upstream; retry after `retry-after` seconds. `error.type` is `overloaded`.
+      headers:
+        retry-after: { schema: { type: integer }, description: 'Seconds to wait before retrying.' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    AnthropicOverloaded:
+      description: The PII model's queue is full (Anthropic shape, `error.type` = `overloaded_error`). Nothing was sent upstream.
+      headers:
+        retry-after: { schema: { type: integer } }
       content:
         application/json:
           schema: { $ref: '#/components/schemas/AnthropicError' }

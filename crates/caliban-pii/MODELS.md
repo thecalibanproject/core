@@ -130,8 +130,12 @@ only**. For air-gapped builds, point `ORT_LIB_LOCATION` at a vendored ONNX Runti
   - Model-detected credentials → `Custom("CREDENTIAL")`. They are not mapped to `Secret`,
     because a false positive would block the request.
   - Ignored: `MISC`, `DATE`, `TIME`, `AGE`, `GENDER`, `COUNTRY`, `STATE`, `URL`.
-- **Concurrency**: `sessions` independent ONNX sessions, each behind a `Mutex` (`run` needs
-  `&mut Session`), with `intra_threads` ONNX threads each. `NerDetector` is `Send + Sync`.
+- **Concurrency**: `sessions` independent ONNX sessions (default `min(cores / 2, 4)`), each
+  behind a `Mutex` (`run` needs `&mut Session`), with `intra_threads` ONNX threads each
+  (default `cores / (2 × sessions)`, 1 to 4) and spin-waiting off (`intra_spinning`).
+  `NerDetector` is `Send + Sync` and reports `Detector::is_heavy`, so the gateway runs it on its
+  dedicated PII worker pool (one worker per session, bounded queue, fail-closed `503` when full;
+  see the README) rather than on async workers.
 - **Failure**: an inference error makes `PiiEngine::protect` return
   `PiiError::DetectorFailed`, so the request fails closed. `Detector::detect` is best-effort
   and counts failures in `NerDetector::failures()`.
@@ -144,4 +148,5 @@ Run the eval and benchmark yourself:
 CALIBAN_PII_NER_DIR=$PWD/../ml/artifacts/pii_ner/nym-pii-multilingual-small-int8/3.0.0 \
   cargo test --release -p caliban-pii --features ner --test ner_integration -- --nocapture --test-threads=1
 cargo run --release -p caliban-pii --features ner --example ner_bench -- "$CALIBAN_PII_NER_DIR"
+cargo run --release -p caliban-pii --features ner --example ner_bench -- "$CALIBAN_PII_NER_DIR" --pool  # session/thread sizing
 ```

@@ -6,7 +6,7 @@ The P0 exit criteria (reference architecture, section 8) are: **under 3 ms p50 o
 
 | Criterion | Result |
 |---|---|
-| Under 3 ms p50 overhead | **Pass** for every non-streaming path (chat, PII regex tier, cache hit, native Anthropic, usage WAL) at concurrency 1, 16 and 64: worst p50 0.75 ms. **Pass** for streams at concurrency 1 and 16 (worst p50 1.17 ms total, 0.49 ms TTFB) and for paced streams at every level (TTFB p50 at most 0.57 ms). **Fail** for unpaced streams at concurrency 64: p50 4.1 ms (PII off) and 5.4 ms (PII on) in the full run, 2.9 ms in the quietest A/B round. See [Streaming at concurrency 64](#streaming-at-concurrency-64). The NER tier (model inference) is outside the 3 ms budget and is reported separately. |
+| Under 3 ms p50 overhead | **Pass** for every non-streaming path (chat, PII regex tier, cache hit, native Anthropic, usage WAL) at concurrency 1, 16 and 64: worst p50 0.75 ms. **Pass** for streams at concurrency 1 and 16 (worst p50 1.17 ms total, 0.49 ms TTFB) and for paced streams at every level (TTFB p50 at most 0.57 ms). **Fail** in the first run for unpaced streams at concurrency 64: p50 4.1 ms (PII off) and 5.4 ms (PII on) in the full run, 2.9 ms in the quietest A/B round. **Borderline** after the stream passthrough (`perf/ner-and-streams`): 3.16 ms (PII off) and 3.40 ms (PII on), medians of three A/B rounds on a machine at load average 6 to 12, against 3.46 and 4.70 ms for the build before it in the same rounds; best rounds 2.62 and 3.15 ms. Gateway CPU per stream is down 27% (PII off) and 25% (PII on). See [Streaming at concurrency 64](#streaming-at-concurrency-64). The NER tier (model inference) is outside the 3 ms budget and is reported separately. |
 | Isolation audit passes | **Pass**: 9 of 9 properties, through the real binary. No cross-tenant leak found. One property (datasources) is only partly testable today because the data plane does not consume datasources yet. |
 | Usage within 1% of provider bills | **Pass** after the metering fixes (`fix/metering`): tokens and cost equal the provider's bill on every path, prompt-cache pricing included (81 requests, +0.00%; before the fixes the same workload was metered +21.8% above the bill, and the first measurement +33.0%). Streams whose client sets `include_usage: false` are metered from the provider's usage (were 0 tokens); client disconnects are metered as flagged estimates (were 0). See [Usage accuracy](#usage-accuracy). |
 
@@ -15,7 +15,8 @@ The P0 exit criteria (reference architecture, section 8) are: **under 3 ms p50 o
 - Hardware: Apple M5, 10 cores (4 performance, 6 efficiency), 16 GiB, macOS 26.5.1. rustc 1.96.0.
 - Commit measured: `652fc17` on `feat/bench` (branch point `409a138`, plus the two stream fixes listed below).
 - Date: 2026-10-09. Load average before the run: 5.96 (other agents were compiling on the same machine earlier; see caveats).
-- Release build (`lto = "thin"`, `codegen-units = 1`); NER rows use a `--features ner` build with `nym-pii-multilingual-small-int8` 3.0.0 (`CALIBAN_PII_NER_DIR`), default `NerOptions` (1 session, up to 4 intra-op threads).
+- Release build (`lto = "thin"`, `codegen-units = 1`); NER rows use a `--features ner` build with `nym-pii-multilingual-small-int8` 3.0.0 (`CALIBAN_PII_NER_DIR`), default `NerOptions` (1 session, up to 4 intra-op threads; the defaults are now 4 sessions of 1 thread on this machine, see the NER section).
+- The before and after tables for `perf/ner-and-streams` were measured later the same day, with the same harness, against `fix/metering` as "before".
 
 ## Method
 
@@ -91,6 +92,35 @@ At concurrency 1 the model costs 8.7 ms for a 230-character prompt, inside the d
 2. Size `CALIBAN_PII_NER_SESSIONS` to the cores available (for example cores divided by `intra_threads`) by default, not 1.
 3. Skip the model when the regex tier already covers the text, or batch concurrent requests into one inference call.
 
+#### After the inference pool (`perf/ner-and-streams`)
+
+Fixes 1 and 2 are done (see [PII NER model](../README.md#inference-pool-and-backpressure) in the README):
+
+- `PiiEngine::protect` runs on dedicated worker threads, one per ONNX session, never on tokio workers and never on tokio's blocking pool. Callers await a oneshot.
+- Sessions default to `min(cores / 2, 4)` (4 here) with `cores / (2 × sessions)` intra-op threads each (1 here) and ONNX Runtime spin-waiting off.
+- A bounded queue (128) sits in front of the workers. When it is full the default is fail closed: `503` with `retry-after`, nothing sent upstream. Degrading to the regex tier is an explicit opt-in (`CALIBAN_PII_NER_OVERFLOW=degrade`).
+
+Same machine, back to back, 1000 requests per side per row in two interleaved rounds; "before" is `fix/metering` (`5e71b61`: 1 session, 4 intra-op threads, spinning on, inference inline). Overhead in ms (TTFB for the stream rows):
+
+| Scenario | Conc. | p50 before | p50 after | p99 before | p99 after | req/s before | req/s after |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| chat + PII with NER | 1 | 10.8 | 12.0 | 14.4 | 13.7 | 91 | 82 |
+| | 16 | 167.8 | 119.1 | 227.6 | 210.2 | 95 | 127 |
+| | 64 | 618.1 | 475.5 | 1089.9 | 540.2 | 97 | 133 |
+| stream + PII with NER, TTFB | 1 | 10.3 | 12.4 | 13.2 | 16.6 | 90 | 78 |
+| | 16 | 127.9 | 122.1 | 215.8 | 136.2 | 93 | 128 |
+| | 64 | 321.2 | 490.1 | 941.0 | 543.0 | 92 | 129 |
+| PII-off chat on the NER gateway while 16 NER requests are in flight | 1 | 0.08 | 0.11 | **63.8** | **0.18** | 749 | 4869 |
+| | 16 | 0.26 | 0.30 | 0.35 | 0.47 | 39095 | 28334 |
+| | 64 | 0.73 | 0.77 | 0.94 | 1.25 | 49134 | 39747 |
+
+What changed:
+
+- **Collateral damage is gone.** PII-off traffic on a gateway busy with NER keeps its normal latency: p99 0.18 ms at concurrency 1 (was 64 to 140 ms, because requests waiting for the session blocked their tokio worker). At concurrency 16 and 64 its throughput is lower than before because inference now uses 4 sessions' worth of cores instead of 1 (the background load is 16 NER requests); its latency stays under 1.3 ms p99.
+- **NER throughput is up about 35%** (95 to 130 requests per second), and the p99 at concurrency 64 is halved. Throughput did not scale with the 4 sessions because the machine was shared: the 10 cores (4 performance, 6 efficiency) also ran the load generator, the mock and other agents' builds (load average 5 to 12). `ner_bench --pool` on the same machine gives 82 to 90 requests per second for 1 session and 122 to 140 for 2 to 8 sessions, so the pool is CPU-bound here. Expect it to scale with performance cores on a dedicated host.
+- **Single-request latency** rose from about 10.8 to 12.0 ms: 1 intra-op thread per session instead of 4. For latency-sensitive, low-concurrency deployments, set `CALIBAN_PII_NER_THREADS=2` (10.2 ms at concurrency 1 in `ner_bench --pool`, at the cost of some throughput).
+- No request was rejected in these runs: concurrency 64 stays within the default queue of 128.
+
 ### Streaming at concurrency 64
 
 Unpaced streams at concurrency 64 are the one gateway path over budget. In this scenario the mock writes all 62 events of a stream back to back with no delay, about 9,000 streams per second through the gateway, which is roughly 560,000 SSE events per second. It is a stress case: a real model emits a token every 10 to 50 ms, and the paced rows (1 ms between chunks, still far faster than a model) show 0.1 to 0.6 ms TTFB overhead at every concurrency. At concurrency 1 the gateway spends about 6 microseconds per streamed event (0.37 ms for 62 events).
@@ -115,6 +145,47 @@ Fix suggestions (not done here, they change shared gateway code):
 2. **Serialise into a reused buffer** (`serde_json::to_writer` into one `Vec<u8>` per stream) instead of `format!` plus a fresh `String` per event, and reuse the SSE parser's output strings. This targets most of the allocator share.
 3. **Record `gen_ai.response.model` once per stream**, not on every chunk.
 4. Write coalescing beyond one upstream read would add latency and is not recommended.
+
+#### After the stream passthrough (`perf/ner-and-streams`)
+
+Fixes 1 to 3 above are done, plus a few more. Write coalescing (point 4) is done only for data that has already arrived, which adds no waiting:
+
+- **Passthrough** (`crates/caliban-gateway/src/passthrough.rs`). One serde_json pass over each chunk, with no tree and no allocation, finds the byte range of the top-level `model` value, whether `usage` is present, and the output text bytes for usage estimates. The chunk then goes out as received, with only the `model` literal replaced by the gateway's model id. The replacement is serialised by serde_json, so escaping is always correct. For clients that did not ask for usage, OpenAI's `"usage": null` member is cut out together with one adjacent comma (`metering::strip_usage` semantics). Chunks that carry usage, unusual chunks (not an object, duplicate keys, escaped keys, multi-line data, unexpected types), the Anthropic-client translation and semantic-cache capture take the general path, which is unchanged.
+- **Surrogate restoring in place** (PII on). A chunk with one unfinished choice and a string `delta.content` (no reasoning fields) feeds the streaming rehydrator as before. Only the `content` literal is rewritten, and only when the restored text differs. Finishing, multi-choice and reasoning chunks go through `transform_chunk`.
+- **Native Anthropic**. Content block start, delta and stop events and `ping` pass through as received when there is nothing to restore. `message_start` (model rewrite, usage) and `message_delta` (usage) take the general path.
+- **Buffers**. Each stream writes into one `BytesMut` that batches are split off (`serde_json::to_writer` on the general path, no `format!`). The SSE parser hands out borrowed payloads (`SseParser::push_each`; a single `data:` line is not copied), finds event boundaries with memchr, and only rescans new bytes.
+- **Coalescing**. After the first frame of a stream (sent at once, for time to first byte), upstream reads that are already waiting are merged into one body frame, up to 64 KiB.
+- `gen_ai.response.model` is recorded once per stream.
+- The per-request rehydrator builds a contiguous NFA instead of letting aho-corasick pick a DFA. Building it was 6% of busy samples on PII streams.
+
+Correctness: unit tests feed a corpus through both paths (passthrough, and the general path forced with a test switch). The corpus covers unicode and surrogate-pair escapes, escaped quotes in content and in the upstream model name, key order and whitespace, `model: null`, no model, reasoning and tool-call deltas, `usage: null` (literal and escaped key), usage chunks, `[DONE]`, error events, non-JSON and non-object data, and multi-line data. Native Anthropic events and PII streams with surrogates split across chunks are also covered. Each case is split three ways: one read, one read per event, and 7-byte reads. The tests check the same client events (as JSON values), the same metered usage, and the same output-byte counts, with and without client usage.
+
+A/B, same machine, back to back, three alternating rounds of 3000 requests per side, median of the rounds (load average 6 to 8). "Before" is `fix/metering` (`5e71b61`). Overhead in ms:
+
+| Scenario | Conc. | p50 before | p50 after | p99 before | p99 after | TTFB p50 before | TTFB p50 after |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| stream (PII off) | 1 | 0.276 | **0.191** | 0.355 | 0.259 | 0.051 | 0.052 |
+| | 16 | 0.779 | **0.612** | 3.355 | 1.356 | 0.294 | 0.322 |
+| | 64 | 3.463 | **3.158** | 9.380 | 7.328 | 0.685 | 1.055 |
+| stream + PII (regex, reversible) | 1 | 0.338 | **0.246** | 0.422 | 0.293 | 0.080 | 0.074 |
+| | 16 | 0.937 | **0.717** | 4.650 | 2.838 | 0.399 | 0.372 |
+| | 64 | 4.704 | **3.404** | 17.474 | 11.514 | 0.740 | 1.141 |
+
+Rounds at concurrency 64, p50: PII off 3.46 / 3.62 / 3.37 before, 2.62 / 3.25 / 3.16 after; PII on 4.70 / 5.17 / 4.65 before, 3.15 / 3.40 / 3.58 after.
+
+Latency at concurrency 64 swings with the machine's load, so gateway CPU time per request is the steadier measure. It was read from the gateway process's CPU time over 21,000 streams at concurrency 64, alternating builds:
+
+| Scenario | Before (µs/stream) | After (µs/stream) | Change |
+|---|---:|---:|---:|
+| stream (PII off) | 583 | 424 | -27% |
+| stream + PII | 625, 674 | 495, 478 | -25% |
+
+(An earlier, quieter pair gave 495 and 337 µs for PII off.)
+
+- **Time to first byte at concurrency 64 rose** (0.69 to 1.06 ms) while total latency fell. With every upstream read of a stream already waiting, the stream task now processes them all in one go before yielding, so other streams' first frames wait a little longer for a worker. With a real model's pacing nothing is waiting to merge, and the paced and concurrency 1 and 16 rows do not show it.
+- New profile (same method, PII off, concurrency 64). The stream task fell from 42% to 8% of busy samples; scanning chunks is about 5%. `writev` to the client is now 37%. Request setup (`pipeline::run`) is 10%, reqwest's connection-pool mutex 3.4%, and `uuid::now_v7`'s global mutex 1.5%. What remains is mostly HTTP plumbing on both legs and kernel writes, not per-chunk work.
+- **Coalescing the first frame too** made no measurable difference to CPU (406 to 420 vs 400 to 412 µs per stream), so the first frame still leaves at once.
+- **TCP_NODELAY, re-tested** (`CALIBAN_TCP_NODELAY=1`, new, off by default). Concurrency 64: 850 µs of CPU per stream and 8.8 to 9.0 ms p50 overhead, against 310 to 400 µs and 3.3 to 4.1 ms with it off. Concurrency 1: 0.19 ms against 0.22 ms. On loopback Nagle coalesces hyper's small writes, which helps far more than it hurts, so it stays off. **For the AWS run**: measure both settings over a real network, where a token frame can wait for a delayed ACK with Nagle on; at real token rates (one frame every 10 to 50 ms) that is the case that matters.
 
 ## Fixes made on this branch
 
@@ -233,4 +304,6 @@ QUICK=1 scripts/bench.sh                       # smoke check of the suite
 cargo test -p caliban --test isolation         # isolation audit only
 cargo test -p caliban --test usage_accuracy    # usage accuracy only
 cargo build --profile profiling -p caliban     # symbols for `sample` or flamegraphs
+caliban-bench --caliban … --only '=stream,=stream+pii'   # exact scenario names (`stream` alone matches every stream row)
+cargo run --release -p caliban-pii --features ner --example ner_bench -- "$CALIBAN_PII_NER_DIR" --pool   # NER session sizing
 ```

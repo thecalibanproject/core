@@ -54,7 +54,8 @@ struct Args {
     /// Measured requests per side for the paced scenarios (each stream takes ~70 ms).
     #[arg(long, default_value_t = 600)]
     paced_requests: usize,
-    /// Only run scenarios whose name contains one of these (comma-separated).
+    /// Only run scenarios whose name contains one of these (comma-separated); `=name` matches
+    /// exactly.
     #[arg(long, value_delimiter = ',')]
     only: Vec<String>,
     /// Markdown report path.
@@ -400,8 +401,10 @@ async fn main() -> Result<()> {
     );
     let env = vec![("BENCH_UPSTREAM_KEY".to_owned(), UPSTREAM_KEY.to_owned())];
 
-    let wanted =
-        |name: &str| args.only.is_empty() || args.only.iter().any(|o| name.contains(o.as_str()));
+    // `--only stream` matches every scenario containing "stream"; `--only =stream` only that one.
+    let wanted = |name: &str| {
+        args.only.is_empty() || args.only.iter().any(|o| o.strip_prefix('=').map_or_else(|| name.contains(o.as_str()), |exact| name == exact))
+    };
     let all = scenarios();
     let needs = |p: Profile| all.iter().any(|s| s.profile == p && wanted(s.name));
 

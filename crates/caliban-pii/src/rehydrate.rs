@@ -5,7 +5,7 @@
 //! Matching is ASCII case-insensitive as a cheap fuzzy fallback.
 
 use crate::Vault;
-use aho_corasick::{AhoCorasick, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 use std::sync::Arc;
 
 pub struct Rehydrator {
@@ -20,7 +20,11 @@ impl Rehydrator {
             return Self { ac: None, originals: vec![], surrogates_lower: vec![] };
         }
         let (surrogates, originals): (Vec<String>, Vec<String>) = vault.pairs().iter().cloned().unzip();
+        // One automaton per request over a handful of short patterns, searched over short texts:
+        // a contiguous NFA builds an order of magnitude faster than the DFA the builder would
+        // otherwise pick, and searches as fast at this size.
         let ac = AhoCorasick::builder()
+            .kind(Some(AhoCorasickKind::ContiguousNFA))
             .match_kind(MatchKind::LeftmostLongest)
             .ascii_case_insensitive(true)
             .build(&surrogates)

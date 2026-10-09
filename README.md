@@ -269,7 +269,12 @@ exemplars = { "legal.review" = ["review this NDA clause for risky terms", "check
 | `CALIBAN_QDRANT_API_KEY` | data plane | Qdrant API key, used when `[cache.semantic] qdrant_api_key` is unset |
 | `CALIBAN_LOG` | all | Log filter (default `info,tower_http=info`) |
 | `CALIBAN_PII_NER_DIR` | data plane | Verified NER artifact directory; needs a `ner` build |
-| `CALIBAN_PII_NER_SESSIONS` | data plane | Number of NER inference sessions |
+| `CALIBAN_PII_NER_SESSIONS` | data plane | NER inference sessions, which is also the number of PII worker threads (default `min(cores / 2, 4)`) |
+| `CALIBAN_PII_NER_THREADS` | data plane | ONNX Runtime intra-op threads per session (default: half the cores shared between the sessions, 1 to 4) |
+| `CALIBAN_PII_NER_QUEUE` | data plane | Requests that may wait for a PII worker (default 128) |
+| `CALIBAN_PII_NER_QUEUE_WAIT_MS` | data plane | How long a request waits for a queue slot when the queue is full (default 0) |
+| `CALIBAN_PII_NER_OVERFLOW` | data plane | `reject` (default: 503, fail closed) or `degrade` (regex tier only); see [PII NER model](#pii-ner-model-ner-feature) |
+| `CALIBAN_TCP_NODELAY` | all | `1` sets `TCP_NODELAY` on accepted connections (default off; see `bench/RESULTS.md`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | Turns on OTLP/HTTP trace export (off when unset). `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME` and `OTEL_SDK_DISABLED` are honoured |
 
 Split-mode variables are listed under [Split mode](#split-mode).
@@ -282,7 +287,19 @@ The L1 detector is off by default, so the workspace builds without ONNX Runtime.
 cargo build -p caliban --features ner
 ```
 
-Fetch and verify the model with [`scripts/fetch_pii_ner.py`](https://github.com/thecalibanproject/ml/blob/main/scripts/fetch_pii_ner.py) from the ml repo, then set `CALIBAN_PII_NER_DIR` to the artifact directory (and optionally `CALIBAN_PII_NER_SESSIONS`). If the variable is set and the artifact fails hash verification, or the binary was built without `ner`, Caliban refuses to start rather than run without the detector. The `ort` crate downloads a prebuilt ONNX Runtime at build time only; for air-gapped builds, set `ORT_LIB_LOCATION`. Model choice, licences and the open licence item are in [`crates/caliban-pii/MODELS.md`](crates/caliban-pii/MODELS.md).
+Fetch and verify the model with [`scripts/fetch_pii_ner.py`](https://github.com/thecalibanproject/ml/blob/main/scripts/fetch_pii_ner.py) from the ml repo, then set `CALIBAN_PII_NER_DIR` to the artifact directory. If the variable is set and the artifact fails hash verification, or the binary was built without `ner`, Caliban refuses to start rather than run without the detector. The `ort` crate downloads a prebuilt ONNX Runtime at build time only; for air-gapped builds, set `ORT_LIB_LOCATION`. Model choice, licences and the open licence item are in [`crates/caliban-pii/MODELS.md`](crates/caliban-pii/MODELS.md).
+
+#### Inference pool and backpressure
+
+Model inference costs milliseconds of CPU per request, so it never runs on the async runtime that serves HTTP:
+
+- **Workers.** A fixed set of dedicated threads (`caliban-pii-N`), one per ONNX session. Each session holds its own copy of the weights (about 100 MB for the int8 models). Defaults: `min(cores / 2, 4)` sessions (`CALIBAN_PII_NER_SESSIONS`) of `cores / (2 × sessions)` intra-op threads each, between 1 and 4 (`CALIBAN_PII_NER_THREADS`), so inference uses at most about half of the machine. ONNX Runtime's spin-waiting is off, so idle sessions do not burn cores. Requests with PII off, and engines without the model, never touch the pool.
+- **Bounded queue.** At most `CALIBAN_PII_NER_QUEUE` requests (default 128) wait for a worker. A request whose client disconnects while it waits is dropped without running the model.
+- **When the queue is full**, a request waits up to `CALIBAN_PII_NER_QUEUE_WAIT_MS` (default 0) for a slot, then `CALIBAN_PII_NER_OVERFLOW` applies:
+  - `reject` (default): **fail closed.** The request gets `503` with `retry-after: 1` (OpenAI `type: overloaded`, Anthropic `overloaded_error`) and nothing is sent upstream. This is the right default for a privacy gateway: the alternative sends text upstream that the model has not screened.
+  - `degrade`: the request is screened by the regex tier only (emails, phone numbers, cards, IBANs, credentials and the tenant dictionaries) and goes upstream. **Names, organisations and places are then not pseudonymised.** Only choose this when availability matters more than screening for every request; each degraded request is logged at `warn` and marked `caliban.pii.degraded` on its `pii` span.
+
+A model failure (as opposed to a full queue) always blocks the request with `403`, whatever the policy. An unknown `CALIBAN_PII_NER_OVERFLOW` value, or a non-numeric size, refuses to start.
 
 ### Shared quotas (Valkey)
 
