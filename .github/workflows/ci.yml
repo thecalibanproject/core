@@ -26,8 +26,9 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Default features: no ONNX Runtime. Postgres and MongoDB tests return early without
-      # CALIBAN_TEST_DATABASE_URL / CALIBAN_MONGO_TEST_URI; the NER test needs `--features ner`.
+      # Default features: no ONNX Runtime. Postgres, Valkey and MongoDB tests return early without
+      # CALIBAN_TEST_DATABASE_URL / CALIBAN_TEST_VALKEY_URL / CALIBAN_MONGO_TEST_URI; the NER
+      # test needs `--features ner`.
       - run: cargo test --workspace
 
   postgres:
@@ -54,6 +55,29 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p caliban-cp store::tests::postgres
+
+  valkey:
+    name: Valkey quota store
+    runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:9.1.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      CALIBAN_TEST_VALKEY_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      # The memory store's suite against Valkey, plus concurrency across two store instances,
+      # reserve/settle, TTL expiry, outage fallback and recovery, and a latency printout.
+      - run: 'cargo test -p caliban-meter quota:: -- --nocapture'
 
   ner:
     name: Build with NER (ONNX Runtime)

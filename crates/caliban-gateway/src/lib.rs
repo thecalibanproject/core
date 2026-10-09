@@ -22,6 +22,7 @@ pub mod telemetry;
 mod tests;
 
 pub use error::{ApiError, Dialect};
+pub use limits::quota_store;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -48,7 +49,8 @@ pub struct Gateway {
     pub cache: ExactCache,
     pub providers: Providers,
     pub usage: Arc<dyn UsageSink>,
-    /// Rate limits and token budgets (`[limits]`). In-memory: exact per router process.
+    /// Rate limits and token budgets (`[limits]`). In-memory by default (exact per router
+    /// process); `store = "valkey"` shares them across routers (see [`quota_store`]).
     pub quota: Arc<dyn QuotaStore>,
     /// Derives per-tenant `cache_salt` values. Derived from `CALIBAN_KEK` when set so all routers
     /// of a deployment agree; otherwise random per process.
@@ -143,5 +145,6 @@ pub fn app(gw: Arc<Gateway>) -> Router {
 
 async fn health(axum::extract::State(gw): axum::extract::State<Arc<Gateway>>) -> axum::Json<serde_json::Value> {
     let snap = gw.config.load();
-    axum::Json(serde_json::json!({ "status": "ok", "mode": "router", "config_version": snap.version }))
+    // A degraded quota store does not fail the probe: limits are then enforced locally.
+    axum::Json(serde_json::json!({ "status": "ok", "mode": "router", "config_version": snap.version, "quota": gw.quota.status() }))
 }

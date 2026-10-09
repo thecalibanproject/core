@@ -1,6 +1,6 @@
 //! Rate limits and token budgets (request lifecycle stage 3; settlement is stage 13).
 //!
-//! - **Request rate**: GCRA (`governor`) per tenant and, optionally, per API key.
+//! - **Request rate**: GCRA per tenant and, optionally, per API key.
 //! - **Token budgets**: tokens per minute (a token bucket that refills continuously), tokens per
 //!   UTC day, and USD per UTC day.
 //!
@@ -9,8 +9,18 @@
 //! the reservation against the usage the upstream reported. Over-estimates are refunded;
 //! under-estimates leave the minute bucket in debt so the next request waits.
 //!
-//! [`InMemoryQuota`] is exact for a single router process. Multi-router deployments need a shared
-//! store: [`ValkeyQuota`] is the placeholder for a Valkey implementation (same trait).
+//! Stores ([`QuotaStore`]):
+//! - [`InMemoryQuota`]: exact for one router process (`[limits] store = "memory"`, the default).
+//! - [`ValkeyQuota`]: shared by every router of a deployment; each check is one atomic Lua script
+//!   on the server, so routers cannot double-spend (see [`valkey`]).
+//! - [`FallbackQuota`]: what `store = "valkey"` runs: Valkey, with this router's in-memory
+//!   limiter as the fallback while Valkey is unreachable (see [`fallback`] for the policy).
+
+pub mod fallback;
+pub mod valkey;
+
+pub use fallback::FallbackQuota;
+pub use valkey::{ValkeyOptions, ValkeyQuota};
 
 use async_trait::async_trait;
 use governor::clock::{Clock, DefaultClock};
@@ -89,6 +99,32 @@ pub struct Reservation {
     pub day: i64,
     /// False when the tenant had no budgets at reservation time (settling is then a no-op).
     pub tracked: bool,
+    /// Made in this router's local fallback store rather than the shared one; settled there too.
+    pub local: bool,
+}
+
+/// What a store reports on the health endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct QuotaStatus {
+    /// `memory` or `valkey`.
+    pub store: &'static str,
+    /// `ok`, or `degraded` while a shared store is unreachable and limits are local.
+    pub state: &'static str,
+    /// Shared store address, password redacted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Quota calls served by the local fallback since start.
+    pub local_fallbacks: u64,
+    /// Shared-store settlements that failed (those reservations stay charged).
+    pub settlements_lost: u64,
+}
+
+impl Default for QuotaStatus {
+    fn default() -> Self {
+        Self { store: "memory", state: "ok", endpoint: None, detail: None, local_fallbacks: 0, settlements_lost: 0 }
+    }
 }
 
 #[async_trait]
@@ -101,6 +137,11 @@ pub trait QuotaStore: Send + Sync {
 
     /// Replaces the reserved amount with what was actually used.
     async fn settle(&self, reservation: &Reservation, actual: Amount);
+
+    /// Health detail (store kind, degraded or not).
+    fn status(&self) -> QuotaStatus {
+        QuotaStatus::default()
+    }
 }
 
 // ─────────────────────────────── in-memory store ───────────────────────────────
@@ -148,7 +189,7 @@ impl Bucket {
     }
 }
 
-fn utc_day_and_secs_left() -> (i64, u64) {
+pub(crate) fn utc_day_and_secs_left() -> (i64, u64) {
     let now = chrono::Utc::now().timestamp();
     (now.div_euclid(86_400), u64::try_from(86_400 - now.rem_euclid(86_400)).unwrap_or(1))
 }
@@ -182,7 +223,7 @@ impl InMemoryQuota {
     /// `reserve` with an explicit clock, for tests.
     fn reserve_at(&self, tenant: &str, policy: &QuotaPolicy, amount: Amount, now: Instant, day: i64, secs_left: u64) -> Result<Reservation, QuotaError> {
         if !policy.has_budgets() {
-            return Ok(Reservation { tenant: tenant.to_owned(), amount, day, tracked: false });
+            return Ok(Reservation { tenant: tenant.to_owned(), amount, day, tracked: false, local: false });
         }
         let mut budgets = self.budgets.lock();
         let b = budgets
@@ -229,7 +270,7 @@ impl InMemoryQuota {
         }
         b.day_tokens = b.day_tokens.saturating_add(amount.tokens);
         b.day_usd += amount.usd;
-        Ok(Reservation { tenant: tenant.to_owned(), amount, day, tracked: true })
+        Ok(Reservation { tenant: tenant.to_owned(), amount, day, tracked: true, local: false })
     }
 
     fn settle_at(&self, r: &Reservation, actual: Amount, now: Instant) {
@@ -282,37 +323,6 @@ impl QuotaStore for InMemoryQuota {
     }
 }
 
-// ─────────────────────────────── Valkey (stub) ───────────────────────────────
-
-/// Shared store for deployments with several routers (`CALIBAN_VALKEY_URL`).
-///
-/// TODO: GCRA as a Lua script (`theoretical arrival time` key per tenant/key, `PTTL`-based
-/// expiry), minute bucket + day counters as a second script that checks and reserves atomically,
-/// settlement via `INCRBYFLOAT` on the same keys. Until then every call reports
-/// [`QuotaError::Backend`] so callers can fail open or closed explicitly.
-pub struct ValkeyQuota {
-    url: String,
-}
-
-impl ValkeyQuota {
-    pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
-    }
-}
-
-#[async_trait]
-impl QuotaStore for ValkeyQuota {
-    async fn check_rate(&self, _: &str, _: Option<&str>, _: &QuotaPolicy) -> Result<(), QuotaError> {
-        Err(QuotaError::Backend(format!("valkey quota store ({}) is not implemented yet", self.url)))
-    }
-
-    async fn reserve(&self, _: &str, _: &QuotaPolicy, _: Amount) -> Result<Reservation, QuotaError> {
-        Err(QuotaError::Backend(format!("valkey quota store ({}) is not implemented yet", self.url)))
-    }
-
-    async fn settle(&self, _: &Reservation, _: Amount) {}
-}
-
 // ─────────────────────────────── settlement guard ───────────────────────────────
 
 /// Owns a reservation until it is settled. If dropped unsettled (client disconnected, handler
@@ -359,6 +369,9 @@ impl Drop for Settlement {
         }
     }
 }
+
+#[cfg(test)]
+mod store_tests;
 
 #[cfg(test)]
 mod tests {
@@ -489,11 +502,5 @@ mod tests {
         let r = store.reserve("t", &p, Amount { tokens: 400, usd: 0.0 }).await.unwrap();
         Settlement::new(Arc::clone(&store), r).settle(Amount { tokens: 10, usd: 0.0 }).await;
         assert_eq!(q.day_usage("t").0, 410);
-    }
-
-    #[tokio::test]
-    async fn valkey_stub_reports_backend_error() {
-        let v = ValkeyQuota::new("redis://valkey:6379");
-        assert!(matches!(v.check_rate("t", None, &policy()).await, Err(QuotaError::Backend(_))));
     }
 }

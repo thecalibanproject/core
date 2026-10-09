@@ -82,10 +82,38 @@ impl Limits {
     }
 }
 
+/// Where quota state lives.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum QuotaStoreKind {
+    /// In this router process only (exact for a single router).
+    #[default]
+    Memory,
+    /// Shared by every router through Valkey (`CALIBAN_VALKEY_URL`), with an in-memory
+    /// fallback per router while Valkey is unreachable.
+    Valkey,
+}
+
+impl QuotaStoreKind {
+    fn is_memory(&self) -> bool {
+        *self == Self::Memory
+    }
+}
+
 /// `[limits]` (defaults for every tenant) and `[limits.tenants.<tenant_id>]` (overrides).
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
+    /// `memory` (default) or `valkey`. Read when a router starts; changing it needs a restart.
+    #[serde(default, skip_serializing_if = "QuotaStoreKind::is_memory")]
+    pub store: QuotaStoreKind,
+    /// Valkey key namespace (default `caliban`), so several deployments can share one Valkey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valkey_key_prefix: Option<String>,
+    /// Upper bound on each Valkey quota call in milliseconds (default 30); past it the router
+    /// limits locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valkey_timeout_ms: Option<u64>,
     pub requests_per_minute: Option<u32>,
     pub key_requests_per_minute: Option<u32>,
     pub tokens_per_minute: Option<u64>,
@@ -115,9 +143,20 @@ impl LimitsConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(p) = &self.valkey_key_prefix
+            && (p.is_empty() || p.len() > 64 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':')))
+        {
+            return Err(ConfigError::Invalid("limits: valkey_key_prefix must be 1-64 characters of [A-Za-z0-9_.:-]".into()));
+        }
+        if self.valkey_timeout_ms.is_some_and(|t| t == 0 || t > 1000) {
+            return Err(ConfigError::Invalid("limits: valkey_timeout_ms must be between 1 and 1000".into()));
+        }
         for (who, l) in std::iter::once(("defaults".to_owned(), self.defaults())).chain(self.tenants.iter().map(|(t, l)| (t.to_string(), l.clone()))) {
             if l.requests_per_minute == Some(0) || l.key_requests_per_minute == Some(0) {
                 return Err(ConfigError::Invalid(format!("limits ({who}): requests_per_minute must be > 0 (omit it for unlimited)")));
+            }
+            if l.tokens_per_minute == Some(0) {
+                return Err(ConfigError::Invalid(format!("limits ({who}): tokens_per_minute must be > 0 (omit it for unlimited)")));
             }
             if l.usd_per_day.is_some_and(|u| !u.is_finite() || u < 0.0) {
                 return Err(ConfigError::Invalid(format!("limits ({who}): usd_per_day must be a non-negative number")));
@@ -649,5 +688,24 @@ mod tests {
         assert_eq!(Config::from_toml_str(SHARED).unwrap().limits, LimitsConfig::default());
         let zero = format!("{SHARED}\n[limits]\nrequests_per_minute = 0\n");
         assert!(Config::from_toml_str(&zero).unwrap_err().to_string().contains("must be > 0"));
+        let zero = format!("{SHARED}\n[limits.tenants.acme]\ntokens_per_minute = 0\n");
+        assert!(Config::from_toml_str(&zero).unwrap_err().to_string().contains("tokens_per_minute must be > 0"));
+    }
+
+    #[test]
+    fn limits_store_selection() {
+        let l = Config::from_toml_str(SHARED).unwrap().limits;
+        assert_eq!((l.store, l.valkey_key_prefix, l.valkey_timeout_ms), (QuotaStoreKind::Memory, None, None));
+        // The defaults are not serialized, so snapshots stay readable by routers that predate them.
+        assert!(!serde_json::to_string(&LimitsConfig::default()).unwrap().contains("store"));
+
+        let cfg = format!("{SHARED}\n[limits]\nstore = \"valkey\"\nvalkey_key_prefix = \"prod-eu:caliban\"\nvalkey_timeout_ms = 40\n");
+        let l = Config::from_toml_str(&cfg).unwrap().limits;
+        assert_eq!((l.store, l.valkey_key_prefix.as_deref(), l.valkey_timeout_ms), (QuotaStoreKind::Valkey, Some("prod-eu:caliban"), Some(40)));
+        assert!(serde_json::to_string(&l).unwrap().contains(r#""store":"valkey""#));
+
+        for bad in ["store = \"redis\"", "valkey_key_prefix = \"a{b}\"", "valkey_key_prefix = \"\"", "valkey_timeout_ms = 0", "valkey_timeout_ms = 5000"] {
+            assert!(Config::from_toml_str(&format!("{SHARED}\n[limits]\n{bad}\n")).is_err(), "{bad}");
+        }
     }
 }

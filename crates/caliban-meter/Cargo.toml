@@ -18,9 +18,16 @@ tokio.workspace = true
 tracing.workspace = true
 # GCRA request-rate limiting (quota.rs).
 governor = { version = "0.10.4", default-features = false, features = ["std", "quanta"] }
+# Shared quota store (quota/valkey.rs): redis-rs (BSD-3-Clause), RESP-compatible with Valkey 8/9.
+# One multiplexed connection per router behind a ConnectionManager (auto-reconnect); rustls for
+# rediss:// with the platform trust store. `script` gives the SHA1 used for EVALSHA.
+redis = { version = "1.7", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "connection-manager", "script"] }
+# redis-rs builds rustls without a crypto provider; pin ring (already used by reqwest).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+uuid.workspace = true
 
 [lints]
 workspace = true
