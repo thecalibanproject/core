@@ -13,6 +13,7 @@
 use crate::error::Dialect;
 use crate::pipeline::{Outcome, caliban_headers, finish};
 use crate::quirks::{self, ThinkSplitter};
+use crate::semantic::StreamCapture;
 use crate::{Gateway, telemetry};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -210,6 +211,7 @@ fn tail(choices: &mut BTreeMap<u64, ChoiceState>, last_id: &Value, model_id: &st
     out
 }
 
+#[allow(clippy::too_many_arguments)] // one call site per path; a params struct would only move the list
 pub(crate) fn openai_shaped(
     gw: Arc<Gateway>,
     outcome: Outcome,
@@ -218,6 +220,7 @@ pub(crate) fn openai_shaped(
     think: bool,
     mut settlement: Settlement,
     upstream_span: Span,
+    mut capture: Option<StreamCapture>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let resp = sse_response(&outcome, rx);
@@ -240,6 +243,9 @@ pub(crate) fn openai_shaped(
                 Err(e) => {
                     telemetry::record_error(&upstream_span, e.kind());
                     let _ = tx.send(Ok(Bytes::from(enc.error(&e.to_string())))).await;
+                    if let Some(c) = capture.as_mut() {
+                        c.abandon();
+                    }
                     ended = true;
                     break;
                 }
@@ -261,6 +267,9 @@ pub(crate) fn openai_shaped(
                             if v.get("model").is_some() {
                                 v["model"] = Value::String(model_id.clone());
                             }
+                            if let Some(c) = capture.as_mut() {
+                                c.openai_chunk(&v);
+                            }
                             if transform {
                                 transform_chunk(&mut v, &mut choices, rehydrator.as_ref(), think);
                             }
@@ -274,6 +283,9 @@ pub(crate) fn openai_shaped(
                     // Client went away: dropping `upstream` cancels the provider request.
                     tracing::info!(request_id = %outcome.request_id, "client disconnected mid-stream");
                     client_gone = true;
+                    if let Some(c) = capture.as_mut() {
+                        c.abandon();
+                    }
                     break 'outer;
                 }
                 if ended {
@@ -289,6 +301,9 @@ pub(crate) fn openai_shaped(
         drop(upstream);
         telemetry::record_usage(&upstream_span, usage);
         drop(upstream_span);
+        if let Some(c) = capture {
+            c.finish(usage);
+        }
         finish(&gw, &outcome, usage, 0, settlement, streamed).await;
     };
     tokio::spawn(task.instrument(span));
@@ -309,6 +324,7 @@ pub(crate) fn native_anthropic(
     rehydrator: Option<Arc<Rehydrator>>,
     mut settlement: Settlement,
     upstream_span: Span,
+    mut capture: Option<StreamCapture>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let resp = sse_response(&outcome, rx);
@@ -328,6 +344,9 @@ pub(crate) fn native_anthropic(
                     telemetry::record_error(&upstream_span, e.kind());
                     let ev = anthropic::error_body("api_error", &e.to_string());
                     let _ = tx.send(Ok(Bytes::from(anthropic::sse_event(&ev)))).await;
+                    if let Some(c) = capture.as_mut() {
+                        c.abandon();
+                    }
                     break;
                 }
             };
@@ -337,6 +356,9 @@ pub(crate) fn native_anthropic(
                     Err(_) => out.push_str(&format!("data: {data}\n\n")),
                     Ok(mut ev) => {
                         usage.observe(&ev);
+                        if let Some(c) = capture.as_mut() {
+                            c.anthropic_event(&ev);
+                        }
                         let index = ev.get("index").and_then(Value::as_u64).unwrap_or(0);
                         match ev.get("type").and_then(Value::as_str) {
                             Some("message_start") => {
@@ -388,6 +410,9 @@ pub(crate) fn native_anthropic(
                 }
                 if tx.send(Ok(Bytes::from(out))).await.is_err() {
                     tracing::info!(request_id = %outcome.request_id, "client disconnected mid-stream");
+                    if let Some(c) = capture.as_mut() {
+                        c.abandon();
+                    }
                     break 'outer;
                 }
             }
@@ -397,6 +422,9 @@ pub(crate) fn native_anthropic(
         let usage = usage.usage();
         telemetry::record_usage(&upstream_span, usage);
         drop(upstream_span);
+        if let Some(c) = capture {
+            c.finish(usage);
+        }
         finish(&gw, &outcome, usage, 0, settlement, streamed).await;
     };
     tokio::spawn(task.instrument(span));

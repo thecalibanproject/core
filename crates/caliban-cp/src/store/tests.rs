@@ -83,6 +83,7 @@ fn tenant(id: &str) -> Tenant {
         region: Some("eu".into()),
         pii_default: PiiMode::Off,
         pii_surrogate_scope: PiiSurrogateScope::Tenant,
+        semantic_cache: SemanticCacheMode::Off,
         created_at: ts(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -150,14 +151,23 @@ async fn suite(s: &Store) {
         StoreError::Conflict("tenant 'globex' already exists".into())
     );
     // PII settings: session scope is a per-tenant opt-in, shipped in the snapshot.
-    let to_session = Mutation::UpdateTenantPii { id: "globex".into(), pii_default: None, pii_surrogate_scope: Some(PiiSurrogateScope::Session) };
+    let to_session = Mutation::UpdateTenant { id: "globex".into(), pii_default: None, pii_surrogate_scope: Some(PiiSurrogateScope::Session), semantic_cache: None };
     s.apply(A, to_session).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
     assert_eq!((g.pii_default, g.pii_surrogate_scope), (PiiMode::Off, PiiSurrogateScope::Session));
     let snap = s.config.load();
     assert_eq!(snap.pii_surrogate_scope_for(snap.tenant(&"globex".into()).unwrap()), PiiSurrogateScope::Session);
     assert_eq!(snap.pii_surrogate_scope_for(snap.tenant(&"acme".into()).unwrap()), PiiSurrogateScope::Tenant);
-    let ghost = Mutation::UpdateTenantPii { id: "nobody".into(), pii_default: Some(PiiMode::Mask), pii_surrogate_scope: None };
+    // Semantic cache: off by default, switched on per tenant, shipped in the snapshot.
+    assert_eq!(s.state().tenant("globex").unwrap().semantic_cache, SemanticCacheMode::Off);
+    let on = Mutation::UpdateTenant { id: "globex".into(), pii_default: None, pii_surrogate_scope: None, semantic_cache: Some(SemanticCacheMode::On) };
+    s.apply(A, on).await.unwrap();
+    let g = s.state().tenant("globex").cloned().unwrap();
+    assert_eq!((g.semantic_cache, g.pii_surrogate_scope), (SemanticCacheMode::On, PiiSurrogateScope::Session), "other settings kept");
+    let snap = s.config.load();
+    assert_eq!(snap.tenant(&"globex".into()).unwrap().semantic_cache, SemanticCacheMode::On);
+    assert_eq!(snap.tenant(&"acme".into()).unwrap().semantic_cache, SemanticCacheMode::Off);
+    let ghost = Mutation::UpdateTenant { id: "nobody".into(), pii_default: Some(PiiMode::Mask), pii_surrogate_scope: None, semantic_cache: None };
     assert_eq!(s.apply(A, ghost).await.unwrap_err(), StoreError::NotFound("tenant".into()));
     let key = ApiKeyRecord {
         id: "key_g1".into(),
@@ -517,6 +527,15 @@ fn surrogate_scope_from_the_config_file_is_seeded() {
     assert_eq!(st.tenants[0].pii_surrogate_scope, PiiSurrogateScope::Session);
     assert!(st.tenants[0].settings.get("pii_surrogate_scope").is_none(), "modelled, not passed through");
     assert_eq!(render(&cfg, &st).unwrap().tenants[0].pii_surrogate_scope, PiiSurrogateScope::Session);
+}
+
+#[test]
+fn semantic_cache_from_the_config_file_is_seeded() {
+    let cfg = Config::from_toml_str(&BASE.replace("pii_mode = \"mask\"", "pii_mode = \"mask\"\nsemantic_cache = \"on\"")).unwrap();
+    let st = State::from_config(&cfg);
+    assert_eq!(st.tenants[0].semantic_cache, SemanticCacheMode::On);
+    assert!(st.tenants[0].settings.get("semantic_cache").is_none(), "modelled, not passed through");
+    assert_eq!(render(&cfg, &st).unwrap().tenants[0].semantic_cache, SemanticCacheMode::On);
 }
 
 #[test]

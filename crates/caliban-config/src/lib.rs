@@ -12,7 +12,7 @@ pub mod signing;
 pub use secret::{Secret, SecretRef, open, process_kek, seal};
 
 use arc_swap::ArcSwap;
-use caliban_types::{ModelId, PiiMode, PiiSurrogateScope, ProviderId, ProviderKind, TenantId, TrustTier};
+use caliban_types::{ModelId, PiiMode, PiiSurrogateScope, ProviderId, ProviderKind, SemanticCacheMode, TenantId, TrustTier};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -215,12 +215,198 @@ pub struct CacheConfig {
     pub exact_max_entries: u64,
     #[serde(default = "default_cache_ttl")]
     pub exact_ttl_secs: u64,
+    /// T2 semantic cache (`[cache.semantic]`). Left out of the rendered snapshot when it is the
+    /// default, so routers that predate it keep accepting snapshots.
+    #[serde(default, skip_serializing_if = "SemanticCacheConfig::is_default")]
+    pub semantic: SemanticCacheConfig,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        Self { exact_enabled: true, exact_max_entries: default_cache_entries(), exact_ttl_secs: default_cache_ttl() }
+        Self {
+            exact_enabled: true,
+            exact_max_entries: default_cache_entries(),
+            exact_ttl_secs: default_cache_ttl(),
+            semantic: SemanticCacheConfig::default(),
+        }
     }
+}
+
+/// Where T2 entries live.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticStoreKind {
+    /// Qdrant over its REST API (`qdrant_url`, or `CALIBAN_QDRANT_URL`). Shared by every router.
+    #[default]
+    Qdrant,
+    /// Brute-force in-process store: one router, lost on restart. For development and tests.
+    Memory,
+}
+
+/// `[cache.semantic]`: the T2 semantic cache. It answers a request with the response to an earlier,
+/// semantically similar request **of the same tenant** (same model, same system prompt, history and
+/// parameters; only the last user message may differ). Off unless `enabled` here **and**
+/// `semantic_cache = "on"` on the tenant. Threshold policy: see `caliban_cache::semantic::policy`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub store: SemanticStoreKind,
+    /// Qdrant REST endpoint (port 6333). `CALIBAN_QDRANT_URL` takes precedence.
+    pub qdrant_url: Option<String>,
+    /// Qdrant API key, e.g. `{ env = "CALIBAN_QDRANT_API_KEY" }`. When unset, the
+    /// `CALIBAN_QDRANT_API_KEY` environment variable is used if present.
+    pub qdrant_api_key: Option<SecretRef>,
+    /// Collections are named `{prefix}_{embedding model}_{dimension}`.
+    #[serde(default = "default_collection_prefix")]
+    pub collection_prefix: String,
+    /// Catalogue id of the embedding model (`kind = "embedding"`) used for cache keys. Each tenant
+    /// must reach it through its own or a shared provider; otherwise T2 is skipped for that tenant.
+    pub embedding_model: Option<ModelId>,
+    /// Starting per-entry cosine threshold. Conservative on purpose: entries only go below it after
+    /// verified-correct matches.
+    #[serde(default = "default_sem_threshold")]
+    pub threshold: f32,
+    /// Learned thresholds never go below this.
+    #[serde(default = "default_sem_min_threshold")]
+    pub min_threshold: f32,
+    /// Matches in `[threshold - grey_band, threshold)` are answered fresh and the fresh answer is
+    /// compared with the cached one in the background; agreement lowers the entry's threshold.
+    #[serde(default = "default_sem_grey_band")]
+    pub grey_band: f32,
+    /// Error budget: the highest acceptable share of wrong answers among semantic hits. When the
+    /// sampled error rate of a tenant goes above it, that tenant's thresholds tighten.
+    #[serde(default = "default_sem_max_error_rate")]
+    pub max_error_rate: f32,
+    /// Share of would-be hits answered fresh instead and used to verify the cached answer.
+    #[serde(default = "default_sem_verify_rate")]
+    pub verify_rate: f32,
+    /// Answers whose embeddings have at least this cosine count as "the same answer".
+    #[serde(default = "default_sem_answer_similarity")]
+    pub verify_answer_similarity: f32,
+    /// Requests with `temperature` above this are not semantically cached (temperature unset counts
+    /// as the provider default, i.e. sampling). `caliban.cache = "semantic"` on a request opts in
+    /// regardless of temperature.
+    #[serde(default = "default_sem_max_temperature")]
+    pub max_temperature: f64,
+    #[serde(default = "default_sem_ttl")]
+    pub ttl_secs: u64,
+    /// Total time allowed for embedding plus vector search before the request goes on as a miss.
+    #[serde(default = "default_sem_budget")]
+    pub lookup_budget_ms: u64,
+    /// Timeout of one embedding call (the lookup budget still applies on the request path; a
+    /// slower embedding is kept for the insert after the upstream answers).
+    #[serde(default = "default_sem_embed_timeout")]
+    pub embed_timeout_ms: u64,
+}
+
+impl Default for SemanticCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            store: SemanticStoreKind::default(),
+            qdrant_url: None,
+            qdrant_api_key: None,
+            collection_prefix: default_collection_prefix(),
+            embedding_model: None,
+            threshold: default_sem_threshold(),
+            min_threshold: default_sem_min_threshold(),
+            grey_band: default_sem_grey_band(),
+            max_error_rate: default_sem_max_error_rate(),
+            verify_rate: default_sem_verify_rate(),
+            verify_answer_similarity: default_sem_answer_similarity(),
+            max_temperature: default_sem_max_temperature(),
+            ttl_secs: default_sem_ttl(),
+            lookup_budget_ms: default_sem_budget(),
+            embed_timeout_ms: default_sem_embed_timeout(),
+        }
+    }
+}
+
+impl SemanticCacheConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `CALIBAN_QDRANT_URL`, then `qdrant_url`.
+    pub fn resolved_qdrant_url(&self) -> Option<String> {
+        std::env::var("CALIBAN_QDRANT_URL").ok().filter(|u| !u.trim().is_empty()).or_else(|| self.qdrant_url.clone())
+    }
+
+    /// `qdrant_api_key`, then `CALIBAN_QDRANT_API_KEY`.
+    pub fn resolved_qdrant_api_key(&self) -> Result<Option<String>, ConfigError> {
+        match &self.qdrant_api_key {
+            Some(r) => r.resolve().map(|s| Some(s.expose().to_owned())).map_err(|e| ConfigError::Secret("cache.semantic.qdrant_api_key".into(), e.to_string())),
+            None => Ok(std::env::var("CALIBAN_QDRANT_API_KEY").ok().filter(|k| !k.is_empty())),
+        }
+    }
+
+    fn validate(&self, models: &HashMap<&ModelId, &ModelEntry>) -> Result<(), ConfigError> {
+        let unit = |name: &str, v: f32| {
+            if v.is_finite() && (0.0..=1.0).contains(&v) { Ok(()) } else { Err(ConfigError::Invalid(format!("cache.semantic.{name} must be in [0, 1]"))) }
+        };
+        unit("threshold", self.threshold)?;
+        unit("min_threshold", self.min_threshold)?;
+        unit("grey_band", self.grey_band)?;
+        unit("max_error_rate", self.max_error_rate)?;
+        unit("verify_rate", self.verify_rate)?;
+        unit("verify_answer_similarity", self.verify_answer_similarity)?;
+        if self.min_threshold > self.threshold {
+            return Err(ConfigError::Invalid("cache.semantic.min_threshold must be <= threshold".into()));
+        }
+        if !self.max_temperature.is_finite() || self.max_temperature < 0.0 {
+            return Err(ConfigError::Invalid("cache.semantic.max_temperature must be a non-negative number".into()));
+        }
+        if self.collection_prefix.is_empty() || !self.collection_prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Err(ConfigError::Invalid("cache.semantic.collection_prefix must be non-empty [A-Za-z0-9_-]".into()));
+        }
+        if let Some(m) = &self.embedding_model {
+            match models.get(m) {
+                Some(e) if e.kind == ModelKind::Embedding => {}
+                Some(_) => return Err(ConfigError::Invalid(format!("cache.semantic.embedding_model '{m}' is not an embedding model"))),
+                None => return Err(ConfigError::Invalid(format!("cache.semantic.embedding_model: unknown model '{m}'"))),
+            }
+        } else if self.enabled {
+            return Err(ConfigError::Invalid("cache.semantic.enabled needs cache.semantic.embedding_model".into()));
+        }
+        Ok(())
+    }
+}
+
+fn default_collection_prefix() -> String {
+    "caliban_semcache".into()
+}
+fn default_sem_threshold() -> f32 {
+    0.95
+}
+fn default_sem_min_threshold() -> f32 {
+    0.90
+}
+fn default_sem_grey_band() -> f32 {
+    0.03
+}
+fn default_sem_max_error_rate() -> f32 {
+    0.02
+}
+fn default_sem_verify_rate() -> f32 {
+    0.05
+}
+fn default_sem_answer_similarity() -> f32 {
+    0.90
+}
+fn default_sem_max_temperature() -> f64 {
+    0.3
+}
+fn default_sem_ttl() -> u64 {
+    86_400
+}
+fn default_sem_budget() -> u64 {
+    50
+}
+fn default_sem_embed_timeout() -> u64 {
+    2_000
 }
 
 fn yes() -> bool {
@@ -272,6 +458,10 @@ pub struct TenantConfig {
     /// Omitted from the rendered snapshot when it is the default.
     #[serde(default, skip_serializing_if = "PiiSurrogateScope::is_default")]
     pub pii_surrogate_scope: PiiSurrogateScope,
+    /// T2 semantic cache for this tenant: `off` (default) or `on`. Also needs
+    /// `[cache.semantic] enabled`. Omitted from the rendered snapshot when it is the default.
+    #[serde(default, skip_serializing_if = "SemanticCacheMode::is_default")]
+    pub semantic_cache: SemanticCacheMode,
     #[serde(default)]
     pub api_key_hashes: Vec<String>,
     #[serde(default)]
@@ -458,6 +648,7 @@ impl Config {
                 }
             }
         }
+        self.cache.semantic.validate(&models)?;
         self.limits.validate()
     }
 }
@@ -517,6 +708,11 @@ impl Snapshot {
 
     pub fn pii_surrogate_scope_for(&self, tenant: &TenantConfig) -> PiiSurrogateScope {
         tenant.pii_surrogate_scope
+    }
+
+    /// Whether the T2 semantic cache applies to this tenant (deployment switch and tenant opt-in).
+    pub fn semantic_cache_for(&self, tenant: &TenantConfig) -> bool {
+        self.config.cache.semantic.enabled && tenant.semantic_cache == SemanticCacheMode::On
     }
 
     /// Effective rate limits / budgets for a tenant (`[limits]` overlaid with its override).
@@ -640,6 +836,37 @@ mod tests {
         assert_eq!(json[1]["pii_surrogate_scope"], "session");
         let bad = toml.replace("pii_surrogate_scope = \"session\"", "pii_surrogate_scope = \"global\"");
         assert!(Config::from_toml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn semantic_cache_defaults_validation_and_tenant_switch() {
+        let c = SemanticCacheConfig::default();
+        assert!(!c.enabled);
+        assert_eq!((c.threshold, c.min_threshold, c.lookup_budget_ms, c.store), (0.95, 0.90, 50, SemanticStoreKind::Qdrant));
+        let on = |extra: &str| format!("{SHARED}\n[cache.semantic]\nenabled = true\n{extra}");
+        let cfg = Config::from_toml_str(&on("embedding_model = \"local/b\"\nstore = \"memory\"")).unwrap();
+        assert_eq!(cfg.cache.semantic.store, SemanticStoreKind::Memory);
+        assert!(Config::from_toml_str(&on("")).unwrap_err().to_string().contains("needs cache.semantic.embedding_model"));
+        assert!(Config::from_toml_str(&on("embedding_model = \"local/qwen\"")).unwrap_err().to_string().contains("not an embedding model"));
+        assert!(Config::from_toml_str(&on("embedding_model = \"nope\"")).unwrap_err().to_string().contains("unknown model"));
+        let bad = on("embedding_model = \"local/b\"\nthreshold = 0.8\nmin_threshold = 0.9");
+        assert!(Config::from_toml_str(&bad).unwrap_err().to_string().contains("min_threshold"));
+        assert!(Config::from_toml_str(&on("embedding_model = \"local/b\"\nthreshold = 1.5")).is_err());
+        assert!(Config::from_toml_str(&on("embedding_model = \"local/b\"\ntreshold = 0.9")).is_err(), "typos rejected");
+
+        // Tenant switch: off by default and left out of the snapshot; on needs the deployment switch.
+        let toml = on("embedding_model = \"local/b\"").replace("id = \"globex\"\n        name = \"Globex\"", "id = \"globex\"\n        name = \"Globex\"\n        semantic_cache = \"on\"");
+        let snap = Snapshot::new(Config::from_toml_str(&toml).unwrap(), "t");
+        assert!(!snap.semantic_cache_for(snap.tenant(&"acme".into()).unwrap()));
+        assert!(snap.semantic_cache_for(snap.tenant(&"globex".into()).unwrap()));
+        let json = serde_json::to_value(&snap.config.tenants).unwrap();
+        assert!(json[0].get("semantic_cache").is_none());
+        let cache = serde_json::to_value(&Config::from_toml_str(SHARED).unwrap().cache).unwrap();
+        assert!(cache.get("semantic").is_none(), "default section left out of snapshots");
+        assert_eq!(serde_json::to_value(&snap.config.cache).unwrap()["semantic"]["enabled"], true);
+        assert_eq!(json[1]["semantic_cache"], "on");
+        let off = Snapshot::new(Config::from_toml_str(&toml.replace("enabled = true", "enabled = false")).unwrap(), "t");
+        assert!(!off.semantic_cache_for(off.tenant(&"globex".into()).unwrap()), "deployment switch wins");
     }
 
     #[test]

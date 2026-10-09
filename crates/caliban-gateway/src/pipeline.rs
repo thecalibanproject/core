@@ -2,8 +2,8 @@
 //! (Anthropic dialect):
 //!
 //! auth → rate limit (GCRA) → parse to IR → route → PII protect → token reservation →
-//! per candidate: [exact cache] → provider call (BYOK, fallbacks) → rehydrate → translate to the
-//! client's dialect → meter + settle reservation + record span.
+//! per candidate: [T1 exact cache → T2 semantic cache] → provider call (BYOK, fallbacks) →
+//! rehydrate → translate to the client's dialect → meter + settle reservation + record span.
 //!
 //! The IR drives every decision. The upstream body is the IR rendered as OpenAI Chat Completions,
 //! except when the client speaks Anthropic **and** the routed provider is Anthropic: then the
@@ -11,7 +11,7 @@
 //! `cache_control` breakpoints, server tools and thinking signatures survive.
 
 use crate::error::Dialect;
-use crate::{ApiError, Gateway, auth, limits, quirks, stream, telemetry};
+use crate::{ApiError, Gateway, auth, limits, quirks, semantic, stream, telemetry};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -24,7 +24,7 @@ use caliban_meter::{UsageEvent, cost_usd};
 use caliban_pii::{PiiSurrogateScope, Rehydrator};
 use caliban_providers::{NativeOptions, ProviderResponse};
 use caliban_route::RouteError;
-use caliban_types::{CacheMode, CacheStatus, CalibanError, PiiMode, ProviderKind, RequestId};
+use caliban_types::{CacheMode, CacheStatus, CacheTier, CalibanError, PiiMode, ProviderKind, RequestId};
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,6 +37,8 @@ pub(crate) struct Outcome {
     pub model: ModelEntry,
     pub intent: String,
     pub cache: CacheStatus,
+    /// Which tier answered a hit (`None` otherwise).
+    pub cache_tier: Option<CacheTier>,
     pub pii_entities: usize,
     pub started: Instant,
     pub dialect: Dialect,
@@ -206,12 +208,29 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
             })
         });
 
+        // T2 semantic cache (semantic.rs): same tenant, model, context and params; only the last
+        // user message may differ. Looked up after a T1 miss.
+        let mut sem = (attempt == 0 && !native_tools)
+            .then(|| {
+                semantic::prepare(&gw, &snap, &tenant, semantic::Inputs {
+                    req: &req,
+                    upstream_body: &upstream_body,
+                    model: &model,
+                    is_native,
+                    pii_mode,
+                    vault: &protected.vault,
+                    pii_ok: deterministic_pii && (use_protected || protected.entities == 0),
+                })
+            })
+            .flatten();
+
         let outcome = Outcome {
             request_id: request_id.clone(),
             tenant_id: tenant.id.to_string(),
             model: model.clone(),
             intent: decision.intent.clone(),
-            cache: if cacheable { CacheStatus::Miss } else { CacheStatus::Bypass },
+            cache: if cacheable || sem.is_some() { CacheStatus::Miss } else { CacheStatus::Bypass },
+            cache_tier: None,
             pii_entities,
             started,
             dialect,
@@ -224,25 +243,17 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
             let hit = gw.cache.get(k).instrument(cs.clone()).await;
             cs.record("caliban.cache", if hit.is_some() { "hit" } else { "miss" });
             if let Some(hit) = hit {
-                let outcome = Outcome { cache: CacheStatus::Hit, ..outcome };
-                // Cached bodies are upstream-shaped and still pseudonymised: rehydrate with this
-                // request's own vault (only its values are restored), then translate
-                // OpenAI-shaped ones for Anthropic clients.
-                let body = if rh.is_none() && (is_native || dialect == Dialect::OpenAi) {
-                    hit.body.clone()
-                } else {
-                    let mut v: Value = serde_json::from_slice(&hit.body).unwrap_or_default();
-                    if let Some(r) = &rh {
-                        if is_native { rehydrate_anthropic(&mut v, r) } else { rehydrate_message(&mut v, r) }
-                    }
-                    if dialect == Dialect::Anthropic && !is_native {
-                        v = anthropic::from_openai_response(&v);
-                    }
-                    Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
-                };
+                let outcome = Outcome { cache: CacheStatus::Hit, cache_tier: Some(CacheTier::Exact), ..outcome };
+                let body = render_cached(&hit.body, rh.as_ref(), is_native, dialect);
                 finish(&gw, &outcome, Usage::default(), hit.prompt_tokens + hit.completion_tokens, settlement, 0).await;
                 return Ok(json_response(&outcome, body, Some(0.0)));
             }
+        }
+        if let Some(s) = sem.as_mut()
+            && let Some(hit) = s.lookup().await
+        {
+            let outcome = Outcome { cache: CacheStatus::Hit, cache_tier: Some(CacheTier::Semantic), ..outcome };
+            return Ok(semantic::respond(Arc::clone(&gw), outcome, &hit, rh, is_native, req.stream, settlement).await);
         }
 
         let adapter = gw.providers.adapter(provider.kind).map_err(|e| CalibanError::Upstream(e.to_string()))?;
@@ -260,7 +271,7 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
                 }
                 // The cache keeps the pseudonymised body (before rehydration): a hit is restored with
                 // the vault of the request that hits, never with this one's originals.
-                let cache_bytes = |v: &Value| key.is_some().then(|| Bytes::from(serde_json::to_vec(v).unwrap_or_default()));
+                let cache_bytes = |v: &Value| (key.is_some() || sem.is_some()).then(|| Bytes::from(serde_json::to_vec(v).unwrap_or_default()));
                 let (client_body, cache_body, usage) = if is_native {
                     set_model(&mut v, &model);
                     let usage = Usage::from_anthropic_usage(v.get("usage").unwrap_or(&Value::Null));
@@ -285,6 +296,9 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
                     };
                     (client, cache_body, usage)
                 };
+                if let (Some(s), Some(b)) = (sem, &cache_body) {
+                    s.complete(b.clone(), usage);
+                }
                 if let (Some(k), Some(cache_body)) = (key, cache_body) {
                     gw.cache
                         .put(k, CachedResponse {
@@ -302,11 +316,12 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
                 return Ok(json_response(&outcome, client_body, cost));
             }
             Ok(ProviderResponse::Stream(upstream)) => {
+                let capture = sem.map(semantic::Semantic::into_capture);
                 return Ok(if is_native {
-                    stream::native_anthropic(gw, outcome, upstream, rh, settlement, us)
+                    stream::native_anthropic(gw, outcome, upstream, rh, settlement, us, capture)
                 } else {
                     let think = model.capabilities.inline_think_tags;
-                    stream::openai_shaped(gw, outcome, upstream, rh, think, settlement, us)
+                    stream::openai_shaped(gw, outcome, upstream, rh, think, settlement, us, capture)
                 });
             }
             Err(e) => {
@@ -389,7 +404,24 @@ fn body_hash(body: &Value, model: &str) -> blake3::Hash {
         }
         o.insert("model".into(), Value::String(model.to_owned()));
     }
-    blake3::hash(&serde_json::to_vec(&b).unwrap_or_default())
+    blake3::hash(&semantic::canonical_json(&b))
+}
+
+/// A cached body (upstream-shaped, still pseudonymised) for this client: rehydrated with this
+/// request's own vault (only its values are restored), and translated for Anthropic clients when
+/// the body is OpenAI-shaped.
+pub(crate) fn render_cached(body: &Bytes, rh: Option<&Arc<Rehydrator>>, is_native: bool, dialect: Dialect) -> Bytes {
+    if rh.is_none() && (is_native || dialect == Dialect::OpenAi) {
+        return body.clone();
+    }
+    let mut v: Value = serde_json::from_slice(body).unwrap_or_default();
+    if let Some(r) = rh {
+        if is_native { rehydrate_anthropic(&mut v, r) } else { rehydrate_message(&mut v, r) }
+    }
+    if dialect == Dialect::Anthropic && !is_native {
+        v = anthropic::from_openai_response(&v);
+    }
+    Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
 }
 
 /// Restores originals in `content`, `reasoning_content` and tool-call arguments.
@@ -444,6 +476,9 @@ pub(crate) fn caliban_headers(h: &mut HeaderMap, o: &Outcome) {
     set("x-caliban-request-id", o.request_id.to_string());
     set("x-caliban-routed-model", o.model.id.to_string());
     set("x-caliban-cache", o.cache.as_str().to_owned());
+    if let Some(t) = o.cache_tier {
+        set("x-caliban-cache-tier", t.as_str().to_owned());
+    }
     set("x-caliban-pii-entities", o.pii_entities.to_string());
     if o.dialect == Dialect::Anthropic {
         // Anthropic SDKs surface this as `_request_id`.
@@ -465,6 +500,12 @@ pub(crate) fn json_response(o: &Outcome, body: Bytes, cost: Option<f64>) -> Resp
 /// Completes a request: usage event, quota settlement, span attributes. `streamed_bytes`
 /// estimates output when a stream ended without usage (e.g. the client disconnected).
 pub(crate) async fn finish(gw: &Gateway, o: &Outcome, usage: Usage, tokens_saved: u64, settlement: Settlement, streamed_bytes: u64) {
+    // A replayed (cached) stream shows the client the original usage, but nothing was consumed.
+    let (usage, tokens_saved) = if o.cache == CacheStatus::Hit && tokens_saved == 0 {
+        (Usage::default(), usage.prompt_tokens + usage.completion_tokens)
+    } else {
+        (usage, tokens_saved)
+    };
     record(gw, o, usage, tokens_saved).await;
     let (tokens, usd) = if o.cache == CacheStatus::Hit {
         (0, 0.0)
@@ -492,6 +533,7 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, usage: Usage, tokens_saved
         cached_prompt_tokens: usage.cached_prompt_tokens,
         tokens_saved,
         cache: o.cache,
+        cache_tier: o.cache_tier,
         pii_entities: o.pii_entities,
         cost_usd: cost_usd(usage.prompt_tokens, usage.completion_tokens, o.model.price_in_per_mtok, o.model.price_out_per_mtok),
         latency_ms: u64::try_from(o.started.elapsed().as_millis()).unwrap_or(u64::MAX),

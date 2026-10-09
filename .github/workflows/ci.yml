@@ -26,9 +26,9 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Default features: no ONNX Runtime. Postgres, Valkey and MongoDB tests return early without
-      # CALIBAN_TEST_DATABASE_URL / CALIBAN_TEST_VALKEY_URL / CALIBAN_MONGO_TEST_URI; the NER
-      # test needs `--features ner`.
+      # Default features: no ONNX Runtime. Postgres, Valkey, Qdrant and MongoDB tests return early
+      # without CALIBAN_TEST_DATABASE_URL / CALIBAN_TEST_VALKEY_URL / CALIBAN_TEST_QDRANT_URL /
+      # CALIBAN_MONGO_TEST_URI; the NER test needs `--features ner`.
       - run: cargo test --workspace
 
   postgres:
@@ -78,6 +78,28 @@ jobs:
       # The memory store's suite against Valkey, plus concurrency across two store instances,
       # reserve/settle, TTL expiry, outage fallback and recovery, and a latency printout.
       - run: 'cargo test -p caliban-meter quota:: -- --nocapture'
+
+  qdrant:
+    name: Qdrant semantic cache store
+    runs-on: ubuntu-latest
+    services:
+      qdrant:
+        # Same image as the deploy compose file.
+        image: qdrant/qdrant:v1.19.1-unprivileged
+        env:
+          QDRANT__TELEMETRY_DISABLED: "true"
+        ports:
+          - 6333:6333
+    env:
+      CALIBAN_TEST_QDRANT_URL: http://localhost:6333
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      # The image has no curl or wget, so wait for the REST port from the runner.
+      - run: for i in $(seq 1 30); do curl -sf http://localhost:6333/readyz && exit 0; sleep 2; done; exit 1
+      - run: cargo test -p caliban-cache --test qdrant -- --nocapture
+      - run: cargo test -p caliban-gateway semantic_miss_latency_against_qdrant -- --nocapture
 
   ner:
     name: Build with NER (ONNX Runtime)

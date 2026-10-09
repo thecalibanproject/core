@@ -18,7 +18,7 @@ use caliban_config::signing::{SnapshotPayload, SnapshotSigner, config_digest};
 use caliban_config::{RouteConfig, SecretRef, process_kek, seal};
 use caliban_nodes::NodeSpec;
 use caliban_ontology::Status;
-use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, TrustTier, hash_api_key};
+use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, SemanticCacheMode, TrustTier, hash_api_key};
 use parking_lot::Mutex;
 use rand::RngCore;
 use serde::Deserialize;
@@ -298,6 +298,7 @@ struct TenantCreate {
     region: Option<String>,
     pii_default: Option<PiiMode>,
     pii_surrogate_scope: Option<PiiSurrogateScope>,
+    semantic_cache: Option<SemanticCacheMode>,
 }
 
 async fn create_tenant(State(cp): State<Cp>, Json(body): Json<TenantCreate>) -> ApiResult<(StatusCode, Json<Tenant>)> {
@@ -311,6 +312,7 @@ async fn create_tenant(State(cp): State<Cp>, Json(body): Json<TenantCreate>) -> 
         region: body.region,
         pii_default: body.pii_default.unwrap_or(cp.store.base().pii.default_mode),
         pii_surrogate_scope: body.pii_surrogate_scope.unwrap_or_default(),
+        semantic_cache: body.semantic_cache.unwrap_or_default(),
         created_at: now_micros(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -329,12 +331,18 @@ async fn get_tenant(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiR
 struct TenantUpdate {
     pii_default: Option<PiiMode>,
     pii_surrogate_scope: Option<PiiSurrogateScope>,
+    semantic_cache: Option<SemanticCacheMode>,
 }
 
-/// Changes a tenant's PII settings (absent fields are kept). Audited; routers pick it up with the
-/// next snapshot.
+/// Changes a tenant's PII and cache settings (absent fields are kept). Audited; routers pick it up
+/// with the next snapshot.
 async fn update_tenant(State(cp): State<Cp>, Path(tenant_id): Path<String>, Json(body): Json<TenantUpdate>) -> ApiResult<Json<Tenant>> {
-    let m = Mutation::UpdateTenantPii { id: tenant_id.clone(), pii_default: body.pii_default, pii_surrogate_scope: body.pii_surrogate_scope };
+    let m = Mutation::UpdateTenant {
+        id: tenant_id.clone(),
+        pii_default: body.pii_default,
+        pii_surrogate_scope: body.pii_surrogate_scope,
+        semantic_cache: body.semantic_cache,
+    };
     let st = cp.store.apply(ADMIN_ACTOR, m).await?;
     st.tenant(&tenant_id).cloned().map(Json).ok_or_else(|| not_found("tenant"))
 }
@@ -630,6 +638,7 @@ async fn usage(State(cp): State<Cp>, Query(q): Query<UsageQuery>) -> Json<Value>
         "prompt_tokens": all.iter().map(|e| e.prompt_tokens).sum::<u64>(),
         "completion_tokens": all.iter().map(|e| e.completion_tokens).sum::<u64>(),
         "cache_hits": all.iter().filter(|e| e.cache == caliban_types::CacheStatus::Hit).count(),
+        "semantic_cache_hits": all.iter().filter(|e| e.cache_tier == Some(caliban_types::CacheTier::Semantic)).count(),
         "tokens_saved": all.iter().map(|e| e.tokens_saved + e.cached_prompt_tokens).sum::<u64>(),
         "cost_usd": all.iter().filter_map(|e| e.cost_usd).sum::<f64>(),
     });
@@ -724,6 +733,28 @@ mod tests {
         assert!(s.is_client_error(), "only PII settings can be patched");
         let (s, _) = call(&app, "PATCH", "/api/v1/tenants/nobody", Some(json!({"pii_default": "mask"})), true).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn semantic_cache_is_a_per_tenant_opt_in() {
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        let (s, t) = call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert_eq!(t["semantic_cache"], "off", "off by default");
+        let (s, t) = call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Initech", "semantic_cache": "on"})), true).await;
+        assert_eq!((s, t["semantic_cache"].as_str()), (StatusCode::CREATED, Some("on")));
+
+        let (s, t) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"semantic_cache": "on"})), true).await;
+        assert_eq!(s, StatusCode::OK, "{t}");
+        assert_eq!((t["semantic_cache"].as_str(), t["pii_surrogate_scope"].as_str()), (Some("on"), Some("tenant")));
+        let snap = c.store.config.load();
+        assert_eq!(snap.tenant(&"globex".into()).unwrap().semantic_cache, SemanticCacheMode::On);
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=1", None, true).await;
+        assert_eq!(a["entries"][0]["action"], "tenant.update");
+        assert_eq!(a["entries"][0]["detail"]["semantic_cache"], json!({"from": "off", "to": "on"}));
+        let (s, _) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"semantic_cache": "maybe"})), true).await;
+        assert!(s.is_client_error());
     }
 
     #[tokio::test]

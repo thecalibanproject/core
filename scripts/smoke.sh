@@ -3,8 +3,9 @@
 # upstream (OpenAI-compatible + Anthropic Messages). Checks: PII never reaches an external model,
 # responses (incl. streams) are rehydrated, sovereign models get raw text, exact cache hits,
 # secrets are blocked, the Anthropic Messages API (translated and native passthrough), rate
-# limits (429 + retry-after), keys / BYOK credentials created through the control plane work
-# on the data plane, and revoked keys / deleted tenants are rejected (401).
+# limits (429 + retry-after), the semantic cache (in-memory store; hit, stream replay, tenant
+# isolation), keys / BYOK credentials created through the control plane work on the data plane,
+# and revoked keys / deleted tenants are rejected (401).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,12 +17,26 @@ KEY=cal_smoke_$(python3 -c 'import secrets;print(secrets.token_hex(16))')
 HASH=$(printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1)
 TKEY=cal_smoke_$(python3 -c 'import secrets;print(secrets.token_hex(16))')
 THASH=$(printf %s "$TKEY" | shasum -a 256 | cut -d' ' -f1)
+SKEY=cal_smoke_$(python3 -c 'import secrets;print(secrets.token_hex(16))')
+SHASH=$(printf %s "$SKEY" | shasum -a 256 | cut -d' ' -f1)
+S2KEY=cal_smoke_$(python3 -c 'import secrets;print(secrets.token_hex(16))')
+S2HASH=$(printf %s "$S2KEY" | shasum -a 256 | cut -d' ' -f1)
 export SMOKE_ANTHROPIC_KEY=sk-ant-smoke-5678
 
 cat > "$WORK/caliban.toml" <<TOML
 [server]
 router_addr = "127.0.0.1:$DP"
 control_plane_addr = "127.0.0.1:$CP"
+
+[cache.semantic]
+enabled = true
+store = "memory"
+embedding_model = "local/embed"
+# Deterministic checks: no explore sampling (a sampled would-be hit is answered fresh), and a
+# generous budget for a debug build against a single-threaded Python mock. Both are covered by
+# the Rust tests.
+verify_rate = 0.0
+lookup_budget_ms = 1000
 
 [[models]]
 id = "ext/mock"
@@ -50,6 +65,14 @@ tools = true
 reasoning = "hybrid"
 reasoning_control = "enable_thinking"
 inline_think_tags = true
+
+[[models]]
+id = "local/embed"
+provider = "qwen-pool"
+# Not the model the mock advertises, so the discovery check below still has one to suggest.
+upstream_model = "BAAI/bge-small-en-v1.5"
+kind = "embedding"
+trust_tier = "t0_sovereign"
 
 [[models]]
 id = "local/rerank"
@@ -101,6 +124,28 @@ api_key_hashes = ["$THASH"]
   base_url = "http://127.0.0.1:$MOCK_PORT/v1"
   trust_tier = "t0_sovereign"
 
+[[tenants]]
+id = "semco"
+name = "SemCo"
+semantic_cache = "on"
+api_key_hashes = ["$SHASH"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "http://127.0.0.1:$MOCK_PORT/v1"
+  trust_tier = "t2_contracted"
+
+[[tenants]]
+id = "semco2"
+name = "SemCo Two"
+semantic_cache = "on"
+api_key_hashes = ["$S2HASH"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "http://127.0.0.1:$MOCK_PORT/v1"
+  trust_tier = "t2_contracted"
+
 [limits.tenants.throttled]
 requests_per_minute = 2
 TOML
@@ -144,6 +189,22 @@ grep -qi 'x-caliban-cache: hit' "$WORK/h" && [[ $(wc -l <"$MOCK_LOG") == "$N1" ]
 python3 -c 'import sys,json;m=json.loads(sys.argv[1]);assert m["choices"][0]["message"]["content"]=="You said: "+sys.argv[2],m' "$OUT" "$PII" \
   && pass "cached answer rehydrated" || fail "cached rehydration: $OUT"
 grep -q 'jane.doe@acme.com' <<<"$SENT1" && fail "cached request leaked raw PII upstream" || true
+
+# Semantic cache (tenant semco opted in; in-memory store; the mock embeds bag-of-words).
+SQ='{"model":"ext/mock","temperature":0.2,"messages":[{"role":"user","content":"What is the capital of France?"}]}'
+chat "$SQ" "$SKEY" >/dev/null
+grep -qi 'x-caliban-cache: miss' "$WORK/h" && pass "semantic cache: first question is a miss" || fail "semantic miss: $(grep -i x-caliban-cache "$WORK/h")"
+sleep 0.5; N1=$(wc -l <"$MOCK_LOG")
+OUT=$(chat '{"model":"ext/mock","temperature":0.2,"messages":[{"role":"user","content":"what is the capital of france"}]}' "$SKEY")
+grep -qi 'x-caliban-cache: hit' "$WORK/h" && grep -qi 'x-caliban-cache-tier: semantic' "$WORK/h" && [[ $(wc -l <"$MOCK_LOG") == "$N1" ]] \
+  && pass "semantic cache: rephrased question served from T2 (x-caliban-cache: hit, tier semantic)" || fail "semantic hit: $(grep -i x-caliban-cache "$WORK/h")"
+python3 -c 'import sys,json;m=json.loads(sys.argv[1]);assert m["choices"][0]["message"]["content"]=="You said: What is the capital of France?",m' "$OUT" \
+  && pass "semantic cache: cached answer returned" || fail "semantic answer: $OUT"
+OUT=$(chat '{"model":"ext/mock","temperature":0.2,"stream":true,"messages":[{"role":"user","content":"What is the capital of France"}]}' "$SKEY")
+TEXT=$(grep '^data: {' <<<"$OUT" | sed 's/^data: //' | python3 -c 'import sys,json;print("".join((json.loads(l)["choices"][0]["delta"].get("content") or "") for l in sys.stdin if json.loads(l).get("choices")))')
+grep -qi 'x-caliban-cache-tier: semantic' "$WORK/h" && [[ "$TEXT" == "You said: What is the capital of France?" ]] && pass "semantic cache: hit replayed as a stream" || fail "semantic stream: $TEXT ($(grep -i x-caliban-cache "$WORK/h" | tr -d '\r' | tr '\n' ' '))"
+chat "$SQ" "$S2KEY" >/dev/null
+grep -qi 'x-caliban-cache: miss' "$WORK/h" && pass "semantic cache: another opted-in tenant never gets the entry" || fail "semantic entry crossed tenants: $(grep -i x-caliban-cache "$WORK/h")"
 
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DP/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"model":"ext/mock","messages":[{"role":"user","content":"key AKIAIOSFODNN7EXAMPLE"}]}')

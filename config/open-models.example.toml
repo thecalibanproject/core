@@ -35,6 +35,26 @@ exact_enabled = true
 exact_max_entries = 100000
 exact_ttl_secs = 3600
 
+# T2 semantic cache: reuses the answer to an earlier, semantically similar request of the SAME
+# tenant (same model, system prompt, history and parameters; only the last user message may
+# differ). Off unless enabled here AND `semantic_cache = "on"` on the tenant. Store: Qdrant over
+# REST (port 6333; CALIBAN_QDRANT_URL wins over qdrant_url), or "memory" for one process.
+# Thresholds start conservative and are learned per entry from verification (see the README).
+# Keys are embedded with the TEI pool below. Leave it off until hit quality has been measured on
+# your traffic, then switch tenants on one at a time. On CPU-only hosts Qwen3-Embedding-0.6B takes
+# far longer than the 50 ms lookup budget (about 275 ms per prompt measured): use a GPU, a small
+# embedding model for cache keys, or a larger budget.
+[cache.semantic]
+enabled = false
+store = "qdrant"
+qdrant_url = "http://qdrant:6333"
+embedding_model = "local/qwen3-embedding-0.6b"
+threshold = 0.95
+min_threshold = 0.90
+max_error_rate = 0.02
+ttl_secs = 86400
+lookup_budget_ms = 50
+
 [pii]
 default_mode = "reversible"
 
@@ -300,6 +320,8 @@ price_out_per_mtok = 0.0
 id = "acme"
 name = "Acme Corp"
 pii_mode = "reversible"
+# "on" lets this tenant use the semantic cache once [cache.semantic] is enabled.
+semantic_cache = "off"
 # SHA-256 hex of each API key (`caliban keygen`). Empty = no key can reach this tenant yet.
 api_key_hashes = []
 

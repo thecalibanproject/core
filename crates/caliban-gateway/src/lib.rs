@@ -2,13 +2,14 @@
 //!
 //! Request lifecycle (docs/architecture/caliban-reference-architecture.md §4):
 //! auth → quota (GCRA rate + token reservation) → parse to IR → route → PII protect (per
-//! destination trust tier) → exact cache → provider call with fallbacks (BYOK) →
-//! stream/rehydrate → translate to the client's dialect → meter + settle → OTel GenAI span.
+//! destination trust tier) → T1 exact cache → T2 semantic cache → provider call with fallbacks
+//! (BYOK) → stream/rehydrate → translate to the client's dialect → meter + settle → OTel GenAI span.
 //!
-//! TODO: semantic cache, ontology grounding, nodes, Prometheus metrics, `Idempotency-Key`.
+//! TODO: ontology grounding, nodes, Prometheus metrics, `Idempotency-Key`.
 
 mod auth;
 mod chat;
+pub mod embedder;
 mod embeddings;
 mod error;
 mod limits;
@@ -16,6 +17,7 @@ mod messages;
 mod pipeline;
 mod quirks;
 mod rerank;
+mod semantic;
 mod stream;
 pub mod telemetry;
 #[cfg(test)]
@@ -27,6 +29,9 @@ pub use limits::quota_store;
 use axum::Router;
 use axum::routing::{get, post};
 use caliban_cache::ExactCache;
+use caliban_cache::semantic::{MemoryStore, QdrantStore, SemanticCache, VectorStore};
+use caliban_config::{SemanticCacheConfig, SemanticStoreKind};
+use caliban_types::Embedder;
 use caliban_config::ConfigHandle;
 use caliban_meter::UsageSink;
 use caliban_meter::quota::{InMemoryQuota, QuotaStore};
@@ -47,7 +52,12 @@ pub struct Gateway {
     pub router: caliban_route::Router,
     pub pii: PiiEngine,
     pub cache: ExactCache,
-    pub providers: Providers,
+    /// T2 semantic cache; `None` when no store is configured (`[cache.semantic]`).
+    pub semantic: Option<Arc<SemanticCache>>,
+    /// Embeddings for internal consumers (semantic cache, kNN routing): the tenant's embedding
+    /// model through its provider ([`embedder::ProviderEmbedder`]).
+    pub embedder: Arc<dyn Embedder>,
+    pub providers: Arc<Providers>,
     pub usage: Arc<dyn UsageSink>,
     /// Rate limits and token budgets (`[limits]`). In-memory by default (exact per router
     /// process); `store = "valkey"` shares them across routers (see [`quota_store`]).
@@ -63,17 +73,34 @@ pub struct Gateway {
 impl Gateway {
     pub fn new(config: ConfigHandle, usage: Arc<dyn UsageSink>) -> Self {
         let c = config.load().config.cache.clone();
+        let providers = Arc::new(Providers::default());
+        let embedder = Arc::new(embedder::ProviderEmbedder::new(
+            config.clone(),
+            Arc::clone(&providers),
+            embedder::DEFAULT_LRU_ENTRIES,
+            Duration::from_millis(c.semantic.embed_timeout_ms),
+            embedder::DEFAULT_MAX_BATCH,
+        ));
         Self {
             config,
             router: caliban_route::Router::default(),
             pii: PiiEngine::default(),
             cache: ExactCache::new(c.exact_max_entries, Duration::from_secs(c.exact_ttl_secs)),
-            providers: Providers::default(),
+            semantic: semantic_cache(&c.semantic),
+            embedder,
+            providers,
             usage,
             quota: Arc::new(InMemoryQuota::new()),
             salt_key: salt_key(),
             pii_keys: pii_keys(),
         }
+    }
+
+    /// Replaces the T2 store (tests, or a store built elsewhere).
+    pub fn with_semantic_store(mut self, store: Arc<dyn VectorStore>) -> Self {
+        let prefix = self.config.load().config.cache.semantic.collection_prefix.clone();
+        self.semantic = Some(Arc::new(SemanticCache::new(store, prefix)));
+        self
     }
 
     /// Replaces the quota store (e.g. a shared Valkey store for multi-router deployments).
@@ -105,9 +132,51 @@ fn cors() -> CorsLayer {
             HeaderName::from_static("x-caliban-request-id"),
             HeaderName::from_static("x-caliban-routed-model"),
             HeaderName::from_static("x-caliban-cache"),
+            HeaderName::from_static("x-caliban-cache-tier"),
             HeaderName::from_static("x-caliban-pii-entities"),
             HeaderName::from_static("x-caliban-cost-usd"),
         ])
+}
+
+/// Builds the T2 store from `[cache.semantic]` at start-up. The store exists whenever it can be
+/// reached, even if the cache is disabled, so a later snapshot can switch it on; whether a request
+/// uses it is decided per request from the current snapshot.
+fn semantic_cache(c: &SemanticCacheConfig) -> Option<Arc<SemanticCache>> {
+    let store: Arc<dyn VectorStore> = match c.store {
+        SemanticStoreKind::Memory => {
+            tracing::info!("semantic cache store: in-memory (this router only, lost on restart)");
+            Arc::new(MemoryStore::default())
+        }
+        SemanticStoreKind::Qdrant => {
+            let Some(url) = c.resolved_qdrant_url() else {
+                if c.enabled {
+                    tracing::warn!("cache.semantic is enabled but no Qdrant URL is set (CALIBAN_QDRANT_URL or cache.semantic.qdrant_url); semantic cache off");
+                }
+                return None;
+            };
+            if url.trim_end_matches('/').ends_with(":6334") {
+                tracing::warn!(%url, "6334 is Qdrant's gRPC port; Caliban uses the REST API (default port 6333)");
+            }
+            let key = match c.resolved_qdrant_api_key() {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!(error = %e, "semantic cache off: Qdrant API key could not be resolved");
+                    return None;
+                }
+            };
+            match QdrantStore::new(&url, key) {
+                Ok(s) => {
+                    tracing::info!(%url, "semantic cache store: qdrant");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "semantic cache off: Qdrant client");
+                    return None;
+                }
+            }
+        }
+    };
+    Some(Arc::new(SemanticCache::new(store, c.collection_prefix.clone())))
 }
 
 fn salt_key() -> [u8; 32] {

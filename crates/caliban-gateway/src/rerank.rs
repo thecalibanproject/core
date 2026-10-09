@@ -118,6 +118,7 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
         model,
         intent: "rerank".into(),
         cache: CacheStatus::Bypass,
+        cache_tier: None,
         pii_entities: entities,
         started,
         dialect: Dialect::OpenAi,

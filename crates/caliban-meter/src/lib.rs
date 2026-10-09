@@ -8,7 +8,7 @@
 pub mod quota;
 
 use async_trait::async_trait;
-use caliban_types::CacheStatus;
+use caliban_types::{CacheStatus, CacheTier};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -30,6 +30,9 @@ pub struct UsageEvent {
     /// Tokens not sent upstream thanks to Caliban (cache hits; later compression/routing).
     pub tokens_saved: u64,
     pub cache: CacheStatus,
+    /// On hits: `exact` (T1) or `semantic` (T2). `cache` stays `hit` for both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_tier: Option<CacheTier>,
     pub pii_entities: usize,
     pub cost_usd: Option<f64>,
     pub latency_ms: u64,

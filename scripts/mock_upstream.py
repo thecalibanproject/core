@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Tiny OpenAI-compatible + Anthropic Messages mock used by scripts/smoke.sh. Echoes the last user
 message so the smoke test can check what the upstream actually received (pseudonymized) and what
-the client got back (rehydrated). Writes every request (path, auth headers, body) to $MOCK_LOG."""
-import json, os, sys, time
+the client got back (rehydrated). Writes every request (path, auth headers, body) to $MOCK_LOG,
+except embeddings (the semantic cache calls them in the background, which would reorder the log).
+Embeddings are bag-of-words vectors, so rephrasings that only change case or punctuation embed
+identically."""
+import json, os, re, sys, time, zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 LOG = os.environ.get("MOCK_LOG", "/tmp/caliban-mock.jsonl")
@@ -19,6 +22,13 @@ def last_user(body):
         if m.get("role") == "user":
             return text_of(m.get("content"))
     return ""
+
+def bag_of_words(text, dim=32):
+    v = [0.0] * dim
+    for w in re.findall(r"[a-z]+", text.lower()):
+        v[zlib.crc32(w.encode()) % dim] += 1.0
+    v[-1] += 0.01
+    return v
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -42,6 +52,11 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        if self.path.endswith("/embeddings"):
+            inputs = body["input"] if isinstance(body["input"], list) else [body["input"]]
+            return self._json({"object": "list", "model": body["model"],
+                               "data": [{"object": "embedding", "index": i, "embedding": bag_of_words(t)} for i, t in enumerate(inputs)],
+                               "usage": {"prompt_tokens": 5, "total_tokens": 5}})
         with open(LOG, "a") as f:
             f.write(json.dumps({"path": self.path, "auth": self.headers.get("authorization"),
                                 "x_api_key": self.headers.get("x-api-key"),
@@ -53,11 +68,6 @@ class H(BaseHTTPRequestHandler):
             scores = [len(set(q.lower().split()) & set(d.lower().split())) / 10 for d in docs]
             return self._json({"results": [{"index": i, "relevance_score": s} for i, s in enumerate(scores)],
                                "usage": {"total_tokens": 7}})
-        if self.path.endswith("/embeddings"):
-            inputs = body["input"] if isinstance(body["input"], list) else [body["input"]]
-            return self._json({"object": "list", "model": body["model"],
-                               "data": [{"object": "embedding", "index": i, "embedding": [0.1, 0.2, 0.3]} for i in range(len(inputs))],
-                               "usage": {"prompt_tokens": 5, "total_tokens": 5}})
         if self.path.endswith("/messages"):
             return self.anthropic(body)
         text = "You said: " + last_user(body)

@@ -107,6 +107,20 @@ async fn mock_upstream() -> (String, Log) {
                 l2.0.lock().unwrap().push(("messages".into(), h, b.clone()));
                 anthropic_reply(&b)
             }),
+        )
+        // Embeddings (not logged): the semantic tests' bag-of-words vectors.
+        .route(
+            "/v1/embeddings",
+            post(|Json(b): Json<Value>| async move {
+                let data: Vec<Value> = b["input"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(i, t)| json!({"object": "embedding", "index": i, "embedding": semantic::bow(t.as_str().unwrap_or_default())}))
+                    .collect();
+                Json(json!({"object": "list", "data": data}))
+            }),
         );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -720,4 +734,663 @@ async fn native_anthropic_cache_hit_is_rehydrated() {
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["content"][0]["text"], format!("You said: {PII}"));
     assert_eq!(v["model"], "anth/claude");
+}
+
+// ───────────────────────── T2 semantic cache ─────────────────────────
+
+mod semantic {
+    use super::*;
+    use caliban_cache::semantic::{
+        Candidate, EntryPayload, EntryStats, MemoryStore, SearchQuery, StoreError, VectorStore,
+    };
+    use caliban_meter::UsageEvent;
+    use caliban_types::{CacheStatus, CacheTier, EmbedError, Embedder, ModelId, TenantId};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Bag-of-words over alphabetic words only (digits, emails and other tokens are ignored, so
+    /// prompts that differ only in such tokens embed identically and only the guards separate
+    /// them), with per-text overrides.
+    #[derive(Default)]
+    pub(super) struct FakeEmbedder {
+        pub overrides: Mutex<HashMap<String, Vec<f32>>>,
+        pub calls: AtomicUsize,
+        pub delay: Duration,
+        pub fail: bool,
+    }
+
+    pub(super) const DIM: usize = 64;
+
+    pub(super) fn bow(text: &str) -> Vec<f32> {
+        let mut v = vec![0.0f32; DIM];
+        for w in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | '?' | '!' | ';' | ':')) {
+            let w = w.trim_end_matches('.');
+            if !w.is_empty() && w.chars().all(char::is_alphabetic) {
+                let h = blake3::hash(w.to_lowercase().as_bytes());
+                v[h.as_bytes()[0] as usize % DIM] += 1.0;
+            }
+        }
+        v[DIM - 1] += 0.01; // never all-zero
+        v
+    }
+
+    /// Unit vector with cosine `c` to `e0`, tilted towards `e_axis` (`axis` > 0).
+    pub(super) fn at(c: f32, axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; DIM];
+        v[0] = c;
+        v[axis] = (1.0 - c * c).sqrt();
+        v
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for FakeEmbedder {
+        async fn embed(&self, _: &TenantId, _: &ModelId, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            if self.fail {
+                return Err(EmbedError::Upstream("down".into()));
+            }
+            let o = self.overrides.lock().unwrap();
+            Ok(texts.iter().map(|t| o.get(t).cloned().unwrap_or_else(|| bow(t))).collect())
+        }
+    }
+
+    /// Store wrapper that adds latency to searches.
+    struct SlowStore(MemoryStore, Duration);
+
+    #[async_trait::async_trait]
+    impl VectorStore for SlowStore {
+        async fn search(&self, q: &SearchQuery<'_>) -> Result<Vec<Candidate>, StoreError> {
+            tokio::time::sleep(self.1).await;
+            self.0.search(q).await
+        }
+        async fn upsert(&self, c: &str, id: &str, v: &[f32], p: &EntryPayload) -> Result<(), StoreError> {
+            self.0.upsert(c, id, v, p).await
+        }
+        async fn update_stats(&self, c: &str, t: &str, id: &str, s: &EntryStats, th: f32) -> Result<(), StoreError> {
+            self.0.update_stats(c, t, id, s, th).await
+        }
+        async fn delete_expired(&self, c: &str, now: i64) -> Result<(), StoreError> {
+            self.0.delete_expired(c, now).await
+        }
+        async fn delete_tenant(&self, c: &str, t: &str) -> Result<(), StoreError> {
+            self.0.delete_tenant(c, t).await
+        }
+    }
+
+    pub(super) struct Sem {
+        pub app: Router,
+        pub log: Log,
+        pub store: Arc<MemoryStore>,
+        pub embedder: Arc<FakeEmbedder>,
+        pub usage: RecentUsage,
+    }
+
+    pub(super) struct Opts {
+        pub verify_rate: f32,
+        pub budget_ms: u64,
+        pub embedder: FakeEmbedder,
+        pub slow_store: Option<Duration>,
+        pub keys: Option<SurrogateKeys>,
+        /// Use a real Qdrant instead of the in-memory store.
+        pub qdrant: Option<String>,
+        /// Use the gateway's `ProviderEmbedder` (against the mock's `/v1/embeddings`, or
+        /// `embed_base` when set).
+        pub real_embedder: bool,
+        pub embed_base: Option<String>,
+        pub prefix: String,
+    }
+
+    impl Default for Opts {
+        fn default() -> Self {
+            Self {
+                verify_rate: 0.0,
+                budget_ms: 2000,
+                embedder: FakeEmbedder::default(),
+                slow_store: None,
+                keys: None,
+                qdrant: None,
+                real_embedder: false,
+                embed_base: None,
+                prefix: "caliban_semcache".into(),
+            }
+        }
+    }
+
+    pub(super) async fn setup(o: Opts) -> Sem {
+        let (base, log) = mock_upstream().await;
+        let key_file = std::env::temp_dir().join(format!("caliban-gw-test-sem-{}", std::process::id()));
+        std::fs::write(&key_file, "sk-ant-test").unwrap();
+        let toml = format!(
+            r#"
+[cache.semantic]
+enabled = true
+store = "memory"
+embedding_model = "local/embed"
+verify_rate = {verify_rate}
+lookup_budget_ms = {budget}
+collection_prefix = "{prefix}"
+
+[[models]]
+id = "ext/mock"
+provider = "mockext"
+upstream_model = "mock-external"
+trust_tier = "t2_contracted"
+price_in_per_mtok = 1.0
+price_out_per_mtok = 2.0
+
+[[models]]
+id = "anth/claude"
+provider = "anth"
+upstream_model = "claude-test"
+trust_tier = "t2_contracted"
+
+[[models]]
+id = "local/embed"
+provider = "mocklocal"
+upstream_model = "embed"
+kind = "embedding"
+trust_tier = "t0_sovereign"
+
+[[providers]]
+id = "mocklocal"
+kind = "openai_compatible"
+base_url = "{embed_base}"
+trust_tier = "t0_sovereign"
+
+[[tenants]]
+id = "acme"
+name = "Acme"
+semantic_cache = "on"
+api_key_hashes = ["{acme}"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t2_contracted"
+  [[tenants.providers]]
+  id = "anth"
+  kind = "anthropic"
+  base_url = "{base}"
+  trust_tier = "t2_contracted"
+  api_key = {{ file = "{key}" }}
+
+[[tenants]]
+id = "globex"
+name = "Globex"
+semantic_cache = "on"
+api_key_hashes = ["{globex}"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t2_contracted"
+
+[[tenants]]
+id = "solo"
+name = "Solo"
+semantic_cache = "on"
+pii_surrogate_scope = "session"
+api_key_hashes = ["{solo}"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t2_contracted"
+
+[[tenants]]
+id = "limited"
+name = "Semantic off"
+api_key_hashes = ["{limited}"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t2_contracted"
+"#,
+            verify_rate = o.verify_rate,
+            budget = o.budget_ms,
+            prefix = o.prefix,
+            embed_base = o.embed_base.clone().unwrap_or_else(|| base.clone()),
+            acme = hash("cal_acme"),
+            globex = hash("cal_globex"),
+            solo = hash("cal_solo"),
+            limited = hash("cal_limited"),
+            key = key_file.display(),
+        );
+        let cfg = Config::from_toml_str(&toml).unwrap();
+        let usage = RecentUsage::default();
+        let store = Arc::new(MemoryStore::default());
+        let vs: Arc<dyn VectorStore> = match (o.slow_store, &o.qdrant) {
+            (Some(d), _) => Arc::new(SlowStore(MemoryStore::default(), d)),
+            (None, Some(url)) => Arc::new(caliban_cache::semantic::QdrantStore::new(url, None).unwrap()),
+            (None, None) => store.clone(),
+        };
+        let mut gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(usage.clone())).with_semantic_store(vs);
+        let embedder = Arc::new(o.embedder);
+        if !o.real_embedder {
+            gw.embedder = embedder.clone();
+        }
+        if let Some(k) = o.keys {
+            gw.pii_keys = k;
+        }
+        Sem { app: app(Arc::new(gw)), log, store, embedder, usage }
+    }
+
+    pub(super) async fn wait_entries(store: &MemoryStore, n: usize) {
+        for _ in 0..200 {
+            if store.len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("expected {n} semantic entries, have {}", store.len());
+    }
+
+    /// Lets background tasks (inserts, verifications) run.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    fn q(text: &str) -> Value {
+        json!({"model": "ext/mock", "temperature": 0.2, "messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": text}]})
+    }
+
+    fn last_event(u: &RecentUsage) -> UsageEvent {
+        u.snapshot(None, 1).remove(0)
+    }
+
+    const LIMITED: (&str, &str) = ("authorization", "Bearer cal_limited");
+
+    #[tokio::test]
+    async fn rephrased_question_is_a_semantic_hit_and_metered() {
+        let s = setup(Opts::default()).await;
+        let (status, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q("What is the capital of France?")).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(h["x-caliban-cache"], "miss");
+        assert!(h.get("x-caliban-cache-tier").is_none());
+        wait_entries(&s.store, 1).await;
+        let calls = upstream_calls(&s.log);
+
+        let (status, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q("what is the capital of france")).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(h["x-caliban-cache"], "hit", "SDKs keep seeing hit | miss | bypass");
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+        assert_eq!(h["x-caliban-cost-usd"], "0.00000000");
+        assert_eq!(upstream_calls(&s.log), calls, "served from T2");
+        assert_eq!(reply_text(&out), "You said: What is the capital of France?", "the cached answer");
+
+        let e = last_event(&s.usage);
+        assert_eq!((e.cache, e.cache_tier), (CacheStatus::Hit, Some(CacheTier::Semantic)));
+        assert_eq!((e.prompt_tokens, e.completion_tokens, e.tokens_saved), (0, 0, 19));
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!((json["cache"].as_str(), json["cache_tier"].as_str()), (Some("hit"), Some("semantic")));
+        settle().await;
+        assert_eq!(s.store.entries()[0].2.stats.hits, 1, "hit counted on the entry");
+    }
+
+    #[tokio::test]
+    async fn tenant_b_never_gets_tenant_a_entry_for_an_identical_prompt() {
+        let s = setup(Opts::default()).await;
+        call(&s.app, "/v1/chat/completions", BEARER, q("What is our refund policy?")).await;
+        wait_entries(&s.store, 1).await;
+        let calls = upstream_calls(&s.log);
+        let (status, h, _) = call(&s.app, "/v1/chat/completions", GLOBEX, q("What is our refund policy?")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h["x-caliban-cache"], "miss", "identical prompt, other tenant");
+        assert_eq!(upstream_calls(&s.log), calls + 1);
+        wait_entries(&s.store, 2).await;
+        let tenants: std::collections::BTreeSet<String> = s.store.entries().into_iter().map(|(_, _, p)| p.tenant_id).collect();
+        assert_eq!(tenants.into_iter().collect::<Vec<_>>(), ["acme", "globex"]);
+        // Each tenant now hits only its own entry.
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", GLOBEX, q("what is our refund policy")).await;
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+        assert_eq!(last_event(&s.usage).tenant_id, "globex");
+    }
+
+    #[tokio::test]
+    async fn context_params_numbers_and_people_must_match_exactly() {
+        let s = setup(Opts::default()).await;
+        call(&s.app, "/v1/chat/completions", BEARER, q("Summarise revenue for 2025")).await;
+        wait_entries(&s.store, 1).await;
+        // Same vector (the fake ignores numbers), different number: the slot guard keeps them apart.
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, q("Summarise revenue for 2026")).await;
+        assert_eq!(h["x-caliban-cache"], "miss");
+        // Another system prompt.
+        let mut other_sys = q("Summarise revenue for 2025");
+        other_sys["messages"][0]["content"] = json!("Be verbose.");
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, other_sys).await;
+        assert_eq!(h["x-caliban-cache"], "miss", "system prompt is part of the context hash");
+        // Another temperature.
+        let mut other_temp = q("Summarise revenue for 2025");
+        other_temp["temperature"] = json!(0.1);
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, other_temp).await;
+        assert_eq!(h["x-caliban-cache"], "miss", "params are part of the context hash");
+        // Earlier turns.
+        let mut follow_up = q("Summarise revenue for 2025");
+        follow_up["messages"] = json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}, {"role": "user", "content": "Summarise revenue for 2025"}]);
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, follow_up).await;
+        assert_eq!(h["x-caliban-cache"], "miss", "history is part of the context hash");
+        // Same prompt again: hit.
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, q("summarise revenue for 2025")).await;
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+
+        // People: the fake embeds both identically (emails are ignored); the surrogate guard
+        // keeps an answer about jane from being served for john.
+        let (_, _, out) = call(&s.app, "/v1/chat/completions", BEARER, q(PII)).await;
+        assert_eq!(reply_text(&out), format!("You said: {PII}"));
+        settle().await;
+        let n = s.store.len();
+        let other = PII.replace(EMAIL, "john.roe@initech.com");
+        let (_, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q(&other)).await;
+        assert_eq!(h["x-caliban-cache"], "miss");
+        assert_eq!(reply_text(&out), format!("You said: {other}"));
+        wait_entries(&s.store, n + 1).await;
+        // The same person again: hit, rehydrated with this request's own vault.
+        let (_, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q(&PII.replace("Email", "email"))).await;
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+        assert_eq!(reply_text(&out), format!("You said: {PII}"));
+        // Stored entries hold surrogates only.
+        for (_, _, p) in s.store.entries() {
+            assert!(!p.response.contains(EMAIL) && !p.response.contains("john.roe"), "{}", p.response);
+        }
+    }
+
+    #[tokio::test]
+    async fn eligibility_rules() {
+        let s = setup(Opts::default()).await;
+        // Sampling temperature: neither tier applies.
+        let mut hot = q("Write a poem about rain");
+        hot["temperature"] = json!(1.0);
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, hot.clone()).await;
+        assert_eq!(h["x-caliban-cache"], "bypass");
+        let mut unset = q("Write a poem about rain");
+        unset.as_object_mut().unwrap().remove("temperature");
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, unset).await;
+        assert_eq!(h["x-caliban-cache"], "bypass", "unset temperature means sampling");
+        // ... unless the request opts in.
+        hot["caliban"] = json!({"cache": "semantic"});
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, hot.clone()).await;
+        assert_eq!(h["x-caliban-cache"], "miss");
+        wait_entries(&s.store, 1).await;
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, hot).await;
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+        // caliban.cache = exact or off: no T2.
+        for mode in ["exact", "off"] {
+            let mut b = q("write a poem about rain");
+            b["caliban"] = json!({"cache": mode});
+            let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, b).await;
+            assert_ne!(h.get("x-caliban-cache-tier").map(|v| v.to_str().unwrap()), Some("semantic"), "{mode}");
+        }
+        // Tools, or a tool result in the history.
+        let mut tools = q("Weather in Paris?");
+        tools["tools"] = json!([{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]);
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, tools).await;
+        assert_eq!(h["x-caliban-cache"], "bypass");
+        let mut tool_result = q("thanks");
+        tool_result["messages"] = json!([{"role": "user", "content": "weather?"}, {"role": "assistant", "content": null, "tool_calls": [{"id": "c", "type": "function", "function": {"name": "w", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c", "content": "sunny"}, {"role": "user", "content": "thanks"}]);
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, tool_result).await;
+        assert_eq!(h["x-caliban-cache"], "bypass");
+        // Tenant without the opt-in.
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", LIMITED, q("Write a poem about rain")).await;
+        assert_eq!(h["x-caliban-cache"], "bypass");
+        // Session-scoped surrogates with PII: never stored (could never hit).
+        let n = s.store.len();
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", SOLO, q(PII)).await;
+        assert_eq!(h["x-caliban-cache"], "bypass");
+        settle().await;
+        assert_eq!(s.store.len(), n);
+    }
+
+    #[tokio::test]
+    async fn streams_replay_hits_and_streamed_misses_are_cached() {
+        let s = setup(Opts::default()).await;
+        let stream_text = |out: &str| -> String {
+            out.lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+                .filter_map(|c| c["choices"][0]["delta"]["content"].as_str().map(str::to_owned))
+                .collect()
+        };
+        // A streamed miss is captured and cached.
+        let mut b = q(PII);
+        b["stream"] = json!(true);
+        let (status, h, out) = call(&s.app, "/v1/chat/completions", BEARER, b.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h["x-caliban-cache"], "miss");
+        assert_eq!(stream_text(&out), format!("You said: {PII}"));
+        wait_entries(&s.store, 1).await;
+        let stored = &s.store.entries()[0].2;
+        assert!(!stored.response.contains(EMAIL), "captured before rehydration: {}", stored.response);
+        let calls = upstream_calls(&s.log);
+
+        // Non-streaming hit on the streamed entry.
+        let (_, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q(PII)).await;
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+        assert_eq!(reply_text(&out), format!("You said: {PII}"));
+        // Streaming hit (rephrased): replayed as SSE, rehydrated, usage chunk included, [DONE].
+        b["messages"][1]["content"] = json!(PII.to_lowercase());
+        let (status, h, out) = call(&s.app, "/v1/chat/completions", BEARER, b).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h["content-type"], "text/event-stream");
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+        assert_eq!(stream_text(&out), format!("You said: {PII}"));
+        assert!(out.trim_end().ends_with("data: [DONE]"));
+        assert_eq!(upstream_calls(&s.log), calls);
+        settle().await;
+        let e = last_event(&s.usage);
+        assert_eq!((e.cache_tier, e.prompt_tokens, e.tokens_saved), (Some(CacheTier::Semantic), 0, 19), "replayed stream is metered as a hit");
+
+        // Anthropic client on an OpenAI-shaped upstream: stream replay as Anthropic events.
+        let ab = json!({"model": "ext/mock", "max_tokens": 64, "temperature": 0, "messages": [{"role": "user", "content": "Name three primary colours"}]});
+        call(&s.app, "/v1/messages", ANTH, ab.clone()).await;
+        wait_entries(&s.store, 2).await;
+        let mut ab = ab;
+        ab["stream"] = json!(true);
+        ab["messages"][0]["content"] = json!("name three primary colours.");
+        let (_, h, out) = call(&s.app, "/v1/messages", ANTH, ab).await;
+        let entries: Vec<_> = s.store.entries().into_iter().map(|(_, id, p)| (id, p.route, p.partition, p.stats)).collect();
+        assert_eq!(h.get("x-caliban-cache-tier").map(|v| v.to_str().unwrap()), Some("semantic"), "{h:?} {entries:?}");
+        let evs = events(&out);
+        assert_eq!(streamed_text(&evs), "You said: Name three primary colours");
+        assert_eq!(evs.last().unwrap()["type"], "message_stop");
+    }
+
+    #[tokio::test]
+    async fn native_anthropic_entries_are_stored_pseudonymised_and_replayed() {
+        let s = setup(Opts::default()).await;
+        let body = json!({"model": "anth/claude", "max_tokens": 50, "temperature": 0.2, "messages": [{"role": "user", "content": PII}]});
+        let (_, h, out) = call(&s.app, "/v1/messages", ANTH, body.clone()).await;
+        assert_eq!(h["x-caliban-cache"], "miss", "{out}");
+        wait_entries(&s.store, 1).await;
+        assert!(!s.store.entries()[0].2.response.contains(EMAIL));
+        let calls = upstream_calls(&s.log);
+        let (_, h, out) = call(&s.app, "/v1/messages", ANTH, body.clone()).await;
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["content"][0]["text"], format!("You said: {PII}"));
+        let mut b = body;
+        b["stream"] = json!(true);
+        let (_, h, out) = call(&s.app, "/v1/messages", ANTH, b).await;
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+        let evs = events(&out);
+        assert_eq!(streamed_text(&evs), format!("You said: {PII}"));
+        assert_eq!(evs[0]["message"]["model"], "anth/claude");
+        assert_eq!(evs.last().unwrap()["type"], "message_stop");
+        assert_eq!(upstream_calls(&s.log), calls);
+    }
+
+    #[tokio::test]
+    async fn exact_hits_report_the_exact_tier() {
+        let s = setup(Opts::default()).await;
+        let mut b = q("Define latency");
+        b["temperature"] = json!(0);
+        call(&s.app, "/v1/chat/completions", BEARER, b.clone()).await;
+        wait_entries(&s.store, 1).await;
+        assert_eq!(s.embedder.calls.load(Ordering::SeqCst), 1, "one embedding serves the T2 lookup and the insert");
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, b).await;
+        assert_eq!((h["x-caliban-cache"].to_str().unwrap(), h["x-caliban-cache-tier"].to_str().unwrap()), ("hit", "exact"));
+        assert_eq!(last_event(&s.usage).cache_tier, Some(CacheTier::Exact));
+        settle().await;
+        assert_eq!(s.embedder.calls.load(Ordering::SeqCst), 1, "a T1 hit embeds nothing");
+    }
+
+    #[tokio::test]
+    async fn slow_or_failing_dependencies_are_a_miss_within_the_budget() {
+        // Embedder slower than the 60 ms budget.
+        let s = setup(Opts { budget_ms: 60, embedder: FakeEmbedder { delay: Duration::from_millis(400), ..Default::default() }, ..Default::default() }).await;
+        let t0 = Instant::now();
+        let (status, h, _) = call(&s.app, "/v1/chat/completions", BEARER, q("Explain HNSW")).await;
+        let took = t0.elapsed();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h["x-caliban-cache"], "miss");
+        assert!(took < Duration::from_millis(350), "did not wait for the embedder: {took:?}");
+        // The late embedding is still used to cache the answer.
+        wait_entries(&s.store, 1).await;
+        assert_eq!(s.embedder.calls.load(Ordering::SeqCst), 1, "one embedding for lookup and insert");
+
+        // Embedder down.
+        let s = setup(Opts { embedder: FakeEmbedder { fail: true, ..Default::default() }, ..Default::default() }).await;
+        let (status, h, _) = call(&s.app, "/v1/chat/completions", BEARER, q("Explain HNSW")).await;
+        assert_eq!((status, h["x-caliban-cache"].to_str().unwrap()), (StatusCode::OK, "miss"));
+        settle().await;
+        assert!(s.store.is_empty());
+
+        // Vector store slower than the budget.
+        let s = setup(Opts { budget_ms: 60, slow_store: Some(Duration::from_millis(400)), ..Default::default() }).await;
+        let t0 = Instant::now();
+        let (status, h, _) = call(&s.app, "/v1/chat/completions", BEARER, q("Explain HNSW")).await;
+        assert_eq!((status, h["x-caliban-cache"].to_str().unwrap()), (StatusCode::OK, "miss"));
+        assert!(t0.elapsed() < Duration::from_millis(350));
+    }
+
+    #[tokio::test]
+    async fn grey_zone_agreement_lowers_an_entry_threshold() {
+        let s = setup(Opts::default()).await;
+        let prompts = ["alpha question", "beta question", "gamma question", "delta question"];
+        {
+            let mut o = s.embedder.overrides.lock().unwrap();
+            // cos to "alpha": 0.93, 0.935 and 0.94, in orthogonal directions (far from each other).
+            o.insert(prompts[0].into(), at(1.0, 10));
+            o.insert(prompts[1].into(), at(0.93, 1));
+            o.insert(prompts[2].into(), at(0.935, 2));
+            o.insert(prompts[3].into(), at(0.94, 3));
+            // Every answer embeds the same: the judge calls them equivalent.
+            for p in prompts {
+                o.insert(format!("You said: {p}"), at(1.0, 9));
+            }
+        }
+        call(&s.app, "/v1/chat/completions", BEARER, q(prompts[0])).await;
+        wait_entries(&s.store, 1).await;
+        let alpha = s.store.entries()[0].1.clone();
+        let stats = || s.store.entries().into_iter().find(|(_, id, _)| *id == alpha).unwrap().2;
+
+        // 0.93 and 0.935: grey zone, answered fresh, verified correct.
+        for (i, p) in prompts[1..3].iter().enumerate() {
+            let (_, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q(p)).await;
+            assert_eq!(h["x-caliban-cache"], "miss");
+            assert_eq!(reply_text(&out), format!("You said: {p}"), "fresh answer");
+            wait_entries(&s.store, 2 + i).await;
+            settle().await;
+        }
+        let st = stats();
+        assert_eq!((st.stats.verified_ok, st.stats.lowest_ok), (2, Some(0.93)));
+        assert!((st.threshold - 0.93).abs() < 1e-3, "{}", st.threshold);
+        // 0.94 is now served from alpha's entry (it was below the starting 0.95).
+        let (_, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q(prompts[3])).await;
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+        assert_eq!(reply_text(&out), "You said: alpha question");
+    }
+
+    #[tokio::test]
+    async fn a_verified_wrong_answer_raises_the_entry_threshold() {
+        let s = setup(Opts { verify_rate: 1.0, ..Default::default() }).await;
+        {
+            let mut o = s.embedder.overrides.lock().unwrap();
+            o.insert("first prompt".into(), at(1.0, 10));
+            o.insert("second prompt".into(), at(0.97, 1));
+            o.insert("You said: first prompt".into(), at(1.0, 5));
+            o.insert("You said: second prompt".into(), at(0.0, 6)); // orthogonal: a different answer
+        }
+        call(&s.app, "/v1/chat/completions", BEARER, q("first prompt")).await;
+        wait_entries(&s.store, 1).await;
+        let first = s.store.entries()[0].1.clone();
+        // 0.97 >= 0.95 would hit; verify_rate = 1 explores instead and finds a different answer.
+        let (_, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q("second prompt")).await;
+        assert_eq!(h["x-caliban-cache"], "miss");
+        assert_eq!(reply_text(&out), "You said: second prompt");
+        wait_entries(&s.store, 2).await;
+        settle().await;
+        let p = s.store.entries().into_iter().find(|(_, id, _)| *id == first).unwrap().2;
+        assert_eq!((p.stats.verified_bad, p.stats.highest_bad), (1, Some(0.97)));
+        assert!((p.threshold - 0.975).abs() < 1e-3, "{}", p.threshold);
+    }
+}
+
+/// Added latency of T2 on a miss, end to end through the gateway: real `ProviderEmbedder` (HTTP to
+/// the mock's `/v1/embeddings`, or to a real embedding server at `CALIBAN_TEST_EMBED_URL`; LRU
+/// cold) and a real Qdrant. Skipped unless `CALIBAN_TEST_QDRANT_URL` is set; run with
+/// `--release -- --nocapture` for meaningful numbers.
+#[tokio::test]
+async fn semantic_miss_latency_against_qdrant() {
+    use semantic::{Opts, setup};
+    use std::time::{Duration, Instant};
+    let Some(url) = std::env::var("CALIBAN_TEST_QDRANT_URL").ok().filter(|u| !u.is_empty()) else {
+        eprintln!("CALIBAN_TEST_QDRANT_URL not set; skipping");
+        return;
+    };
+    let prefix = format!("calgw_{}", uuid::Uuid::new_v4().simple());
+    let embed_base = std::env::var("CALIBAN_TEST_EMBED_URL").ok().filter(|u| !u.is_empty());
+    eprintln!("embedding server: {}", embed_base.as_deref().unwrap_or("mock (bag of words)"));
+    let s = setup(Opts { qdrant: Some(url.clone()), real_embedder: true, embed_base, budget_ms: 50, prefix: prefix.clone(), ..Default::default() }).await;
+    // Eight pseudo-random words and a unique number per prompt: the numeric-slot guard keeps every
+    // measured request a miss (a real model may still find gibberish prompts similar), while the
+    // embedding and the filtered search run in full.
+    let words = |i: usize, tag: &str| -> String {
+        let w: Vec<String> = (0..8).map(|j| blake3::hash(format!("{tag}-{i}-{j}").as_bytes()).as_bytes()[..6].iter().map(|b| char::from(b'a' + b % 26)).collect()).collect();
+        format!("{} {i}", w.join(" "))
+    };
+    let body = |i: usize, tag: &str| json!({"model": "ext/mock", "temperature": 0.2, "messages": [{"role": "user", "content": words(i, tag)}]});
+    // Warm up connections and create the collection.
+    for i in 0..20 {
+        call(&s.app, "/v1/chat/completions", BEARER, body(i, "warm")).await;
+        call(&s.app, "/v1/chat/completions", ("authorization", "Bearer cal_limited"), body(i, "warm")).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let n = 300;
+    let mut on = Vec::new();
+    let mut off = Vec::new();
+    for i in 0..n {
+        let t0 = Instant::now();
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, body(i, "measure")).await;
+        on.push(t0.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(h["x-caliban-cache"], "miss");
+        let t0 = Instant::now();
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", ("authorization", "Bearer cal_limited"), body(i, "measure")).await;
+        off.push(t0.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(h["x-caliban-cache"], "bypass");
+    }
+    let pct = |v: &mut Vec<f64>, p: f64| {
+        v.sort_by(f64::total_cmp);
+        v[((v.len() as f64 - 1.0) * p) as usize]
+    };
+    let (on50, on99, off50, off99) = (pct(&mut on, 0.5), pct(&mut on, 0.99), pct(&mut off, 0.5), pct(&mut off, 0.99));
+    eprintln!("miss with T2 (embed over HTTP + Qdrant search): p50 {on50:.2} ms, p99 {on99:.2} ms");
+    eprintln!("same request without T2:                       p50 {off50:.2} ms, p99 {off99:.2} ms");
+    eprintln!("added on a miss: p50 {:.2} ms, p99 {:.2} ms", on50 - off50, on99 - off99);
+
+    // And the hit path through Qdrant works end to end.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, body(3, "measure")).await;
+    assert_eq!(h["x-caliban-cache-tier"], "semantic");
+    let http = reqwest::Client::new();
+    let v: Value = http.get(format!("{url}/collections")).send().await.unwrap().json().await.unwrap();
+    for c in v["result"]["collections"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        if name.starts_with(&prefix) {
+            http.delete(format!("{url}/collections/{name}")).send().await.unwrap();
+        }
+    }
 }
