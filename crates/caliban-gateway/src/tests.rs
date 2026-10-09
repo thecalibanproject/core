@@ -1509,6 +1509,7 @@ mod auto_routing {
     use super::*;
     use crate::route_embed;
     use caliban_cache::semantic::MemoryStore;
+    use caliban_meter::UsageEvent;
     use caliban_types::{CacheStatus, CacheTier};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -1784,28 +1785,45 @@ api_key_hashes = ["{acme}"]
         assert!(!seen.iter().any(|t| t == prompt), "the raw prompt is never embedded");
     }
 
-    /// Both cache tiers meter a `caliban/auto` hit the same way: no tokens, zero routed cost and
-    /// zero flat price (whether a hit should charge the flat price is an open pricing question),
-    /// and the answer's tokens as `tokens_saved`.
+    /// Sends `body` until a cache tier answers it (T2 stores in the background), checks the
+    /// tier header, and returns the miss and the hit usage events.
+    async fn miss_then_hit(env: &Env, body: &Value, tier: CacheTier) -> (UsageEvent, UsageEvent) {
+        let (_, h, _) = call(&env.app, "/v1/chat/completions", BEARER, body.clone()).await;
+        assert_eq!(h["x-caliban-cache"], "miss");
+        let miss = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
+        for _ in 0..200 {
+            let (_, h, _) = call(&env.app, "/v1/chat/completions", BEARER, body.clone()).await;
+            if h["x-caliban-cache"] == "hit" {
+                assert_eq!(h["x-caliban-cache-tier"], tier.as_str());
+                if body["stream"] != true {
+                    assert_eq!(h["x-caliban-cost-usd"], "0.00000000", "no model was called");
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let hit = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
+        assert_eq!((hit.cache, hit.cache_tier), (CacheStatus::Hit, Some(tier)), "{tier:?}");
+        (miss, hit)
+    }
+
+    fn close(a: Option<f64>, b: f64) -> bool {
+        a.is_some_and(|a| (a - b).abs() < 1e-15)
+    }
+
+    /// Both cache tiers bill a `caliban/auto` hit the same way: no tokens, zero routed cost, the
+    /// full flat price of the cached answer's tokens next to the discounted billed amount (the
+    /// default 20%), the difference as the saving, and the answer's tokens as `tokens_saved`.
     #[tokio::test]
-    async fn exact_and_semantic_hits_meter_auto_the_same_way() {
+    async fn exact_and_semantic_hits_bill_auto_at_the_discounted_flat_price() {
         let env = setup(WITH_T2).await;
         let ask = |temperature: f64| json!({"model": "caliban/auto", "temperature": temperature, "messages": [{"role": "user", "content": TRANSLATE}]});
         for (temperature, tier) in [(0.0, CacheTier::Exact), (0.2, CacheTier::Semantic)] {
-            let (_, h, _) = call(&env.app, "/v1/chat/completions", BEARER, ask(temperature)).await;
-            assert_eq!(h["x-caliban-cache"], "miss");
-            let miss = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
-            assert!(miss.flat_price_usd.unwrap() > 0.0);
-            for _ in 0..200 {
-                let (_, h, _) = call(&env.app, "/v1/chat/completions", BEARER, ask(temperature)).await;
-                if h["x-caliban-cache"] == "hit" {
-                    assert_eq!(h["x-caliban-cache-tier"], tier.as_str());
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            let hit = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
-            assert_eq!((hit.cache, hit.cache_tier), (CacheStatus::Hit, Some(tier)), "{tier:?}");
+            let (miss, hit) = miss_then_hit(&env, &ask(temperature), tier).await;
+            let flat = miss.flat_price_usd.unwrap();
+            assert!(flat > 0.0);
+            assert_eq!(miss.billed_usd, Some(flat), "a miss bills the full flat price");
+            assert_eq!(miss.saved_usd, None);
             assert_eq!(hit.requested_model.as_deref(), Some("caliban/auto"));
             assert_eq!((hit.prompt_tokens, hit.completion_tokens), (0, 0), "{tier:?}");
             assert_eq!(
@@ -1813,13 +1831,50 @@ api_key_hashes = ["{acme}"]
                 miss.prompt_tokens + miss.completion_tokens,
                 "{tier:?}: saved tokens recorded"
             );
-            assert_eq!(
-                (hit.cost_usd, hit.routed_model_cost_usd, hit.flat_price_usd),
-                (Some(0.0), Some(0.0), Some(0.0)),
-                "{tier:?}"
-            );
-            assert_eq!(hit.margin_usd(), Some(0.0));
+            assert_eq!((hit.cost_usd, hit.routed_model_cost_usd), (Some(0.0), Some(0.0)), "{tier:?}");
+            assert!(close(hit.flat_price_usd, flat), "{tier:?}: the full flat price is recorded next to the bill");
+            assert!(close(hit.billed_usd, flat * 0.2), "{tier:?}: billed {:?} of {flat}", hit.billed_usd);
+            assert!(close(hit.saved_usd, flat * 0.8), "{tier:?}");
+            assert!(close(hit.margin_usd(), flat * 0.2), "{tier:?}: margin is the billed amount");
         }
+    }
+
+    /// The fraction comes from the tenant, else `[routing] auto_cache_hit_fraction`; a new snapshot
+    /// applies to the next request. Streams replayed from T2 are billed like JSON hits.
+    #[tokio::test]
+    async fn auto_cache_hit_fraction_follows_deployment_and_tenant_settings() {
+        let env = setup(&format!("auto_cache_hit_fraction = 0.25\n{WITH_T2}")).await;
+        let body = |text: &str| json!({"model": "caliban/auto", "temperature": 0, "messages": [{"role": "user", "content": text}]});
+        let (miss, hit) = miss_then_hit(&env, &body(TRANSLATE), CacheTier::Exact).await;
+        let flat = miss.flat_price_usd.unwrap();
+        assert!(close(hit.billed_usd, flat * 0.25), "deployment value: {:?}", hit.billed_usd);
+
+        let mut cfg = env.gw.config.load().config.clone();
+        cfg.tenants[0].auto_cache_hit_fraction = Some(0.1);
+        env.gw.config.store(Snapshot::new(cfg, "override"));
+        let (_, hit) =
+            miss_then_hit(&env, &body("please translate the release notes into spanish"), CacheTier::Exact).await;
+        assert!(close(hit.billed_usd, hit.flat_price_usd.unwrap() * 0.1), "tenant override: {:?}", hit.billed_usd);
+
+        // A semantic hit served as a stream (replayed) is priced from the same cached tokens.
+        let streamed = json!({"model": "caliban/auto", "temperature": 0.2, "stream": true, "messages": [{"role": "user", "content": TRANSLATE}]});
+        let (miss, hit) = miss_then_hit(&env, &streamed, CacheTier::Semantic).await;
+        assert_eq!(hit.tokens_saved, miss.prompt_tokens + miss.completion_tokens);
+        assert!(close(hit.flat_price_usd, miss.flat_price_usd.unwrap()));
+        assert!(close(hit.billed_usd, miss.flat_price_usd.unwrap() * 0.1));
+    }
+
+    /// A pinned (BYOK) model's cache hit costs the customer nothing at the provider; the usage
+    /// event records the model cost it avoided as `saved_usd`, and no auto price fields.
+    #[tokio::test]
+    async fn pinned_model_hits_record_the_avoided_model_cost() {
+        let env = setup("").await;
+        let body = json!({"model": "ext/mock", "temperature": 0, "messages": [{"role": "user", "content": TRANSLATE}]});
+        let (miss, hit) = miss_then_hit(&env, &body, CacheTier::Exact).await;
+        assert_eq!((miss.saved_usd, miss.billed_usd), (None, None));
+        assert_eq!(hit.cost_usd, Some(0.0));
+        assert!(close(hit.saved_usd, miss.cost_usd.unwrap()), "{:?} vs {:?}", hit.saved_usd, miss.cost_usd);
+        assert!(hit.flat_price_usd.is_none() && hit.billed_usd.is_none() && hit.routed_model_cost_usd.is_none());
     }
 
     /// Added routing latency through the real adapter (HTTP to a local mock embedder) versus the

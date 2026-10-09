@@ -379,6 +379,8 @@ mod tests {
             route_stage: None,
             routed_model_cost_usd: None,
             flat_price_usd: None,
+            billed_usd: None,
+            saved_usd: None,
         }
     }
 
@@ -410,6 +412,7 @@ mod tests {
             (back[0].request_id.as_str(), back[0].cache_tier, back[0].usage_source),
             ("old_1", Some(CacheTier::Exact), None)
         );
+        assert_eq!((back[0].billed_usd, back[0].saved_usd), (None, None), "older lines have no billing fields");
         assert_eq!(&back[1..], &events[..], "same events, same order");
 
         // The format is unchanged: one JSON object per line, readable as plain JSON (the bench

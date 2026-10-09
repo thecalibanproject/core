@@ -90,16 +90,34 @@ pub struct UsageEvent {
     /// reported usage; the same number as `cost_usd`), recorded next to `flat_price_usd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_model_cost_usd: Option<f64>,
-    /// `caliban/auto` only: the flat auto price for this request's tokens
-    /// (`[routing] auto_price_in_per_mtok` / `auto_price_out_per_mtok`).
+    /// `caliban/auto` only: the full flat auto price for this request's tokens
+    /// (`[routing] auto_price_in_per_mtok` / `auto_price_out_per_mtok`). On a cache hit, the flat
+    /// price of the cached answer's tokens: what a miss would have been billed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flat_price_usd: Option<f64>,
+    /// `caliban/auto` only: what the customer is billed. `flat_price_usd` on a miss; on a cache hit
+    /// of either tier, `flat_price_usd` x the tenant's `auto_cache_hit_fraction` (default 0.20).
+    /// Absent on events written before cache-hit billing (they billed `flat_price_usd`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billed_usd: Option<f64>,
+    /// Cache hits only: what the hit saved the customer. `caliban/auto`: `flat_price_usd -
+    /// billed_usd`. Other models: the cost the hit avoided at the model's prices (the cached
+    /// answer's tokens at the input and output price). Absent on misses and for unpriced models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_usd: Option<f64>,
 }
 
 impl UsageEvent {
-    /// `flat_price_usd - routed_model_cost_usd`, when both are known.
+    /// What the customer is billed for a `caliban/auto` request: `billed_usd`, or `flat_price_usd`
+    /// on events written before cache-hit billing.
+    pub fn auto_billed_usd(&self) -> Option<f64> {
+        self.billed_usd.or(self.flat_price_usd)
+    }
+
+    /// Billed amount minus the routed model's real cost, when both are known. On a cache hit the
+    /// routed cost is 0, so the margin is the discounted price.
     pub fn margin_usd(&self) -> Option<f64> {
-        Some(self.flat_price_usd? - self.routed_model_cost_usd?)
+        Some(self.auto_billed_usd()? - self.routed_model_cost_usd?)
     }
 }
 
@@ -262,6 +280,29 @@ mod tests {
         let t = Tokens { prompt: 1000, completion: 10, cache_read: 900, cache_write: 50, cache_write_1h: 0 };
         assert_eq!(cost(t, Prices::flat(Some(2.0), Some(8.0))), cost_usd(1000, 10, Some(2.0), Some(8.0)));
         assert_eq!(cost(t, Prices { input: None, ..Prices::flat(None, Some(1.0)) }), None);
+    }
+
+    #[test]
+    fn auto_margin_uses_the_billed_amount() {
+        let e: UsageEvent = serde_json::from_value(serde_json::json!({
+            "request_id": "r", "tenant_id": "t", "model": "m", "intent": "chat", "prompt_tokens": 0,
+            "completion_tokens": 0, "cached_prompt_tokens": 0, "tokens_saved": 120, "cache": "hit",
+            "cache_tier": "exact", "pii_entities": 0, "cost_usd": 0.0, "latency_ms": 1,
+            "ts": "2026-10-09T12:00:00Z", "requested_model": "caliban/auto", "routed_model_cost_usd": 0.0,
+            "flat_price_usd": 0.001, "billed_usd": 0.0002, "saved_usd": 0.0008
+        }))
+        .unwrap();
+        // A hit: billed at the discounted price, routed cost 0, so the margin is the billed amount.
+        assert_eq!((e.auto_billed_usd(), e.margin_usd()), (Some(0.0002), Some(0.0002)));
+        // Events written before cache-hit billing carry no billed_usd: they billed the flat price.
+        let legacy = UsageEvent { billed_usd: None, saved_usd: None, routed_model_cost_usd: Some(0.0004), ..e };
+        assert_eq!(legacy.auto_billed_usd(), Some(0.001));
+        assert!(close(legacy.margin_usd(), 0.0006));
+        // Unset fields stay out of the JSON.
+        let plain = UsageEvent { billed_usd: None, saved_usd: None, flat_price_usd: None, ..legacy };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("billed_usd").is_none() && json.get("saved_usd").is_none());
+        assert_eq!(plain.margin_usd(), None);
     }
 
     #[test]

@@ -4,6 +4,10 @@
 //!   and writes (the Anthropic 1-hour TTL at its own price) and output, each at the model's price.
 //!   The usage event's `cost_usd`, the `x-caliban-cost-usd` header, quota settlement, and the
 //!   `caliban/auto` `routed_model_cost_usd` and `flat_price_usd` all use it.
+//! - **Cache hits.** A hit of either tier consumes nothing (`cost_usd` 0). `caliban/auto` hits are
+//!   billed `[routing] auto_cache_hit_fraction` (or the tenant's override; default 0.20) of the
+//!   flat price of the cached answer's tokens; every priced hit records what it saved
+//!   ([`HitBilling`]).
 //! - **Usage source.** Every non-hit event says whether its tokens are the provider's report or a
 //!   gateway estimate ([`Metered`], [`stream_end`]).
 //! - **Usage the client did not ask for.** Usage is always requested upstream on streams; for an
@@ -45,8 +49,43 @@ pub(crate) fn model_cost(m: &ModelEntry, u: Usage) -> Option<f64> {
 
 /// The flat `caliban/auto` price for the same tokens, through the same cost function. The flat
 /// price has no cache prices of its own, so cache reads and writes are charged at its input price.
-pub(crate) fn flat_cost(flat: (Option<f64>, Option<f64>), u: Usage) -> Option<f64> {
+pub(crate) fn flat_cost(flat: FlatPrice, u: Usage) -> Option<f64> {
     cost(tokens(u), Prices::flat(flat.0, flat.1))
+}
+
+/// A flat price per million tokens: (input, output).
+pub(crate) type FlatPrice = (Option<f64>, Option<f64>);
+
+/// The `caliban/auto` price and cache-hit saving fields of a usage event.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct HitBilling {
+    pub flat_price_usd: Option<f64>,
+    pub billed_usd: Option<f64>,
+    pub saved_usd: Option<f64>,
+}
+
+impl HitBilling {
+    /// A request the model answered. `caliban/auto` (`flat` set) bills the full flat price for its
+    /// tokens; other requests have no billed amount and no saving.
+    pub(crate) fn miss(flat: Option<FlatPrice>, u: Usage) -> Self {
+        let flat_price_usd = flat.and_then(|f| flat_cost(f, u));
+        Self { flat_price_usd, billed_usd: flat_price_usd, saved_usd: None }
+    }
+
+    /// A gateway cache hit (either tier) whose cached answer used `cached` tokens. `caliban/auto`
+    /// (`auto` = flat price and cache-hit fraction): `flat_price_usd` is the full flat price of
+    /// those tokens, `billed_usd` that times the fraction, and `saved_usd` the difference. Other
+    /// models: `saved_usd` is the model cost the hit avoided (`None` without prices).
+    pub(crate) fn hit(model: &ModelEntry, auto: Option<(FlatPrice, f64)>, cached: Usage) -> Self {
+        match auto {
+            Some((flat, fraction)) => {
+                let full = flat_cost(flat, cached);
+                let billed = full.map(|f| f * fraction);
+                Self { flat_price_usd: full, billed_usd: billed, saved_usd: full.zip(billed).map(|(f, b)| f - b) }
+            }
+            None => Self { saved_usd: model_cost(model, cached), ..Self::default() },
+        }
+    }
 }
 
 /// Usage to meter, and where it came from (`None` on gateway cache hits: nothing was consumed).

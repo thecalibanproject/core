@@ -278,14 +278,12 @@ async fn run(
             if let Some(hit) = hit {
                 let outcome = Outcome { cache: CacheStatus::Hit, cache_tier: Some(CacheTier::Exact), ..outcome };
                 let body = render_cached(&hit.body, rh.as_ref(), is_native, dialect);
-                finish(
-                    &gw,
-                    &outcome,
-                    Metered::hit(Usage::default()),
-                    hit.prompt_tokens + hit.completion_tokens,
-                    settlement,
-                )
-                .await;
+                let cached = Usage {
+                    prompt_tokens: hit.prompt_tokens,
+                    completion_tokens: hit.completion_tokens,
+                    ..Usage::default()
+                };
+                finish(&gw, &outcome, Metered::hit(cached), 0, settlement).await;
                 return Ok(json_response(&outcome, body, Some(0.0)));
             }
         }
@@ -566,12 +564,20 @@ pub(crate) fn json_response(o: &Outcome, body: Bytes, cost: Option<f64>) -> Resp
 }
 
 /// Completes a request: usage event, quota settlement, span attributes. On a gateway cache hit
-/// nothing was consumed: `m.usage` (the cached answer's usage, as replayed streams report it)
-/// only becomes `tokens_saved` when `tokens_saved` is 0.
+/// nothing was consumed: `m.usage` is the cached answer's usage (as stored with the entry, or as
+/// a replayed stream reports it). It becomes `tokens_saved` (when `tokens_saved` is 0) and prices
+/// the hit: the full and discounted `caliban/auto` price, or the avoided model cost.
 pub(crate) async fn finish(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: u64, settlement: Settlement) {
     let m = if o.cache == CacheStatus::Hit {
-        let saved = if tokens_saved == 0 { m.usage.prompt_tokens + m.usage.completion_tokens } else { tokens_saved };
-        record(gw, o, Metered::hit(Usage::default()), saved).await;
+        // Prompt and completion only: what the cache stores with an entry, for both tiers and
+        // both transports, so a hit is priced the same however it is served.
+        let cached = Usage {
+            prompt_tokens: m.usage.prompt_tokens,
+            completion_tokens: m.usage.completion_tokens,
+            ..Usage::default()
+        };
+        let saved = if tokens_saved == 0 { cached.prompt_tokens + cached.completion_tokens } else { tokens_saved };
+        record(gw, o, Metered::hit(cached), saved).await;
         settlement.settle(Amount { tokens: 0, usd: 0.0 }).await;
         Metered::hit(Usage::default())
     } else {
@@ -592,10 +598,19 @@ pub(crate) async fn finish(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
     telemetry::record_usage(s, m.usage);
 }
 
+/// Writes the usage event. On a gateway cache hit, `m.usage` is the cached answer's usage: the
+/// event reports no tokens and no cost, and the cached usage prices the hit
+/// ([`metering::HitBilling`]).
 pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: u64) {
-    let usage = m.usage;
-    let cost = metering::model_cost(&o.model, usage);
     let auto = o.route.as_ref().filter(|r| r.auto);
+    let hit = o.cache == CacheStatus::Hit;
+    let usage = if hit { Usage::default() } else { m.usage };
+    let cost = metering::model_cost(&o.model, usage);
+    let billing = if hit {
+        metering::HitBilling::hit(&o.model, auto.map(|r| (r.flat_price, r.cache_hit_fraction)), m.usage)
+    } else {
+        metering::HitBilling::miss(auto.map(|r| r.flat_price), usage)
+    };
     let event = UsageEvent {
         request_id: o.request_id.to_string(),
         tenant_id: o.tenant_id.clone(),
@@ -618,7 +633,9 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
         intent_confidence: o.route.as_ref().map(|r| r.confidence),
         route_stage: o.route.as_ref().map(|r| r.stage.to_owned()),
         routed_model_cost_usd: auto.and(cost),
-        flat_price_usd: auto.and_then(|r| metering::flat_cost(r.flat_price, usage)),
+        flat_price_usd: billing.flat_price_usd,
+        billed_usd: billing.billed_usd,
+        saved_usd: billing.saved_usd,
     };
     gw.usage.record(event).await;
 }

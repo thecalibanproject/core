@@ -114,6 +114,9 @@ pub(crate) struct RouteMeta {
     pub requested_model: String,
     /// Flat `caliban/auto` price per million tokens (in, out) for this tenant.
     pub flat_price: (Option<f64>, Option<f64>),
+    /// Fraction of the flat price billed when a cache tier answers (tenant override, else
+    /// `[routing] auto_cache_hit_fraction`, else 0.20).
+    pub cache_hit_fraction: f64,
 }
 
 impl RouteMeta {
@@ -125,6 +128,7 @@ impl RouteMeta {
             auto: d.auto,
             requested_model: req.model.clone(),
             flat_price: snap.config.routing.auto_price_for(&tenant.id),
+            cache_hit_fraction: snap.auto_cache_hit_fraction_for(tenant),
         }
     }
 }

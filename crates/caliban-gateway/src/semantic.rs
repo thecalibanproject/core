@@ -638,10 +638,14 @@ pub(crate) async fn respond(
     settlement: Settlement,
 ) -> Response {
     let body = Bytes::from(m.payload.response.clone());
-    let saved = m.payload.prompt_tokens + m.payload.completion_tokens;
     if !stream {
         let body = render_cached(&body, rh.as_ref(), is_native, outcome.dialect);
-        finish(&gw, &outcome, crate::metering::Metered::hit(Usage::default()), saved, settlement).await;
+        let cached = Usage {
+            prompt_tokens: m.payload.prompt_tokens,
+            completion_tokens: m.payload.completion_tokens,
+            ..Usage::default()
+        };
+        finish(&gw, &outcome, crate::metering::Metered::hit(cached), 0, settlement).await;
         return json_response(&outcome, body, Some(0.0));
     }
     let v: Value = serde_json::from_slice(&body).unwrap_or_default();
