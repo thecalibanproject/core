@@ -148,6 +148,12 @@ async fn setup() -> (Router, Log, Arc<InMemoryQuota>) {
 
 /// `keys`: the PII surrogate keyring, as derived from a deployment's `CALIBAN_KEK`.
 async fn setup_with_keys(keys: Option<SurrogateKeys>) -> (Router, Log, Arc<InMemoryQuota>) {
+    let (app, log, quota, _) = setup_full(keys).await;
+    (app, log, quota)
+}
+
+/// [`setup_with_keys`], also returning the usage events.
+async fn setup_full(keys: Option<SurrogateKeys>) -> (Router, Log, Arc<InMemoryQuota>, RecentUsage) {
     let (base, log) = mock_upstream().await;
     let key_file = std::env::temp_dir().join(format!("caliban-gw-test-anthropic-{}", std::process::id()));
     std::fs::write(&key_file, "sk-ant-test").unwrap();
@@ -250,12 +256,13 @@ tokens_per_day = 2000
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     let quota = Arc::new(InMemoryQuota::new());
-    let mut gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(RecentUsage::default()))
-        .with_quota(quota.clone());
+    let usage = RecentUsage::default();
+    let mut gw =
+        Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(usage.clone())).with_quota(quota.clone());
     if let Some(k) = keys {
         gw.pii_keys = k;
     }
-    (app(Arc::new(gw)), log, quota)
+    (app(Arc::new(gw)), log, quota, usage)
 }
 
 async fn call(app: &Router, path: &str, auth: (&str, &str), body: Value) -> (StatusCode, HeaderMap, String) {
@@ -1855,5 +1862,198 @@ api_key_hashes = ["{acme}"]
         let (r50, r99) = measure(false).await;
         println!("routing over HTTP mock embedder: knn p50 {k50:?} p99 {k99:?}; rules only p50 {r50:?} p99 {r99:?}");
         assert!(k99 < Duration::from_millis(25), "p99 {k99:?}");
+    }
+}
+
+// ─────────────── Idempotency-Key ───────────────
+
+mod idempotency_key {
+    use super::*;
+    use crate::idempotency;
+    use caliban_meter::idempotency::{Begin, IdempotencyStore, MemoryIdempotency};
+    use std::time::Duration;
+
+    async fn send(
+        app: &Router,
+        path: &str,
+        auth: (&str, &str),
+        key: Option<&str>,
+        body: &Value,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut req = Request::post(path)
+            .header(auth.0, auth.1)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01");
+        if let Some(k) = key {
+            req = req.header("idempotency-key", k);
+        }
+        let resp = app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        (parts.status, parts.headers, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn events(u: &RecentUsage) -> usize {
+        u.snapshot(None, 1000).len()
+    }
+
+    /// Lets background work (records, usage events) finish.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    #[tokio::test]
+    async fn completed_requests_are_replayed_and_charged_once() {
+        let (app, log, _, usage) = setup_full(None).await;
+        for (path, auth, stream) in [
+            ("/v1/chat/completions", BEARER, false),
+            ("/v1/chat/completions", BEARER, true),
+            ("/v1/messages", ANTH, false),
+            ("/v1/messages", ANTH, true),
+        ] {
+            let key = format!("key-{path}-{stream}");
+            let body = json!({"model": "ext/mock", "max_tokens": 32, "stream": stream, "messages": [{"role": "user", "content": PII}]});
+            let (status, h1, b1) = send(&app, path, auth, Some(&key), &body).await;
+            assert_eq!(status, StatusCode::OK, "{b1}");
+            assert!(h1.get(idempotency::REPLAYED).is_none());
+            settle().await;
+            let (calls, charged) = (upstream_calls(&log), events(&usage));
+            assert!(b1.contains(EMAIL), "rehydrated: {b1}");
+
+            let (status, h2, b2) = send(&app, path, auth, Some(&key), &body).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(h2[idempotency::REPLAYED], "true");
+            assert_eq!(b2, b1, "the same body, {path} stream={stream}");
+            assert_eq!(h2["x-caliban-request-id"], h1["x-caliban-request-id"]);
+            assert_eq!(h2["content-type"], h1["content-type"]);
+            settle().await;
+            assert_eq!(upstream_calls(&log), calls, "not sent upstream again");
+            assert_eq!(events(&usage), charged, "no second usage event");
+
+            // Without the key, the same request runs again.
+            let (_, h3, _) = send(&app, path, auth, None, &body).await;
+            assert!(h3.get(idempotency::REPLAYED).is_none());
+            assert_eq!(upstream_calls(&log), calls + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn reused_keys_running_requests_and_bad_keys_are_refused() {
+        let (app, _, _, _) = setup_full(None).await;
+        let body = json!({"model": "ext/mock", "messages": [{"role": "user", "content": "hello"}]});
+        let (status, _, _) = send(&app, "/v1/chat/completions", BEARER, Some("k1"), &body).await;
+        assert_eq!(status, StatusCode::OK);
+        let other = json!({"model": "ext/mock", "messages": [{"role": "user", "content": "hello again"}]});
+        let (status, _, out) = send(&app, "/v1/chat/completions", BEARER, Some("k1"), &other).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["error"]["code"], "idempotency_key_reused");
+        // The same key on another endpoint is another request too (Anthropic error shape there).
+        let (status, _, out) = send(&app, "/v1/messages", ANTH, Some("k1"), &body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["type"], "error");
+        // Keys are per tenant.
+        let globex = ("authorization", "Bearer cal_globex");
+        let (status, h, _) = send(&app, "/v1/chat/completions", globex, Some("k1"), &other).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(h.get(idempotency::REPLAYED).is_none());
+
+        let (status, _, _) = send(&app, "/v1/chat/completions", BEARER, Some(&"x".repeat(300)), &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, _) =
+            send(&app, "/v1/chat/completions", ("authorization", "Bearer nope"), Some("k9"), &body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_of_a_running_request_gets_409_and_failures_free_the_key() {
+        let store = Arc::new(MemoryIdempotency::default());
+        let (base, _log) = mock_upstream().await;
+        let toml = format!(
+            r#"
+[[models]]
+id = "ext/mock"
+provider = "mockext"
+upstream_model = "mock-external"
+trust_tier = "t2_contracted"
+[[tenants]]
+id = "acme"
+name = "Acme"
+api_key_hashes = ["{acme}"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t2_contracted"
+"#,
+            acme = hash("cal_acme")
+        );
+        let gw = Gateway::new(
+            ConfigHandle::new(Snapshot::new(Config::from_toml_str(&toml).unwrap(), "t")),
+            Arc::new(RecentUsage::default()),
+        )
+        .with_idempotency(store.clone());
+        let app = app(Arc::new(gw));
+        let body = json!({"model": "ext/mock", "messages": [{"role": "user", "content": "hi"}]});
+        // Another router (or request) holds the key for this exact request.
+        let fp = idempotency::fingerprint("POST", "/v1/chat/completions", body.to_string().as_bytes());
+        let Begin::Started(lease) = store.begin("acme", "busy", &fp).await.unwrap() else { panic!() };
+        let (status, h, out) = send(&app, "/v1/chat/completions", BEARER, Some("busy"), &body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{out}");
+        assert_eq!(h["retry-after"], "1");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["error"]["code"], "idempotency_key_in_use");
+        store.release(&lease).await;
+        let (status, _, _) = send(&app, "/v1/chat/completions", BEARER, Some("busy"), &body).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A failed request (unknown model: 400) frees its key: the retry runs again.
+        let bad = json!({"model": "nope/none", "messages": [{"role": "user", "content": "hi"}]});
+        for _ in 0..2 {
+            let (status, h, _) = send(&app, "/v1/chat/completions", BEARER, Some("bad"), &bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(h.get(idempotency::REPLAYED).is_none());
+            settle().await;
+        }
+        assert!(matches!(
+            store
+                .begin(
+                    "acme",
+                    "bad",
+                    &idempotency::fingerprint("POST", "/v1/chat/completions", bad.to_string().as_bytes())
+                )
+                .await
+                .unwrap(),
+            Begin::Started(_)
+        ));
+    }
+
+    /// A stream whose client went away is still read to its end and recorded, so the retry is
+    /// answered from the record instead of running (and being charged) again.
+    #[tokio::test]
+    async fn a_stream_completes_after_the_client_leaves() {
+        let (app, log, _, usage) = setup_full(None).await;
+        let body =
+            json!({"model": "ext/mock", "stream": true, "messages": [{"role": "user", "content": "tell me a story"}]});
+        let req = Request::post("/v1/chat/completions")
+            .header(BEARER.0, BEARER.1)
+            .header("idempotency-key", "gone")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        drop(resp); // the client disconnects before reading the body
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (calls, charged) = (upstream_calls(&log), events(&usage));
+        let (status, h, out) = send(&app, "/v1/chat/completions", BEARER, Some("gone"), &body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h[idempotency::REPLAYED], "true");
+        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
+        let text: String = super::events(&out)
+            .iter()
+            .filter_map(|e| e.pointer("/choices/0/delta/content").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        assert_eq!(text, "You said: tell me a story");
+        settle().await;
+        assert_eq!((upstream_calls(&log), events(&usage)), (calls, charged));
     }
 }

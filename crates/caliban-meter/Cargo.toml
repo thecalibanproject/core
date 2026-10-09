@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 caliban-types.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
@@ -16,6 +17,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 # GCRA request-rate limiting (quota.rs).
 governor = { version = "0.10.4", default-features = false, features = ["std", "quanta"] }
 # Shared quota store (quota/valkey.rs): redis-rs (BSD-3-Clause), RESP-compatible with Valkey 8/9.
@@ -27,7 +29,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-uuid.workspace = true
 
 [lints]
 workspace = true

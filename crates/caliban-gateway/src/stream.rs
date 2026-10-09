@@ -82,6 +82,16 @@ fn write_sse_event(out: &mut BytesMut, ev: &Value) {
 /// than this to send its first event gets its headers first, as before.
 const FIRST_FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// A streamed body, returned once its first frame is ready (or after [`FIRST_FRAME_WAIT`]).
+pub(crate) async fn body_after_first_frame(mut rx: mpsc::Receiver<Result<Bytes, std::io::Error>>) -> Body {
+    let first = tokio::time::timeout(FIRST_FRAME_WAIT, rx.recv()).await.ok().flatten();
+    let rest = tokio_stream::wrappers::ReceiverStream::new(rx);
+    match first {
+        Some(f) => Body::from_stream(futures::stream::once(std::future::ready(f)).chain(rest)),
+        None => Body::from_stream(rest),
+    }
+}
+
 /// Headers of a streamed response, set before the stream task takes the outcome.
 fn sse_headers(o: &Outcome) -> axum::http::HeaderMap {
     let mut h = axum::http::HeaderMap::new();
@@ -92,17 +102,8 @@ fn sse_headers(o: &Outcome) -> axum::http::HeaderMap {
 }
 
 /// The streamed response, returned once its first frame is ready (or after [`FIRST_FRAME_WAIT`]).
-async fn sse_response(
-    headers: axum::http::HeaderMap,
-    mut rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
-) -> Response {
-    let first = tokio::time::timeout(FIRST_FRAME_WAIT, rx.recv()).await.ok().flatten();
-    let rest = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body = match first {
-        Some(f) => Body::from_stream(futures::stream::once(std::future::ready(f)).chain(rest)),
-        None => Body::from_stream(rest),
-    };
-    let mut resp = Response::new(body);
+async fn sse_response(headers: axum::http::HeaderMap, rx: mpsc::Receiver<Result<Bytes, std::io::Error>>) -> Response {
+    let mut resp = Response::new(body_after_first_frame(rx).await);
     *resp.status_mut() = StatusCode::OK;
     *resp.headers_mut() = headers;
     resp

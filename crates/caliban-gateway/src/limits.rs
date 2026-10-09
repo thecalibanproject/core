@@ -7,6 +7,7 @@
 
 use crate::{ApiError, Gateway};
 use caliban_config::{Limits, LimitsConfig, QuotaStoreKind};
+use caliban_meter::idempotency::{FallbackIdempotency, IdempotencyStore, MemoryIdempotency, ValkeyIdempotency};
 use caliban_meter::quota::valkey::{DEFAULT_PREFIX, DEFAULT_TIMEOUT};
 use caliban_meter::quota::{
     Amount, FallbackQuota, InMemoryQuota, QuotaError, QuotaPolicy, QuotaStore, Settlement, ValkeyOptions, ValkeyQuota,
@@ -52,6 +53,28 @@ pub fn quota_store(l: &LimitsConfig) -> Result<Arc<dyn QuotaStore>, String> {
                 }
             });
             Ok(store)
+        }
+    }
+}
+
+/// Builds the `Idempotency-Key` store: Valkey (with this router's memory as the fallback while it
+/// is unreachable) when `[limits] store = "valkey"`, with the same URL, password, prefix and
+/// timeout as the quota store; otherwise in memory. Must run inside a Tokio runtime.
+pub fn idempotency_store(l: &LimitsConfig) -> Result<Arc<dyn IdempotencyStore>, String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    match l.store {
+        QuotaStoreKind::Memory => Ok(Arc::new(MemoryIdempotency::default())),
+        QuotaStoreKind::Valkey => {
+            let url = env("CALIBAN_VALKEY_URL")
+                .ok_or("[limits] store = \"valkey\" needs CALIBAN_VALKEY_URL (redis:// or rediss://)")?;
+            let opts = ValkeyOptions {
+                url,
+                password: env("CALIBAN_VALKEY_PASSWORD"),
+                key_prefix: l.valkey_key_prefix.clone().unwrap_or_else(|| DEFAULT_PREFIX.to_owned()),
+                timeout: l.valkey_timeout_ms.map_or(DEFAULT_TIMEOUT, Duration::from_millis),
+            };
+            let shared = ValkeyIdempotency::new(&opts).map_err(|e| e.to_string())?;
+            Ok(Arc::new(FallbackIdempotency::new(shared)))
         }
     }
 }

@@ -372,11 +372,12 @@ fn spawn_router_warmup(gw: &Arc<caliban_gateway::Gateway>) {
 
 /// Builds the data plane. With `CALIBAN_PII_NER_DIR` set, the L1 NER detector is loaded (and its
 /// artifact hashes verified) and run on a dedicated worker pool; a failure refuses to start rather
-/// than silently running without it. The quota store follows `[limits] store` (`valkey` needs
-/// `CALIBAN_VALKEY_URL`).
+/// than silently running without it. The quota and `Idempotency-Key` stores follow `[limits] store`
+/// (`valkey` needs `CALIBAN_VALKEY_URL`).
 fn new_gateway(handle: ConfigHandle, usage: Arc<dyn UsageSink>) -> Result<caliban_gateway::Gateway> {
     let quota = caliban_gateway::quota_store(&handle.load().config.limits).map_err(anyhow::Error::msg)?;
-    let mut gw = caliban_gateway::Gateway::new(handle, usage).with_quota(quota);
+    let idempotency = caliban_gateway::idempotency_store(&handle.load().config.limits).map_err(anyhow::Error::msg)?;
+    let mut gw = caliban_gateway::Gateway::new(handle, usage).with_quota(quota).with_idempotency(idempotency);
     if let Some(dir) = std::env::var("CALIBAN_PII_NER_DIR").ok().filter(|d| !d.trim().is_empty()) {
         let (engine, pool) = load_ner(&dir)?;
         gw = gw.with_pii(engine, pool);

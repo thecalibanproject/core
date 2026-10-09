@@ -3,8 +3,9 @@
 //! computed from them.
 //!
 //! Quotas (rate limits, token reservation before the call and settlement after) live in
-//! [`quota`]. TODO: NATS/Kafka sink.
+//! [`quota`]; `Idempotency-Key` records (shared with the same Valkey) in [`idempotency`]. TODO: NATS/Kafka sink.
 
+pub mod idempotency;
 pub mod quota;
 mod wal;
 

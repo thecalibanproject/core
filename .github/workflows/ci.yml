@@ -78,8 +78,9 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       # The memory store's suite against Valkey, plus concurrency across two store instances,
-      # reserve/settle, TTL expiry, outage fallback and recovery, and a latency printout.
-      - run: 'cargo test -p caliban-meter quota:: -- --nocapture'
+      # reserve/settle, TTL expiry, outage fallback and recovery, and a latency printout; the same
+      # for the Idempotency-Key store.
+      - run: 'cargo test -p caliban-meter -- --nocapture quota:: idempotency::'
 
   qdrant:
     name: Qdrant semantic cache store

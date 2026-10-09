@@ -73,13 +73,13 @@ pub fn redact(url: &str) -> String {
     }
 }
 
-struct Lua {
+pub(crate) struct Lua {
     src: &'static str,
     sha: String,
 }
 
 impl Lua {
-    fn new(src: &'static str) -> Self {
+    pub(crate) fn new(src: &'static str) -> Self {
         Self { src, sha: redis::Script::new(src).get_hash().to_owned() }
     }
 }
@@ -145,10 +145,6 @@ impl ValkeyQuota {
             .map(|_| ())
     }
 
-    async fn bounded<T>(&self, fut: impl Future<Output = redis::RedisResult<T>>) -> Result<T, QuotaError> {
-        self.bounded_by(self.timeout, fut).await
-    }
-
     async fn bounded_by<T>(
         &self,
         limit: Duration,
@@ -174,6 +170,17 @@ impl ValkeyQuota {
     /// EVALSHA, then EVAL if the server does not have the script cached (restart, failover,
     /// SCRIPT FLUSH). EVAL also caches it, so the next EVALSHA hits.
     async fn eval<T: FromRedisValue>(&self, script: &Lua, keys: &[String], args: &[String]) -> Result<T, QuotaError> {
+        self.eval_within(self.timeout, script, keys, args).await
+    }
+
+    /// [`Self::eval`] with its own bound (also used by the idempotency store).
+    pub(crate) async fn eval_within<T: FromRedisValue>(
+        &self,
+        limit: Duration,
+        script: &Lua,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<T, QuotaError> {
         let mut conn = self.conn.clone();
         let fut = async move {
             let mut cmd = redis::cmd("EVALSHA");
@@ -187,7 +194,7 @@ impl ValkeyQuota {
                 other => other,
             }
         };
-        self.bounded(fut).await
+        self.bounded_by(limit, fut).await
     }
 
     fn key(&self, tenant: &str, limit: &str) -> String {

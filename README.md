@@ -328,6 +328,21 @@ tokens_per_day = 20000000
 - **Failure policy: fail open on shared state, never unlimited.** Each call waits at most `valkey_timeout_ms`. On an error or timeout the router serves that call from its own in-memory limiter with the same limits, and for the next 2 s skips Valkey entirely (no added latency); then one call probes Valkey again, and shared limits resume when it answers. A `429` from Valkey is final. During an outage each router enforces the full limits on its own (so the deployment-wide ceiling is up to N times the limit), local day budgets start from zero, and settlements of reservations made in Valkey are skipped, so those stay charged (conservative). The router logs one warning when it degrades, at most one every 30 s after that, and one line when Valkey is back; `GET /healthz` shows `quota.state` (`ok` or `degraded`), the last error, and counters for local fallbacks and lost settlements.
 - **Latency.** Three round trips per request (rate check, reserve, settle). Measured on a laptop through Docker Desktop's port forwarding (release build, sequential): p50 0.6 to 0.8 ms and p99 2 to 3 ms, the same as three bare `PING`s on that path; the in-memory store costs about 1 µs. Same-host or same-zone Valkey on Linux is faster.
 
+### Idempotency-Key
+
+`POST /v1/chat/completions`, `/v1/messages`, `/v1/embeddings` and `/v1/rerank` honour an `Idempotency-Key` header (1 to 255 visible ASCII characters), so a client can retry without being charged twice ([`crates/caliban-gateway/src/idempotency.rs`](crates/caliban-gateway/src/idempotency.rs)). Records are per tenant and key:
+
+| Situation | Response |
+|---|---|
+| First request with the key | Runs. It runs to completion even if the client disconnects (a stream is read to its end), so the retry can be answered from the record. |
+| Same key while the first is still running | `409`, `Retry-After: 1`, code `idempotency_key_in_use`. The gateway does not hold the duplicate open: a stream can take minutes. |
+| Same key after a `2xx` (within 24 h) | The stored response: same status, headers and body, plus `Idempotent-Replayed: true`. Streams are stored as sent (every SSE event, after rehydration) and replayed as one SSE body. Nothing runs upstream, no usage event is recorded and no quota is used. |
+| Same key, different method, path or body | `422`, code `idempotency_key_reused`. |
+| The first request failed (non-`2xx`, or a stream that ended with an error event or without its final event) | The key is freed; the retry runs again. |
+| The first response was over 4 MiB | Not kept; duplicates get `409`, code `idempotency_response_not_stored`. |
+
+Records live in Valkey when `[limits] store = "valkey"` (keys `<prefix>:idem:{<hash of tenant and key>}`, one Lua script each to claim, complete and release; shared by all routers), otherwise in the router's memory (256 MiB budget, oldest completed records dropped first). While Valkey is unreachable, keys are deduplicated by the router that sees them, as quotas are limited locally. A claim whose router dies expires after 15 minutes. A replay carries the original `x-caliban-request-id`. Without the header nothing changes.
+
 ### Tenant offboarding (semantic cache)
 
 Deleting a tenant on the control plane removes it from the next data-plane snapshot. Each data plane checks its snapshot every 2 s, and when a tenant id disappears it deletes that tenant's entries from every collection of its semantic cache (`{collection_prefix}_*`, so entries written under an earlier `embedding_model` go too).
@@ -422,9 +437,9 @@ cargo clippy --all-targets
 cargo test -p caliban --test isolation
 cargo test -p caliban --test usage_accuracy
 
-# Valkey quota tests (the memory store's suite plus concurrency, TTL and outage tests):
+# Valkey quota and Idempotency-Key tests (the memory stores' suites plus concurrency, TTL and outage tests):
 docker run -d --rm -p 56379:6379 --name caliban-valkey-test valkey/valkey:9.1.2
-CALIBAN_TEST_VALKEY_URL=redis://127.0.0.1:56379 cargo test -p caliban-meter quota:: -- --nocapture
+CALIBAN_TEST_VALKEY_URL=redis://127.0.0.1:56379 cargo test -p caliban-meter -- --nocapture quota:: idempotency::
 
 # Postgres store parity tests (the memory store's suite, run against Postgres):
 docker run -d --rm -p 55432:5432 -e POSTGRES_PASSWORD=x --name caliban-pg-test postgres:17-alpine
@@ -477,7 +492,7 @@ Next, in order:
 2. MongoDB connector: wire `introspect` and `propose` into the control plane's introspection job; `$jsonSchema`-declared types; map and scalar-array attributes; per-shard sampling.
 3. CDC replica and planner: connect the planner to the `explain` gate and replica lag in a query service; delta Parquet with compaction instead of whole-table rewrites; resume from the manifest after a restart (today it re-snapshots); parallel `_id`-range snapshots; arrays nested in arrays.
 4. PII: licence sign-off on the NER model's fine-tuning data (see `MODELS.md`); FF1 format-preserving encryption for structured IDs; coreference so a first name maps to the surrogate's first name.
-5. Gateway: tokenizer-based estimates, rate-limit headers on successful responses, tool-call argument rehydration in streams, `Idempotency-Key`, the ONNX intent classifier (Stage 2), model health on the data plane, control-plane management of routing exemplars and floors, and for the semantic cache an async LLM judge, per-intent thresholds and per-tenant entry encryption.
+5. Gateway: tokenizer-based estimates, rate-limit headers on successful responses, the ONNX intent classifier (Stage 2), model health on the data plane, control-plane management of routing exemplars and floors, and for the semantic cache an async LLM judge, per-intent thresholds and per-tenant entry encryption.
 
 ## Related repositories
 

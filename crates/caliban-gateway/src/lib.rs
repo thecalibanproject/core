@@ -5,13 +5,16 @@
 //! destination trust tier) → T1 exact cache → T2 semantic cache → provider call with fallbacks
 //! (BYOK) → stream/rehydrate → translate to the client's dialect → meter + settle → OTel GenAI span.
 //!
-//! TODO: ontology grounding, nodes, Prometheus metrics, `Idempotency-Key`.
+//! `Idempotency-Key` on the inference POSTs: see [`idempotency`].
+//!
+//! TODO: ontology grounding, nodes, Prometheus metrics.
 
 mod auth;
 mod chat;
 pub mod embedder;
 mod embeddings;
 mod error;
+mod idempotency;
 mod limits;
 mod messages;
 mod metering;
@@ -31,7 +34,7 @@ pub mod telemetry;
 mod tests;
 
 pub use error::{ApiError, Dialect};
-pub use limits::quota_store;
+pub use limits::{idempotency_store, quota_store};
 
 use axum::Router;
 use axum::http::{HeaderName, Method, header};
@@ -41,6 +44,7 @@ use caliban_cache::semantic::{MemoryStore, QdrantStore, SemanticCache, VectorSto
 use caliban_config::ConfigHandle;
 use caliban_config::{SemanticCacheConfig, SemanticStoreKind};
 use caliban_meter::UsageSink;
+use caliban_meter::idempotency::{IdempotencyStore, MemoryIdempotency};
 use caliban_meter::quota::{InMemoryQuota, QuotaStore};
 use caliban_pii::{PiiEngine, SurrogateKeys};
 use caliban_providers::Providers;
@@ -74,6 +78,9 @@ pub struct Gateway {
     /// Rate limits and token budgets (`[limits]`). In-memory by default (exact per router
     /// process); `store = "valkey"` shares them across routers (see [`quota_store`]).
     pub quota: Arc<dyn QuotaStore>,
+    /// `Idempotency-Key` records (see [`idempotency`]). In-memory by default; Valkey with
+    /// `[limits] store = "valkey"` (see [`idempotency_store`]).
+    pub idempotency: Arc<dyn IdempotencyStore>,
     /// Derives per-tenant `cache_salt` values. Derived from `CALIBAN_KEK` when set so all routers
     /// of a deployment agree; otherwise random per process.
     pub salt_key: [u8; 32],
@@ -107,6 +114,7 @@ impl Gateway {
             providers,
             usage,
             quota: Arc::new(InMemoryQuota::new()),
+            idempotency: Arc::new(MemoryIdempotency::default()),
             salt_key: salt_key(),
             pii_keys: pii_keys(),
             cache_price_warned: Default::default(),
@@ -144,6 +152,12 @@ impl Gateway {
         self.quota = quota;
         self
     }
+
+    /// Replaces the `Idempotency-Key` store (e.g. the shared Valkey store).
+    pub fn with_idempotency(mut self, store: Arc<dyn IdempotencyStore>) -> Self {
+        self.idempotency = store;
+        self
+    }
 }
 
 /// Browser SDKs authenticate with a bearer key (no cookies), so any origin may call the API;
@@ -172,6 +186,7 @@ fn cors() -> CorsLayer {
             HeaderName::from_static("x-caliban-cache-tier"),
             HeaderName::from_static("x-caliban-pii-entities"),
             HeaderName::from_static("x-caliban-cost-usd"),
+            HeaderName::from_static(idempotency::REPLAYED),
         ])
 }
 
@@ -237,12 +252,16 @@ fn pii_keys() -> SurrogateKeys {
 }
 
 pub fn app(gw: Arc<Gateway>) -> Router {
-    Router::new()
+    // Billed endpoints honour `Idempotency-Key`.
+    let billed = Router::new()
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/messages", post(messages::messages))
-        .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/rerank", post(rerank::rerank))
+        .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&gw), idempotency::middleware));
+    Router::new()
+        .merge(billed)
+        .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/models", get(chat::list_models))
         .route("/healthz", get(health))
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
