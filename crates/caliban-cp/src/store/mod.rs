@@ -21,7 +21,12 @@
 //! and deleted datasources and nodes keep their rows (`deleted_at`). Tombstones stay in [`State`]
 //! so both backends agree on them, but they are never rendered into the data-plane snapshot and
 //! the API treats them as not found. Secrets are the exception: a deleted tenant's BYOK
-//! credentials are removed outright and a deleted datasource's `connection` is wiped.
+//! credentials and its data key (DEK) are removed outright, and a deleted datasource's
+//! `connection` is wiped.
+//!
+//! Tenant secrets (BYOK keys, datasource credentials) are sealed under the tenant's DEK, which is
+//! stored wrapped by a KEK ([`State::deks`]); see [`crate::keys`] for the hierarchy, the startup
+//! migration and KEK rotation.
 
 pub mod audit;
 pub mod memory;
@@ -31,7 +36,8 @@ mod tests;
 
 use audit::{AuditDraft, AuditEntry};
 use caliban_config::{
-    Config, ConfigHandle, ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider, Snapshot, TenantConfig,
+    Config, ConfigHandle, Keyring, ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider, Snapshot,
+    TenantConfig, TenantSealed, WrappedDek,
 };
 use caliban_meter::RecentUsage;
 use caliban_ontology::{Element, Ontology, Status};
@@ -107,7 +113,26 @@ pub struct ProviderKeyRecord {
     pub cache_salt: bool,
     pub created_at: DateTime<Utc>,
     #[serde(skip)]
-    pub secret: Option<SecretRef>,
+    pub secret: Option<StoredSecret>,
+}
+
+/// How a tenant provider key is held by the store.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredSecret {
+    /// A reference from the config file (`{env}`, `{file}`), or a value sealed directly under the
+    /// KEK by a release before migration 0008 (re-sealed under the tenant DEK at startup).
+    Ref(SecretRef),
+    /// Sealed under the tenant's DEK: base64(nonce ‖ ciphertext), the tenant id as associated
+    /// data. Rendered into the snapshot as a self-contained [`TenantSealed`] envelope.
+    TenantDek(String),
+}
+
+/// A tenant's data-encryption key, wrapped by the KEK `wrapped.kek_id`. Destroyed with the tenant.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DekRecord {
+    pub wrapped: WrappedDek,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -118,7 +143,9 @@ pub struct DatasourceRecord {
     pub name: String,
     pub status: String,
     pub epoch: u64,
-    #[serde(skip)]
+    /// Secrets inside are sealed under the tenant DEK (`{"$sealed": ...}`); the API only ever
+    /// returns the redacted form.
+    #[serde(serialize_with = "crate::keys::serialize_redacted")]
     pub connection: Value,
     /// Soft delete; deleted datasources are never returned by the API.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,6 +184,8 @@ pub struct State {
     /// Includes soft-deleted rows (`deleted_at` set).
     pub nodes: Vec<NodeRecord>,
     pub ontologies: BTreeMap<String, Ontology>,
+    /// Tenant → wrapped DEK. Created on the tenant's first secret, destroyed with the tenant.
+    pub deks: BTreeMap<String, DekRecord>,
     /// Sequence number of the last audit row; doubles as the state version.
     pub audit_head: u64,
 }
@@ -202,7 +231,7 @@ impl State {
                     last4: None,
                     cache_salt: p.cache_salt,
                     created_at: now,
-                    secret: p.api_key.clone(),
+                    secret: p.api_key.clone().map(StoredSecret::Ref),
                 });
             }
             if !t.routes.is_empty() {
@@ -289,21 +318,39 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
         .iter()
         .filter(|t| t.is_active())
         .map(|t| {
-            let providers: Vec<ProviderConfig> = st
-                .provider_keys
-                .iter()
-                .filter(|p| p.tenant_id == t.id)
-                .filter_map(|p| {
-                    Some(ProviderConfig {
-                        id: p.id.as_str().into(),
-                        kind: p.kind,
-                        base_url: p.base_url.clone().or_else(|| default_base_url(p.kind))?,
-                        trust_tier: p.trust_tier,
-                        api_key: p.secret.clone(),
-                        cache_salt: p.cache_salt,
-                    })
-                })
-                .collect();
+            let mut providers: Vec<ProviderConfig> = Vec::new();
+            for p in st.provider_keys.iter().filter(|p| p.tenant_id == t.id) {
+                let Some(base_url) = p.base_url.clone().or_else(|| default_base_url(p.kind)) else { continue };
+                let api_key = match &p.secret {
+                    None => None,
+                    Some(StoredSecret::Ref(r)) => Some(r.clone()),
+                    // Self-contained for routers: the DEK travels wrapped, opened with the keyring.
+                    Some(StoredSecret::TenantDek(sealed)) => {
+                        let d = st.deks.get(&t.id).ok_or_else(|| {
+                            format!(
+                                "tenant {}: provider key '{}' is sealed under a tenant key that does not exist",
+                                t.id, p.id
+                            )
+                        })?;
+                        Some(SecretRef::TenantSealed {
+                            tenant_sealed: TenantSealed {
+                                tenant: t.id.clone(),
+                                kek_id: d.wrapped.kek_id.clone(),
+                                wrapped_dek: d.wrapped.wrapped.clone(),
+                                sealed: sealed.clone(),
+                            },
+                        })
+                    }
+                };
+                providers.push(ProviderConfig {
+                    id: p.id.as_str().into(),
+                    kind: p.kind,
+                    base_url,
+                    trust_tier: p.trust_tier,
+                    api_key,
+                    cache_salt: p.cache_salt,
+                });
+            }
             // Built through serde so fields this crate does not model (in `settings`) pass through.
             let mut obj = t.settings.clone();
             obj.insert("id".into(), json!(t.id));
@@ -415,6 +462,79 @@ pub enum Mutation {
         id: String,
         status: Status,
     },
+    /// Stores a tenant's first DEK (wrapped). Conflict if the tenant already has one.
+    CreateDek {
+        tenant_id: String,
+        dek: DekRecord,
+    },
+    /// Startup migration or KEK rotation, planned by [`crate::keys::plan`].
+    Rekey(Rekey),
+}
+
+/// A batch of key changes. Every change names the value it replaces; if any of them changed in
+/// the meantime the whole batch is a conflict and nothing is written (the caller replans).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Rekey {
+    /// `keys.rotate` (operator command) rather than `keys.migrate` (startup).
+    pub rotate: bool,
+    /// The current KEK: every DEK created or re-wrapped here is wrapped by it.
+    pub kek_id: String,
+    pub deks: Vec<DekChange>,
+    pub provider_secrets: Vec<ProviderSecretChange>,
+    pub shared_secrets: Vec<SharedSecretChange>,
+    pub datasources: Vec<ConnectionChange>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DekChange {
+    pub tenant_id: String,
+    /// `None`: a new DEK. `Some`: re-wrapped (same DEK, `created_at` kept).
+    pub prev: Option<WrappedDek>,
+    pub next: DekRecord,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderSecretChange {
+    pub tenant_id: String,
+    pub id: String,
+    pub prev: StoredSecret,
+    pub next: StoredSecret,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharedSecretChange {
+    pub id: String,
+    pub prev: SecretRef,
+    pub next: SecretRef,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnectionChange {
+    pub tenant_id: String,
+    pub id: String,
+    pub prev: Value,
+    pub next: Value,
+}
+
+impl Rekey {
+    pub fn is_empty(&self) -> bool {
+        self.deks.is_empty()
+            && self.provider_secrets.is_empty()
+            && self.shared_secrets.is_empty()
+            && self.datasources.is_empty()
+    }
+
+    /// Audit detail: ids and KEK ids only, never key material.
+    pub fn summary(&self) -> Value {
+        json!({
+            "kek_id": self.kek_id,
+            "tenant_keys_created": self.deks.iter().filter(|d| d.prev.is_none()).map(|d| &d.tenant_id).collect::<Vec<_>>(),
+            "tenant_keys_rewrapped": self.deks.iter().filter_map(|d| d.prev.as_ref().map(|p| json!({"tenant": d.tenant_id, "from": p.kek_id}))).collect::<Vec<_>>(),
+            "provider_keys_resealed": self.provider_secrets.iter().map(|c| format!("{}/{}", c.tenant_id, c.id)).collect::<Vec<_>>(),
+            "shared_provider_keys_resealed": self.shared_secrets.iter().map(|c| &c.id).collect::<Vec<_>>(),
+            "datasources_sealed": self.datasources.iter().map(|c| &c.id).collect::<Vec<_>>(),
+        })
+    }
 }
 
 impl Mutation {
@@ -471,6 +591,8 @@ impl Mutation {
                         "routes_removed": before.routes.get(id).map(|r| r.iter().map(|r| r.intent.clone()).collect::<Vec<_>>()).unwrap_or_default(),
                         "datasources_deleted": ids(before.datasources.iter().filter(|x| &x.tenant_id == id && x.is_live()).map(|x| &x.id).collect()),
                         "nodes_deleted": ids(before.nodes.iter().filter(|x| &x.tenant_id == id && x.is_live()).map(|x| &x.id).collect()),
+                        // Crypto-shredding: everything sealed under this key is unreadable without it.
+                        "tenant_key_destroyed": before.deks.get(id).map(|d| &d.wrapped.kek_id),
                     }),
                 )
             }
@@ -502,9 +624,12 @@ impl Mutation {
                 tenant_id,
                 json!({"routes": routes.iter().map(|r| json!({"intent": r.intent, "models": r.models})).collect::<Vec<_>>()}),
             ),
-            Mutation::CreateDatasource(ds) => {
-                d(Some(&ds.tenant_id), "datasource.create", &ds.id, json!({"kind": ds.kind, "name": ds.name}))
-            }
+            Mutation::CreateDatasource(ds) => d(
+                Some(&ds.tenant_id),
+                "datasource.create",
+                &ds.id,
+                json!({"kind": ds.kind, "name": ds.name, "sealed_secrets": crate::keys::count_sealed(&ds.connection)}),
+            ),
             Mutation::SetDatasourceStatus { id, status } => d(None, "datasource.status", id, json!({"status": status})),
             Mutation::DeleteDatasource { tenant_id, id, .. } => {
                 let ds = before.live_datasource(tenant_id, id);
@@ -532,6 +657,15 @@ impl Mutation {
                 json!({"elements": elements.iter().map(|e| e.id.as_str()).collect::<Vec<_>>()}),
             ),
             Mutation::ReviewOntologyElement { id, status } => d(None, "ontology.review", id, json!({"status": status})),
+            Mutation::CreateDek { tenant_id, dek } => {
+                d(Some(tenant_id), "tenant_key.create", tenant_id, json!({"kek_id": dek.wrapped.kek_id}))
+            }
+            Mutation::Rekey(r) => AuditDraft {
+                tenant_id: None,
+                action: if r.rotate { "keys.rotate" } else { "keys.migrate" },
+                target: None,
+                detail: r.summary(),
+            },
         }
     }
 }
@@ -645,6 +779,37 @@ impl Store {
         let st = self.backend.load().await?;
         self.install(st);
         Ok(true)
+    }
+
+    /// Plans and applies a key migration (`rotate = false`, run at control-plane startup) or a
+    /// KEK rotation (`rotate = true`, `caliban keys rotate`). Idempotent: when there is nothing to
+    /// do, nothing is written or audited. Replans if a concurrent write got in between.
+    ///
+    /// A rotation is all or nothing: any item it cannot handle (for example a DEK wrapped by a KEK
+    /// missing from the keyring) fails it before anything is written. The startup migration
+    /// applies what it can and returns the problems.
+    pub async fn rekey(
+        &self,
+        keyring: &Keyring,
+        rotate: bool,
+        actor: &str,
+    ) -> Result<(Rekey, Vec<String>), StoreError> {
+        let mut attempts = 0;
+        loop {
+            self.refresh().await?;
+            let (plan, problems) = crate::keys::plan(&self.state(), keyring, rotate);
+            if rotate && !problems.is_empty() {
+                return Err(StoreError::Invalid(format!("rotation not started: {}", problems.join("; "))));
+            }
+            if plan.is_empty() {
+                return Ok((plan, problems));
+            }
+            match self.apply(actor, Mutation::Rekey(plan.clone())).await {
+                Ok(_) => return Ok((plan, problems)),
+                Err(StoreError::Conflict(_)) if attempts < 3 => attempts += 1,
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Swaps the read cache (never backwards) and republishes the snapshot.

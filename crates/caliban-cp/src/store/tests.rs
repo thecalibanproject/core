@@ -4,10 +4,11 @@
 use super::audit::verify_chain;
 use super::postgres::{MIGRATIONS, PgBackend};
 use super::*;
-use caliban_config::seal;
+use caliban_config::{Keyring, seal};
 use chrono::TimeZone;
 use sqlx::AssertSqlSafe;
 use sqlx::postgres::PgConnectOptions;
+use sqlx::types::Json;
 
 const KEY_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -131,10 +132,21 @@ async fn pg_backend() -> Option<PgBackend> {
 
 const A: &str = "admin";
 
-/// One sealed blob for every run (sealing uses a random nonce).
+/// One sealed blob for every run (sealing uses a random nonce). Sealed directly under the KEK
+/// `[7; 32]`, as releases before migration 0008 stored BYOK keys.
 fn sealed_blob() -> String {
     static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     S.get_or_init(|| seal(&[7u8; 32], "sk-test-1234")).clone()
+}
+
+/// The deployment keyring of the suite (obviously fake keys).
+fn ring() -> Keyring {
+    Keyring::new([7; 32], [])
+}
+
+/// After a rotation: new current KEK, the old one kept as previous.
+fn rotated() -> Keyring {
+    Keyring::new([8; 32], [[7; 32]])
 }
 
 /// The behaviour every backend must have. Returns the number of audit rows expected.
@@ -146,7 +158,11 @@ async fn suite(s: &Store) {
     assert_eq!(st.tenants[0].pii_surrogate_scope, PiiSurrogateScope::Tenant, "tenant scope by default");
     assert_eq!(st.routes["acme"].iter().map(|r| r.intent.as_str()).collect::<Vec<_>>(), ["default", "code"]);
     assert_eq!(st.routes["acme"][0].models.iter().map(|m| m.as_str()).collect::<Vec<_>>(), ["local/qwen", "ext/gpt"]);
-    assert_eq!(st.provider_keys[0].secret, Some(SecretRef::Env { env: "ACME_OPENAI_API_KEY".into() }));
+    assert_eq!(
+        st.provider_keys[0].secret,
+        Some(StoredSecret::Ref(SecretRef::Env { env: "ACME_OPENAI_API_KEY".into() }))
+    );
+    assert!(st.deks.is_empty(), "data keys are created on a tenant's first secret");
     assert!(st.shared_providers[0].provider.cache_salt);
     assert_eq!(st.models[0].capabilities.reasoning, caliban_config::Reasoning::Hybrid);
     assert_eq!(st.models[0].context_window, Some(32768));
@@ -214,7 +230,7 @@ async fn suite(s: &Store) {
     assert_eq!(s.apply(A, Mutation::CreateApiKey(orphan)).await.unwrap_err(), StoreError::NotFound("tenant".into()));
     assert!(matches!(s.apply(A, Mutation::CreateApiKey(key)).await.unwrap_err(), StoreError::Conflict(_)));
 
-    // ── BYOK: sealed blob round-trips unchanged ──
+    // ── BYOK: a key sealed directly under the KEK (pre-0008 rows) round-trips unchanged ──
     let sealed = sealed_blob();
     let byok = ProviderKeyRecord {
         id: "openai".into(),
@@ -226,7 +242,7 @@ async fn suite(s: &Store) {
         last4: Some("1234".into()),
         cache_salt: false,
         created_at: ts(),
-        secret: Some(SecretRef::Sealed { sealed: sealed.clone() }),
+        secret: Some(StoredSecret::Ref(SecretRef::Sealed { sealed: sealed.clone() })),
     };
     s.apply(A, Mutation::CreateProviderKey(byok.clone())).await.unwrap();
     assert_eq!(
@@ -349,6 +365,7 @@ async fn suite(s: &Store) {
         [("e_b", Status::Approved), ("e_a", Status::Proposed)]
     );
 
+    tenant_keys(s).await;
     deletes(s).await;
 
     // ── concurrent writers: serialized, chain stays intact ──
@@ -364,10 +381,20 @@ async fn suite(s: &Store) {
     assert!(verify_chain(&log).is_ok());
     let actions: Vec<&str> = log.iter().map(|e| e.action.as_str()).collect();
     assert_eq!(actions.iter().filter(|a| **a == "tenant.create").count(), 10);
-    for a in ["api_key.revoke", "datasource.delete", "node.delete", "tenant.delete", "tenant.update"] {
+    for a in [
+        "api_key.revoke",
+        "datasource.delete",
+        "node.delete",
+        "tenant.delete",
+        "tenant.update",
+        "tenant_key.create",
+        "keys.migrate",
+        "keys.rotate",
+    ] {
         assert!(actions.contains(&a), "{a} is audited");
     }
-    assert!(!serde_json::to_string(&log).unwrap().contains("sk-test"));
+    let log_text = serde_json::to_string(&log).unwrap();
+    assert!(!log_text.contains("sk-test") && !log_text.contains("hunter2"), "no secrets in the audit log");
     assert_eq!(s.audit(3).await.unwrap(), log[log.len() - 3..].to_vec());
     assert_eq!(s.config.load().version, format!("cp-{}", s.state().audit_head));
 }
@@ -464,6 +491,8 @@ async fn deletes(s: &Store) {
         revoked_at: None,
     };
     s.apply(A, Mutation::CreateApiKey(dkey)).await.unwrap();
+    let (dek, rec) = crate::keys::new_dek(&ring(), "doomed");
+    s.apply(A, Mutation::CreateDek { tenant_id: "doomed".into(), dek: rec }).await.unwrap();
     let byok = ProviderKeyRecord {
         id: "openai".into(),
         tenant_id: "doomed".into(),
@@ -474,7 +503,7 @@ async fn deletes(s: &Store) {
         last4: Some("1234".into()),
         cache_salt: false,
         created_at: ts(),
-        secret: Some(SecretRef::Sealed { sealed: sealed_blob() }),
+        secret: Some(StoredSecret::TenantDek(dek.seal("doomed", "sk-test-doomed"))),
     };
     s.apply(A, Mutation::CreateProviderKey(byok)).await.unwrap();
     let routes = vec![RouteConfig { intent: "default".into(), models: vec!["ext/gpt".into(), "local/qwen".into()] }];
@@ -503,6 +532,7 @@ async fn deletes(s: &Store) {
     assert!(st.tenant("doomed").is_none() && !st.has_tenant("doomed"));
     assert_eq!(st.api_keys.iter().find(|k| k.id == "key_d1").unwrap().revoked_at, Some(del_ts()));
     assert!(st.provider_keys.iter().all(|p| p.tenant_id != "doomed"), "BYOK credentials destroyed");
+    assert!(!st.deks.contains_key("doomed"), "the tenant's data key is destroyed (crypto-shredding)");
     assert!(!st.routes.contains_key("doomed"));
     let ds = st.datasources.iter().find(|d| d.id == "ds_d").unwrap();
     assert_eq!((ds.deleted_at, &ds.connection), (Some(del_ts()), &json!({})));
@@ -518,7 +548,7 @@ async fn deletes(s: &Store) {
     assert_eq!(
         a.detail,
         json!({"api_keys_revoked": ["key_d1"], "provider_keys_destroyed": ["openai"], "routes_removed": ["default"],
-               "datasources_deleted": ["ds_d"], "nodes_deleted": ["node_d"]})
+               "datasources_deleted": ["ds_d"], "nodes_deleted": ["node_d"], "tenant_key_destroyed": ring().current_id()})
     );
     // Everything tenant-scoped now 404s; the id cannot be reused; a repeat delete is 404.
     assert_eq!(s.apply(A, del_tenant("doomed")).await.unwrap_err(), not_found("tenant"));
@@ -539,6 +569,150 @@ async fn deletes(s: &Store) {
         s.apply(A, Mutation::CreateTenant(tenant("doomed"))).await.unwrap_err(),
         StoreError::Conflict("tenant id 'doomed' belonged to a deleted tenant and cannot be reused".into())
     );
+    // A deleted tenant never gets a data key again, and migration and rotation skip it.
+    assert_eq!(
+        s.apply(A, Mutation::CreateDek { tenant_id: "doomed".into(), dek: crate::keys::new_dek(&ring(), "doomed").1 })
+            .await
+            .unwrap_err(),
+        not_found("tenant")
+    );
+    assert!(s.rekey(&rotated(), true, A).await.unwrap().0.is_empty());
+}
+
+/// The secret at `id` of `tenant` in the published snapshot, opened with `keyring`.
+fn snapshot_secret(s: &Store, tenant: &str, id: &str, keyring: &Keyring) -> Result<String, String> {
+    let snap = s.config.load();
+    let t = snap.tenant(&tenant.into()).ok_or("no tenant")?;
+    let p = t.providers.iter().find(|p| p.id.as_str() == id).ok_or("no provider")?;
+    let r = p.api_key.as_ref().ok_or("no key")?;
+    r.resolve_with(keyring).map(|s| s.expose().to_owned()).map_err(|e| e.to_string())
+}
+
+/// Tenant data keys: creation, startup migration, KEK rotation (run inside `suite`).
+async fn tenant_keys(s: &Store) {
+    let r1 = ring();
+    let dek_of = |s: &Store, t: &str| s.state().deks.get(t).cloned();
+
+    // ── explicit creation: tenant-scoped, one per tenant ──
+    let (_, rec) = crate::keys::new_dek(&r1, "nobody");
+    assert_eq!(
+        s.apply(A, Mutation::CreateDek { tenant_id: "nobody".into(), dek: rec }).await.unwrap_err(),
+        StoreError::NotFound("tenant".into())
+    );
+
+    // A datasource row with credentials in clear, as releases before 0008 stored them.
+    let legacy_conn = json!({"uri": "mongodb://app:hunter2@db/sales", "user": "app"});
+    let ds = DatasourceRecord {
+        id: "ds_k".into(),
+        tenant_id: "globex".into(),
+        kind: "mongodb".into(),
+        name: "legacy".into(),
+        status: "pending".into(),
+        epoch: 0,
+        connection: legacy_conn.clone(),
+        deleted_at: None,
+    };
+    s.apply(A, Mutation::CreateDatasource(ds)).await.unwrap();
+    // Sealed values need the tenant's data key to exist.
+    let orphan = DatasourceRecord {
+        id: "ds_o".into(),
+        tenant_id: "globex".into(),
+        kind: "mongodb".into(),
+        name: "orphan".into(),
+        status: "pending".into(),
+        epoch: 0,
+        connection: json!({"password": {"$sealed": "AAAA"}}),
+        deleted_at: None,
+    };
+    assert!(matches!(s.apply(A, Mutation::CreateDatasource(orphan)).await, Err(StoreError::Invalid(_))));
+
+    // ── startup migration: DEK created, legacy BYOK key re-sealed, datasource credentials sealed ──
+    let head = s.state().audit_head;
+    let (plan, problems) = s.rekey(&r1, false, A).await.unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!((plan.deks.len(), plan.provider_secrets.len(), plan.datasources.len()), (1, 1, 1));
+    assert_eq!(s.state().audit_head, head + 1, "one audited transaction");
+    let st = s.state();
+    let d = st.deks.get("globex").expect("globex has a data key");
+    assert_eq!(d.wrapped.kek_id, r1.current_id());
+    let openai = st.provider_keys.iter().find(|p| p.tenant_id == "globex" && p.id == "openai").unwrap();
+    assert!(matches!(openai.secret, Some(StoredSecret::TenantDek(_))));
+    let conn = &st.datasources.iter().find(|x| x.id == "ds_k").unwrap().connection;
+    assert!(!conn.to_string().contains("hunter2"));
+    let dek = r1.unwrap_dek("globex", &d.wrapped).unwrap();
+    assert_eq!(crate::keys::open_connection(conn, "globex", &dek).unwrap(), legacy_conn);
+    assert_eq!(crate::keys::redact_connection(conn), json!({"uri": "mongodb://app:****@db/sales", "user": "app"}));
+    // Routers get a self-contained envelope and open it with the keyring alone.
+    let snap = s.config.load();
+    let key = snap.tenant(&"globex".into()).unwrap().providers[0].api_key.clone().unwrap();
+    assert!(matches!(&key, SecretRef::TenantSealed { tenant_sealed } if tenant_sealed.kek_id == r1.current_id()));
+    assert_eq!(snapshot_secret(s, "globex", "openai", &r1).unwrap(), "sk-test-1234");
+    let a = &s.audit(1).await.unwrap()[0];
+    assert_eq!((a.action.as_str(), a.tenant_id.as_deref()), ("keys.migrate", None));
+    assert_eq!(a.detail["tenant_keys_created"], json!(["globex"]));
+    assert_eq!(a.detail["provider_keys_resealed"], json!(["globex/openai"]));
+    assert_eq!(a.detail["datasources_sealed"], json!(["ds_k"]));
+    // Idempotent: a second run (every restart) writes nothing.
+    assert!(s.rekey(&r1, false, A).await.unwrap().0.is_empty());
+    assert_eq!(s.state().audit_head, head + 1);
+    let again = Mutation::CreateDek { tenant_id: "globex".into(), dek: crate::keys::new_dek(&r1, "globex").1 };
+    assert!(matches!(s.apply(A, again).await, Err(StoreError::Conflict(_))));
+    assert_eq!(dek_of(s, "globex"), Some(d.clone()), "a live tenant's key never changes");
+
+    // ── a stale plan is refused as a whole ──
+    let stale = Mutation::Rekey(Rekey {
+        rotate: true,
+        kek_id: rotated().current_id().into(),
+        deks: vec![DekChange { tenant_id: "globex".into(), prev: None, next: d.clone() }],
+        ..Rekey::default()
+    });
+    assert!(matches!(s.apply(A, stale).await, Err(StoreError::Conflict(_))));
+
+    // ── KEK rotation ──
+    // A shared provider key sealed under the old KEK.
+    let shared: SharedProvider = serde_json::from_value(json!({
+        "id": "gpu-s", "kind": "openai_compatible", "base_url": "http://s:8000/v1", "trust_tier": "t0_sovereign",
+        "api_key": {"sealed": sealed_blob()}
+    }))
+    .unwrap();
+    s.apply(A, Mutation::CreateSharedProvider(shared)).await.unwrap();
+    // A keyring without the KEK that wraps a live DEK cannot rotate, and nothing is written.
+    let head = s.state().audit_head;
+    let lost = Keyring::new([9; 32], []);
+    assert!(matches!(s.rekey(&lost, true, A).await, Err(StoreError::Invalid(m)) if m.contains("rotation not started")));
+    assert_eq!(s.state().audit_head, head);
+    let status = crate::keys::status(&s.state(), Some(&rotated()));
+    assert_eq!(status["previous_keks_still_needed"], json!([r1.current_id()]));
+    assert_eq!(status["rotation_complete"], false);
+
+    let r2 = rotated();
+    let (plan, _) = s.rekey(&r2, true, A).await.unwrap();
+    assert_eq!((plan.deks.len(), plan.shared_secrets.len(), plan.provider_secrets.len()), (1, 1, 0));
+    let d2 = dek_of(s, "globex").unwrap();
+    assert_eq!(d2.wrapped.kek_id, r2.current_id());
+    assert_eq!(d2.created_at, d.created_at, "re-wrapped, not replaced");
+    let a = &s.audit(1).await.unwrap()[0];
+    assert_eq!(a.action, "keys.rotate");
+    assert_eq!(a.detail["tenant_keys_rewrapped"], json!([{"tenant": "globex", "from": r1.current_id()}]));
+    assert_eq!(a.detail["shared_provider_keys_resealed"], json!(["gpu-s"]));
+    // The old KEK is no longer needed: the new key alone opens everything.
+    let new_only = Keyring::new([8; 32], []);
+    assert_eq!(snapshot_secret(s, "globex", "openai", &new_only).unwrap(), "sk-test-1234");
+    assert!(snapshot_secret(s, "globex", "openai", &Keyring::new([7; 32], [])).is_err());
+    let st = s.state();
+    let sp = st.shared_providers.iter().find(|p| p.provider.id.as_str() == "gpu-s").unwrap();
+    assert_eq!(sp.provider.api_key.as_ref().unwrap().resolve_with(&new_only).unwrap().expose(), "sk-test-1234");
+    let conn = &st.datasources.iter().find(|x| x.id == "ds_k").unwrap().connection;
+    let dek = new_only.unwrap_dek("globex", &d2.wrapped).unwrap();
+    assert_eq!(crate::keys::open_connection(conn, "globex", &dek).unwrap(), legacy_conn);
+    let status = crate::keys::status(&st, Some(&r2));
+    assert_eq!(
+        (status["previous_keks_still_needed"].clone(), status["rotation_complete"].clone()),
+        (json!([]), json!(true))
+    );
+    // Idempotent.
+    assert!(s.rekey(&r2, true, A).await.unwrap().0.is_empty());
+    s.apply(A, Mutation::DeleteSharedProvider("gpu-s".into())).await.unwrap();
 }
 
 /// Backend-independent view of the state (no timestamps of seeded rows).
@@ -559,11 +733,16 @@ fn normalize(st: &State) -> Value {
     let mut v = json!({
         "tenants": tenants,
         "api_keys": st.api_keys.iter().map(|k| json!([k, k.hash])).collect::<Vec<_>>(),
-        "provider_keys": st.provider_keys.iter().map(|p| json!([p, p.secret])).collect::<Vec<_>>(),
+        // Ciphertexts and DEKs are random per run: compare their shape, not their bytes.
+        "provider_keys": st.provider_keys.iter().map(|p| json!([p, match &p.secret {
+            Some(StoredSecret::TenantDek(_)) => json!("tenant_dek"),
+            other => json!(other),
+        }])).collect::<Vec<_>>(),
+        "deks": st.deks.iter().map(|(t, d)| (t.clone(), d.wrapped.kek_id.clone())).collect::<BTreeMap<_, _>>(),
         "shared_providers": st.shared_providers,
         "models": st.models,
         "routes": st.routes,
-        "datasources": st.datasources.iter().map(|d| json!([d, d.connection])).collect::<Vec<_>>(),
+        "datasources": st.datasources.iter().map(|d| json!([d, crate::keys::count_sealed(&d.connection)])).collect::<Vec<_>>(),
         "nodes": st.nodes,
         "ontologies": st.ontologies,
         "audit_head": st.audit_head,
@@ -675,6 +854,24 @@ async fn postgres_backend_matches_memory_and_persists() {
     .await
     .unwrap();
     assert_eq!(n, 1);
+    assert_eq!(
+        scalar_of(&pool, "SELECT count(*) FROM provider_credential WHERE sealed_by = 'tenant_dek'").await,
+        1,
+        "migrated BYOK key is recorded as sealed under the tenant DEK"
+    );
+    let deks: Vec<(String, String)> =
+        sqlx::query_as("SELECT tenant_id, kek_id FROM tenant_dek ORDER BY tenant_id").fetch_all(&pool).await.unwrap();
+    assert_eq!(deks, vec![("globex".to_owned(), rotated().current_id().to_owned())], "doomed's key was destroyed");
+    let conn: Json<Value> =
+        sqlx::query_scalar("SELECT connection FROM datasource WHERE id = 'ds_k'").fetch_one(&pool).await.unwrap();
+    assert!(!conn.0.to_string().contains("hunter2"), "datasource credentials are sealed at rest");
+    // A row cannot claim to be sealed under the tenant DEK without ciphertext.
+    assert!(
+        sqlx::query("UPDATE provider_credential SET sealed_key = NULL WHERE sealed_by = 'tenant_dek'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
 
     // Deletes at rest: rows kept for audit, secrets gone, tombstones final.
     let scalar = |sql: &'static str| {
@@ -706,7 +903,7 @@ async fn postgres_backend_matches_memory_and_persists() {
     );
     assert_eq!(
         scalar("SELECT count(*) FROM audit_log WHERE tenant_id = 'doomed'").await,
-        8,
+        9,
         "audit rows of a deleted tenant are kept"
     );
     assert!(sqlx::query("UPDATE api_key SET revoked_at = NULL WHERE id = 'key_g1'").execute(&pool).await.is_err());
@@ -725,6 +922,73 @@ async fn postgres_backend_matches_memory_and_persists() {
             .await
             .is_err()
     );
+}
+
+/// A database written by a release before 0008 (BYOK keys sealed directly under the KEK,
+/// datasource credentials in clear) is migrated by the next start: schema 0008, then the startup
+/// re-keying, which is idempotent.
+#[tokio::test]
+async fn postgres_upgrade_from_0007_moves_secrets_under_tenant_keys() {
+    let Some(pg) = pg_backend().await else { return };
+    let pool = pg.pool().clone();
+    // The schema as 0007 left it, recorded the way `migrate` records it.
+    sqlx::raw_sql(
+        "CREATE TABLE caliban_schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
+                                                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for &(version, name, sql) in &MIGRATIONS[..7] {
+        sqlx::raw_sql(AssertSqlSafe(sql)).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO caliban_schema_migrations (version, name, checksum) VALUES ($1, $2, $3)")
+            .bind(version)
+            .bind(name)
+            .bind(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(sql.as_bytes())))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let raw_blob = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sealed_blob()).unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO cp_meta (key, value) VALUES ('seeded_at', '2026-01-01T00:00:00Z');
+         INSERT INTO tenant (id, name) VALUES ('acme', 'Acme');
+         INSERT INTO datasource (id, tenant_id, kind, name, connection)
+             VALUES ('ds_old', 'acme', 'postgres', 'erp', '{\"host\": \"db\", \"password\": \"hunter2\"}');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_credential (tenant_id, id, kind, label, base_url, trust_tier, sealed_key, last4)
+         VALUES ('acme', 'openai', 'openai', 'OpenAI', 'https://api.openai.com/v1', 't2_contracted', $1, '1234')",
+    )
+    .bind(raw_blob)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let cfg = base();
+    let s = Store::open_postgres(pg, cfg.clone(), handle(&cfg), RecentUsage::default()).await.unwrap();
+    assert_eq!(scalar_of(&pool, "SELECT count(*) FROM provider_credential WHERE sealed_by = 'kek'").await, 1);
+    assert_eq!(snapshot_secret(&s, "acme", "openai", &ring()).unwrap(), "sk-test-1234", "legacy keys still work");
+    let (plan, problems) = s.rekey(&ring(), false, "system").await.unwrap();
+    assert!(problems.is_empty());
+    assert_eq!((plan.deks.len(), plan.provider_secrets.len(), plan.datasources.len()), (1, 1, 1));
+    assert_eq!(scalar_of(&pool, "SELECT count(*) FROM provider_credential WHERE sealed_by = 'tenant_dek'").await, 1);
+    assert_eq!(scalar_of(&pool, "SELECT count(*) FROM tenant_dek WHERE tenant_id = 'acme'").await, 1);
+    assert_eq!(scalar_of(&pool, "SELECT count(*) FROM datasource WHERE connection::text LIKE '%hunter2%'").await, 0);
+    assert_eq!(snapshot_secret(&s, "acme", "openai", &ring()).unwrap(), "sk-test-1234");
+    // A second start finds nothing to do; a fresh load matches.
+    let pg2 = PgBackend::connect_with(pool.connect_options().as_ref().clone()).await.unwrap();
+    let s2 = Store::open_postgres(pg2, cfg.clone(), handle(&cfg), RecentUsage::default()).await.unwrap();
+    assert!(s2.rekey(&ring(), false, "system").await.unwrap().0.is_empty());
+    assert_eq!(normalize(&s2.state()), normalize(&s.state()));
+    assert_eq!(s2.audit(10).await.unwrap().last().unwrap().action, "keys.migrate");
+}
+
+async fn scalar_of(pool: &sqlx::PgPool, sql: &'static str) -> i64 {
+    sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await.unwrap()
 }
 
 #[tokio::test]

@@ -8,12 +8,12 @@
 
 use super::audit::{AuditDraft, AuditEntry, now_micros};
 use super::{
-    ApiKeyRecord, Backend, Check, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, State, StoreError, Tenant,
-    TenantStatus,
+    ApiKeyRecord, Backend, Check, DatasourceRecord, DekRecord, Mutation, NodeRecord, ProviderKeyRecord, Rekey, State,
+    StoreError, StoredSecret, Tenant, TenantStatus,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use caliban_config::{ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider};
+use caliban_config::{ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider, WrappedDek};
 use caliban_ontology::{Element, Ontology};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -34,6 +34,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (5, "usage_routing", include_str!("../../../../migrations/0005_usage_routing.sql")),
     (6, "tenant_semantic_cache", include_str!("../../../../migrations/0006_tenant_semantic_cache.sql")),
     (7, "usage_cache_tier", include_str!("../../../../migrations/0007_usage_cache_tier.sql")),
+    (8, "tenant_data_keys", include_str!("../../../../migrations/0008_tenant_data_keys.sql")),
 ];
 
 /// Advisory lock keys ("calibn" + n).
@@ -96,6 +97,35 @@ fn join_secret(sealed: Option<Vec<u8>>, reference: Option<Json<Value>>) -> Resul
         (None, Some(Json(v))) => parse(v).map(Some),
         (None, None) => Ok(None),
     }
+}
+
+/// `(sealed_key, secret_ref, sealed_by)` column values for a tenant provider key.
+type StoredColumns = (Option<Vec<u8>>, Option<Json<Value>>, &'static str);
+
+fn split_stored(s: Option<&StoredSecret>) -> Result<StoredColumns, StoreError> {
+    match s {
+        Some(StoredSecret::TenantDek(ct)) => {
+            let raw = B64.decode(ct).map_err(|e| StoreError::Invalid(format!("sealed secret is not base64: {e}")))?;
+            Ok((Some(raw), None, "tenant_dek"))
+        }
+        Some(StoredSecret::Ref(r)) => split_secret(Some(r)).map(|(a, b)| (a, b, "kek")),
+        None => Ok((None, None, "kek")),
+    }
+}
+
+fn join_stored(
+    sealed: Option<Vec<u8>>,
+    reference: Option<Json<Value>>,
+    sealed_by: &str,
+) -> Result<Option<StoredSecret>, StoreError> {
+    match (sealed_by, sealed) {
+        ("tenant_dek", Some(raw)) => Ok(Some(StoredSecret::TenantDek(B64.encode(raw)))),
+        (_, sealed) => Ok(join_secret(sealed, reference)?.map(StoredSecret::Ref)),
+    }
+}
+
+fn wrapped_bytes(w: &WrappedDek) -> Result<Vec<u8>, StoreError> {
+    B64.decode(&w.wrapped).map_err(|e| StoreError::Invalid(format!("wrapped tenant key is not base64: {e}")))
 }
 
 impl PgBackend {
@@ -379,7 +409,78 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
                 .ok_or_else(|| StoreError::NotFound("ontology element".into()))?;
             ontology_commit(c, &tenant, &format!("review {id}: {}", enum_str(status)), std::slice::from_ref(&e)).await
         }
+        Mutation::CreateDek { tenant_id, dek } => insert_dek(c, tenant_id, dek).await,
+        Mutation::Rekey(r) => rekey(c, r).await,
     }
+}
+
+async fn insert_dek(c: &mut PgConnection, tenant: &str, d: &DekRecord) -> Result<(), StoreError> {
+    exec(
+        c,
+        sqlx::query("INSERT INTO tenant_dek (tenant_id, wrapped_dek, kek_id, created_at) VALUES ($1, $2, $3, $4)")
+            .bind(tenant)
+            .bind(wrapped_bytes(&d.wrapped)?)
+            .bind(&d.wrapped.kek_id)
+            .bind(d.created_at),
+    )
+    .await
+}
+
+/// Writes a [`Rekey`] batch (already checked against the locked state by `memory::apply_to`).
+async fn rekey(c: &mut PgConnection, r: &Rekey) -> Result<(), StoreError> {
+    for d in &r.deks {
+        exec(
+            c,
+            sqlx::query(
+                "INSERT INTO tenant_dek (tenant_id, wrapped_dek, kek_id, created_at) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (tenant_id) DO UPDATE SET wrapped_dek = EXCLUDED.wrapped_dek, kek_id = EXCLUDED.kek_id",
+            )
+            .bind(&d.tenant_id)
+            .bind(wrapped_bytes(&d.next.wrapped)?)
+            .bind(&d.next.wrapped.kek_id)
+            .bind(d.next.created_at),
+        )
+        .await?;
+    }
+    for p in &r.provider_secrets {
+        let (sealed, reference, sealed_by) = split_stored(Some(&p.next))?;
+        exec(
+            c,
+            sqlx::query(
+                "UPDATE provider_credential SET sealed_key = $3, secret_ref = $4, sealed_by = $5 WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(&p.tenant_id)
+            .bind(&p.id)
+            .bind(sealed)
+            .bind(reference)
+            .bind(sealed_by),
+        )
+        .await?;
+    }
+    for p in &r.shared_secrets {
+        let (sealed, reference) = split_secret(Some(&p.next))?;
+        exec(
+            c,
+            sqlx::query("UPDATE shared_provider SET sealed_key = $2, secret_ref = $3 WHERE id = $1")
+                .bind(&p.id)
+                .bind(sealed)
+                .bind(reference),
+        )
+        .await?;
+    }
+    for d in &r.datasources {
+        exec(
+            c,
+            sqlx::query(
+                "UPDATE datasource SET connection = $3 WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+            )
+            .bind(&d.tenant_id)
+            .bind(&d.id)
+            .bind(Json(d.next.clone())),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Tenant tombstone and its cascade, matching `memory::apply_to`. Audit rows are untouched (the
@@ -399,8 +500,8 @@ async fn delete_tenant(c: &mut PgConnection, id: &str, at: DateTime<Utc>) -> Res
     exec(c, tenant_at("UPDATE node SET deleted_at = $2 WHERE tenant_id = $1 AND deleted_at IS NULL")).await?;
     let tenant = |sql: &'static str| sqlx::query(sql).bind(id);
     exec(c, tenant("DELETE FROM route WHERE tenant_id = $1")).await?;
-    // BYOK: drop the sealed ciphertext with its rows, and the tenant's wrapped DEK if one exists
-    // (crypto-shredding once per-tenant DEKs are in use).
+    // BYOK: drop the sealed ciphertext with its rows, and the tenant's wrapped DEK
+    // (crypto-shredding: nothing sealed under it opens again).
     exec(c, tenant("DELETE FROM provider_credential WHERE tenant_id = $1")).await?;
     exec(c, tenant("DELETE FROM tenant_dek WHERE tenant_id = $1")).await
 }
@@ -449,13 +550,13 @@ async fn insert_api_key(c: &mut PgConnection, k: &ApiKeyRecord) -> Result<(), St
 }
 
 async fn insert_provider_key(c: &mut PgConnection, p: &ProviderKeyRecord) -> Result<(), StoreError> {
-    let (sealed, reference) = split_secret(p.secret.as_ref())?;
+    let (sealed, reference, sealed_by) = split_stored(p.secret.as_ref())?;
     exec(
         c,
         sqlx::query(
             "INSERT INTO provider_credential
-                 (tenant_id, id, kind, label, base_url, trust_tier, sealed_key, secret_ref, last4, cache_salt, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 (tenant_id, id, kind, label, base_url, trust_tier, sealed_key, secret_ref, last4, cache_salt, created_at, sealed_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(&p.tenant_id)
         .bind(&p.id)
@@ -467,7 +568,8 @@ async fn insert_provider_key(c: &mut PgConnection, p: &ProviderKeyRecord) -> Res
         .bind(reference)
         .bind(&p.last4)
         .bind(p.cache_salt)
-        .bind(p.created_at),
+        .bind(p.created_at)
+        .bind(sealed_by),
     )
     .await
 }
@@ -720,7 +822,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
 
     for r in rows(
         c,
-        "SELECT tenant_id, id, kind, label, base_url, trust_tier, sealed_key, secret_ref, last4, cache_salt, created_at
+        "SELECT tenant_id, id, kind, label, base_url, trust_tier, sealed_key, secret_ref, last4, cache_salt, created_at, sealed_by
          FROM provider_credential ORDER BY ord",
     )
     .await?
@@ -735,7 +837,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             last4: get(&r, "last4")?,
             cache_salt: get(&r, "cache_salt")?,
             created_at: get(&r, "created_at")?,
-            secret: join_secret(get(&r, "sealed_key")?, get(&r, "secret_ref")?)?,
+            secret: join_stored(get(&r, "sealed_key")?, get(&r, "secret_ref")?, &get::<String>(&r, "sealed_by")?)?,
         });
     }
 
@@ -848,6 +950,19 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
         if let Some(o) = st.ontologies.get_mut(&tenant) {
             o.elements.push(element);
         }
+    }
+
+    for r in rows(c, "SELECT tenant_id, wrapped_dek, kek_id, created_at FROM tenant_dek ORDER BY tenant_id").await? {
+        st.deks.insert(
+            get(&r, "tenant_id")?,
+            DekRecord {
+                wrapped: WrappedDek {
+                    kek_id: get(&r, "kek_id")?,
+                    wrapped: B64.encode(get::<Vec<u8>>(&r, "wrapped_dek")?),
+                },
+                created_at: get(&r, "created_at")?,
+            },
+        );
     }
 
     st.audit_head = audit_head(c).await?;

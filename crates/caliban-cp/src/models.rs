@@ -107,10 +107,8 @@ pub(crate) async fn create_provider(
         return Err(bad("id and base_url are required"));
     }
     let api_key = match b.api_key.as_deref().filter(|k| !k.is_empty()) {
-        Some(k) => {
-            let kek = caliban_config::process_kek().map_err(|e| bad(format!("cannot store provider keys: {e}")))?;
-            Some(caliban_config::SecretRef::Sealed { sealed: caliban_config::seal(kek, k) })
-        }
+        // Deployment-wide: sealed under the current KEK (re-sealed by `caliban keys rotate`).
+        Some(k) => Some(caliban_config::SecretRef::Sealed { sealed: cp.keyring("provider keys")?.seal(k) }),
         None => None,
     };
     let sp = SharedProvider {
@@ -147,11 +145,11 @@ fn find_provider(cp: &Cp, id: &str) -> ApiResult<ProviderConfig> {
 }
 
 /// Calls `GET <base_url>/models` on the server.
-async fn fetch_models(p: &ProviderConfig) -> Result<(Vec<Value>, u128), String> {
+async fn fetch_models(cp: &Cp, p: &ProviderConfig) -> Result<(Vec<Value>, u128), String> {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().map_err(|e| e.to_string())?;
     let mut req = client.get(format!("{}/models", p.base_url.trim_end_matches('/')));
     if let Some(r) = &p.api_key {
-        req = req.bearer_auth(r.resolve().map_err(|e| e.to_string())?.expose());
+        req = req.bearer_auth(cp.resolve(r)?.expose());
     }
     let t = Instant::now();
     let resp = req.send().await.map_err(|e| e.to_string())?;
@@ -166,7 +164,7 @@ async fn fetch_models(p: &ProviderConfig) -> Result<(Vec<Value>, u128), String> 
 
 pub(crate) async fn provider_health(State(cp): State<Cp>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let p = find_provider(&cp, &id)?;
-    Ok(Json(match fetch_models(&p).await {
+    Ok(Json(match fetch_models(&cp, &p).await {
         Ok((models, ms)) => json!({ "status": "ok", "latency_ms": ms, "models": models.len() }),
         Err(e) => json!({ "status": "unreachable", "error": e }),
     }))
@@ -177,7 +175,7 @@ pub(crate) async fn provider_health(State(cp): State<Cp>, Path(id): Path<String>
 pub(crate) async fn discover(State(cp): State<Cp>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let p = find_provider(&cp, &id)?;
     let (served, _) =
-        fetch_models(&p).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("discovery failed: {e}")))?;
+        fetch_models(&cp, &p).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("discovery failed: {e}")))?;
     let known: Vec<(String, String)> =
         cp.store.state().models.iter().map(|m| (m.provider.to_string(), m.upstream_model.clone())).collect();
     let mut available = Vec::new();

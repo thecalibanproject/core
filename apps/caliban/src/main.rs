@@ -9,7 +9,7 @@ mod split;
 use anyhow::{Context, Result};
 use base64::Engine;
 use caliban_config::signing::{SnapshotSigner, SnapshotVerifier, generate_signing_key};
-use caliban_config::{Config, ConfigHandle, Snapshot};
+use caliban_config::{Config, ConfigHandle, Keyring, Snapshot};
 use caliban_meter::{FsyncPolicy, JsonlSink, RecentUsage, Tee, UsageSink, WalOptions};
 use clap::{Parser, Subcommand};
 use rand::RngCore;
@@ -53,6 +53,12 @@ enum Cmd {
     Keygen,
     /// Generate a base64 32-byte key-encryption key for CALIBAN_KEK.
     GenKek,
+    /// Tenant data keys and KEK rotation (Postgres store; uses CALIBAN_DATABASE_URL, CALIBAN_KEK,
+    /// CALIBAN_KEK_PREVIOUS and the config file, like the control plane).
+    Keys {
+        #[command(subcommand)]
+        cmd: KeysCmd,
+    },
     /// Generate an Ed25519 snapshot signing key (control plane) and its public key (routers).
     GenSigningKey,
     /// Probe a local health endpoint and exit 0/1 (for container healthchecks; the image has no shell).
@@ -62,6 +68,17 @@ enum Cmd {
         #[arg(long, default_value = "/healthz")]
         path: String,
     },
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Show which KEK wraps each tenant data key, what still waits for migration, and whether the
+    /// retired keys in CALIBAN_KEK_PREVIOUS are still needed. Read-only.
+    Status,
+    /// Re-wrap every tenant data key and re-seal shared provider keys under the current
+    /// CALIBAN_KEK (and migrate anything still sealed the old way). All or nothing; idempotent;
+    /// audited as `keys.rotate`.
+    Rotate,
 }
 
 #[derive(clap::Args)]
@@ -88,6 +105,12 @@ async fn main() -> Result<()> {
     // guard alive until exit so buffered spans are flushed.
     let _telemetry = caliban_gateway::telemetry::init();
     let cli = Cli::parse();
+    // A malformed keyring must stop every mode: routers would otherwise derive cache salts and PII
+    // surrogate keys from a random secret, and fail to open BYOK keys.
+    let keyring = caliban_config::process_keyring().map_err(anyhow::Error::msg).context("KEK keyring")?;
+    if let Some(k) = keyring {
+        tracing::info!(current = k.current_id(), previous = ?&k.ids()[1..], "KEK keyring loaded");
+    }
 
     match &cli.cmd {
         Cmd::Healthcheck { addr, path } => {
@@ -104,6 +127,10 @@ async fn main() -> Result<()> {
             rand::rng().fill_bytes(&mut k);
             println!("{}", base64::engine::general_purpose::STANDARD.encode(k));
             return Ok(());
+        }
+        Cmd::Keys { cmd } => {
+            let cfg = Config::from_file(&cli.config).with_context(|| format!("loading {}", cli.config))?;
+            return keys_command(cmd, &cfg).await;
         }
         Cmd::GenSigningKey => {
             let (seed, public) = generate_signing_key();
@@ -184,7 +211,12 @@ async fn main() -> Result<()> {
             purge_gw.spawn_tenant_purge(PURGE_EVERY);
             tokio::try_join!(router_task(), cp).map(|_| ())
         }
-        Cmd::CheckConfig | Cmd::Keygen | Cmd::GenKek | Cmd::GenSigningKey | Cmd::Healthcheck { .. } => unreachable!(),
+        Cmd::CheckConfig
+        | Cmd::Keygen
+        | Cmd::GenKek
+        | Cmd::Keys { .. }
+        | Cmd::GenSigningKey
+        | Cmd::Healthcheck { .. } => unreachable!(),
     };
     flush_wal(wal.as_deref()).await;
     res
@@ -227,6 +259,23 @@ async fn control_plane(
         }
     };
     let postgres = store.backend_name() == "postgres";
+    let keyring = Keyring::from_env().map_err(anyhow::Error::msg)?.map(Arc::new);
+    match &keyring {
+        // Startup migration: BYOK keys sealed directly under the KEK (before migration 0008) and
+        // datasource credentials in clear are sealed under tenant data keys. Idempotent.
+        Some(k) => match store.rekey(k, false, "system").await {
+            Ok((plan, problems)) => {
+                if !plan.is_empty() {
+                    tracing::info!(detail = %plan.summary(), "migrated tenant secrets to tenant data keys");
+                }
+                for p in problems {
+                    tracing::warn!(problem = %p, "tenant secret not migrated (see `caliban keys status`)");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "tenant secret migration failed; will retry at the next start"),
+        },
+        None => tracing::warn!("CALIBAN_KEK is not set: BYOK keys and datasource credentials cannot be stored"),
+    }
     let signer = SnapshotSigner::from_env().context("CALIBAN_SNAPSHOT_SIGNING_KEY")?;
     let router_token = std::env::var("CALIBAN_ROUTER_TOKEN").ok().filter(|t| !t.is_empty());
     match (&signer, &router_token) {
@@ -238,7 +287,11 @@ async fn control_plane(
             "split mode needs both CALIBAN_SNAPSHOT_SIGNING_KEY and CALIBAN_ROUTER_TOKEN; /api/v1/snapshot is disabled"
         ),
     }
-    let cp = Arc::new(caliban_cp::ControlPlane::new(store, admin_token, mode).with_snapshots(signer, router_token));
+    let cp = Arc::new(
+        caliban_cp::ControlPlane::new(store, admin_token, mode)
+            .with_snapshots(signer, router_token)
+            .with_keyring(keyring),
+    );
     if postgres {
         // Picks up writes made through other control-plane replicas.
         caliban_cp::spawn_refresh(Arc::clone(&cp), Duration::from_secs(5));
@@ -249,6 +302,46 @@ async fn control_plane(
         tracing::warn!("web console not found (set CALIBAN_WEB_DIR); serving API only");
     }
     Ok(serve("control-plane", cfg.server.control_plane_addr.clone(), caliban_cp::app(cp, web_dir.as_deref())))
+}
+
+/// `caliban keys status|rotate` against the Postgres store (the in-memory store is rebuilt from the
+/// config file at every start, so there is nothing to rotate).
+async fn keys_command(cmd: &KeysCmd, cfg: &Config) -> Result<()> {
+    let url = std::env::var("CALIBAN_DATABASE_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .context("`caliban keys` needs CALIBAN_DATABASE_URL (the in-memory store keeps no keys across restarts)")?;
+    let keyring = Keyring::from_env().map_err(anyhow::Error::msg)?;
+    let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "keys"));
+    let store = caliban_cp::store::Store::postgres(&url, cfg.clone(), handle, RecentUsage::default())
+        .await
+        .context("opening the Postgres control-plane store (CALIBAN_DATABASE_URL)")?;
+    match cmd {
+        KeysCmd::Status => {
+            let status = caliban_cp::keys::status(&store.state(), keyring.as_ref());
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        KeysCmd::Rotate => {
+            let k = keyring.context("CALIBAN_KEK is not set")?;
+            let (plan, _) = store.rekey(&k, true, "cli").await.context("rotating tenant keys")?;
+            if plan.is_empty() {
+                println!("nothing to do: every key is already under {}", k.current_id());
+            } else {
+                println!("{}", serde_json::to_string_pretty(&plan.summary())?);
+            }
+            let status = caliban_cp::keys::status(&store.state(), Some(&k));
+            if status["previous_keks_still_needed"].as_array().is_some_and(Vec::is_empty) {
+                println!(
+                    "No live key depends on CALIBAN_KEK_PREVIOUS any more. Once every control plane and router has \
+                     reloaded the snapshot, remove the retired keys from CALIBAN_KEK_PREVIOUS and destroy them when your \
+                     backup retention allows (see README, KEK rotation)."
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Minimal HTTP/1.1 GET; true on a 2xx status line within 3 seconds.

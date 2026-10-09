@@ -5,6 +5,7 @@
 //! row). Split deployments: routers poll `GET /api/v1/snapshot` (router token, not the admin
 //! token) for an Ed25519-signed config snapshot.
 
+pub mod keys;
 mod models;
 pub mod store;
 
@@ -15,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use caliban_config::signing::{SnapshotPayload, SnapshotSigner, config_digest};
-use caliban_config::{RouteConfig, SecretRef, process_kek, seal};
+use caliban_config::{Keyring, RouteConfig, SecretRef};
 use caliban_nodes::NodeSpec;
 use caliban_ontology::Status;
 use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, SemanticCacheMode, TrustTier, hash_api_key};
@@ -27,8 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use store::audit::{now_micros, verify_chain};
 use store::{
-    ApiKeyRecord, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, Store, StoreError, Tenant, TenantStatus,
-    new_id, slug,
+    ApiKeyRecord, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, Store, StoreError, StoredSecret, Tenant,
+    TenantStatus, new_id, slug,
 };
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -43,6 +44,8 @@ pub struct ControlPlane {
     signer: Option<SnapshotSigner>,
     router_token: Option<String>,
     exported: Mutex<Option<Arc<Exported>>>,
+    /// KEK keyring (`CALIBAN_KEK`, `CALIBAN_KEK_PREVIOUS`); without it secrets cannot be stored.
+    keyring: Option<Arc<Keyring>>,
 }
 
 /// The last signed snapshot, re-served while the rendered config is unchanged.
@@ -55,7 +58,27 @@ struct Exported {
 
 impl ControlPlane {
     pub fn new(store: Store, admin_token: String, mode: &'static str) -> Self {
-        Self { store, admin_token, mode, signer: None, router_token: None, exported: Mutex::new(None) }
+        Self { store, admin_token, mode, signer: None, router_token: None, exported: Mutex::new(None), keyring: None }
+    }
+
+    /// Enables storing tenant and shared secrets (sealed under keys from this keyring).
+    #[must_use]
+    pub fn with_keyring(mut self, keyring: Option<Arc<Keyring>>) -> Self {
+        self.keyring = keyring;
+        self
+    }
+
+    pub(crate) fn keyring(&self, what: &str) -> ApiResult<&Keyring> {
+        self.keyring.as_deref().ok_or_else(|| bad(format!("cannot store {what}: CALIBAN_KEK is not set")))
+    }
+
+    /// Resolves a secret reference with this control plane's keyring.
+    pub(crate) fn resolve(&self, r: &SecretRef) -> Result<caliban_config::Secret, String> {
+        match &self.keyring {
+            Some(k) => r.resolve_with(k),
+            None => r.resolve(),
+        }
+        .map_err(|e| e.to_string())
     }
 
     /// Enables `GET /api/v1/snapshot` for remote routers.
@@ -463,12 +486,14 @@ async fn create_provider_key(
         return Err(bad("base_url is required for this provider kind"));
     }
     let id = body.provider_id.as_deref().map_or_else(|| slug(&body.label), slug);
-    // Sealed before it reaches the store: plaintext is never persisted or audited.
+    // Sealed under the tenant's DEK before it reaches the store: plaintext is never persisted or
+    // audited.
     let (secret, last4) = match body.api_key.as_deref().filter(|k| !k.is_empty()) {
         Some(k) => {
-            let kek = process_kek().map_err(|e| bad(format!("cannot store provider keys: {e}")))?;
+            let keyring = cp.keyring("provider keys")?;
+            let dek = keys::tenant_dek(&cp.store, keyring, &tenant_id, ADMIN_ACTOR).await?;
             let last4: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-            (Some(SecretRef::Sealed { sealed: seal(kek, k) }), Some(last4))
+            (Some(StoredSecret::TenantDek(dek.seal(&tenant_id, k))), Some(last4))
         }
         None => (None, None),
     };
@@ -492,8 +517,8 @@ async fn delete_provider_key(
     State(cp): State<Cp>,
     Path((tenant_id, key_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    // The sealed ciphertext is dropped with the row; with per-tenant DEKs (TODO) deleting the DEK
-    // crypto-shreds every copy.
+    // The sealed ciphertext is dropped with the row. Copies in backups stay sealed under the
+    // tenant DEK, which is destroyed with the tenant (see `keys`).
     cp.store
         .apply(ADMIN_ACTOR, Mutation::DeleteProviderKey { tenant_id, id: key_id })
         .await
@@ -569,7 +594,17 @@ async fn create_datasource(
     if !DATASOURCE_KINDS.contains(&body.kind.as_str()) {
         return Err(bad(format!("unsupported datasource kind '{}'", body.kind)));
     }
-    // TODO: seal secrets inside `connection` (passwords, URIs with credentials) like BYOK keys.
+    keys::reject_reserved(&body.connection).map_err(bad)?;
+    ensure_tenant(&cp, &body.tenant_id)?;
+    // Credentials (password fields, URIs with a password, tokens, ...) are sealed under the
+    // tenant's DEK like BYOK keys; `{env}`/`{file}` references are kept as references.
+    let connection = if keys::needs_sealing(&body.connection) {
+        let keyring = cp.keyring("datasource credentials")?;
+        let dek = keys::tenant_dek(&cp.store, keyring, &body.tenant_id, ADMIN_ACTOR).await?;
+        keys::seal_connection(&body.connection, &body.tenant_id, &dek)
+    } else {
+        body.connection
+    };
     let rec = DatasourceRecord {
         id: new_id("ds"),
         tenant_id: body.tenant_id,
@@ -577,7 +612,7 @@ async fn create_datasource(
         name: body.name,
         status: "pending".into(),
         epoch: 0,
-        connection: body.connection,
+        connection,
         deleted_at: None,
     };
     cp.store.apply(ADMIN_ACTOR, Mutation::CreateDatasource(rec.clone())).await?;
@@ -721,14 +756,22 @@ mod tests {
     use caliban_meter::RecentUsage;
     use tower::ServiceExt;
 
-    fn cp() -> Cp {
+    /// The test keyring (an obviously fake KEK).
+    fn test_ring() -> Keyring {
+        Keyring::new([7; 32], [])
+    }
+
+    fn cp_with(keyring: Option<Keyring>) -> Cp {
         let cfg = Config::from_toml_str(include_str!("../../../config/caliban.example.toml")).unwrap();
         let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "boot"));
-        Arc::new(ControlPlane::new(
-            Store::new(cfg, handle, RecentUsage::default()),
-            "admin-secret".into(),
-            "standalone",
-        ))
+        Arc::new(
+            ControlPlane::new(Store::new(cfg, handle, RecentUsage::default()), "admin-secret".into(), "standalone")
+                .with_keyring(keyring.map(Arc::new)),
+        )
+    }
+
+    fn cp() -> Cp {
+        cp_with(Some(test_ring()))
     }
 
     async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>, auth: bool) -> (StatusCode, Value) {
@@ -1035,6 +1078,119 @@ mod tests {
             a["entries"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
         assert_eq!(actions, ["node.delete", "datasource.delete"]);
         assert_eq!(a["entries"][0]["detail"], json!({"name": "triage", "version": 1}));
+    }
+
+    #[tokio::test]
+    async fn tenant_secrets_are_sealed_under_the_tenant_key() {
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        let ring = test_ring();
+        call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
+        assert!(!c.store.state().deks.contains_key("globex"), "created on the first secret");
+
+        // ── BYOK: first key creates the tenant's DEK (audited), the second reuses it ──
+        let byok = |label: &str, key: &str| json!({"kind": "openai", "label": label, "api_key": key, "trust_tier": "t2_contracted"});
+        let (s, k) = call(
+            &app,
+            "POST",
+            "/api/v1/tenants/globex/provider-keys",
+            Some(byok("OpenAI", "sk-test-globex-9876")),
+            true,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{k}");
+        assert_eq!(k["last4"], "9876");
+        assert!(!k.to_string().contains("sk-test-globex"), "{k}");
+        let dek = c.store.state().deks.get("globex").cloned().expect("globex has a data key");
+        assert_eq!(dek.wrapped.kek_id, ring.current_id());
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=3", None, true).await;
+        assert_eq!(a["entries"][0]["action"], "provider_key.create");
+        assert_eq!(a["entries"][1]["action"], "tenant_key.create");
+        assert_eq!(a["entries"][1]["detail"], json!({"kek_id": ring.current_id()}));
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/api/v1/tenants/globex/provider-keys",
+            Some(byok("Second", "sk-test-globex-5555")),
+            true,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert_eq!(c.store.state().deks.get("globex"), Some(&dek), "one key per tenant");
+        // The data plane gets an envelope it opens with the keyring; the plaintext is nowhere.
+        let snap = c.store.config.load();
+        let t = snap.tenant(&"globex".into()).unwrap();
+        let key = t.providers.iter().find(|p| p.id.as_str() == "openai").unwrap().api_key.clone().unwrap();
+        assert!(matches!(key, SecretRef::TenantSealed { .. }));
+        assert_eq!(key.resolve_with(&ring).unwrap().expose(), "sk-test-globex-9876");
+        assert!(key.resolve_with(&Keyring::new([8; 32], [])).is_err(), "another deployment's KEK opens nothing");
+        let wire = serde_json::to_string(&snap.config).unwrap();
+        assert!(!wire.contains("sk-test-globex"));
+        // Split mode: the config travels as JSON; a router parses it and opens the envelope.
+        let routed = Snapshot::new(serde_json::from_str::<Config>(&wire).unwrap(), "router");
+        let t = routed.tenant(&"globex".into()).unwrap();
+        let key = t.providers.iter().find(|p| p.id.as_str() == "openai").unwrap().api_key.clone().unwrap();
+        assert_eq!(key.resolve_with(&ring).unwrap().expose(), "sk-test-globex-9876");
+
+        // ── datasources: credentials sealed, responses redacted, references kept ──
+        let conn = json!({"uri": "mongodb://app:hunter2@db:27017/sales", "password": "hunter2",
+                          "api_key": {"env": "SALES_KEY"}, "database": "sales"});
+        let (s, ds) = call(
+            &app,
+            "POST",
+            "/api/v1/datasources",
+            Some(json!({"tenant_id": "globex", "kind": "mongodb", "name": "sales", "connection": conn})),
+            true,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{ds}");
+        let view = json!({"uri": "mongodb://app:****@db:27017/sales", "password": "****",
+                          "api_key": {"env": "SALES_KEY"}, "database": "sales"});
+        assert_eq!(ds["connection"], view);
+        let (_, list) = call(&app, "GET", "/api/v1/datasources?tenant_id=globex", None, true).await;
+        assert_eq!(list[0]["connection"], view);
+        assert!(!list.to_string().contains("hunter2"));
+        let st = c.store.state();
+        let stored = &st.datasources.iter().find(|d| d.tenant_id == "globex").unwrap().connection;
+        assert!(!stored.to_string().contains("hunter2"), "sealed at rest");
+        let open = ring.unwrap_dek("globex", &dek.wrapped).unwrap();
+        assert_eq!(keys::open_connection(stored, "globex", &open).unwrap(), conn);
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/api/v1/datasources",
+            Some(json!({"tenant_id": "globex", "kind": "mongodb", "name": "x", "connection": {"password": {"$sealed": "AAAA"}}})),
+            true,
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "clients cannot send pre-sealed values");
+
+        // ── deleting the tenant destroys its data key ──
+        assert_eq!(call(&app, "DELETE", "/api/v1/tenants/globex", None, true).await.0, StatusCode::NO_CONTENT);
+        assert!(!c.store.state().deks.contains_key("globex"));
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=50", None, true).await;
+        assert_eq!(a["entries"][0]["detail"]["tenant_key_destroyed"], json!(ring.current_id()));
+        assert!(!a.to_string().contains("hunter2") && !a.to_string().contains("sk-test-globex"));
+        assert_eq!(call(&app, "DELETE", "/api/v1/tenants/globex", None, true).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn secrets_need_a_kek() {
+        let app = app(cp_with(None), None);
+        let byok = json!({"kind": "openai", "label": "x", "api_key": "sk-test-0000", "trust_tier": "t2_contracted"});
+        let (s, e) = call(&app, "POST", "/api/v1/tenants/acme/provider-keys", Some(byok), true).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(e["error"]["message"].as_str().unwrap().contains("CALIBAN_KEK"));
+        let ds = |conn: Value| json!({"tenant_id": "acme", "kind": "postgres", "name": "erp", "connection": conn});
+        assert_eq!(
+            call(&app, "POST", "/api/v1/datasources", Some(ds(json!({"password": "x"}))), true).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(&app, "POST", "/api/v1/datasources", Some(ds(json!({"password": {"env": "ERP_PW"}}))), true).await.0,
+            StatusCode::CREATED,
+            "references need no key"
+        );
     }
 
     #[tokio::test]

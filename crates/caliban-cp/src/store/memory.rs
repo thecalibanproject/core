@@ -106,8 +106,10 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             for k in st.api_keys.iter_mut().filter(|k| &k.tenant_id == id && k.is_active()) {
                 k.revoked_at = Some(*at);
             }
-            // BYOK credentials are destroyed, not kept: nothing can open them again.
+            // BYOK credentials and the tenant's DEK are destroyed, not kept: nothing can open
+            // what was sealed under the DEK again (crypto-shredding).
             st.provider_keys.retain(|p| &p.tenant_id != id);
+            st.deks.remove(id);
             st.routes.remove(id);
             for ds in st.datasources.iter_mut().filter(|d| &d.tenant_id == id && d.is_live()) {
                 ds.deleted_at = Some(*at);
@@ -201,6 +203,12 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
         }
         Mutation::CreateDatasource(ds) => {
             need_tenant(st, &ds.tenant_id)?;
+            if crate::keys::count_sealed(&ds.connection) > 0 && !st.deks.contains_key(&ds.tenant_id) {
+                return Err(StoreError::Invalid(format!(
+                    "datasource '{}' has secrets sealed under a tenant key that does not exist",
+                    ds.name
+                )));
+            }
             if st.datasources.iter().any(|x| x.tenant_id == ds.tenant_id && x.name == ds.name && x.is_live()) {
                 return Err(StoreError::Conflict(format!("datasource '{}' already exists for this tenant", ds.name)));
             }
@@ -274,6 +282,50 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             // Any reviewed change publishes a new ontology version (cache keys include it).
             onto.version += 1;
         }
+        Mutation::CreateDek { tenant_id, dek } => {
+            need_tenant(st, tenant_id)?;
+            if st.deks.contains_key(tenant_id) {
+                return Err(StoreError::Conflict(format!("tenant '{tenant_id}' already has a data key")));
+            }
+            st.deks.insert(tenant_id.clone(), dek.clone());
+        }
+        Mutation::Rekey(r) => rekey(st, r)?,
+    }
+    Ok(())
+}
+
+/// Applies a [`super::Rekey`] batch: every change must still find the value it was planned from.
+fn rekey(st: &mut State, r: &super::Rekey) -> Result<(), StoreError> {
+    let stale = || StoreError::Conflict("keys changed while they were being re-keyed; run it again".into());
+    for d in &r.deks {
+        if !st.has_tenant(&d.tenant_id) || st.deks.get(&d.tenant_id).map(|x| &x.wrapped) != d.prev.as_ref() {
+            return Err(stale());
+        }
+        st.deks.insert(d.tenant_id.clone(), d.next.clone());
+    }
+    for c in &r.provider_secrets {
+        let p = st
+            .provider_keys
+            .iter_mut()
+            .find(|p| p.tenant_id == c.tenant_id && p.id == c.id && p.secret.as_ref() == Some(&c.prev))
+            .ok_or_else(stale)?;
+        p.secret = Some(c.next.clone());
+    }
+    for c in &r.shared_secrets {
+        let p = st
+            .shared_providers
+            .iter_mut()
+            .find(|p| p.provider.id.as_str() == c.id && p.provider.api_key.as_ref() == Some(&c.prev))
+            .ok_or_else(stale)?;
+        p.provider.api_key = Some(c.next.clone());
+    }
+    for c in &r.datasources {
+        let ds = st
+            .datasources
+            .iter_mut()
+            .find(|d| d.tenant_id == c.tenant_id && d.id == c.id && d.is_live() && d.connection == c.prev)
+            .ok_or_else(stale)?;
+        ds.connection = c.next.clone();
     }
     Ok(())
 }
