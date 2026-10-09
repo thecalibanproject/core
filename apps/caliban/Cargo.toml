@@ -33,6 +33,8 @@ blake3.workspace = true
 caliban-cache.workspace = true
 chrono.workspace = true
 tower.workspace = true
+# Black-box tests (tests/isolation.rs, tests/usage_accuracy.rs): mock upstream + process harness.
+caliban-bench = { path = "../../bench" }
 
 [lints]
 workspace = true

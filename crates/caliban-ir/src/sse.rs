@@ -25,9 +25,12 @@ impl SseParser {
             self.buf = self.buf.replace("\r\n", "\n");
         }
         let mut out = Vec::new();
-        while let Some(pos) = self.buf.find("\n\n") {
-            let event: String = self.buf.drain(..pos + 2).collect();
-            let data: Vec<&str> = event
+        // Scan with an offset and drop consumed bytes once: draining each event from the front
+        // would move the rest of the buffer per event (quadratic when one read carries many).
+        let mut start = 0;
+        while let Some(rel) = self.buf[start..].find("\n\n") {
+            let end = start + rel;
+            let data: Vec<&str> = self.buf[start..end]
                 .lines()
                 .filter_map(|l| l.strip_prefix("data:"))
                 .map(|d| d.strip_prefix(' ').unwrap_or(d))
@@ -35,7 +38,9 @@ impl SseParser {
             if !data.is_empty() {
                 out.push(data.join("\n"));
             }
+            start = end + 2;
         }
+        self.buf.drain(..start);
         out
     }
 }
@@ -49,6 +54,17 @@ mod tests {
         let mut p = SseParser::default();
         assert!(p.push(b"data: {\"a\"").is_empty());
         assert_eq!(p.push(b":1}\r\n\r\n: keepalive\n\ndata: [DONE]\n\n"), vec!["{\"a\":1}", "[DONE]"]);
+    }
+
+    #[test]
+    fn many_events_in_one_read_keep_the_partial_tail() {
+        let mut p = SseParser::default();
+        let mut bytes: String = (0..100).map(|i| format!("data: {{\"i\":{i}}}\n\n")).collect();
+        bytes.push_str("data: {\"i\":");
+        let out = p.push(bytes.as_bytes());
+        assert_eq!(out.len(), 100);
+        assert_eq!(out[99], "{\"i\":99}");
+        assert_eq!(p.push(b"100}\n\n"), vec!["{\"i\":100}"]);
     }
 
     #[test]

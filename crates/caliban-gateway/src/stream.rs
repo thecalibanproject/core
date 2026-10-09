@@ -250,6 +250,9 @@ pub(crate) fn openai_shaped(
                     break;
                 }
             };
+            // Events that arrived in one upstream read leave in one write (one channel message,
+            // one body frame) instead of one syscall per event.
+            let mut batch = String::new();
             for data in parser.push(&bytes) {
                 let out = if data == "[DONE]" {
                     ended = true;
@@ -279,18 +282,22 @@ pub(crate) fn openai_shaped(
                         Err(_) => enc.raw(&data),
                     }
                 };
-                if !out.is_empty() && tx.send(Ok(Bytes::from(out))).await.is_err() {
-                    // Client went away: dropping `upstream` cancels the provider request.
-                    tracing::info!(request_id = %outcome.request_id, "client disconnected mid-stream");
-                    client_gone = true;
-                    if let Some(c) = capture.as_mut() {
-                        c.abandon();
-                    }
-                    break 'outer;
-                }
+                batch.push_str(&out);
                 if ended {
-                    break 'outer;
+                    break;
                 }
+            }
+            if !batch.is_empty() && tx.send(Ok(Bytes::from(batch))).await.is_err() {
+                // Client went away: dropping `upstream` cancels the provider request.
+                tracing::info!(request_id = %outcome.request_id, "client disconnected mid-stream");
+                client_gone = true;
+                if let Some(c) = capture.as_mut() {
+                    c.abandon();
+                }
+                break 'outer;
+            }
+            if ended {
+                break 'outer;
             }
         }
         if !ended && !client_gone {
@@ -350,6 +357,8 @@ pub(crate) fn native_anthropic(
                     break;
                 }
             };
+            // One write per upstream read (see `openai_shaped`).
+            let mut batch = String::new();
             for data in parser.push(&bytes) {
                 let mut out = String::new();
                 match serde_json::from_str::<Value>(&data) {
@@ -408,13 +417,14 @@ pub(crate) fn native_anthropic(
                         out.push_str(&anthropic::sse_event(&ev));
                     }
                 }
-                if tx.send(Ok(Bytes::from(out))).await.is_err() {
-                    tracing::info!(request_id = %outcome.request_id, "client disconnected mid-stream");
-                    if let Some(c) = capture.as_mut() {
-                        c.abandon();
-                    }
-                    break 'outer;
+                batch.push_str(&out);
+            }
+            if !batch.is_empty() && tx.send(Ok(Bytes::from(batch))).await.is_err() {
+                tracing::info!(request_id = %outcome.request_id, "client disconnected mid-stream");
+                if let Some(c) = capture.as_mut() {
+                    c.abandon();
                 }
+                break 'outer;
             }
         }
         drop(tx);
