@@ -122,7 +122,7 @@ The binary is in `apps/caliban`; everything else is in `crates/`, except the P0 
 | Crate | Status | Role |
 |---|---|---|
 | `caliban-types` | Done | Ids, trust tiers, PII and cache modes, errors |
-| `caliban-config` | Done | TOML config to an indexed `Snapshot` behind `ArcSwap`; secret references (`env`, `file`, and `sealed` with AES-256-GCM under `CALIBAN_KEK`); Ed25519 snapshot signing |
+| `caliban-config` | Done | TOML config to an indexed `Snapshot` behind `ArcSwap`; secret references (`env`, `file`, `sealed` under the KEK keyring, and `tenant_sealed` envelopes under per-tenant DEKs, AES-256-GCM); Ed25519 snapshot signing |
 | `caliban-ir` | Done (OpenAI, Anthropic) | Canonical request IR, unknown-field passthrough, canonical hashing for cache keys, Anthropic Messages codecs (requests, responses, stream events), SSE parser |
 | `caliban-pii` | L0 done; L1 NER done behind `ner` | Regexes and validators, tenant dictionaries, in-process multilingual NER (ONNX, MIT-licensed weights, hash-verified artifact; see [`crates/caliban-pii/MODELS.md`](crates/caliban-pii/MODELS.md)), surrogates, vault, streaming rehydration |
 | `caliban-cache` | Exact and semantic caches done; plan cache planned | T1 exact cache (moka) with tenant, ACL and datasource-epoch keys; T2 semantic cache: `VectorStore` trait with Qdrant (REST) and in-memory stores, per-entry learned thresholds, tenant error budgets |
@@ -187,6 +187,8 @@ For container images, compose and Kubernetes, see [deploy](https://github.com/th
 | `caliban check-config` | Validate `$CALIBAN_CONFIG` and exit |
 | `caliban keygen` | New tenant API key and its hash |
 | `caliban gen-kek` | New base64 32-byte key-encryption key for `CALIBAN_KEK` |
+| `caliban keys status` | Postgres store: which KEK wraps each tenant data key, what still waits for migration, and whether the keys in `CALIBAN_KEK_PREVIOUS` are still needed (read-only, JSON) |
+| `caliban keys rotate` | Postgres store: re-wrap every tenant data key and re-seal shared provider keys under the current `CALIBAN_KEK`; all or nothing, idempotent, audited as `keys.rotate`. See [KEK rotation](#kek-rotation) |
 | `caliban gen-signing-key` | New Ed25519 snapshot signing key (control plane) and its public key (routers) |
 | `caliban healthcheck [--addr 127.0.0.1:8080] [--path /healthz]` | Exit 0 on a 2xx response, 1 otherwise; for container healthchecks in the shell-less image |
 
@@ -209,7 +211,7 @@ Global flags: `--config` (`CALIBAN_CONFIG`, default `/etc/caliban/caliban.toml`)
 - `[[models]]`: the catalogue (provider, `upstream_model`, trust tier, licence, context window, prices, capabilities). Prices are USD per million tokens: `price_in_per_mtok`, `price_out_per_mtok`, and for providers with prompt caching `price_cache_read_per_mtok`, `price_cache_write_per_mtok` and `price_cache_write_1h_per_mtok` (Anthropic's 1-hour TTL). No list prices ship with Caliban; copy them from your provider. `capabilities.rejects_stream_options = true` marks a server that rejects `stream_options` (its streams are metered from an estimate).
 - `[[tenants]]`, with `pii_mode`, `pii_surrogate_scope` (`tenant` or `session`), `semantic_cache` (`off` or `on`, default `off`), `[[tenants.providers]]` (BYOK) and `[[tenants.routes]]` (intent to ordered models).
 
-Secrets are never written inline: use `{ env = "VAR" }`, `{ file = "/path" }`, or a value sealed under `CALIBAN_KEK`. Trust tiers run from `t0_sovereign` to `t3_public`.
+Secrets are never written inline: use `{ env = "VAR" }`, `{ file = "/path" }`, or a value sealed under `CALIBAN_KEK` (`{ sealed = "..." }`, opened with any key of the keyring). Keys added through the admin API are sealed by the control plane (see [Secrets and keys](#secrets-and-keys)). Trust tiers run from `t0_sovereign` to `t3_public`.
 
 ### Routing (`caliban/auto`)
 
@@ -257,7 +259,8 @@ exemplars = { "legal.review" = ["review this NDA clause for risky terms", "check
 |---|---|---|
 | `CALIBAN_CONFIG` | all | Config file path (default `/etc/caliban/caliban.toml`) |
 | `CALIBAN_ADMIN_TOKEN` | control plane | Admin bearer token, unless `[security] admin_token` resolves it another way |
-| `CALIBAN_KEK` | all | Base64 32-byte key-encryption key: seals and opens BYOK keys, derives the cache-salt key and the per-tenant PII surrogate keys. Rotating it changes every tenant's surrogates (only costs cache misses) |
+| `CALIBAN_KEK` | all | Current base64 32-byte key-encryption key: wraps the per-tenant data keys and seals shared provider keys, and derives the cache-salt key and the per-tenant PII surrogate keys. Rotating it changes every tenant's surrogates (only costs cache misses). See [Secrets and keys](#secrets-and-keys) |
+| `CALIBAN_KEK_PREVIOUS` | all | Retired KEKs (base64, comma separated), only used to open what is still wrapped or sealed under them during a [KEK rotation](#kek-rotation). Remove once `caliban keys status` shows they are no longer needed |
 | `CALIBAN_DATABASE_URL` | control plane | Postgres store; unset means in-memory |
 | `CALIBAN_VALKEY_URL` | data plane | Valkey for shared quotas, required with `[limits] store = "valkey"`: `redis://[:password@]host:6379[/db]`, or `rediss://` for TLS |
 | `CALIBAN_VALKEY_PASSWORD` | data plane | Valkey password, if it is not in the URL (overrides the URL's) |
@@ -334,11 +337,41 @@ Deleting a tenant on the control plane removes it from the next data-plane snaps
 
 With Postgres, the config file seeds the database **once**, on the first start against an empty database (marker row `cp_meta.seeded_at`). From then on the database is the source of truth for tenants, API keys, BYOK credentials, shared providers, models, routes, datasources, nodes and the ontology: `[[tenants]]`, `[[models]]` and `[[providers]]` in the file are ignored (and the startup log says so). All other sections (`[server]`, `[security]`, `[cache]`, `[pii]`, `[limits]`, …) always come from the control plane's file and are shipped to split-mode routers inside the snapshot. Without Postgres, the file seeds memory at every start.
 
-Every mutation is one transaction: apply the change, render and validate the data-plane config (an invalid result, such as deleting a model a route uses, rolls back with 409 or 422), append an `audit_log` row (`hash = sha256(prev_hash ‖ canonical row)`, append-only trigger), commit. `GET /api/v1/audit?limit=` returns the newest rows and `chain_verified`. BYOK keys are sealed with AES-256-GCM under `CALIBAN_KEK` before they reach the store; `{env}` and `{file}` references from the file are stored as references.
+Every mutation is one transaction: apply the change, render and validate the data-plane config (an invalid result, such as deleting a model a route uses, rolls back with 409 or 422), append an `audit_log` row (`hash = sha256(prev_hash ‖ canonical row)`, append-only trigger), commit. `GET /api/v1/audit?limit=` returns the newest rows and `chain_verified`. BYOK keys and datasource credentials are sealed under the tenant's data key before they reach the store (see [Secrets and keys](#secrets-and-keys)); `{env}` and `{file}` references from the file are stored as references.
 
-Deletes keep what audit needs and drop secrets. A revoked API key keeps its row (`revoked_at`); a deleted tenant stays as a tombstone (`status = 'deleted'`, `deleted_at`), and its audit rows are never touched; deleted datasources and nodes keep their rows (`deleted_at`). A deleted tenant's `provider_credential` rows (the sealed BYOK ciphertext) and `tenant_dek` row are deleted, and a deleted datasource's `connection` is replaced with `{}`. Triggers make revocations and tombstones final. Revoked keys and deleted tenants are left out of the rendered snapshot: in `standalone` the data plane rejects them on the next request, and a split-mode router rejects them once it applies its next snapshot poll. With the in-memory store, the config file reseeds tenants and keys at every start, so a revoked config-file key is valid again after a restart until its hash is removed from the file.
+Deletes keep what audit needs and drop secrets. A revoked API key keeps its row (`revoked_at`); a deleted tenant stays as a tombstone (`status = 'deleted'`, `deleted_at`), and its audit rows are never touched; deleted datasources and nodes keep their rows (`deleted_at`). A deleted tenant's `provider_credential` rows (the sealed BYOK ciphertext) and its `tenant_dek` row (its data key, which crypto-shreds everything sealed under it) are deleted in the same transaction, and a deleted datasource's `connection` is replaced with `{}`. Triggers make revocations and tombstones final. Revoked keys and deleted tenants are left out of the rendered snapshot: in `standalone` the data plane rejects them on the next request, and a split-mode router rejects them once it applies its next snapshot poll. With the in-memory store, the config file reseeds tenants and keys at every start, so a revoked config-file key is valid again after a restart until its hash is removed from the file.
 
 Several control-plane replicas can share one database. Writes are serialised with an advisory lock, and each replica reloads when the audit head moves (every 5 s, and on every snapshot request). The control plane connects as the schema owner (or a `BYPASSRLS` role); row-level security policies apply to tenant-scoped roles.
+
+### Secrets and keys
+
+```text
+KEK keyring   CALIBAN_KEK (current) + CALIBAN_KEK_PREVIOUS (retired, open only)
+  └─ tenant data key (DEK), one per tenant, stored wrapped in tenant_dek
+       AES-256-GCM, associated data = tenant id + KEK id
+       └─ the tenant's secrets: BYOK provider keys, datasource credentials
+            AES-256-GCM, associated data = tenant id
+```
+
+- **KEK ids.** A KEK is identified by a fingerprint (`kek_` + 16 hex characters of a SHA-256 over the key), never by a name or number you have to manage. `tenant_dek.kek_id` records which KEK wraps each data key.
+- **Data keys.** A tenant gets a random 256-bit DEK with its first secret (audited as `tenant_key.create`, KEK id only). Deleting the tenant deletes the DEK in the same transaction (`tenant.delete` records `tenant_key_destroyed`). Wrapping binds the DEK to the tenant and the KEK id, and sealing binds each secret to the tenant, so a ciphertext copied to another tenant's row does not open.
+- **BYOK keys** are sealed under the DEK and never returned (the API shows `last4`). Shared provider keys belong to no tenant and are sealed directly under the current KEK.
+- **Datasource credentials.** Values of credential fields (`password`, `api_key`, `client_secret`, `token`, `private_key`, `credentials`, `connection_string`, ...), URIs with a password (`mongodb://user:pw@host`), secret query parameters and `Password=...;` pairs are sealed under the DEK as `{"$sealed": ...}`. `{"env": ...}` and `{"file": ...}` references stay references. Responses show the redacted form (`mongodb://user:****@host`, `****`).
+- **Routers.** The signed snapshot carries each BYOK key as a self-contained envelope (`tenant_sealed`: tenant, KEK id, wrapped DEK, ciphertext) that a router opens per request with its own keyring. The trust model is unchanged: routers hold the KEK, keys never travel in clear, and the control plane never sends a plaintext DEK.
+- **Migration.** Migration `0008` adds `provider_credential.sealed_by`. On every start the control plane (with `CALIBAN_KEK` set) re-seals BYOK keys still sealed directly under the KEK by earlier releases, and seals datasource credentials stored in clear, under tenant DEKs. It is idempotent (nothing to do means no write and no audit row), runs as one audited transaction (`keys.migrate`), and anything it cannot open is logged and left for `caliban keys status`. `caliban keys rotate` performs the same migration.
+
+#### KEK rotation
+
+Rotating the KEK is what makes a deleted tenant unrecoverable from older backups: those backups hold its wrapped DEK, which opens only with the KEK that wrapped it. The procedure (Postgres store):
+
+1. `caliban gen-kek` for a new key. On every router and control plane set `CALIBAN_KEK=<new>` and `CALIBAN_KEK_PREVIOUS=<old>`, and restart the routers first, then the control planes. Everything keeps working: retired keys still open what they wrap.
+2. Run `caliban keys rotate` once (for example `docker compose exec control-plane caliban keys rotate`, or `kubectl exec` into a control-plane pod). It re-wraps every live DEK and re-seals shared provider keys under the new KEK, in one audited transaction, and refuses to start if anything cannot be opened.
+3. `caliban keys status` should show `"previous_keks_still_needed": []`. Wait until every router has polled the new snapshot (`CALIBAN_SNAPSHOT_POLL_SECS`), then remove `CALIBAN_KEK_PREVIOUS` everywhere and restart.
+4. Destroy the old KEK when your backup retention allows (below).
+
+The trade-off: after rotation, every backup taken before it needs the retired KEK for **every** tenant, not only the deleted one, because all DEKs in it are wrapped by the old key. Keep a retired KEK (offline, like the current one) only as long as you keep backups that predate the rotation, and destroy it when the last of them expires. If you destroy it earlier, restoring such a backup restores tenants whose BYOK keys, datasource credentials and shared provider keys cannot be opened: delete and re-enter them after the restore. To shred a deleted tenant promptly, rotate right after deleting it and shorten the retention of older backups accordingly.
+
+The PII surrogate keys and the per-tenant `cache_salt` are derived from the current KEK, so a rotation changes them (cache misses only, no data loss). Values written as `{ sealed = "..." }` in the config file are not rewritten by `keys rotate`; keep their KEK in `CALIBAN_KEK_PREVIOUS` or replace them with `{ env }` or `{ file }` references. The in-memory store keeps nothing across restarts, so `caliban keys` needs `CALIBAN_DATABASE_URL`.
 
 ### Split mode
 
@@ -351,14 +384,14 @@ caliban gen-signing-key      # prints CALIBAN_SNAPSHOT_SIGNING_KEY=… and CALIB
 CALIBAN_DATABASE_URL=postgres://… CALIBAN_SNAPSHOT_SIGNING_KEY=… CALIBAN_ROUTER_TOKEN=… CALIBAN_KEK=… \
   caliban control-plane
 
-# each router (same CALIBAN_KEK, to open sealed BYOK keys)
+# each router (same CALIBAN_KEK, and CALIBAN_KEK_PREVIOUS during a rotation, to open BYOK keys)
 CALIBAN_SNAPSHOT_PUBLIC_KEY=… CALIBAN_ROUTER_TOKEN=… CALIBAN_KEK=… \
   caliban router --control-plane-url http://cp:8081 --snapshot-cache /var/lib/caliban/snapshot.json
 ```
 
 `GET /api/v1/snapshot` (router token, not the admin token) returns `{key_id, payload, signature}`. The payload is base64 of `{version, issued_at_ms, config}`, signed with Ed25519 (domain-separated). The ETag is the config digest, so a router sending `If-None-Match` gets `304` while nothing has changed. A router verifies the signature, validates the config, refuses snapshots issued before the one it serves (anti-rollback), then swaps the new one in.
 
-**Fail-static.** On any error (control plane down, bad signature, invalid config) the router logs it and keeps serving its last good snapshot. With `CALIBAN_SNAPSHOT_CACHE`, that snapshot is persisted (mode 0600, re-verified on load), so a router restarted while the control plane is down still serves. Sealed secrets stay sealed inside the snapshot; `{env}` and `{file}` references resolve on the router host. When a release adds config fields, upgrade routers before the control plane.
+**Fail-static.** On any error (control plane down, bad signature, invalid config) the router logs it and keeps serving its last good snapshot. With `CALIBAN_SNAPSHOT_CACHE`, that snapshot is persisted (mode 0600, re-verified on load), so a router restarted while the control plane is down still serves. Sealed secrets stay sealed inside the snapshot (BYOK keys as tenant envelopes, opened with the router's keyring); `{env}` and `{file}` references resolve on the router host. When a release adds config fields, upgrade routers before the control plane.
 
 | Variable | Where | Meaning |
 |---|---|---|
@@ -420,8 +453,9 @@ CALIBAN_TEST_QDRANT_URL=http://127.0.0.1:56333 cargo test --release -p caliban-g
 Known gaps:
 
 - Usage events stay on each router (its WAL and in-memory ring); in split mode, the control plane's `/usage` only sees its own process.
-- No per-tenant data-encryption keys yet (`tenant_dek` is unused): BYOK keys are sealed directly under `CALIBAN_KEK`.
-- Deleting a tenant removes its sealed BYOK ciphertext from the live tables, but Postgres keeps dead row versions until `VACUUM`, and WAL archives and backups keep their copies. Crypto-shredding needs per-tenant DEKs (above).
+- Deleting a tenant destroys its data key, but Postgres keeps dead row versions until `VACUUM`, and WAL archives, backups and router snapshot caches keep copies of the wrapped key. They stay openable until the KEK is rotated and the retired KEK destroyed (see [KEK rotation](#kek-rotation)).
+- KEKs come from environment variables only; PKCS#11, KMS and Vault backends are not built. Rotation re-wraps DEKs but never replaces them (a DEK lives as long as its tenant).
+- Datasource credentials are detected by field name and URI shape; a secret in a field with an unusual name is stored as given (use an `{ env }` or `{ file }` reference for those).
 - Revocation in split mode takes effect on the router's next snapshot poll (`CALIBAN_SNAPSHOT_POLL_SECS`, default 10 s), not instantly.
 - Quotas default to in-memory per router process; set `[limits] store = "valkey"` to share them. While Valkey is unreachable each router limits on its own (see [Shared quotas](#shared-quotas-valkey)), and changing `store` needs a router restart.
 - No Prometheus metrics endpoint yet.
@@ -434,7 +468,7 @@ Known gaps:
 
 Next, in order:
 
-1. Control plane: per-tenant DEKs (so a tenant delete crypto-shreds its BYOK keys), OIDC actors in the audit log, usage shipping from routers to the control plane, push (long-poll) instead of polling (faster revocation in split mode).
+1. Control plane: OIDC actors in the audit log, usage shipping from routers to the control plane, push (long-poll) instead of polling (faster revocation in split mode).
 2. MongoDB connector: wire `introspect` and `propose` into the control plane's introspection job; `$jsonSchema`-declared types; map and scalar-array attributes; per-shard sampling.
 3. CDC replica and planner: connect the planner to the `explain` gate and replica lag in a query service; delta Parquet with compaction instead of whole-table rewrites; resume from the manifest after a restart (today it re-snapshots); parallel `_id`-range snapshots; arrays nested in arrays.
 4. PII: licence sign-off on the NER model's fine-tuning data (see `MODELS.md`); FF1 format-preserving encryption for structured IDs; coreference so a first name maps to the surrogate's first name.

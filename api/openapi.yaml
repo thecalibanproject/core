@@ -355,7 +355,7 @@ paths:
       description: |
         In one audited transaction (`tenant.delete`): the tenant becomes a tombstone
         (`status: deleted`, `deleted_at` set), all its API keys are revoked, its BYOK provider
-        credentials are destroyed (sealed ciphertext removed), its routes are removed, and its
+        credentials and its data key (DEK) are destroyed (crypto-shredding), its routes are removed, and its
         datasources (connection settings wiped) and nodes are soft-deleted. The tenant leaves the
         data-plane snapshot, so routers reject its keys from their next snapshot. Audit rows are
         kept. The tenant id cannot be reused (`POST /api/v1/tenants` with the same name is a 409).
@@ -1114,7 +1114,7 @@ components:
         label: { type: string }
         provider_id: { type: string, description: 'Provider id referenced by the model catalogue (e.g. local-llm, openai). Defaults to the slugified label.' }
         base_url: { type: string }
-        api_key: { type: string, description: 'Write-only. Sealed under CALIBAN_KEK. Optional for keyless local endpoints.' }
+        api_key: { type: string, description: 'Write-only. Sealed under the tenant data key (created on the first secret, wrapped by CALIBAN_KEK). Optional for keyless local endpoints.' }
         trust_tier: { $ref: '#/components/schemas/TrustTier' }
         cache_salt: { type: boolean, default: false, description: 'Send a per-tenant cache_salt (vLLM prefix-cache isolation)' }
 
@@ -1187,7 +1187,7 @@ components:
         base_url: { type: string, description: 'e.g. http://qwen3-30b:8000/v1' }
         trust_tier: { $ref: '#/components/schemas/TrustTier' }
         cache_salt: { type: boolean, default: false }
-        api_key: { type: string, description: 'Write-only; sealed at rest' }
+        api_key: { type: string, description: 'Write-only. Sealed under the current CALIBAN_KEK (re-sealed by `caliban keys rotate`).' }
         tenants: { type: array, items: { type: string } }
 
     DatasourceKind:
@@ -1203,6 +1203,10 @@ components:
         name: { type: string }
         status: { type: string, enum: [pending, connected, error, introspecting] }
         epoch: { type: integer, description: 'Monotonic data version used for cache invalidation' }
+        connection:
+          type: object
+          additionalProperties: true
+          description: 'Redacted connection settings: credentials are shown masked (`****`, or a URI as `scheme://user:****@host`); `{env}`/`{file}` references are shown as they are. Credentials are never returned.'
     DatasourceCreate:
       type: object
       required: [tenant_id, kind, name, connection]
@@ -1213,7 +1217,7 @@ components:
         connection:
           type: object
           additionalProperties: true
-          description: 'Kind-specific connection settings. Secrets inside are encrypted at rest.'
+          description: 'Kind-specific connection settings. Credentials (password, api_key, token, client_secret, private_key, credentials and similar fields, URIs with a password, secret query parameters, `Password=...;` pairs) are sealed under the tenant data key before they are stored; `{"env": ...}` and `{"file": ...}` references are kept as references. Keys named `$sealed` or `$redacted` are rejected (400). Storing credentials needs CALIBAN_KEK on the control plane (400 otherwise).'
 
     OntologyElementKind:
       type: string

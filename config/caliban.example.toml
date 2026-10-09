@@ -1,5 +1,7 @@
 # Caliban configuration (standalone / on-prem example)
 # Loaded from $CALIBAN_CONFIG. Secrets are never written inline: use { env = "..." } or { file = "..." }.
+# BYOK keys added through the admin API are sealed by the control plane under a per-tenant data key
+# wrapped by CALIBAN_KEK (rotation: CALIBAN_KEK_PREVIOUS and `caliban keys rotate`, see README).
 # In connected mode, the control plane renders this same structure as a signed snapshot.
 
 [server]
