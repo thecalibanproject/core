@@ -1,0 +1,20 @@
+[package]
+name = "caliban-cache"
+description = "Tenant-scoped response caches: T1 exact, T2 semantic (trait), plan cache (TODO)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+caliban-types.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+moka.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

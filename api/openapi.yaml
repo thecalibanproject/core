@@ -1,0 +1,1181 @@
+openapi: 3.1.0
+info:
+  title: Caliban API
+  version: 0.1.0
+  description: |
+    Two surfaces:
+    - **Data plane** (port 8080): OpenAI-compatible inference API with Caliban extensions.
+    - **Control plane** (port 8081): admin API used by the web console and SDKs.
+    This file is the contract for `web/`, `sdk-typescript/` and `sdk-python/`.
+servers:
+  - url: http://localhost:8080
+    description: Data plane
+  - url: http://localhost:8081
+    description: Control plane
+
+tags:
+  - name: inference
+  - name: tenants
+  - name: provider-keys
+  - name: models
+  - name: datasources
+  - name: ontology
+  - name: nodes
+  - name: usage
+  - name: system
+
+security:
+  - bearer: []
+
+paths:
+  # ───────────────────────────── Data plane ─────────────────────────────
+  /v1/chat/completions:
+    post:
+      tags: [inference]
+      summary: OpenAI-compatible chat completion (streaming via SSE when stream=true)
+      description: Authenticate with a tenant API key (`cal_…`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChatCompletionRequest' }
+      responses:
+        '200':
+          description: Completion, or an SSE stream of `chat.completion.chunk` objects.
+          headers:
+            x-caliban-request-id: { schema: { type: string } }
+            x-caliban-routed-model: { schema: { type: string } }
+            x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] } }
+            x-caliban-pii-entities: { schema: { type: integer } }
+            x-caliban-cost-usd: { schema: { type: string }, description: 'Cost of this request in USD (non-streaming only; absent when the model has no price).' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChatCompletionResponse' }
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502': { $ref: '#/components/responses/Error' }
+  /v1/messages:
+    post:
+      tags: [inference]
+      summary: Anthropic Messages API (streaming via SSE when stream=true)
+      description: |
+        Same pipeline as `/v1/chat/completions` (auth, rate limits, PII protect/rehydrate, routing,
+        cache, fallbacks, metering). Authenticate with `x-api-key: cal_…` (Anthropic SDKs) or a
+        bearer key. When the routed model's provider is Anthropic the request body is passed
+        through natively (`cache_control` breakpoints preserved, PII applied to text blocks);
+        otherwise it is translated to the model's dialect and the response translated back,
+        including stream events (`message_start`, `content_block_start/delta/stop` with
+        `text`/`thinking`/`tool_use`, `message_delta`, `message_stop`, `ping`). `thinking` maps to
+        the Caliban reasoning preference; the optional `caliban` extension is accepted. Errors use
+        the Anthropic shape (`AnthropicError`).
+      security:
+        - apiKey: []
+        - bearer: []
+      parameters:
+        - { name: anthropic-version, in: header, required: false, schema: { type: string, example: '2023-06-01' } }
+        - { name: anthropic-beta, in: header, required: false, schema: { type: string }, description: 'Forwarded to Anthropic on native passthrough.' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnthropicMessagesRequest' }
+      responses:
+        '200':
+          description: An Anthropic `message`, or an SSE stream of Anthropic events.
+          headers:
+            request-id: { schema: { type: string } }
+            x-caliban-request-id: { schema: { type: string } }
+            x-caliban-routed-model: { schema: { type: string } }
+            x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] } }
+            x-caliban-pii-entities: { schema: { type: integer } }
+            x-caliban-cost-usd: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnthropicMessage' }
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/AnthropicError' }
+        '401': { $ref: '#/components/responses/AnthropicError' }
+        '403': { $ref: '#/components/responses/AnthropicError' }
+        '429': { $ref: '#/components/responses/AnthropicRateLimited' }
+        '502': { $ref: '#/components/responses/AnthropicError' }
+  /v1/messages/count_tokens:
+    post:
+      tags: [inference]
+      summary: Approximate input token count for an Anthropic Messages request
+      description: Estimate without a tokenizer (~4 bytes per token plus message, image and tool overhead); the same estimate quota reservations use.
+      security:
+        - apiKey: []
+        - bearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnthropicMessagesRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [input_tokens]
+                properties:
+                  input_tokens: { type: integer }
+        '400': { $ref: '#/components/responses/AnthropicError' }
+        '401': { $ref: '#/components/responses/AnthropicError' }
+  /v1/models:
+    get:
+      tags: [inference]
+      summary: Models available to the calling tenant (OpenAI format)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, data]
+                properties:
+                  object: { type: string, const: list }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, object, owned_by]
+                      properties:
+                        id: { type: string }
+                        object: { type: string, const: model }
+                        owned_by: { type: string }
+                        caliban:
+                          type: object
+                          description: Absent on caliban/auto.
+                          required: [kind, capabilities, trust_tier]
+                          properties:
+                            kind: { $ref: '#/components/schemas/ModelKind' }
+                            family: { type: [string, 'null'] }
+                            capabilities: { $ref: '#/components/schemas/ModelCapabilities' }
+                            trust_tier: { $ref: '#/components/schemas/TrustTier' }
+
+  /v1/embeddings:
+    post:
+      tags: [inference]
+      summary: OpenAI-compatible embeddings (open embedding models on-prem, or BYOK providers)
+      description: Inputs sent outside the trust boundary are PII-masked (vectors cannot be rehydrated).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input]
+              additionalProperties: true
+              properties:
+                model: { type: string }
+                input:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items: { type: string }
+      responses:
+        '200':
+          description: OK
+          headers:
+            x-caliban-request-id: { schema: { type: string } }
+            x-caliban-routed-model: { schema: { type: string } }
+            x-caliban-pii-entities: { schema: { type: integer }, description: 'Entities masked before an external provider' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  object: { type: string }
+                  model: { type: string }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index: { type: integer }
+                        embedding: { type: array, items: { type: number } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/rerank:
+    post:
+      tags: [inference]
+      summary: Rerank documents against a query (Cohere/Jina-style; e.g. Qwen3-Reranker on vLLM, bge-reranker on TEI)
+      description: Text sent outside the trust boundary is PII-masked; returned documents are always the caller's originals.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, query, documents]
+              properties:
+                model: { type: string }
+                query: { type: string }
+                documents: { type: array, items: { type: string }, minItems: 1 }
+                top_n: { type: integer, minimum: 1 }
+                return_documents: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Results sorted by relevance_score, descending
+          headers:
+            x-caliban-request-id: { schema: { type: string } }
+            x-caliban-routed-model: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [model, results]
+                properties:
+                  model: { type: string }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      required: [index, relevance_score]
+                      properties:
+                        index: { type: integer }
+                        relevance_score: { type: number }
+                        document:
+                          type: object
+                          properties:
+                            text: { type: string }
+                  usage:
+                    type: object
+                    properties:
+                      total_tokens: { type: integer }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  # ──────────────────────────── Control plane ───────────────────────────
+  /api/v1/health:
+    get:
+      tags: [system]
+      security: []
+      summary: Liveness and build info
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  /api/v1/tenants:
+    get:
+      tags: [tenants]
+      summary: List tenants
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Tenant' } }
+    post:
+      tags: [tenants]
+      summary: Create a tenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TenantCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+
+  /api/v1/tenants/{tenantId}:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [tenants]
+      summary: Get a tenant
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/api-keys:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [tenants]
+      summary: List the tenant's Caliban API keys (metadata only)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ApiKeyInfo' } }
+    post:
+      tags: [tenants]
+      summary: Mint a Caliban API key. The plaintext is returned exactly once.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyCreated' }
+
+  /api/v1/tenants/{tenantId}/provider-keys:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [provider-keys]
+      summary: List BYOK provider credentials (secrets are never returned)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ProviderKey' } }
+    post:
+      tags: [provider-keys]
+      summary: Add a BYOK provider credential or local endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProviderKeyCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderKey' }
+
+  /api/v1/tenants/{tenantId}/provider-keys/{keyId}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - name: keyId
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [provider-keys]
+      summary: Delete a provider credential (the secret is crypto-shredded)
+      responses:
+        '204': { description: Deleted }
+
+  /api/v1/models:
+    get:
+      tags: [models]
+      summary: Model catalogue
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Model' } }
+    post:
+      tags: [models]
+      summary: Register a model (e.g. an open model served on-prem; often taken from a discovery suggestion)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Model' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/models/{modelId}:
+    parameters:
+      - name: modelId
+        in: path
+        required: true
+        description: Model id; may contain '/', e.g. local/qwen3-8b (sent unescaped).
+        schema: { type: string }
+    delete:
+      tags: [models]
+      summary: Remove a model from the catalogue (409 if a route still uses it)
+      responses:
+        '204': { description: Deleted }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /api/v1/providers:
+    get:
+      tags: [models]
+      summary: Shared model servers (on-prem pools such as vLLM, SGLang, llama.cpp, Ollama)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/SharedProvider' } }
+    post:
+      tags: [models]
+      summary: Register a shared model server
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SharedProviderCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SharedProvider' }
+
+  /api/v1/providers/{providerId}:
+    parameters: [ { $ref: '#/components/parameters/ProviderId' } ]
+    delete:
+      tags: [models]
+      summary: Remove a shared model server (409 if models still use it)
+      responses:
+        '204': { description: Deleted }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /api/v1/providers/{providerId}/health:
+    parameters: [ { $ref: '#/components/parameters/ProviderId' } ]
+    get:
+      tags: [models]
+      summary: Probe the server's /models endpoint
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok, unreachable] }
+                  latency_ms: { type: integer }
+                  models: { type: integer }
+                  error: { type: string }
+
+  /api/v1/providers/{providerId}/discover:
+    parameters: [ { $ref: '#/components/parameters/ProviderId' } ]
+    post:
+      tags: [models]
+      summary: List models the server serves and suggest catalogue entries for new ones (heuristic; review before saving)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [provider, available, suggested]
+                properties:
+                  provider: { type: string }
+                  available: { type: array, items: { type: string } }
+                  suggested: { type: array, items: { $ref: '#/components/schemas/ModelCreate' } }
+        '502': { $ref: '#/components/responses/Error' }
+
+  /api/v1/datasources:
+    get:
+      tags: [datasources]
+      summary: List datasources
+      parameters: [ { $ref: '#/components/parameters/TenantQuery' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Datasource' } }
+    post:
+      tags: [datasources]
+      summary: Register a datasource (credentials are stored like BYOK secrets)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DatasourceCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Datasource' }
+
+  /api/v1/datasources/{datasourceId}/introspect:
+    parameters:
+      - name: datasourceId
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [ontology]
+      summary: Introspect and profile a source, then propose ontology elements (all with status=proposed)
+      responses:
+        '202':
+          description: Bootstrap job accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+
+  /api/v1/ontology:
+    get:
+      tags: [ontology]
+      summary: Current ontology (Caliban Semantic Model) for a tenant
+      parameters: [ { $ref: '#/components/parameters/TenantQuery' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ontology' }
+
+  /api/v1/ontology/elements/{elementId}/review:
+    parameters:
+      - name: elementId
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [ontology]
+      summary: Approve or reject a proposed ontology element
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [approve, reject] }
+                note: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OntologyElement' }
+
+  /api/v1/nodes:
+    get:
+      tags: [nodes]
+      summary: List nodes (AI sub-apps)
+      parameters: [ { $ref: '#/components/parameters/TenantQuery' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Node' } }
+    post:
+      tags: [nodes]
+      summary: Create a node version (spec validated against schemas/node.schema.json)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+
+  /api/v1/usage:
+    get:
+      tags: [usage]
+      summary: Recent usage events and aggregate savings
+      parameters:
+        - { $ref: '#/components/parameters/TenantQuery' }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 1000 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageReport' }
+
+  /api/v1/tenants/{tenantId}/routes:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [tenants]
+      summary: Tenant routes (intent → ordered candidate models)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Route' } }
+        '404': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [tenants]
+      summary: Replace the tenant's routes
+      description: Rejected with 422 (nothing written) if a route names a model the tenant cannot reach.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RoutesPut' }
+      responses:
+        '200':
+          description: The routes now in effect
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Route' } }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/audit:
+    get:
+      tags: [system]
+      summary: Tamper-evident audit log (newest first)
+      description: |
+        One row per control-plane mutation. `hash = sha256(prev_hash ‖ canonical_json({seq, ts, tenant_id, actor,
+        action, target, detail}))` with sorted keys, no whitespace, `ts` in RFC 3339 UTC with microseconds, and 32 zero
+        bytes as `prev_hash` for the first row. `chain_verified` re-checks the returned window. Never contains secrets.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, minimum: 1, maximum: 1000 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditLog' }
+
+  /api/v1/snapshot:
+    get:
+      tags: [system]
+      summary: Signed data-plane config snapshot (split mode; for routers)
+      description: |
+        Authenticated with the router token (`CALIBAN_ROUTER_TOKEN`), not the admin token. Enabled only when the
+        control plane has `CALIBAN_SNAPSHOT_SIGNING_KEY` and `CALIBAN_ROUTER_TOKEN`. The ETag is a digest of the
+        config; send it back in `If-None-Match` to get 304 while nothing changed. Verify `signature` (Ed25519 over
+        `"caliban-snapshot-v1\0" ‖ base64-decoded payload`) before parsing `payload`. Sealed BYOK keys stay sealed.
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag: { schema: { type: string } }
+            x-caliban-snapshot-version: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SignedSnapshot' }
+        '304': { description: Unchanged since the given ETag }
+        '401': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: Tenant API key (`cal_…`) on the data plane; admin token on the control plane.
+    apiKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Tenant API key (`cal_…`) as sent by Anthropic SDKs (data plane only).
+
+  parameters:
+    TenantId:
+      name: tenantId
+      in: path
+      required: true
+      schema: { type: string }
+    ProviderId:
+      name: providerId
+      in: path
+      required: true
+      schema: { type: string }
+    TenantQuery:
+      name: tenant_id
+      in: query
+      required: false
+      schema: { type: string }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: |
+        A rate limit or token budget was exceeded (`[limits]` in the config). `error.type` is
+        `rate_limited`; `error.code` names the limit (`requests_per_minute`,
+        `key_requests_per_minute`, `tokens_per_minute`, `tokens_per_day`, `usd_per_day`).
+      headers:
+        retry-after: { schema: { type: integer }, description: 'Seconds until the request can succeed.' }
+        x-caliban-ratelimit-scope: { schema: { type: string }, description: 'The limit that was hit (same as error.code).' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    AnthropicError:
+      description: Error (Anthropic shape)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AnthropicError' }
+    AnthropicRateLimited:
+      description: Rate limit or token budget exceeded (Anthropic shape, `error.type` = `rate_limit_error`).
+      headers:
+        retry-after: { schema: { type: integer } }
+        x-caliban-ratelimit-scope: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AnthropicError' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type]
+          properties:
+            message: { type: string }
+            type: { type: string, description: 'e.g. invalid_request_error, authentication_error, policy_violation, upstream_error, rate_limited' }
+            code: { type: [string, 'null'], description: 'For rate_limited: the limit that was hit (e.g. tokens_per_minute).' }
+
+    Health:
+      type: object
+      required: [status, version, mode]
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        version: { type: string }
+        mode: { type: string, enum: [router, control-plane, standalone] }
+        config_version: { type: [string, 'null'] }
+        store: { type: string, enum: [memory, postgres], description: 'Control plane only: active store backend' }
+
+    CalibanExtension:
+      type: object
+      description: Caliban-specific request options. Unknown to OpenAI clients; safe to omit.
+      properties:
+        pii: { type: string, enum: [off, mask, reversible], default: reversible }
+        cache: { type: string, enum: [off, exact, semantic], default: exact }
+        datasources: { type: array, items: { type: string } }
+        node: { type: string }
+        max_cost_usd: { type: number }
+        reasoning: { type: string, enum: [off, low, medium, high], description: 'Mapped per model family (Qwen3 enable_thinking, reasoning_effort). OpenAI reasoning_effort is also accepted.' }
+        zdr: { type: boolean, default: false }
+        trace_id: { type: string }
+
+    ChatMessage:
+      type: object
+      required: [role]
+      properties:
+        role: { type: string, enum: [system, developer, user, assistant, tool] }
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: object, additionalProperties: true }
+            - type: 'null'
+        name: { type: string }
+        tool_calls: { type: array, items: { type: object, additionalProperties: true } }
+        tool_call_id: { type: string }
+        reasoning_content: { type: [string, 'null'], description: 'Reasoning text from reasoning models (responses only). Some servers name it `reasoning`.' }
+        reasoning: { type: [string, 'null'], description: 'Alias of reasoning_content used by some servers.' }
+
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: true
+      properties:
+        model: { type: string, description: 'Registry model id, tenant alias, or caliban/auto' }
+        messages: { type: array, items: { $ref: '#/components/schemas/ChatMessage' } }
+        stream: { type: boolean, default: false }
+        temperature: { type: number }
+        max_tokens: { type: integer }
+        tools: { type: array, items: { type: object, additionalProperties: true } }
+        caliban: { $ref: '#/components/schemas/CalibanExtension' }
+
+    ChatCompletionResponse:
+      type: object
+      additionalProperties: true
+      required: [id, object, model, choices]
+      properties:
+        id: { type: string }
+        object: { type: string, const: chat.completion }
+        created: { type: integer }
+        model: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              message: { $ref: '#/components/schemas/ChatMessage' }
+              finish_reason: { type: [string, 'null'] }
+        usage:
+          type: object
+          properties:
+            prompt_tokens: { type: integer }
+            completion_tokens: { type: integer }
+            total_tokens: { type: integer }
+
+    AnthropicError:
+      type: object
+      required: [type, error]
+      properties:
+        type: { type: string, const: error }
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type: { type: string, description: 'invalid_request_error, authentication_error, permission_error, rate_limit_error, api_error' }
+            message: { type: string }
+
+    AnthropicMessagesRequest:
+      type: object
+      required: [model, max_tokens, messages]
+      additionalProperties: true
+      description: Anthropic Messages request. Unknown fields pass through to Anthropic models on native passthrough.
+      properties:
+        model: { type: string, description: 'Registry model id, tenant alias, or caliban/auto' }
+        max_tokens: { type: integer, description: 'Not required by count_tokens.' }
+        system:
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: object, additionalProperties: true, description: 'text block (cache_control allowed)' }
+        messages:
+          type: array
+          items:
+            type: object
+            required: [role, content]
+            properties:
+              role: { type: string, enum: [user, assistant] }
+              content:
+                oneOf:
+                  - type: string
+                  - type: array
+                    items: { type: object, additionalProperties: true, description: 'text | image | document | tool_use | tool_result | thinking block' }
+        tools: { type: array, items: { type: object, additionalProperties: true } }
+        tool_choice: { type: object, additionalProperties: true }
+        stop_sequences: { type: array, items: { type: string } }
+        temperature: { type: number }
+        top_p: { type: number }
+        stream: { type: boolean }
+        thinking: { type: object, additionalProperties: true, description: 'enabled (budget_tokens) / disabled; mapped to caliban.reasoning for non-Anthropic models' }
+        metadata: { type: object, properties: { user_id: { type: string } } }
+        caliban: { $ref: '#/components/schemas/CalibanExtension' }
+
+    AnthropicMessage:
+      type: object
+      additionalProperties: true
+      required: [id, type, role, model, content, stop_reason, usage]
+      properties:
+        id: { type: string }
+        type: { type: string, const: message }
+        role: { type: string, const: assistant }
+        model: { type: string, description: 'The Caliban model id that served the request' }
+        content: { type: array, items: { type: object, additionalProperties: true } }
+        stop_reason: { type: [string, 'null'], enum: [end_turn, max_tokens, stop_sequence, tool_use, refusal, pause_turn, null] }
+        stop_sequence: { type: [string, 'null'] }
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
+            cache_read_input_tokens: { type: integer }
+            cache_creation_input_tokens: { type: integer }
+
+    Tenant:
+      type: object
+      required: [id, name, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        region: { type: [string, 'null'] }
+        pii_default: { type: string, enum: [off, mask, reversible] }
+        created_at: { type: string, format: date-time }
+    TenantCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        region: { type: string }
+        pii_default: { type: string, enum: [off, mask, reversible], default: reversible }
+
+    ApiKeyInfo:
+      type: object
+      required: [id, name, prefix, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        prefix: { type: string, description: 'First 8 chars, for display' }
+        created_at: { type: string, format: date-time }
+    ApiKeyCreated:
+      allOf:
+        - $ref: '#/components/schemas/ApiKeyInfo'
+        - type: object
+          required: [key]
+          properties:
+            key: { type: string, description: 'Plaintext key. Shown once.' }
+
+    ProviderKind:
+      type: string
+      enum: [openai, anthropic, openai_compatible, azure_openai, bedrock, vertex]
+      description: '`openai_compatible` covers on-prem vLLM, SGLang, llama.cpp, Ollama, mistral.rs.'
+    TrustTier:
+      type: string
+      enum: [t0_sovereign, t1_attested, t2_contracted, t3_public]
+    ProviderKey:
+      type: object
+      required: [id, tenant_id, kind, label, trust_tier, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        kind: { $ref: '#/components/schemas/ProviderKind' }
+        label: { type: string }
+        base_url: { type: [string, 'null'] }
+        trust_tier: { $ref: '#/components/schemas/TrustTier' }
+        last4: { type: [string, 'null'] }
+        cache_salt: { type: boolean }
+        created_at: { type: string, format: date-time }
+    ProviderKeyCreate:
+      type: object
+      required: [kind, label, trust_tier]
+      properties:
+        kind: { $ref: '#/components/schemas/ProviderKind' }
+        label: { type: string }
+        provider_id: { type: string, description: 'Provider id referenced by the model catalogue (e.g. local-llm, openai). Defaults to the slugified label.' }
+        base_url: { type: string }
+        api_key: { type: string, description: 'Write-only. Encrypted with the tenant DEK. Optional for keyless local endpoints.' }
+        trust_tier: { $ref: '#/components/schemas/TrustTier' }
+        cache_salt: { type: boolean, default: false, description: 'Send a per-tenant cache_salt (vLLM prefix-cache isolation)' }
+
+    ModelKind:
+      type: string
+      enum: [chat, embedding, rerank]
+    ModelCapabilities:
+      type: object
+      properties:
+        tools: { type: boolean, default: false }
+        vision: { type: boolean, default: false }
+        reasoning: { type: string, enum: [none, always, hybrid], default: none }
+        reasoning_control: { type: string, enum: [none, enable_thinking, reasoning_effort], default: none }
+        inline_think_tags: { type: boolean, default: false, description: 'Server returns <think>…</think> in content; Caliban moves it to reasoning_content.' }
+    ModelCreate:
+      type: object
+      required: [id, provider, upstream_model, trust_tier]
+      properties:
+        id: { type: string, description: 'Caliban model id, e.g. local/qwen3-8b' }
+        provider: { type: string, description: 'Shared provider id or a tenant BYOK provider id' }
+        upstream_model: { type: string, description: 'Name the server expects, e.g. Qwen/Qwen3-8B' }
+        kind: { $ref: '#/components/schemas/ModelKind' }
+        family: { type: [string, 'null'] }
+        capabilities: { $ref: '#/components/schemas/ModelCapabilities' }
+        trust_tier: { $ref: '#/components/schemas/TrustTier' }
+        licence: { type: [string, 'null'] }
+        context_window: { type: [integer, 'null'] }
+        price_in_per_mtok: { type: [number, 'null'] }
+        price_out_per_mtok: { type: [number, 'null'] }
+    Model:
+      type: object
+      required: [id, provider_id, upstream_model, trust_tier, kind, capabilities]
+      properties:
+        id: { type: string }
+        provider_id: { type: string }
+        provider_kind: { oneOf: [ { $ref: '#/components/schemas/ProviderKind' }, { type: 'null' } ] }
+        upstream_model: { type: string }
+        kind: { $ref: '#/components/schemas/ModelKind' }
+        family: { type: [string, 'null'] }
+        capabilities: { $ref: '#/components/schemas/ModelCapabilities' }
+        trust_tier: { $ref: '#/components/schemas/TrustTier' }
+        licence: { type: [string, 'null'] }
+        context_window: { type: [integer, 'null'] }
+        price_in_per_mtok: { type: [number, 'null'] }
+        price_out_per_mtok: { type: [number, 'null'] }
+    SharedProvider:
+      type: object
+      required: [id, kind, base_url, trust_tier, cache_salt, has_api_key, tenants]
+      properties:
+        id: { type: string }
+        kind: { $ref: '#/components/schemas/ProviderKind' }
+        base_url: { type: string }
+        trust_tier: { $ref: '#/components/schemas/TrustTier' }
+        cache_salt: { type: boolean, description: 'Send a per-tenant cache_salt (vLLM prefix-cache isolation)' }
+        has_api_key: { type: boolean }
+        tenants: { type: array, items: { type: string }, description: 'Allow-list; empty = all tenants' }
+    SharedProviderCreate:
+      type: object
+      required: [id, kind, base_url, trust_tier]
+      properties:
+        id: { type: string }
+        kind: { $ref: '#/components/schemas/ProviderKind' }
+        base_url: { type: string, description: 'e.g. http://qwen3-30b:8000/v1' }
+        trust_tier: { $ref: '#/components/schemas/TrustTier' }
+        cache_salt: { type: boolean, default: false }
+        api_key: { type: string, description: 'Write-only; sealed at rest' }
+        tenants: { type: array, items: { type: string } }
+
+    DatasourceKind:
+      type: string
+      enum: [mongodb, postgres, mysql, sqlserver, snowflake, bigquery, clickhouse, elasticsearch, rest_openapi, s3_parquet, mcp]
+    Datasource:
+      type: object
+      required: [id, tenant_id, kind, name, status]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        kind: { $ref: '#/components/schemas/DatasourceKind' }
+        name: { type: string }
+        status: { type: string, enum: [pending, connected, error, introspecting] }
+        epoch: { type: integer, description: 'Monotonic data version used for cache invalidation' }
+    DatasourceCreate:
+      type: object
+      required: [tenant_id, kind, name, connection]
+      properties:
+        tenant_id: { type: string }
+        kind: { $ref: '#/components/schemas/DatasourceKind' }
+        name: { type: string }
+        connection:
+          type: object
+          additionalProperties: true
+          description: 'Kind-specific connection settings. Secrets inside are encrypted at rest.'
+
+    OntologyElementKind:
+      type: string
+      enum: [entity, attribute, relation, metric, dimension, glossary_term, policy, verified_query]
+    OntologyElement:
+      type: object
+      required: [id, kind, name, status, provenance]
+      properties:
+        id: { type: string }
+        kind: { $ref: '#/components/schemas/OntologyElementKind' }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        synonyms: { type: array, items: { type: string } }
+        status: { type: string, enum: [proposed, approved, rejected, stale, deprecated] }
+        provenance: { type: string, enum: [introspect, profile, query_log, llm, human] }
+        confidence: { type: [number, 'null'] }
+        spec: { type: object, additionalProperties: true, description: 'Kind-specific body; see schemas/ontology.schema.json' }
+    Ontology:
+      type: object
+      required: [tenant_id, version, elements]
+      properties:
+        tenant_id: { type: string }
+        version: { type: integer }
+        elements: { type: array, items: { $ref: '#/components/schemas/OntologyElement' } }
+
+    Node:
+      type: object
+      required: [id, tenant_id, name, version, spec, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        name: { type: string }
+        version: { type: integer }
+        spec: { type: object, additionalProperties: true, description: 'See schemas/node.schema.json' }
+        created_at: { type: string, format: date-time }
+    NodeCreate:
+      type: object
+      required: [tenant_id, name, spec]
+      properties:
+        tenant_id: { type: string }
+        name: { type: string }
+        spec: { type: object, additionalProperties: true }
+
+    UsageEvent:
+      type: object
+      required: [request_id, tenant_id, model, prompt_tokens, completion_tokens, cache, latency_ms, ts]
+      properties:
+        request_id: { type: string }
+        tenant_id: { type: string }
+        model: { type: string }
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        cached_prompt_tokens: { type: integer }
+        tokens_saved: { type: integer, description: 'Tokens not sent upstream thanks to Caliban (e.g. cache hits)' }
+        intent: { type: string }
+        cache: { type: string, enum: [hit, miss, bypass] }
+        pii_entities: { type: integer }
+        cost_usd: { type: [number, 'null'] }
+        latency_ms: { type: integer }
+        ts: { type: string, format: date-time }
+    UsageReport:
+      type: object
+      required: [events, totals]
+      properties:
+        events: { type: array, items: { $ref: '#/components/schemas/UsageEvent' } }
+        totals:
+          type: object
+          properties:
+            requests: { type: integer }
+            prompt_tokens: { type: integer }
+            completion_tokens: { type: integer }
+            cache_hits: { type: integer }
+            tokens_saved: { type: integer }
+            cost_usd: { type: number }
+
+    Route:
+      type: object
+      required: [intent, models]
+      properties:
+        intent: { type: string }
+        models: { type: array, items: { type: string }, description: 'Ordered: first is preferred, the rest are fallbacks' }
+    RoutesPut:
+      type: object
+      required: [routes]
+      properties:
+        routes: { type: array, items: { $ref: '#/components/schemas/Route' } }
+
+    AuditEntry:
+      type: object
+      required: [seq, ts, actor, action, detail, hash]
+      properties:
+        seq: { type: integer }
+        ts: { type: string, format: date-time }
+        tenant_id: { type: [string, 'null'] }
+        actor: { type: string, description: 'e.g. admin, system (seed)' }
+        action: { type: string, description: 'e.g. tenant.create, api_key.create, provider_key.delete, routes.set, store.seed' }
+        target: { type: [string, 'null'] }
+        detail: { type: object, additionalProperties: true }
+        prev_hash: { type: [string, 'null'], description: 'Hex; null for the first row' }
+        hash: { type: string, description: 'Hex sha256' }
+    AuditLog:
+      type: object
+      required: [entries, chain_verified]
+      properties:
+        entries: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } }
+        head:
+          type: [object, 'null']
+          properties:
+            seq: { type: integer }
+            hash: { type: string }
+        chain_verified: { type: boolean }
+
+    SignedSnapshot:
+      type: object
+      required: [key_id, payload, signature]
+      properties:
+        key_id: { type: string, description: 'First 16 hex chars of sha256(public key)' }
+        payload: { type: string, description: 'base64 of JSON {version, issued_at_ms, config}; config has the caliban.toml structure' }
+        signature: { type: string, description: 'base64 Ed25519 signature' }

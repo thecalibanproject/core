@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://caliban.local/schemas/node.schema.json",
+  "title": "Caliban Node spec (v0)",
+  "description": "A node is a versioned, declarative AI sub-app. See docs/research/04-agent-orchestration.md §1.",
+  "type": "object",
+  "required": ["kind", "prompt", "model_policy", "budgets"],
+  "additionalProperties": false,
+  "properties": {
+    "kind": { "enum": ["agent", "workflow"] },
+    "description": { "type": "string" },
+    "prompt": {
+      "type": "object",
+      "required": ["system"],
+      "properties": {
+        "system": { "type": "string" },
+        "output_schema": { "type": "object" }
+      }
+    },
+    "model_policy": {
+      "type": "object",
+      "properties": {
+        "intent_classes": { "type": "array", "items": { "type": "string" } },
+        "candidates": { "type": "array", "items": { "type": "string" }, "description": "Model ids or tiers (tier:small, tier:frontier)" },
+        "escalate_on": { "type": "array", "items": { "enum": ["schema_violation", "low_confidence", "tool_error"] } },
+        "max_cost_usd": { "type": "number", "minimum": 0 },
+        "min_trust_tier": { "enum": ["t0_sovereign", "t1_attested", "t2_contracted", "t3_public"] }
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ref", "effect"],
+        "properties": {
+          "ref": { "type": "string", "pattern": "^(mcp|node)://", "description": "mcp://server/tool#sha256:<hash> or node://name@vN" },
+          "effect": { "enum": ["read", "write"] },
+          "requires": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "datasources": {
+      "type": "object",
+      "properties": { "scopes": { "type": "array", "items": { "type": "string", "pattern": "^[a-z0-9_]+\\.[a-z0-9_*]+:(read|write)$" } } }
+    },
+    "memory": {
+      "type": "object",
+      "properties": {
+        "short_term": { "enum": ["none", "run"] },
+        "long_term": { "type": "object", "properties": { "scope": { "enum": ["end_user", "tenant"] }, "ttl_days": { "type": "integer" } } }
+      }
+    },
+    "guardrails": {
+      "type": "object",
+      "properties": {
+        "pii": { "enum": ["off", "mask", "reversible"] },
+        "injection_mode": { "enum": ["none", "plan_then_execute", "camel"] },
+        "egress": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "required": ["steps", "tokens", "wall_clock_s"],
+      "properties": {
+        "steps": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "depth": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3 },
+        "fanout": { "type": "integer", "minimum": 1, "maximum": 64, "default": 8 },
+        "tokens": { "type": "integer", "minimum": 1 },
+        "wall_clock_s": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "exposure": {
+      "type": "object",
+      "properties": { "http": { "type": "boolean" }, "mcp_tool": { "type": "boolean" }, "a2a_agent": { "type": "boolean" } }
+    },
+    "graph": {
+      "type": "object",
+      "description": "Only for kind=workflow. Vertices + edges; loops must declare max_iterations.",
+      "properties": {
+        "vertices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "type"],
+            "properties": {
+              "id": { "type": "string" },
+              "type": { "enum": ["llm", "tool", "router", "map", "reduce", "verify", "human", "subnode", "code"] },
+              "config": { "type": "object" },
+              "max_iterations": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": { "type": "object", "required": ["from", "to"], "properties": { "from": { "type": "string" }, "to": { "type": "string" }, "when": { "type": "string" } } }
+        }
+      }
+    },
+    "eval": {
+      "type": "object",
+      "properties": { "suite": { "type": "string" }, "metrics": { "type": "array", "items": { "type": "string" } } }
+    }
+  }
+}

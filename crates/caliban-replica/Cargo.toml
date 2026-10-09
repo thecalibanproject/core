@@ -1,0 +1,26 @@
+[package]
+name = "caliban-replica"
+description = "CDC-fed analytical replica: MongoDB change streams -> Arrow -> Parquet, queried with DataFusion (accelerated lane)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+caliban-ontology.workspace = true
+caliban-connect.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Apache-2.0. Arrow and Parquet are used through DataFusion's re-exports so versions always match.
+datafusion = { version = "55.1", default-features = false, features = ["parquet", "sql", "datetime_expressions", "string_expressions", "unicode_expressions"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

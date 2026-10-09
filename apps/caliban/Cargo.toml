@@ -1,0 +1,32 @@
+[package]
+name = "caliban"
+description = "Caliban binary: router (data plane), control-plane, or standalone (both; on-prem)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# L1 PII NER model in-process (ONNX Runtime). Enable for production builds; point CALIBAN_PII_NER_DIR
+# at a verified artifact (see crates/caliban-pii/MODELS.md).
+ner = ["caliban-pii/ner"]
+
+[dependencies]
+caliban-pii.workspace = true
+caliban-config.workspace = true
+caliban-cp.workspace = true
+caliban-gateway.workspace = true
+caliban-meter.workspace = true
+caliban-types.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

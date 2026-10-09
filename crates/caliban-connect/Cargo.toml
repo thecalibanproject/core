@@ -1,0 +1,26 @@
+[package]
+name = "caliban-connect"
+description = "Connector trait over customer datasources (MongoDB first), introspection, profiling, change feeds."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["mongodb"]
+# Official MongoDB Rust driver (Apache-2.0).
+mongodb = ["dep:mongodb", "dep:futures", "dep:tokio"]
+
+[dependencies]
+caliban-ontology.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+mongodb = { version = "3.9", optional = true }
+futures = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[lints]
+workspace = true

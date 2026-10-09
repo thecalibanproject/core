@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/caliban"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[workspace.dependencies]
+# internal
+caliban-types     = { path = "crates/caliban-types" }
+caliban-config    = { path = "crates/caliban-config" }
+caliban-ir        = { path = "crates/caliban-ir" }
+caliban-pii       = { path = "crates/caliban-pii" }
+caliban-cache     = { path = "crates/caliban-cache" }
+caliban-route     = { path = "crates/caliban-route" }
+caliban-providers = { path = "crates/caliban-providers" }
+caliban-meter     = { path = "crates/caliban-meter" }
+caliban-ontology  = { path = "crates/caliban-ontology" }
+caliban-connect   = { path = "crates/caliban-connect" }
+caliban-nodes     = { path = "crates/caliban-nodes" }
+caliban-rag       = { path = "crates/caliban-rag" }
+caliban-mcp       = { path = "crates/caliban-mcp" }
+caliban-gateway   = { path = "crates/caliban-gateway" }
+caliban-cp        = { path = "crates/caliban-cp" }
+
+# external
+aes-gcm = "0.10"
+aho-corasick = "1.1"
+anyhow = "1"
+arc-swap = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+blake3 = "1.8"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+futures = "0.3"
+hex = "0.4"
+hmac = "0.12"
+moka = { version = "0.12", features = ["future"] }
+parking_lot = "0.12"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+toml = "0.9"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "fs", "cors", "request-id", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

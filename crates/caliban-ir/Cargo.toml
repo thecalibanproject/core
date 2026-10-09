@@ -1,0 +1,16 @@
+[package]
+name = "caliban-ir"
+description = "Canonical request/response representation and OpenAI/Anthropic wire codecs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+caliban-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+
+[lints]
+workspace = true

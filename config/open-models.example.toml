@@ -1,0 +1,340 @@
+# Caliban configuration: on-prem, open-weight models only (Qwen first).
+#
+# A complete, valid config for a sovereign site that serves open models from its own GPU/CPU
+# pools. Every model entry below was checked against its Hugging Face repo on 2026-10-02:
+# repo id, licence (cardData.license) and native context.
+# Background, flags and hardware sizing: docs/research/09-open-models-on-prem.md.
+# The matching serving stack (one engine container per pool) is deploy/compose/docker-compose.yml.
+#
+# Model servers are declared ONCE, deployment-wide, under [[providers]]. All tenants share
+# them, unless a provider lists `tenants`. A tenant can still add its own BYOK providers under
+# [[tenants.providers]].
+#
+# Request paths Caliban derives from base_url:
+#   chat        {base_url}/chat/completions   (vLLM, SGLang, llama.cpp, Ollama)
+#   embeddings  {base_url}/embeddings         (vLLM, TEI, llama.cpp, Ollama)
+#   rerank      {base_url}/rerank             (vLLM: /v1/rerank; TEI: /rerank -> no /v1 in base_url)
+#
+# Reasoning output differs per engine: vLLM >= 0.30 returns `reasoning`; SGLang and llama.cpp
+# return `reasoning_content`; Ollama returns `reasoning`. Caliban normalises them.
+#
+# Secrets are never written inline: use { env = "..." } or { file = "..." }.
+
+[server]
+router_addr = "0.0.0.0:8080"
+control_plane_addr = "0.0.0.0:8081"
+web_dir = "/usr/share/caliban/web"
+
+[security]
+# deny_by_default: the data plane only calls base_urls declared in this file.
+egress = "deny_by_default"
+admin_token = { env = "CALIBAN_ADMIN_TOKEN" }
+
+[cache]
+exact_enabled = true
+exact_max_entries = 100000
+exact_ttl_secs = 3600
+
+[pii]
+default_mode = "reversible"
+
+# ═════════════════════ Shared model servers (on-prem pools) ═════════════════════
+# Host names match the docker-compose service names; in Kubernetes, the Helm `modelPools`
+# Service names. cache_salt = true only on engines that accept the request field:
+#   vLLM (>= 0.30: <= 128 chars, no '/', '@', '\')  and  SGLang (>= 0.5.21).
+#   llama.cpp, Ollama and TEI have no tenant-salted prefix cache: keep it false and give
+#   them to one trust group, or disable their prompt cache.
+
+# 1×24 GB tier: Qwen3.5-9B (vLLM, online FP8, text-only). compose profile: qwen3-small
+[[providers]]
+id = "vllm-qwen3-small"
+kind = "openai_compatible"
+base_url = "http://qwen3-small:8000/v1"
+trust_tier = "t0_sovereign"
+cache_salt = true
+
+# 1×48/80 GB tier: Qwen3.8-27B-FP8 (vLLM). compose profile: qwen3-large
+[[providers]]
+id = "vllm-qwen3-large"
+kind = "openai_compatible"
+base_url = "http://qwen3-large:8000/v1"
+trust_tier = "t0_sovereign"
+cache_salt = true
+
+# 1×48/80 GB throughput tier: Qwen3.6-35B-A3B-FP8 (vLLM, MoE, 3B active). compose profile: qwen3-moe
+[[providers]]
+id = "vllm-qwen3-moe"
+kind = "openai_compatible"
+base_url = "http://qwen3-moe:8000/v1"
+trust_tier = "t0_sovereign"
+cache_salt = true
+
+# gpt-oss-20b (vLLM). Kept as a cross-family fallback. compose profile: gpt-oss
+[[providers]]
+id = "vllm-gpt-oss"
+kind = "openai_compatible"
+base_url = "http://gpt-oss:8000/v1"
+trust_tier = "t0_sovereign"
+cache_salt = true
+
+# CPU-only: llama.cpp llama-server with the Qwen3.6-35B-A3B Q4_K_M GGUF. compose profile: cpu
+[[providers]]
+id = "llamacpp-qwen3"
+kind = "openai_compatible"
+base_url = "http://qwen3-cpu:8000/v1"
+trust_tier = "t0_sovereign"
+cache_salt = false
+# llama.cpp keeps a per-slot prompt cache that is not tenant-aware. On multi-tenant CPU
+# sites, either restrict this pool to one tenant or start the server with --no-cache-prompt.
+# tenants = ["acme"]
+
+# Embeddings: TEI serving Qwen3-Embedding-0.6B (GPU: profile embeddings, CPU: profile cpu).
+[[providers]]
+id = "tei-embed"
+kind = "openai_compatible"
+base_url = "http://embed:8000/v1"
+trust_tier = "t0_sovereign"
+cache_salt = false
+
+# Reranker on GPU: vLLM pooling runner serving Qwen3-Reranker-0.6B. compose profile: reranker
+[[providers]]
+id = "vllm-rerank"
+kind = "openai_compatible"
+base_url = "http://rerank:8000/v1"
+trust_tier = "t0_sovereign"
+cache_salt = true
+
+# Reranker on CPU: TEI serving BAAI/bge-reranker-v2-m3 (TEI exposes /rerank at the root).
+[[providers]]
+id = "tei-rerank"
+kind = "openai_compatible"
+base_url = "http://rerank-bge:8000"
+trust_tier = "t0_sovereign"
+cache_salt = false
+
+# Ollama: one endpoint, many models (pre-pulled; OLLAMA_NO_CLOUD=1). compose profile: ollama
+[[providers]]
+id = "ollama"
+kind = "openai_compatible"
+base_url = "http://ollama:11434/v1"
+trust_tier = "t0_sovereign"
+cache_salt = false
+# api_key = { env = "OLLAMA_API_KEY" }   # only if a reverse proxy in front of it checks one
+
+# ═════════════════════ Model catalogue ═════════════════════
+# upstream_model = the exact model name the server answers to (vLLM --served-model-name,
+# llama.cpp --alias, TEI --served-model-name, Ollama tag).
+# context_window = what the pool is SERVED with (compose defaults), not the model's maximum;
+# raise both together.
+# family values used here: qwen3.5 (Qwen3.5/3.6: no /think soft switch, enable_thinking only),
+# qwen3.8 (also accepts reasoning_effort xhigh|medium|low), gpt-oss, qwen3-embedding,
+# qwen3-reranker, xlm-roberta-reranker.
+
+# ── chat ──
+
+[[models]]
+id = "local/qwen3.5-9b"
+provider = "vllm-qwen3-small"
+upstream_model = "Qwen/Qwen3.5-9B"
+kind = "chat"
+family = "qwen3.5"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+# Native 262144; served at 131072 on a 24 GB card (Qwen advise >= 128k to keep thinking quality).
+context_window = 131072
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+[models.capabilities]
+tools = true                          # vLLM --tool-call-parser qwen3_coder
+vision = false                        # served with --language-model-only (the checkpoint is VL)
+reasoning = "hybrid"                  # thinking on by default
+reasoning_control = "enable_thinking" # chat_template_kwargs.enable_thinking (no /think, /no_think)
+inline_think_tags = false             # --reasoning-parser qwen3
+
+[[models]]
+id = "local/qwen3.8-27b"
+provider = "vllm-qwen3-large"
+upstream_model = "Qwen/Qwen3.8-27B-FP8"
+kind = "chat"
+family = "qwen3.8"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+# Native 262144 (YaRN to 1M). 131072 fits 1×48 GB with fp8 KV; use 262144 on 1×80 GB.
+context_window = 131072
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+[models.capabilities]
+tools = true
+vision = true                         # native image/video input
+reasoning = "hybrid"
+reasoning_control = "enable_thinking" # also accepts reasoning_effort (xhigh default, medium, low)
+inline_think_tags = false
+
+[[models]]
+id = "local/qwen3.6-35b-a3b"
+provider = "vllm-qwen3-moe"
+upstream_model = "Qwen/Qwen3.6-35B-A3B-FP8"
+kind = "chat"
+family = "qwen3.5"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 131072               # native 262144
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+[models.capabilities]
+tools = true
+vision = true
+reasoning = "hybrid"
+reasoning_control = "enable_thinking"
+inline_think_tags = false
+
+[[models]]
+id = "local/qwen3.6-35b-a3b-q4"
+provider = "llamacpp-qwen3"
+upstream_model = "ggml-org/Qwen3.6-35B-A3B-GGUF"   # llama-server --alias
+kind = "chat"
+family = "qwen3.5"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 32768                # llama.cpp --ctx-size (LLM_CTX); native 262144
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+[models.capabilities]
+tools = true                          # needs --jinja (default on)
+vision = false                        # no --mmproj loaded
+reasoning = "hybrid"
+reasoning_control = "enable_thinking" # llama-server accepts chat_template_kwargs per request
+inline_think_tags = false             # --reasoning-format auto -> message.reasoning_content
+
+[[models]]
+id = "local/gpt-oss-20b"
+provider = "vllm-gpt-oss"
+upstream_model = "openai/gpt-oss-20b"
+kind = "chat"
+family = "gpt-oss"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 131072
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+[models.capabilities]
+tools = true                          # --tool-call-parser openai
+vision = false
+reasoning = "always"                  # harmony format always reasons
+reasoning_control = "reasoning_effort" # low | medium | high
+inline_think_tags = false
+
+[[models]]
+id = "ollama/qwen3.6-35b"
+provider = "ollama"
+upstream_model = "qwen3.6:35b"
+kind = "chat"
+family = "qwen3.5"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 32768                # OLLAMA_CONTEXT_LENGTH in compose
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+[models.capabilities]
+tools = true
+vision = false
+reasoning = "hybrid"
+# Ollama's OpenAI endpoint takes reasoning_effort ("none" = off), not chat_template_kwargs.
+reasoning_control = "reasoning_effort"
+inline_think_tags = false             # returned in `reasoning`
+
+# ── embeddings ──
+
+[[models]]
+id = "local/qwen3-embedding-0.6b"
+provider = "tei-embed"
+upstream_model = "Qwen/Qwen3-Embedding-0.6B"
+kind = "embedding"
+family = "qwen3-embedding"            # 1024-d (MRL 32..1024); queries need an "Instruct: ...\nQuery:" prefix
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 32768
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+
+[[models]]
+id = "ollama/qwen3-embedding-0.6b"
+provider = "ollama"
+upstream_model = "qwen3-embedding:0.6b"
+kind = "embedding"
+family = "qwen3-embedding"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 32768
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+
+# ── rerankers ──
+
+[[models]]
+id = "local/qwen3-reranker-0.6b"
+provider = "vllm-rerank"
+upstream_model = "Qwen/Qwen3-Reranker-0.6B"
+kind = "rerank"
+family = "qwen3-reranker"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 8192                 # served --max-model-len; the model supports 32k
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+
+[[models]]
+id = "local/bge-reranker-v2-m3"
+provider = "tei-rerank"
+upstream_model = "BAAI/bge-reranker-v2-m3"
+kind = "rerank"
+family = "xlm-roberta-reranker"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 8192
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+
+# ═════════════════════ Tenants ═════════════════════
+[[tenants]]
+id = "acme"
+name = "Acme Corp"
+pii_mode = "reversible"
+# SHA-256 hex of each API key (`caliban keygen`). Empty = no key can reach this tenant yet.
+api_key_hashes = []
+
+  # Tenant-scoped BYOK provider (optional; needs the egress override). Uncomment together with
+  # a matching [[models]] entry whose provider = "acme-openai".
+  # [[tenants.providers]]
+  # id = "acme-openai"
+  # kind = "openai"
+  # base_url = "https://api.openai.com/v1"
+  # trust_tier = "t2_contracted"
+  # api_key = { env = "ACME_OPENAI_API_KEY" }
+
+  # Intent → ordered candidates (first = preferred, rest = fallbacks). A candidate whose pool
+  # is not running is skipped, so one list covers every hardware tier: the router falls through
+  # large GPU → small GPU → CPU.
+  [[tenants.routes]]
+  intent = "default"
+  models = ["local/qwen3.8-27b", "local/qwen3.6-35b-a3b", "local/qwen3.5-9b", "local/qwen3.6-35b-a3b-q4", "local/gpt-oss-20b"]
+
+  [[tenants.routes]]
+  intent = "chat"
+  models = ["local/qwen3.6-35b-a3b", "local/qwen3.5-9b", "local/qwen3.6-35b-a3b-q4", "ollama/qwen3.6-35b"]
+
+  [[tenants.routes]]
+  intent = "code"
+  models = ["local/qwen3.8-27b", "local/qwen3.6-35b-a3b", "local/gpt-oss-20b", "local/qwen3.5-9b"]
+
+  [[tenants.routes]]
+  intent = "analytics"
+  models = ["local/qwen3.8-27b", "local/gpt-oss-20b", "local/qwen3.6-35b-a3b", "local/qwen3.5-9b"]
+
+  [[tenants.routes]]
+  intent = "summarize"
+  models = ["local/qwen3.6-35b-a3b", "local/qwen3.5-9b", "local/qwen3.6-35b-a3b-q4", "ollama/qwen3.6-35b"]
+
+  [[tenants.routes]]
+  intent = "extraction"
+  models = ["local/qwen3.5-9b", "local/qwen3.6-35b-a3b", "local/gpt-oss-20b", "local/qwen3.6-35b-a3b-q4"]

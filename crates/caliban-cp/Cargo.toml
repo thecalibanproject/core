@@ -1,0 +1,39 @@
+[package]
+name = "caliban-cp"
+description = "Control plane: admin API (/api/v1), tenant/BYOK/datasource/ontology/node registry, serves the web console."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+caliban-types.workspace = true
+caliban-config.workspace = true
+caliban-meter.workspace = true
+caliban-nodes.workspace = true
+caliban-ontology.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# Postgres store: runtime queries only (no compile-time macros), tokio + rustls.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "chrono", "json"] }
+thiserror.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

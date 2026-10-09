@@ -1,0 +1,102 @@
+# Caliban configuration (standalone / on-prem example)
+# Loaded from $CALIBAN_CONFIG. Secrets are never written inline: use { env = "..." } or { file = "..." }.
+# In connected mode, the control plane renders this same structure as a signed snapshot.
+
+[server]
+router_addr = "0.0.0.0:8080"
+control_plane_addr = "0.0.0.0:8081"
+# Static web console files (built from the web/ repo). Optional.
+web_dir = "/usr/share/caliban/web"
+
+[security]
+# deny_by_default: the data plane only calls base_urls declared under tenants.providers.
+egress = "deny_by_default"
+# Admin bearer token for the control plane API.
+admin_token = { env = "CALIBAN_ADMIN_TOKEN" }
+
+[cache]
+exact_enabled = true
+exact_max_entries = 100000
+exact_ttl_secs = 3600
+
+[pii]
+# Default for tenants that don't override it: off | mask | reversible
+default_mode = "reversible"
+
+# Rate limits and token budgets (all optional; unset = unlimited). 429 + retry-after when exceeded.
+# [limits]
+# requests_per_minute = 600        # GCRA, per tenant
+# key_requests_per_minute = 120    # GCRA, per API key
+# tokens_per_minute = 400000       # reserved: prompt estimate + max_tokens, settled to actual usage
+# tokens_per_day = 20000000        # per UTC day
+# usd_per_day = 50.0               # per UTC day (needs model prices)
+# [limits.tenants.acme]            # per-tenant overrides
+# requests_per_minute = 1200
+
+# ─────────────── Model catalogue ───────────────
+# `provider` names a provider id that each tenant must define (BYOK). A tenant only sees
+# models whose provider it has configured.
+[[models]]
+id = "local/gpt-oss-20b"
+provider = "local-llm"
+upstream_model = "openai/gpt-oss-20b"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 131072
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+
+[[models]]
+id = "local/qwen3-8b"
+provider = "local-llm"
+upstream_model = "Qwen/Qwen3-8B"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 32768
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+
+[[models]]
+id = "openai/gpt-5-mini"
+provider = "openai"
+upstream_model = "gpt-5-mini"
+trust_tier = "t2_contracted"
+licence = "proprietary"
+
+# ─────────────── Tenants ───────────────
+[[tenants]]
+id = "acme"
+name = "Acme Corp"
+pii_mode = "reversible"
+# SHA-256 hex of each API key. Generate a key with `caliban keygen`.
+api_key_hashes = [
+  # "3f5c…",
+]
+
+  # Local, on-prem model server (vLLM, SGLang, llama.cpp, Ollama, …). No key needed.
+  [[tenants.providers]]
+  id = "local-llm"
+  kind = "openai_compatible"
+  base_url = "http://llm:8000/v1"
+  trust_tier = "t0_sovereign"
+
+  # Customer-supplied key (BYOK). Remove this block for fully air-gapped deployments.
+  [[tenants.providers]]
+  id = "openai"
+  kind = "openai"
+  base_url = "https://api.openai.com/v1"
+  trust_tier = "t2_contracted"
+  api_key = { env = "ACME_OPENAI_API_KEY" }
+
+  # Intent → ordered candidate models (first = preferred, rest = fallbacks).
+  [[tenants.routes]]
+  intent = "default"
+  models = ["local/gpt-oss-20b", "openai/gpt-5-mini"]
+
+  [[tenants.routes]]
+  intent = "chat"
+  models = ["local/qwen3-8b", "local/gpt-oss-20b"]
+
+  [[tenants.routes]]
+  intent = "code"
+  models = ["local/gpt-oss-20b"]
