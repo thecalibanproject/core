@@ -56,9 +56,10 @@ impl Backend for MemoryBackend {
         let (committed, log) = &mut *guard;
         // Work on a copy: any error leaves the committed state untouched (= rollback).
         let mut st = committed.clone();
+        let draft = m.audit(&st);
         apply_to(&mut st, m)?;
         check(&st).map_err(StoreError::Invalid)?;
-        let entry = AuditEntry::next(log.last(), actor, &m.audit(), now_micros());
+        let entry = AuditEntry::next(log.last(), actor, &draft, now_micros());
         st.audit_head = entry.seq;
         log.push(entry);
         *committed = st.clone();
@@ -80,10 +81,32 @@ fn need_tenant(st: &State, id: &str) -> Result<(), StoreError> {
 pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
     match m {
         Mutation::CreateTenant(t) => {
-            if st.has_tenant(&t.id) {
-                return Err(StoreError::Conflict(format!("tenant '{}' already exists", t.id)));
+            match st.tenant_record(&t.id) {
+                Some(x) if x.is_active() => return Err(StoreError::Conflict(format!("tenant '{}' already exists", t.id))),
+                Some(_) => {
+                    return Err(StoreError::Conflict(format!("tenant id '{}' belonged to a deleted tenant and cannot be reused", t.id)));
+                }
+                None => {}
             }
             st.tenants.push(t.clone());
+        }
+        Mutation::DeleteTenant { id, at } => {
+            let t = st.tenants.iter_mut().find(|t| &t.id == id && t.is_active()).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
+            t.status = super::TenantStatus::Deleted;
+            t.deleted_at = Some(*at);
+            for k in st.api_keys.iter_mut().filter(|k| &k.tenant_id == id && k.is_active()) {
+                k.revoked_at = Some(*at);
+            }
+            // BYOK credentials are destroyed, not kept: nothing can open them again.
+            st.provider_keys.retain(|p| &p.tenant_id != id);
+            st.routes.remove(id);
+            for ds in st.datasources.iter_mut().filter(|d| &d.tenant_id == id && d.is_live()) {
+                ds.deleted_at = Some(*at);
+                ds.connection = json!({});
+            }
+            for n in st.nodes.iter_mut().filter(|n| &n.tenant_id == id && n.is_live()) {
+                n.deleted_at = Some(*at);
+            }
         }
         Mutation::CreateApiKey(k) => {
             need_tenant(st, &k.tenant_id)?;
@@ -91,6 +114,15 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 return Err(StoreError::Conflict("api key already exists".into()));
             }
             st.api_keys.push(k.clone());
+        }
+        Mutation::RevokeApiKey { tenant_id, id, at } => {
+            need_tenant(st, tenant_id)?;
+            let k = st
+                .api_keys
+                .iter_mut()
+                .find(|k| &k.tenant_id == tenant_id && &k.id == id && k.is_active())
+                .ok_or_else(|| StoreError::NotFound("api key".into()))?;
+            k.revoked_at = Some(*at);
         }
         Mutation::CreateProviderKey(p) => {
             need_tenant(st, &p.tenant_id)?;
@@ -140,20 +172,40 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
         }
         Mutation::CreateDatasource(ds) => {
             need_tenant(st, &ds.tenant_id)?;
-            if st.datasources.iter().any(|x| x.tenant_id == ds.tenant_id && x.name == ds.name) {
+            if st.datasources.iter().any(|x| x.tenant_id == ds.tenant_id && x.name == ds.name && x.is_live()) {
                 return Err(StoreError::Conflict(format!("datasource '{}' already exists for this tenant", ds.name)));
             }
             st.datasources.push(ds.clone());
         }
         Mutation::SetDatasourceStatus { id, status } => {
-            let ds = st.datasources.iter_mut().find(|d| &d.id == id).ok_or_else(|| StoreError::NotFound("datasource".into()))?;
+            let ds = st.datasources.iter_mut().find(|d| &d.id == id && d.is_live()).ok_or_else(|| StoreError::NotFound("datasource".into()))?;
             ds.status.clone_from(status);
+        }
+        Mutation::DeleteDatasource { tenant_id, id, at } => {
+            need_tenant(st, tenant_id)?;
+            let ds = st
+                .datasources
+                .iter_mut()
+                .find(|d| &d.tenant_id == tenant_id && &d.id == id && d.is_live())
+                .ok_or_else(|| StoreError::NotFound("datasource".into()))?;
+            ds.deleted_at = Some(*at);
+            // The connection may carry credentials; a deleted datasource keeps only its metadata.
+            ds.connection = json!({});
         }
         Mutation::CreateNode(n) => {
             need_tenant(st, &n.tenant_id)?;
             let version =
                 st.nodes.iter().filter(|x| x.tenant_id == n.tenant_id && x.name == n.name).map(|x| x.version).max().unwrap_or(0) + 1;
             st.nodes.push(super::NodeRecord { version, ..n.clone() });
+        }
+        Mutation::DeleteNode { tenant_id, id, at } => {
+            need_tenant(st, tenant_id)?;
+            let n = st
+                .nodes
+                .iter_mut()
+                .find(|n| &n.tenant_id == tenant_id && &n.id == id && n.is_live())
+                .ok_or_else(|| StoreError::NotFound("node".into()))?;
+            n.deleted_at = Some(*at);
         }
         Mutation::ProposeOntology { tenant_id, elements } => {
             need_tenant(st, tenant_id)?;
@@ -170,10 +222,11 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             onto.version += 1;
         }
         Mutation::ReviewOntologyElement { id, status } => {
+            let active: Vec<String> = st.tenants.iter().filter(|t| t.is_active()).map(|t| t.id.clone()).collect();
             let onto = st
                 .ontologies
                 .values_mut()
-                .find(|o| o.elements.iter().any(|e| &e.id == id))
+                .find(|o| active.contains(&o.tenant_id) && o.elements.iter().any(|e| &e.id == id))
                 .ok_or_else(|| StoreError::NotFound("ontology element".into()))?;
             if let Some(e) = onto.elements.iter_mut().find(|e| &e.id == id) {
                 e.status = *status;

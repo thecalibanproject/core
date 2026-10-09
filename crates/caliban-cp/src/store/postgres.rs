@@ -7,7 +7,7 @@
 //! rendered data-plane config → append the audit row → commit. Any error rolls everything back.
 
 use super::audit::{AuditDraft, AuditEntry, now_micros};
-use super::{ApiKeyRecord, Backend, Check, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, State, StoreError, Tenant};
+use super::{ApiKeyRecord, Backend, Check, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, State, StoreError, Tenant, TenantStatus};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use caliban_config::{ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider};
@@ -26,6 +26,7 @@ use std::time::Duration;
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "init", include_str!("../../../../migrations/0001_init.sql")),
     (2, "control_plane_store", include_str!("../../../../migrations/0002_control_plane_store.sql")),
+    (3, "soft_delete", include_str!("../../../../migrations/0003_soft_delete.sql")),
 ];
 
 /// Advisory lock keys ("calibn" + n).
@@ -213,11 +214,12 @@ impl Backend for PgBackend {
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(WRITE_LOCK).execute(&mut *tx).await.map_err(db)?;
         let mut next = load_state(&mut tx).await?;
+        let draft = m.audit(&next);
         super::memory::apply_to(&mut next, m)?;
         persist(&mut tx, m, &next).await?;
         let mut post = load_state(&mut tx).await?;
         check(&post).map_err(StoreError::Invalid)?;
-        post.audit_head = append_audit(&mut tx, actor, &m.audit()).await?.seq;
+        post.audit_head = append_audit(&mut tx, actor, &draft).await?.seq;
         tx.commit().await.map_err(db)?;
         Ok(post)
     }
@@ -245,6 +247,11 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
     match m {
         Mutation::CreateTenant(t) => insert_tenant(c, t).await,
         Mutation::CreateApiKey(k) => insert_api_key(c, k).await,
+        Mutation::RevokeApiKey { tenant_id, id, at } => {
+            let q = "UPDATE api_key SET revoked_at = $3 WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL";
+            exec(c, sqlx::query(q).bind(tenant_id).bind(id).bind(at)).await
+        }
+        Mutation::DeleteTenant { id, at } => delete_tenant(c, id, *at).await,
         Mutation::CreateProviderKey(p) => insert_provider_key(c, p).await,
         Mutation::DeleteProviderKey { tenant_id, id } => {
             exec(c, sqlx::query("DELETE FROM provider_credential WHERE tenant_id = $1 AND id = $2").bind(tenant_id).bind(id)).await
@@ -257,6 +264,14 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
         Mutation::CreateDatasource(ds) => insert_datasource(c, ds).await,
         Mutation::SetDatasourceStatus { id, status } => {
             exec(c, sqlx::query("UPDATE datasource SET status = $2 WHERE id = $1").bind(id).bind(status)).await
+        }
+        Mutation::DeleteDatasource { tenant_id, id, at } => {
+            let q = "UPDATE datasource SET deleted_at = $3, connection = '{}' WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL";
+            exec(c, sqlx::query(q).bind(tenant_id).bind(id).bind(at)).await
+        }
+        Mutation::DeleteNode { tenant_id, id, at } => {
+            let q = "UPDATE node SET deleted_at = $3 WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL";
+            exec(c, sqlx::query(q).bind(tenant_id).bind(id).bind(at)).await
         }
         Mutation::CreateNode(n) => {
             let assigned = next.nodes.iter().find(|x| x.id == n.id).ok_or_else(|| StoreError::Backend("node not applied".into()))?;
@@ -276,6 +291,22 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
     }
 }
 
+/// Tenant tombstone and its cascade, matching `memory::apply_to`. Audit rows are untouched (the
+/// table is append-only), and the tenant row stays so its id is never reused.
+async fn delete_tenant(c: &mut PgConnection, id: &str, at: DateTime<Utc>) -> Result<(), StoreError> {
+    let tenant_at = |sql: &'static str| sqlx::query(sql).bind(id).bind(at);
+    exec(c, tenant_at("UPDATE tenant SET status = 'deleted', deleted_at = $2 WHERE id = $1 AND status = 'active'")).await?;
+    exec(c, tenant_at("UPDATE api_key SET revoked_at = $2 WHERE tenant_id = $1 AND revoked_at IS NULL")).await?;
+    exec(c, tenant_at("UPDATE datasource SET deleted_at = $2, connection = '{}' WHERE tenant_id = $1 AND deleted_at IS NULL")).await?;
+    exec(c, tenant_at("UPDATE node SET deleted_at = $2 WHERE tenant_id = $1 AND deleted_at IS NULL")).await?;
+    let tenant = |sql: &'static str| sqlx::query(sql).bind(id);
+    exec(c, tenant("DELETE FROM route WHERE tenant_id = $1")).await?;
+    // BYOK: drop the sealed ciphertext with its rows, and the tenant's wrapped DEK if one exists
+    // (crypto-shredding once per-tenant DEKs are in use).
+    exec(c, tenant("DELETE FROM provider_credential WHERE tenant_id = $1")).await?;
+    exec(c, tenant("DELETE FROM tenant_dek WHERE tenant_id = $1")).await
+}
+
 async fn exec<'q>(c: &mut PgConnection, q: sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>) -> Result<(), StoreError> {
     q.execute(&mut *c).await.map(|_| ()).map_err(db)
 }
@@ -283,13 +314,18 @@ async fn exec<'q>(c: &mut PgConnection, q: sqlx::query::Query<'q, Postgres, sqlx
 async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreError> {
     exec(
         c,
-        sqlx::query("INSERT INTO tenant (id, name, region, pii_default, settings, created_at) VALUES ($1, $2, $3, $4, $5, $6)")
-            .bind(&t.id)
-            .bind(&t.name)
-            .bind(&t.region)
-            .bind(enum_str(&t.pii_default))
-            .bind(Json(Value::Object(t.settings.clone())))
-            .bind(t.created_at),
+        sqlx::query(
+            "INSERT INTO tenant (id, name, region, pii_default, settings, created_at, status, deleted_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&t.id)
+        .bind(&t.name)
+        .bind(&t.region)
+        .bind(enum_str(&t.pii_default))
+        .bind(Json(Value::Object(t.settings.clone())))
+        .bind(t.created_at)
+        .bind(t.status.as_str())
+        .bind(t.deleted_at),
     )
     .await
 }
@@ -297,13 +333,14 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
 async fn insert_api_key(c: &mut PgConnection, k: &ApiKeyRecord) -> Result<(), StoreError> {
     exec(
         c,
-        sqlx::query("INSERT INTO api_key (id, tenant_id, name, prefix, sha256, created_at) VALUES ($1, $2, $3, $4, $5, $6)")
+        sqlx::query("INSERT INTO api_key (id, tenant_id, name, prefix, sha256, created_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(&k.id)
             .bind(&k.tenant_id)
             .bind(&k.name)
             .bind(&k.prefix)
             .bind(&k.hash)
-            .bind(k.created_at),
+            .bind(k.created_at)
+            .bind(k.revoked_at),
     )
     .await
 }
@@ -395,14 +432,18 @@ async fn set_routes(c: &mut PgConnection, tenant: &str, routes: &[RouteConfig]) 
 async fn insert_datasource(c: &mut PgConnection, d: &DatasourceRecord) -> Result<(), StoreError> {
     exec(
         c,
-        sqlx::query("INSERT INTO datasource (id, tenant_id, kind, name, status, connection, epoch) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-            .bind(&d.id)
-            .bind(&d.tenant_id)
-            .bind(&d.kind)
-            .bind(&d.name)
-            .bind(&d.status)
-            .bind(Json(d.connection.clone()))
-            .bind(i64_of(d.epoch)),
+        sqlx::query(
+            "INSERT INTO datasource (id, tenant_id, kind, name, status, connection, epoch, deleted_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&d.id)
+        .bind(&d.tenant_id)
+        .bind(&d.kind)
+        .bind(&d.name)
+        .bind(&d.status)
+        .bind(Json(d.connection.clone()))
+        .bind(i64_of(d.epoch))
+        .bind(d.deleted_at),
     )
     .await
 }
@@ -410,13 +451,14 @@ async fn insert_datasource(c: &mut PgConnection, d: &DatasourceRecord) -> Result
 async fn insert_node(c: &mut PgConnection, n: &NodeRecord) -> Result<(), StoreError> {
     exec(
         c,
-        sqlx::query("INSERT INTO node (id, tenant_id, name, version, spec, created_at) VALUES ($1, $2, $3, $4, $5, $6)")
+        sqlx::query("INSERT INTO node (id, tenant_id, name, version, spec, created_at, deleted_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(&n.id)
             .bind(&n.tenant_id)
             .bind(&n.name)
             .bind(i32::try_from(n.version).unwrap_or(i32::MAX))
             .bind(Json(n.spec.clone()))
-            .bind(n.created_at),
+            .bind(n.created_at)
+            .bind(n.deleted_at),
     )
     .await
 }
@@ -525,13 +567,18 @@ async fn rows(c: &mut PgConnection, sql: &'static str) -> Result<Vec<PgRow>, Sto
 async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     let mut st = State::default();
 
-    for r in rows(c, "SELECT id, name, region, pii_default, settings, created_at FROM tenant ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, name, region, pii_default, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
         st.tenants.push(Tenant {
             id: get(&r, "id")?,
             name: get(&r, "name")?,
             region: get(&r, "region")?,
             pii_default: parse_enum(get(&r, "pii_default")?)?,
             created_at: get(&r, "created_at")?,
+            status: match get::<String>(&r, "status")?.as_str() {
+                "deleted" => TenantStatus::Deleted,
+                _ => TenantStatus::Active,
+            },
+            deleted_at: get(&r, "deleted_at")?,
             settings: match get::<Json<Value>>(&r, "settings")?.0 {
                 Value::Object(m) => m,
                 _ => serde_json::Map::new(),
@@ -539,7 +586,8 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
         });
     }
 
-    for r in rows(c, "SELECT id, tenant_id, name, prefix, sha256, created_at FROM api_key WHERE revoked_at IS NULL ORDER BY ord").await? {
+    // Revoked keys are loaded too (listed with `include_revoked`); `render` leaves them out.
+    for r in rows(c, "SELECT id, tenant_id, name, prefix, sha256, created_at, revoked_at FROM api_key ORDER BY ord").await? {
         st.api_keys.push(ApiKeyRecord {
             id: get(&r, "id")?,
             tenant_id: get(&r, "tenant_id")?,
@@ -547,6 +595,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             prefix: get(&r, "prefix")?,
             hash: get(&r, "sha256")?,
             created_at: get(&r, "created_at")?,
+            revoked_at: get(&r, "revoked_at")?,
         });
     }
 
@@ -618,7 +667,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
         });
     }
 
-    for r in rows(c, "SELECT id, tenant_id, kind, name, status, connection, epoch FROM datasource ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, tenant_id, kind, name, status, connection, epoch, deleted_at FROM datasource ORDER BY ord").await? {
         st.datasources.push(DatasourceRecord {
             id: get(&r, "id")?,
             tenant_id: get(&r, "tenant_id")?,
@@ -627,10 +676,11 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             status: get(&r, "status")?,
             epoch: u64::try_from(get::<i64>(&r, "epoch")?).unwrap_or_default(),
             connection: get::<Json<Value>>(&r, "connection")?.0,
+            deleted_at: get(&r, "deleted_at")?,
         });
     }
 
-    for r in rows(c, "SELECT id, tenant_id, name, version, spec, created_at FROM node ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, tenant_id, name, version, spec, created_at, deleted_at FROM node ORDER BY ord").await? {
         st.nodes.push(NodeRecord {
             id: get(&r, "id")?,
             tenant_id: get(&r, "tenant_id")?,
@@ -638,6 +688,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             version: u32::try_from(get::<i32>(&r, "version")?).unwrap_or_default(),
             spec: get::<Json<Value>>(&r, "spec")?.0,
             created_at: get(&r, "created_at")?,
+            deleted_at: get(&r, "deleted_at")?,
         });
     }
 

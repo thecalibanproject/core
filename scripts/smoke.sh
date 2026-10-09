@@ -3,8 +3,8 @@
 # upstream (OpenAI-compatible + Anthropic Messages). Checks: PII never reaches an external model,
 # responses (incl. streams) are rehydrated, sovereign models get raw text, exact cache hits,
 # secrets are blocked, the Anthropic Messages API (translated and native passthrough), rate
-# limits (429 + retry-after), and keys / BYOK credentials created through the control plane work
-# on the data plane.
+# limits (429 + retry-after), keys / BYOK credentials created through the control plane work
+# on the data plane, and revoked keys / deleted tenants are rejected (401).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -207,7 +207,7 @@ tail -1 "$MOCK_LOG" | grep -q '"enable_thinking": false' && grep -q '"content": 
 echo "control plane → data plane"
 adm() { curl -s "http://127.0.0.1:$CP/api/v1$1" -H "authorization: Bearer $CALIBAN_ADMIN_TOKEN" -H 'content-type: application/json' "${@:2}"; }
 adm /tenants -d '{"name":"Globex"}' >/dev/null
-NEWKEY=$(adm /tenants/globex/api-keys -d '{"name":"smoke"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+read -r NEWKEY NEWKEY_ID < <(adm /tenants/globex/api-keys -d '{"name":"smoke"}' | python3 -c 'import sys,json;k=json.load(sys.stdin);print(k["key"],k["id"])')
 adm /tenants/globex/provider-keys -d "{\"kind\":\"openai_compatible\",\"label\":\"mockext\",\"base_url\":\"http://127.0.0.1:$MOCK_PORT/v1\",\"api_key\":\"sk-byok-globex-1234\",\"trust_tier\":\"t2_contracted\"}" | grep -q '"last4":"1234"' \
   && pass "BYOK key stored sealed (last4 only)" || fail "byok create"
 OUT=$(chat '{"model":"caliban/auto","messages":[{"role":"user","content":"hello there"}]}' "$NEWKEY")
@@ -223,4 +223,24 @@ python3 -c 'import sys,json;d=json.loads(sys.argv[1]);assert len(d["data"])==2 a
 OUT=$(curl -s "http://127.0.0.1:$DP/v1/rerank" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"model":"local/rerank","query":"red apple","documents":["blue sky","red apple pie","green apple"],"top_n":2,"return_documents":true}')
 python3 -c 'import sys,json;r=json.loads(sys.argv[1])["results"];assert [x["index"] for x in r]==[1,2] and r[0]["document"]["text"]=="red apple pie",r' "$OUT" && pass "/v1/rerank sorted, top_n, original documents" || fail "rerank: $OUT"
 adm "/usage?tenant_id=acme" | python3 -c 'import sys,json;t=json.load(sys.stdin)["totals"];assert t["requests"]>=5 and t["cache_hits"]>=1,t' && pass "usage metered" || fail "usage"
+
+echo "revocation and deletes"
+adm_code() { curl -s -o "$WORK/b" -w '%{http_code}' -X "$1" "http://127.0.0.1:$CP/api/v1$2" -H "authorization: Bearer $CALIBAN_ADMIN_TOKEN"; }
+dp_code() { curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DP/v1/models" -H "authorization: Bearer $1"; }
+read -r SPARE SPARE_ID < <(adm /tenants/globex/api-keys -d '{"name":"spare"}' | python3 -c 'import sys,json;k=json.load(sys.stdin);print(k["key"],k["id"])')
+[[ $(dp_code "$NEWKEY") == 200 && $(dp_code "$SPARE") == 200 ]] || fail "keys before revoke"
+CODE=$(adm_code DELETE "/tenants/acme/api-keys/$NEWKEY_ID")
+[[ $CODE == 404 ]] && grep -q '"not_found"' "$WORK/b" && pass "revoking another tenant's key → 404" || fail "cross-tenant revoke: $CODE $(cat "$WORK/b")"
+[[ $(adm_code DELETE "/tenants/globex/api-keys/$NEWKEY_ID") == 204 ]] && pass "key revoked (204)" || fail "revoke: $(cat "$WORK/b")"
+CODE=$(dp_code "$NEWKEY")
+[[ $CODE == 401 ]] && pass "revoked key rejected by the data plane (401)" || fail "revoked key still works: $CODE"
+[[ $(dp_code "$SPARE") == 200 ]] && pass "the tenant's other key still works" || fail "spare key"
+[[ $(adm_code DELETE "/tenants/globex/api-keys/$NEWKEY_ID") == 404 ]] && pass "repeat revoke → 404" || fail "repeat revoke: $(cat "$WORK/b")"
+adm "/tenants/globex/api-keys?include_revoked=true" | python3 -c 'import sys,json;k={x["id"]:x for x in json.load(sys.stdin)};assert k[sys.argv[1]]["revoked_at"] and k[sys.argv[2]]["revoked_at"] is None,k' "$NEWKEY_ID" "$SPARE_ID" \
+  && pass "revoked key kept for audit (revoked_at)" || fail "revoked listing"
+[[ $(adm_code DELETE /tenants/globex) == 204 ]] && pass "tenant deleted (204)" || fail "tenant delete: $(cat "$WORK/b")"
+[[ $(dp_code "$SPARE") == 401 ]] && pass "deleted tenant's keys rejected (401)" || fail "deleted tenant key still works"
+[[ $(adm_code GET /tenants/globex) == 404 && $(adm_code DELETE /tenants/globex) == 404 ]] && pass "deleted tenant → 404 (repeat delete too)" || fail "tombstone: $(cat "$WORK/b")"
+adm '/audit?limit=5' | python3 -c 'import sys,json;d=json.load(sys.stdin);a=[e["action"] for e in d["entries"]];assert d["chain_verified"] and a[:2]==["tenant.delete","api_key.revoke"],a' \
+  && pass "revoke and delete audited, chain verifies" || fail "audit: $(adm '/audit?limit=5')"
 echo "all smoke checks passed"

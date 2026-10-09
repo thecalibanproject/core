@@ -1,5 +1,7 @@
 //! `caliban` — one binary for every deployment shape (SaaS, VPC, air-gapped).
 
+#[cfg(test)]
+mod revocation_tests;
 mod split;
 
 use anyhow::{Context, Result};

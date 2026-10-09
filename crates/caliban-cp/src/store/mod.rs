@@ -15,6 +15,13 @@
 //! row → commit. An invalid result (e.g. deleting a model a route still uses) rolls back and
 //! nothing is written. The store keeps the committed [`State`] as a read cache and republishes the
 //! data-plane `Snapshot` from it.
+//!
+//! Deletes are soft where the row matters for audit: a revoked API key keeps its row
+//! (`revoked_at`), a deleted tenant is a tombstone (`status = deleted`, its id is never reused),
+//! and deleted datasources and nodes keep their rows (`deleted_at`). Tombstones stay in [`State`]
+//! so both backends agree on them, but they are never rendered into the data-plane snapshot and
+//! the API treats them as not found. Secrets are the exception: a deleted tenant's BYOK
+//! credentials are removed outright and a deleted datasource's `connection` is wiped.
 
 pub mod audit;
 pub mod memory;
@@ -34,6 +41,25 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantStatus {
+    #[default]
+    Active,
+    /// Tombstone: not rendered into the data plane, not reachable through the API (404), and
+    /// the id cannot be reused. Audit rows naming the tenant are kept.
+    Deleted,
+}
+
+impl TenantStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TenantStatus::Active => "active",
+            TenantStatus::Deleted => "deleted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Tenant {
     pub id: String,
@@ -41,6 +67,8 @@ pub struct Tenant {
     pub region: Option<String>,
     pub pii_default: PiiMode,
     pub created_at: DateTime<Utc>,
+    pub status: TenantStatus,
+    pub deleted_at: Option<DateTime<Utc>>,
     /// Extra `TenantConfig` fields from the config file (e.g. quotas), passed through to the
     /// data-plane snapshot unchanged.
     #[serde(skip)]
@@ -56,6 +84,8 @@ pub struct ApiKeyRecord {
     #[serde(skip)]
     pub hash: String,
     pub created_at: DateTime<Utc>,
+    /// Set when the key is revoked. The row is kept for audit; the hash leaves the snapshot.
+    pub revoked_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -83,6 +113,9 @@ pub struct DatasourceRecord {
     pub epoch: u64,
     #[serde(skip)]
     pub connection: Value,
+    /// Soft delete; deleted datasources are never returned by the API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -93,6 +126,10 @@ pub struct NodeRecord {
     pub version: u32,
     pub spec: Value,
     pub created_at: DateTime<Utc>,
+    /// Soft delete; deleted node versions are never returned by the API, and their version
+    /// numbers are not reused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -101,12 +138,16 @@ pub struct State {
     pub models: Vec<ModelEntry>,
     /// Deployment-wide providers, e.g. on-prem model servers shared by all tenants.
     pub shared_providers: Vec<SharedProvider>,
+    /// Includes tombstones (`status = deleted`); see [`State::tenant`].
     pub tenants: Vec<Tenant>,
+    /// Includes revoked keys (`revoked_at` set).
     pub api_keys: Vec<ApiKeyRecord>,
     pub provider_keys: Vec<ProviderKeyRecord>,
     /// Tenant → ordered routes (first model preferred, the rest are fallbacks).
     pub routes: BTreeMap<String, Vec<RouteConfig>>,
+    /// Includes soft-deleted rows (`deleted_at` set).
     pub datasources: Vec<DatasourceRecord>,
+    /// Includes soft-deleted rows (`deleted_at` set).
     pub nodes: Vec<NodeRecord>,
     pub ontologies: BTreeMap<String, Ontology>,
     /// Sequence number of the last audit row; doubles as the state version.
@@ -125,6 +166,8 @@ impl State {
                 region: None,
                 pii_default: t.pii_mode.unwrap_or(base.pii.default_mode),
                 created_at: now,
+                status: TenantStatus::Active,
+                deleted_at: None,
                 settings: tenant_settings(t),
             });
             for (i, h) in t.api_key_hashes.iter().enumerate() {
@@ -135,6 +178,7 @@ impl State {
                     prefix: "cal_…".into(),
                     hash: h.to_ascii_lowercase(),
                     created_at: now,
+                    revoked_at: None,
                 });
             }
             for p in &t.providers {
@@ -158,12 +202,54 @@ impl State {
         st
     }
 
+    /// An active tenant (tombstones are not found).
     pub fn tenant(&self, id: &str) -> Option<&Tenant> {
+        self.tenants.iter().find(|t| t.id == id && t.is_active())
+    }
+
+    /// Any tenant record, tombstones included (ids are never reused).
+    pub fn tenant_record(&self, id: &str) -> Option<&Tenant> {
         self.tenants.iter().find(|t| t.id == id)
     }
 
     pub fn has_tenant(&self, id: &str) -> bool {
         self.tenant(id).is_some()
+    }
+
+    pub fn active_api_key(&self, tenant_id: &str, id: &str) -> Option<&ApiKeyRecord> {
+        self.api_keys.iter().find(|k| k.tenant_id == tenant_id && k.id == id && k.is_active())
+    }
+
+    pub fn live_datasource(&self, tenant_id: &str, id: &str) -> Option<&DatasourceRecord> {
+        self.datasources.iter().find(|d| d.tenant_id == tenant_id && d.id == id && d.is_live())
+    }
+
+    pub fn live_node(&self, tenant_id: &str, id: &str) -> Option<&NodeRecord> {
+        self.nodes.iter().find(|n| n.tenant_id == tenant_id && n.id == id && n.is_live())
+    }
+}
+
+impl Tenant {
+    pub fn is_active(&self) -> bool {
+        self.status == TenantStatus::Active
+    }
+}
+
+impl ApiKeyRecord {
+    pub fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
+
+impl DatasourceRecord {
+    pub fn is_live(&self) -> bool {
+        self.deleted_at.is_none()
+    }
+}
+
+impl NodeRecord {
+    pub fn is_live(&self) -> bool {
+        self.deleted_at.is_none()
     }
 }
 
@@ -181,6 +267,8 @@ fn tenant_settings(t: &TenantConfig) -> Map<String, Value> {
 }
 
 /// Renders the data-plane config from control-plane state. `base` supplies process settings.
+/// Deleted tenants and revoked API keys are left out, so a router stops accepting them on the
+/// next snapshot it applies.
 pub fn render(base: &Config, st: &State) -> Result<Config, String> {
     let mut cfg = base.clone();
     cfg.models = st.models.clone();
@@ -188,6 +276,7 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
     cfg.tenants = st
         .tenants
         .iter()
+        .filter(|t| t.is_active())
         .map(|t| {
             let providers: Vec<ProviderConfig> = st
                 .provider_keys
@@ -211,7 +300,7 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
             obj.insert("pii_mode".into(), json!(t.pii_default));
             obj.insert(
                 "api_key_hashes".into(),
-                json!(st.api_keys.iter().filter(|k| k.tenant_id == t.id).map(|k| &k.hash).collect::<Vec<_>>()),
+                json!(st.api_keys.iter().filter(|k| k.tenant_id == t.id && k.is_active()).map(|k| &k.hash).collect::<Vec<_>>()),
             );
             obj.insert("providers".into(), serde_json::to_value(providers).map_err(|e| e.to_string())?);
             obj.insert("routes".into(), serde_json::to_value(st.routes.get(&t.id).cloned().unwrap_or_default()).map_err(|e| e.to_string())?);
@@ -244,6 +333,11 @@ pub enum StoreError {
 pub enum Mutation {
     CreateTenant(Tenant),
     CreateApiKey(ApiKeyRecord),
+    /// Soft revoke: `revoked_at = at`, the row is kept.
+    RevokeApiKey { tenant_id: String, id: String, at: DateTime<Utc> },
+    /// Tombstones the tenant and, in the same transaction, revokes its API keys, destroys its
+    /// BYOK credentials, removes its routes and soft-deletes its datasources and nodes.
+    DeleteTenant { id: String, at: DateTime<Utc> },
     CreateProviderKey(ProviderKeyRecord),
     DeleteProviderKey { tenant_id: String, id: String },
     CreateModel(ModelEntry),
@@ -253,8 +347,12 @@ pub enum Mutation {
     SetRoutes { tenant_id: String, routes: Vec<RouteConfig> },
     CreateDatasource(DatasourceRecord),
     SetDatasourceStatus { id: String, status: String },
+    /// Soft delete; the stored `connection` is wiped.
+    DeleteDatasource { tenant_id: String, id: String, at: DateTime<Utc> },
     /// `version` is assigned by the store (latest version for (tenant, name) + 1).
     CreateNode(NodeRecord),
+    /// Soft-deletes one node version.
+    DeleteNode { tenant_id: String, id: String, at: DateTime<Utc> },
     /// Upserts elements (e.g. proposals from the bootstrap job) as one new ontology version.
     ProposeOntology { tenant_id: String, elements: Vec<Element> },
     ReviewOntologyElement { id: String, status: Status },
@@ -262,7 +360,8 @@ pub enum Mutation {
 
 impl Mutation {
     /// What goes into the audit log. Never secrets: API keys show the prefix, BYOK keys last4.
-    pub fn audit(&self) -> AuditDraft {
+    /// `before` is the committed state the mutation applies to (deletes record what they removed).
+    pub fn audit(&self, before: &State) -> AuditDraft {
         let d = |tenant: Option<&str>, action, target: &str, detail| AuditDraft {
             tenant_id: tenant.map(str::to_owned),
             action,
@@ -272,6 +371,25 @@ impl Mutation {
         match self {
             Mutation::CreateTenant(t) => d(Some(&t.id), "tenant.create", &t.id, json!({"name": t.name})),
             Mutation::CreateApiKey(k) => d(Some(&k.tenant_id), "api_key.create", &k.id, json!({"name": k.name, "prefix": k.prefix})),
+            Mutation::RevokeApiKey { tenant_id, id, .. } => {
+                let k = before.active_api_key(tenant_id, id);
+                d(Some(tenant_id), "api_key.revoke", id, json!({"name": k.map(|k| &k.name), "prefix": k.map(|k| &k.prefix)}))
+            }
+            Mutation::DeleteTenant { id, .. } => {
+                let ids = |v: Vec<&String>| v.into_iter().cloned().collect::<Vec<_>>();
+                d(
+                    Some(id),
+                    "tenant.delete",
+                    id,
+                    json!({
+                        "api_keys_revoked": ids(before.api_keys.iter().filter(|k| &k.tenant_id == id && k.is_active()).map(|k| &k.id).collect()),
+                        "provider_keys_destroyed": ids(before.provider_keys.iter().filter(|p| &p.tenant_id == id).map(|p| &p.id).collect()),
+                        "routes_removed": before.routes.get(id).map(|r| r.iter().map(|r| r.intent.clone()).collect::<Vec<_>>()).unwrap_or_default(),
+                        "datasources_deleted": ids(before.datasources.iter().filter(|x| &x.tenant_id == id && x.is_live()).map(|x| &x.id).collect()),
+                        "nodes_deleted": ids(before.nodes.iter().filter(|x| &x.tenant_id == id && x.is_live()).map(|x| &x.id).collect()),
+                    }),
+                )
+            }
             Mutation::CreateProviderKey(p) => d(
                 Some(&p.tenant_id),
                 "provider_key.create",
@@ -301,7 +419,15 @@ impl Mutation {
                 d(Some(&ds.tenant_id), "datasource.create", &ds.id, json!({"kind": ds.kind, "name": ds.name}))
             }
             Mutation::SetDatasourceStatus { id, status } => d(None, "datasource.status", id, json!({"status": status})),
+            Mutation::DeleteDatasource { tenant_id, id, .. } => {
+                let ds = before.live_datasource(tenant_id, id);
+                d(Some(tenant_id), "datasource.delete", id, json!({"kind": ds.map(|x| &x.kind), "name": ds.map(|x| &x.name)}))
+            }
             Mutation::CreateNode(n) => d(Some(&n.tenant_id), "node.create", &n.id, json!({"name": n.name})),
+            Mutation::DeleteNode { tenant_id, id, .. } => {
+                let n = before.live_node(tenant_id, id);
+                d(Some(tenant_id), "node.delete", id, json!({"name": n.map(|x| &x.name), "version": n.map(|x| x.version)}))
+            }
             Mutation::ProposeOntology { tenant_id, elements } => d(
                 Some(tenant_id),
                 "ontology.propose",

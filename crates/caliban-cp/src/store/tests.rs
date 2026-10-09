@@ -71,8 +71,22 @@ fn ts() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap()
 }
 
+/// When deletes in the suite happen (fixed, so both backends store the same value).
+fn del_ts() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 2, 9, 30, 0).unwrap()
+}
+
 fn tenant(id: &str) -> Tenant {
-    Tenant { id: id.into(), name: id.to_uppercase(), region: Some("eu".into()), pii_default: PiiMode::Off, created_at: ts(), settings: Map::new() }
+    Tenant {
+        id: id.into(),
+        name: id.to_uppercase(),
+        region: Some("eu".into()),
+        pii_default: PiiMode::Off,
+        created_at: ts(),
+        status: TenantStatus::Active,
+        deleted_at: None,
+        settings: Map::new(),
+    }
 }
 
 fn model(v: Value) -> ModelEntry {
@@ -86,6 +100,10 @@ fn element(id: &str) -> Element {
         "spec": {"phrase": format!("{id} phrase"), "maps_to": "orders.total"}
     }))
     .unwrap()
+}
+
+fn node(id: &str, tenant: &str, name: &str) -> NodeRecord {
+    NodeRecord { id: id.into(), tenant_id: tenant.into(), name: name.into(), version: 0, spec: json!({"k": 1}), created_at: ts(), deleted_at: None }
 }
 
 async fn pg_backend() -> Option<PgBackend> {
@@ -136,6 +154,7 @@ async fn suite(s: &Store) {
         prefix: "cal_2222".into(),
         hash: "2".repeat(64),
         created_at: ts(),
+        revoked_at: None,
     };
     s.apply(A, Mutation::CreateApiKey(key.clone())).await.unwrap();
     assert_eq!(s.config.load().tenant_by_key_hash(&"2".repeat(64)).unwrap().id.as_str(), "globex");
@@ -223,6 +242,7 @@ async fn suite(s: &Store) {
         status: "pending".into(),
         epoch: 0,
         connection: json!({"uri": {"env": "SALES_URI"}}),
+        deleted_at: None,
     };
     s.apply(A, Mutation::CreateDatasource(ds.clone())).await.unwrap();
     assert!(matches!(s.apply(A, Mutation::CreateDatasource(DatasourceRecord { id: "ds_2".into(), ..ds })).await, Err(StoreError::Conflict(_))));
@@ -235,7 +255,7 @@ async fn suite(s: &Store) {
 
     // ── nodes: versions assigned by the store ──
     for id in ["node_1", "node_2"] {
-        let n = NodeRecord { id: id.into(), tenant_id: "globex".into(), name: "triage".into(), version: 0, spec: json!({"k": 1}), created_at: ts() };
+        let n = node(id, "globex", "triage");
         s.apply(A, Mutation::CreateNode(n)).await.unwrap();
     }
     assert_eq!(s.state().nodes.iter().map(|n| n.version).collect::<Vec<_>>(), [1, 2]);
@@ -252,6 +272,8 @@ async fn suite(s: &Store) {
     assert_eq!(o.version, 2);
     assert_eq!(o.elements.iter().map(|e| (e.id.as_str(), e.status)).collect::<Vec<_>>(), [("e_b", Status::Approved), ("e_a", Status::Proposed)]);
 
+    deletes(s).await;
+
     // ── concurrent writers: serialized, chain stays intact ──
     let writes = (0..8).map(|i| s.apply("ops", Mutation::CreateTenant(tenant(&format!("burst-{i}")))));
     for r in futures::future::join_all(writes).await {
@@ -264,10 +286,164 @@ async fn suite(s: &Store) {
     assert_eq!(log[0].action, "store.seed");
     assert!(verify_chain(&log).is_ok());
     let actions: Vec<&str> = log.iter().map(|e| e.action.as_str()).collect();
-    assert_eq!(actions.iter().filter(|a| **a == "tenant.create").count(), 9);
+    assert_eq!(actions.iter().filter(|a| **a == "tenant.create").count(), 10);
+    for a in ["api_key.revoke", "datasource.delete", "node.delete", "tenant.delete"] {
+        assert!(actions.contains(&a), "{a} is audited");
+    }
     assert!(!serde_json::to_string(&log).unwrap().contains("sk-test"));
     assert_eq!(s.audit(3).await.unwrap(), log[log.len() - 3..].to_vec());
     assert_eq!(s.config.load().version, format!("cp-{}", s.state().audit_head));
+}
+
+/// Revoke and delete semantics (run inside `suite`, so on both backends).
+async fn deletes(s: &Store) {
+    let not_found = |what: &str| StoreError::NotFound(what.into());
+    let revoke = |tenant: &str, id: &str| Mutation::RevokeApiKey { tenant_id: tenant.into(), id: id.into(), at: del_ts() };
+
+    // ── API key revoke: soft, the row stays, the hash leaves the snapshot ──
+    let head = s.state().audit_head;
+    assert_eq!(s.apply(A, revoke("acme", "key_g1")).await.unwrap_err(), not_found("api key"), "other tenant's key");
+    assert_eq!(s.apply(A, revoke("nobody", "key_g1")).await.unwrap_err(), not_found("tenant"));
+    assert_eq!(s.apply(A, revoke("globex", "key_nope")).await.unwrap_err(), not_found("api key"));
+    assert_eq!(s.state().audit_head, head, "failed deletes are not audited");
+    s.apply(A, revoke("globex", "key_g1")).await.unwrap();
+    assert!(s.config.load().tenant_by_key_hash(&"2".repeat(64)).is_none(), "revoked key is out of the snapshot");
+    assert_eq!(s.state().api_keys.iter().find(|k| k.id == "key_g1").unwrap().revoked_at, Some(del_ts()));
+    assert_eq!(s.apply(A, revoke("globex", "key_g1")).await.unwrap_err(), not_found("api key"), "repeat revoke is 404");
+    // A revoked key's hash can never be minted again.
+    let reuse = ApiKeyRecord {
+        id: "key_g2".into(),
+        tenant_id: "globex".into(),
+        name: "again".into(),
+        prefix: "cal_2222".into(),
+        hash: "2".repeat(64),
+        created_at: ts(),
+        revoked_at: None,
+    };
+    assert!(matches!(s.apply(A, Mutation::CreateApiKey(reuse)).await, Err(StoreError::Conflict(_))));
+    // Config-seeded keys can be revoked too.
+    s.apply(A, revoke("acme", "key_cfg_acme_0")).await.unwrap();
+    assert!(s.config.load().tenant_by_key_hash(KEY_HASH).is_none());
+    let audit = s.audit(1).await.unwrap();
+    assert_eq!((audit[0].action.as_str(), audit[0].actor.as_str()), ("api_key.revoke", A));
+    assert_eq!(audit[0].tenant_id.as_deref(), Some("acme"));
+
+    // ── datasource delete: tenant-scoped, soft, connection wiped, name freed ──
+    let del_ds = |tenant: &str, id: &str| Mutation::DeleteDatasource { tenant_id: tenant.into(), id: id.into(), at: del_ts() };
+    assert_eq!(s.apply(A, del_ds("acme", "ds_1")).await.unwrap_err(), not_found("datasource"), "other tenant's datasource");
+    s.apply(A, del_ds("globex", "ds_1")).await.unwrap();
+    let st = s.state();
+    let ds = st.datasources.iter().find(|d| d.id == "ds_1").unwrap();
+    assert_eq!((ds.deleted_at, &ds.connection), (Some(del_ts()), &json!({})));
+    assert_eq!(s.apply(A, del_ds("globex", "ds_1")).await.unwrap_err(), not_found("datasource"), "repeat delete is 404");
+    assert_eq!(
+        s.apply(A, Mutation::SetDatasourceStatus { id: "ds_1".into(), status: "introspecting".into() }).await.unwrap_err(),
+        not_found("datasource")
+    );
+    let again = DatasourceRecord {
+        id: "ds_3".into(),
+        tenant_id: "globex".into(),
+        kind: "mongodb".into(),
+        name: "sales".into(),
+        status: "pending".into(),
+        epoch: 0,
+        connection: json!({"uri": {"env": "SALES_URI_2"}}),
+        deleted_at: None,
+    };
+    s.apply(A, Mutation::CreateDatasource(again)).await.unwrap();
+
+    // ── node delete: one version, tenant-scoped; versions are not reused ──
+    let del_node = |tenant: &str, id: &str| Mutation::DeleteNode { tenant_id: tenant.into(), id: id.into(), at: del_ts() };
+    assert_eq!(s.apply(A, del_node("acme", "node_2")).await.unwrap_err(), not_found("node"));
+    s.apply(A, del_node("globex", "node_2")).await.unwrap();
+    assert_eq!(s.apply(A, del_node("globex", "node_2")).await.unwrap_err(), not_found("node"));
+    s.apply(A, Mutation::CreateNode(node("node_3", "globex", "triage"))).await.unwrap();
+    let st = s.state();
+    let live: Vec<(&str, u32)> = st.nodes.iter().filter(|n| n.is_live()).map(|n| (n.id.as_str(), n.version)).collect();
+    assert_eq!(live, [("node_1", 1), ("node_3", 3)]);
+
+    // ── tenant delete: tombstone + cascade ──
+    s.apply(A, Mutation::CreateTenant(tenant("doomed"))).await.unwrap();
+    let dkey = ApiKeyRecord {
+        id: "key_d1".into(),
+        tenant_id: "doomed".into(),
+        name: "ci".into(),
+        prefix: "cal_4444".into(),
+        hash: "4".repeat(64),
+        created_at: ts(),
+        revoked_at: None,
+    };
+    s.apply(A, Mutation::CreateApiKey(dkey)).await.unwrap();
+    let byok = ProviderKeyRecord {
+        id: "openai".into(),
+        tenant_id: "doomed".into(),
+        kind: ProviderKind::Openai,
+        label: "OpenAI".into(),
+        base_url: None,
+        trust_tier: TrustTier::T2Contracted,
+        last4: Some("1234".into()),
+        cache_salt: false,
+        created_at: ts(),
+        secret: Some(SecretRef::Sealed { sealed: sealed_blob() }),
+    };
+    s.apply(A, Mutation::CreateProviderKey(byok)).await.unwrap();
+    let routes = vec![RouteConfig { intent: "default".into(), models: vec!["ext/gpt".into(), "local/qwen".into()] }];
+    s.apply(A, Mutation::SetRoutes { tenant_id: "doomed".into(), routes }).await.unwrap();
+    let dds = DatasourceRecord {
+        id: "ds_d".into(),
+        tenant_id: "doomed".into(),
+        kind: "postgres".into(),
+        name: "erp".into(),
+        status: "pending".into(),
+        epoch: 0,
+        connection: json!({"password": "hunter2"}),
+        deleted_at: None,
+    };
+    s.apply(A, Mutation::CreateDatasource(dds)).await.unwrap();
+    s.apply(A, Mutation::CreateNode(node("node_d", "doomed", "triage"))).await.unwrap();
+    s.apply(A, Mutation::ProposeOntology { tenant_id: "doomed".into(), elements: vec![element("e_d")] }).await.unwrap();
+    assert!(s.config.load().tenant(&"doomed".into()).is_some());
+
+    let del_tenant = |id: &str| Mutation::DeleteTenant { id: id.into(), at: del_ts() };
+    assert_eq!(s.apply(A, del_tenant("nobody")).await.unwrap_err(), not_found("tenant"));
+    s.apply(A, del_tenant("doomed")).await.unwrap();
+    let st = s.state();
+    let t = st.tenant_record("doomed").unwrap();
+    assert_eq!((t.status, t.deleted_at), (TenantStatus::Deleted, Some(del_ts())));
+    assert!(st.tenant("doomed").is_none() && !st.has_tenant("doomed"));
+    assert_eq!(st.api_keys.iter().find(|k| k.id == "key_d1").unwrap().revoked_at, Some(del_ts()));
+    assert!(st.provider_keys.iter().all(|p| p.tenant_id != "doomed"), "BYOK credentials destroyed");
+    assert!(!st.routes.contains_key("doomed"));
+    let ds = st.datasources.iter().find(|d| d.id == "ds_d").unwrap();
+    assert_eq!((ds.deleted_at, &ds.connection), (Some(del_ts()), &json!({})));
+    assert_eq!(st.nodes.iter().find(|n| n.id == "node_d").unwrap().deleted_at, Some(del_ts()));
+    // Gone from the data plane: no tenant, no key.
+    let snap = s.config.load();
+    assert!(snap.tenant(&"doomed".into()).is_none());
+    assert!(snap.tenant_by_key_hash(&"4".repeat(64)).is_none());
+    assert!(snap.config.tenants.iter().all(|t| t.id.as_str() != "doomed"));
+    // The audit row lists what went, without secrets.
+    let a = &s.audit(1).await.unwrap()[0];
+    assert_eq!((a.action.as_str(), a.target.as_deref(), a.actor.as_str()), ("tenant.delete", Some("doomed"), A));
+    assert_eq!(
+        a.detail,
+        json!({"api_keys_revoked": ["key_d1"], "provider_keys_destroyed": ["openai"], "routes_removed": ["default"],
+               "datasources_deleted": ["ds_d"], "nodes_deleted": ["node_d"]})
+    );
+    // Everything tenant-scoped now 404s; the id cannot be reused; a repeat delete is 404.
+    assert_eq!(s.apply(A, del_tenant("doomed")).await.unwrap_err(), not_found("tenant"));
+    assert_eq!(s.apply(A, revoke("doomed", "key_d1")).await.unwrap_err(), not_found("tenant"));
+    let k5 = ApiKeyRecord { id: "key_d2".into(), tenant_id: "doomed".into(), hash: "5".repeat(64), ..ApiKeyRecord::clone(&st.api_keys[0]) };
+    assert_eq!(s.apply(A, Mutation::CreateApiKey(k5)).await.unwrap_err(), not_found("tenant"));
+    assert_eq!(s.apply(A, Mutation::CreateNode(node("node_x", "doomed", "x"))).await.unwrap_err(), not_found("tenant"));
+    assert_eq!(
+        s.apply(A, Mutation::ReviewOntologyElement { id: "e_d".into(), status: Status::Approved }).await.unwrap_err(),
+        not_found("ontology element")
+    );
+    assert_eq!(
+        s.apply(A, Mutation::CreateTenant(tenant("doomed"))).await.unwrap_err(),
+        StoreError::Conflict("tenant id 'doomed' belonged to a deleted tenant and cannot be reused".into())
+    );
 }
 
 /// Backend-independent view of the state (no timestamps of seeded rows).
@@ -377,6 +553,30 @@ async fn postgres_backend_matches_memory_and_persists() {
         .await
         .unwrap();
     assert_eq!(n, 1);
+
+    // Deletes at rest: rows kept for audit, secrets gone, tombstones final.
+    let scalar = |sql: &'static str| {
+        let pool = pool.clone();
+        async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(&pool).await.unwrap() }
+    };
+    assert_eq!(scalar("SELECT count(*) FROM api_key WHERE id IN ('key_g1', 'key_d1', 'key_cfg_acme_0') AND revoked_at IS NOT NULL").await, 3);
+    assert_eq!(scalar("SELECT count(*) FROM tenant WHERE id = 'doomed' AND status = 'deleted' AND deleted_at IS NOT NULL").await, 1);
+    assert_eq!(scalar("SELECT count(*) FROM provider_credential WHERE tenant_id = 'doomed'").await, 0, "BYOK ciphertext destroyed");
+    assert_eq!(scalar("SELECT count(*) FROM route WHERE tenant_id = 'doomed'").await, 0);
+    assert_eq!(scalar("SELECT count(*) FROM datasource WHERE id IN ('ds_1', 'ds_d') AND deleted_at IS NOT NULL AND connection = '{}'").await, 2);
+    assert_eq!(scalar("SELECT count(*) FROM node WHERE id IN ('node_2', 'node_d') AND deleted_at IS NOT NULL").await, 2);
+    assert_eq!(scalar("SELECT count(*) FROM audit_log WHERE tenant_id = 'doomed'").await, 8, "audit rows of a deleted tenant are kept");
+    assert!(sqlx::query("UPDATE api_key SET revoked_at = NULL WHERE id = 'key_g1'").execute(&pool).await.is_err());
+    assert!(sqlx::query("UPDATE tenant SET status = 'active', deleted_at = NULL WHERE id = 'doomed'").execute(&pool).await.is_err());
+    assert!(sqlx::query("UPDATE datasource SET deleted_at = NULL WHERE id = 'ds_1'").execute(&pool).await.is_err());
+    assert!(sqlx::query("UPDATE node SET deleted_at = NULL WHERE id = 'node_2'").execute(&pool).await.is_err());
+    // Live datasource names stay unique per tenant at the database level too.
+    assert!(
+        sqlx::query("INSERT INTO datasource (id, tenant_id, kind, name, connection) VALUES ('ds_dup', 'globex', 'mongodb', 'sales', '{}')")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

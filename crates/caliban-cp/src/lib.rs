@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use store::audit::{now_micros, verify_chain};
-use store::{ApiKeyRecord, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, Store, StoreError, Tenant, new_id, slug};
+use store::{ApiKeyRecord, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, Store, StoreError, Tenant, TenantStatus, new_id, slug};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
@@ -133,11 +133,14 @@ pub(crate) type ApiResult<T> = Result<T, ApiError>;
 pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
     let api = Router::new()
         .route("/tenants", get(list_tenants).post(create_tenant))
-        .route("/tenants/{tenant_id}", get(get_tenant))
+        .route("/tenants/{tenant_id}", get(get_tenant).delete(delete_tenant))
         .route("/tenants/{tenant_id}/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/tenants/{tenant_id}/api-keys/{key_id}", delete(revoke_api_key))
         .route("/tenants/{tenant_id}/provider-keys", get(list_provider_keys).post(create_provider_key))
         .route("/tenants/{tenant_id}/provider-keys/{key_id}", delete(delete_provider_key))
         .route("/tenants/{tenant_id}/routes", get(get_routes).put(put_routes))
+        .route("/tenants/{tenant_id}/datasources/{id}", delete(delete_datasource))
+        .route("/tenants/{tenant_id}/nodes/{id}", delete(delete_node))
         .route("/models", get(models::list_models).post(models::create_model))
         .route("/models/{*id}", delete(models::delete_model))
         .route("/providers", get(models::list_providers).post(models::create_provider))
@@ -278,8 +281,15 @@ async fn audit(State(cp): State<Cp>, Query(q): Query<AuditQuery>) -> ApiResult<J
 
 // ───────────────────────────── tenants & keys ─────────────────────────────
 
-async fn list_tenants(State(cp): State<Cp>) -> Json<Vec<Tenant>> {
-    Json(cp.store.state().tenants.clone())
+#[derive(Deserialize, Default)]
+struct TenantList {
+    #[serde(default)]
+    include_deleted: bool,
+}
+
+/// Active tenants; `?include_deleted=true` adds tombstones (`status: deleted`).
+async fn list_tenants(State(cp): State<Cp>, Query(q): Query<TenantList>) -> Json<Vec<Tenant>> {
+    Json(cp.store.state().tenants.iter().filter(|t| q.include_deleted || t.is_active()).cloned().collect())
 }
 
 #[derive(Deserialize)]
@@ -300,6 +310,8 @@ async fn create_tenant(State(cp): State<Cp>, Json(body): Json<TenantCreate>) -> 
         region: body.region,
         pii_default: body.pii_default.unwrap_or(cp.store.base().pii.default_mode),
         created_at: now_micros(),
+        status: TenantStatus::Active,
+        deleted_at: None,
         settings: serde_json::Map::new(),
     };
     cp.store.apply(ADMIN_ACTOR, Mutation::CreateTenant(t.clone())).await?;
@@ -310,13 +322,40 @@ async fn get_tenant(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiR
     cp.store.state().tenant(&tenant_id).cloned().map(Json).ok_or_else(|| not_found("tenant"))
 }
 
+/// Tombstones the tenant: revokes its API keys, destroys its BYOK credentials, removes its routes
+/// and soft-deletes its datasources and nodes, in one audited transaction. The tenant leaves the
+/// data-plane snapshot. A repeat delete is a 404, like every other delete.
+async fn delete_tenant(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiResult<StatusCode> {
+    cp.store.apply(ADMIN_ACTOR, Mutation::DeleteTenant { id: tenant_id, at: now_micros() }).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn ensure_tenant(cp: &ControlPlane, id: &str) -> ApiResult<()> {
     if cp.store.state().has_tenant(id) { Ok(()) } else { Err(not_found("tenant")) }
 }
 
-async fn list_api_keys(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiResult<Json<Vec<ApiKeyRecord>>> {
+#[derive(Deserialize, Default)]
+struct ApiKeyList {
+    #[serde(default)]
+    include_revoked: bool,
+}
+
+/// Active keys; `?include_revoked=true` adds revoked ones (with `revoked_at`).
+async fn list_api_keys(
+    State(cp): State<Cp>,
+    Path(tenant_id): Path<String>,
+    Query(q): Query<ApiKeyList>,
+) -> ApiResult<Json<Vec<ApiKeyRecord>>> {
     ensure_tenant(&cp, &tenant_id)?;
-    Ok(Json(cp.store.state().api_keys.iter().filter(|k| k.tenant_id == tenant_id).cloned().collect()))
+    let st = cp.store.state();
+    Ok(Json(st.api_keys.iter().filter(|k| k.tenant_id == tenant_id && (q.include_revoked || k.is_active())).cloned().collect()))
+}
+
+/// Soft revoke: the row is kept with `revoked_at`, and the key's hash leaves the data-plane
+/// snapshot (standalone: immediately; split mode: on the router's next snapshot poll).
+async fn revoke_api_key(State(cp): State<Cp>, Path((tenant_id, key_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    cp.store.apply(ADMIN_ACTOR, Mutation::RevokeApiKey { tenant_id, id: key_id, at: now_micros() }).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize, Default)]
@@ -337,6 +376,7 @@ async fn create_api_key(
         prefix: key.chars().take(8).collect(),
         hash: hash_api_key(&key),
         created_at: now_micros(),
+        revoked_at: None,
     };
     cp.store.apply(ADMIN_ACTOR, Mutation::CreateApiKey(rec.clone())).await?;
     let mut v = serde_json::to_value(&rec).unwrap_or_default();
@@ -438,7 +478,7 @@ struct TenantFilter {
 
 async fn list_datasources(State(cp): State<Cp>, Query(f): Query<TenantFilter>) -> Json<Vec<DatasourceRecord>> {
     let st = cp.store.state();
-    Json(st.datasources.iter().filter(|d| f.tenant_id.as_ref().is_none_or(|t| &d.tenant_id == t)).cloned().collect())
+    Json(st.datasources.iter().filter(|d| d.is_live() && f.tenant_id.as_ref().is_none_or(|t| &d.tenant_id == t)).cloned().collect())
 }
 
 #[derive(Deserialize)]
@@ -467,9 +507,16 @@ async fn create_datasource(State(cp): State<Cp>, Json(body): Json<DatasourceCrea
         status: "pending".into(),
         epoch: 0,
         connection: body.connection,
+        deleted_at: None,
     };
     cp.store.apply(ADMIN_ACTOR, Mutation::CreateDatasource(rec.clone())).await?;
     Ok((StatusCode::CREATED, Json(rec)))
+}
+
+/// Soft delete scoped to the tenant: the row is kept for audit, its stored connection is wiped.
+async fn delete_datasource(State(cp): State<Cp>, Path((tenant_id, id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    cp.store.apply(ADMIN_ACTOR, Mutation::DeleteDatasource { tenant_id, id, at: now_micros() }).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn introspect_datasource(State(cp): State<Cp>, Path(id): Path<String>) -> ApiResult<(StatusCode, Json<Value>)> {
@@ -516,7 +563,13 @@ async fn review_element(State(cp): State<Cp>, Path(id): Path<String>, Json(r): J
 
 async fn list_nodes(State(cp): State<Cp>, Query(f): Query<TenantFilter>) -> Json<Vec<NodeRecord>> {
     let st = cp.store.state();
-    Json(st.nodes.iter().filter(|n| f.tenant_id.as_ref().is_none_or(|t| &n.tenant_id == t)).cloned().collect())
+    Json(st.nodes.iter().filter(|n| n.is_live() && f.tenant_id.as_ref().is_none_or(|t| &n.tenant_id == t)).cloned().collect())
+}
+
+/// Soft-deletes one node version, scoped to the tenant. Its version number is not reused.
+async fn delete_node(State(cp): State<Cp>, Path((tenant_id, id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    cp.store.apply(ADMIN_ACTOR, Mutation::DeleteNode { tenant_id, id, at: now_micros() }).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -532,7 +585,15 @@ async fn create_node(State(cp): State<Cp>, Json(body): Json<NodeCreate>) -> ApiR
         serde_json::from_value(body.spec.clone()).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid node spec: {e}")))?;
     spec.validate().map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let id = new_id("node");
-    let rec = NodeRecord { id: id.clone(), tenant_id: body.tenant_id, name: body.name, version: 0, spec: body.spec, created_at: now_micros() };
+    let rec = NodeRecord {
+        id: id.clone(),
+        tenant_id: body.tenant_id,
+        name: body.name,
+        version: 0,
+        spec: body.spec,
+        created_at: now_micros(),
+        deleted_at: None,
+    };
     let st = cp.store.apply(ADMIN_ACTOR, Mutation::CreateNode(rec)).await?;
     let created = st.nodes.iter().find(|n| n.id == id).cloned().ok_or_else(|| not_found("node"))?;
     Ok((StatusCode::CREATED, Json(created)))
@@ -650,6 +711,127 @@ mod tests {
         assert!(c.store.state().provider_keys.iter().any(|p| p.id == "local-llm"));
     }
 
+    /// The error envelope every failed admin call returns.
+    fn is_error(v: &Value, kind: &str) -> bool {
+        v["error"]["type"] == kind && v["error"]["message"].is_string()
+    }
+
+    #[tokio::test]
+    async fn revoked_api_key_leaves_the_snapshot_and_is_audited() {
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
+        let (_, k) = call(&app, "POST", "/api/v1/tenants/globex/api-keys", Some(json!({"name": "ci"})), true).await;
+        let (key, id) = (k["key"].as_str().unwrap().to_owned(), k["id"].as_str().unwrap().to_owned());
+        let hash = hash_api_key(&key);
+        assert!(c.store.config.load().tenant_by_key_hash(&hash).is_some());
+
+        let uri = format!("/api/v1/tenants/globex/api-keys/{id}");
+        assert_eq!(call(&app, "DELETE", &uri, None, false).await.0, StatusCode::UNAUTHORIZED);
+        // Unknown key, or a key of another tenant: 404 in the standard envelope.
+        let (s, e) = call(&app, "DELETE", "/api/v1/tenants/globex/api-keys/key_nope", None, true).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert!(is_error(&e, "not_found"), "{e}");
+        assert_eq!(call(&app, "DELETE", &format!("/api/v1/tenants/acme/api-keys/{id}"), None, true).await.0, StatusCode::NOT_FOUND);
+        assert!(c.store.config.load().tenant_by_key_hash(&hash).is_some(), "failed revokes change nothing");
+
+        let (s, body) = call(&app, "DELETE", &uri, None, true).await;
+        assert_eq!((s, body), (StatusCode::NO_CONTENT, Value::Null));
+        // Standalone: the data plane shares this handle, so the very next request sees it.
+        assert!(c.store.config.load().tenant_by_key_hash(&hash).is_none());
+        // Idempotency: a repeat revoke is a 404 (the key is no longer active).
+        assert_eq!(call(&app, "DELETE", &uri, None, true).await.0, StatusCode::NOT_FOUND);
+
+        // Hidden from the default listing, kept (with revoked_at) for audit.
+        let (_, list) = call(&app, "GET", "/api/v1/tenants/globex/api-keys", None, true).await;
+        assert_eq!(list, json!([]));
+        let (_, list) = call(&app, "GET", "/api/v1/tenants/globex/api-keys?include_revoked=true", None, true).await;
+        assert_eq!(list[0]["id"], id.as_str());
+        assert!(list[0]["revoked_at"].is_string() && list[0].get("hash").is_none());
+
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=5", None, true).await;
+        assert_eq!(a["chain_verified"], true);
+        let e = &a["entries"][0];
+        assert_eq!((&e["action"], &e["actor"], &e["tenant_id"], &e["target"]), (&json!("api_key.revoke"), &json!("admin"), &json!("globex"), &json!(id)));
+        assert_eq!(e["detail"], json!({"name": "ci", "prefix": &key[..8]}));
+        assert!(!a.to_string().contains(&key[8..]));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_tenant_tombstones_it_and_cascades() {
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        for _ in 0..2 {
+            call(&app, "POST", "/api/v1/tenants/acme/api-keys", Some(json!({})), true).await;
+        }
+        let seeded: Vec<String> = c.store.config.load().tenant(&"acme".into()).unwrap().api_key_hashes.clone();
+        assert!(seeded.len() >= 2);
+        let (_, ds) = call(&app, "POST", "/api/v1/datasources", Some(json!({"tenant_id": "acme", "kind": "mongodb", "name": "sales", "connection": {"uri": "mongodb://u:p@h"}})), true).await;
+        assert_eq!(call(&app, "DELETE", "/api/v1/tenants/nobody", None, true).await.0, StatusCode::NOT_FOUND);
+
+        assert_eq!(call(&app, "DELETE", "/api/v1/tenants/acme", None, true).await.0, StatusCode::NO_CONTENT);
+        let snap = c.store.config.load();
+        assert!(snap.tenant(&"acme".into()).is_none());
+        assert!(seeded.iter().all(|h| snap.tenant_by_key_hash(h).is_none()), "every key of the tenant is revoked");
+        let st = c.store.state();
+        assert!(st.provider_keys.iter().all(|p| p.tenant_id != "acme"));
+        assert!(!st.routes.contains_key("acme"));
+        assert!(st.datasources.iter().all(|d| d.deleted_at.is_some() && d.connection == json!({})));
+
+        // The tombstone is a 404 everywhere, hidden from the list unless asked for.
+        assert_eq!(call(&app, "GET", "/api/v1/tenants/acme", None, true).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(call(&app, "GET", "/api/v1/tenants/acme/api-keys", None, true).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(call(&app, "GET", "/api/v1/tenants/acme/routes", None, true).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(call(&app, "POST", "/api/v1/tenants/acme/api-keys", Some(json!({})), true).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(call(&app, "GET", "/api/v1/datasources?tenant_id=acme", None, true).await.1, json!([]));
+        let ds_id = ds["id"].as_str().unwrap();
+        assert_eq!(call(&app, "POST", &format!("/api/v1/datasources/{ds_id}/introspect"), None, true).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(call(&app, "GET", "/api/v1/tenants", None, true).await.1, json!([]));
+        let (_, all) = call(&app, "GET", "/api/v1/tenants?include_deleted=true", None, true).await;
+        assert_eq!((&all[0]["id"], &all[0]["status"]), (&json!("acme"), &json!("deleted")));
+        assert!(all[0]["deleted_at"].is_string());
+        // Repeat delete: 404. The id cannot be reused.
+        assert_eq!(call(&app, "DELETE", "/api/v1/tenants/acme", None, true).await.0, StatusCode::NOT_FOUND);
+        let (s, e) = call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Acme"})), true).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert!(is_error(&e, "conflict"), "{e}");
+
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=20", None, true).await;
+        assert_eq!(a["chain_verified"], true);
+        let del = a["entries"].as_array().unwrap().iter().find(|e| e["action"] == "tenant.delete").unwrap();
+        assert_eq!((&del["actor"], &del["target"]), (&json!("admin"), &json!("acme")));
+        assert_eq!(del["detail"]["datasources_deleted"], json!([ds_id]));
+        // The tenant's earlier audit rows are still there.
+        assert!(a["entries"].as_array().unwrap().iter().any(|e| e["action"] == "datasource.create" && e["tenant_id"] == "acme"));
+    }
+
+    #[tokio::test]
+    async fn datasource_and_node_deletes_are_tenant_scoped() {
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
+        let (_, ds) = call(&app, "POST", "/api/v1/datasources", Some(json!({"tenant_id": "acme", "kind": "postgres", "name": "erp", "connection": {}})), true).await;
+        let spec = json!({"kind": "agent", "prompt": {"system": "x"}, "model_policy": {}, "tools": [],
+                          "budgets": {"steps": 3, "tokens": 100, "wall_clock_s": 10}});
+        let (s, n) = call(&app, "POST", "/api/v1/nodes", Some(json!({"tenant_id": "acme", "name": "triage", "spec": spec})), true).await;
+        assert_eq!(s, StatusCode::CREATED, "{n}");
+        for (kind, id) in [("datasources", ds["id"].as_str().unwrap()), ("nodes", n["id"].as_str().unwrap())] {
+            let own = format!("/api/v1/tenants/acme/{kind}/{id}");
+            assert_eq!(call(&app, "DELETE", &own, None, false).await.0, StatusCode::UNAUTHORIZED);
+            let (s, e) = call(&app, "DELETE", &format!("/api/v1/tenants/globex/{kind}/{id}"), None, true).await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{kind}: another tenant's id");
+            assert!(is_error(&e, "not_found"));
+            assert_eq!(call(&app, "DELETE", &format!("/api/v1/tenants/acme/{kind}/nope"), None, true).await.0, StatusCode::NOT_FOUND);
+            assert_eq!(call(&app, "DELETE", &own, None, true).await.0, StatusCode::NO_CONTENT);
+            assert_eq!(call(&app, "DELETE", &own, None, true).await.0, StatusCode::NOT_FOUND, "{kind}: repeat delete");
+            assert_eq!(call(&app, "GET", &format!("/api/v1/{kind}?tenant_id=acme"), None, true).await.1, json!([]));
+        }
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=2", None, true).await;
+        let actions: Vec<&str> = a["entries"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+        assert_eq!(actions, ["node.delete", "datasource.delete"]);
+        assert_eq!(a["entries"][0]["detail"], json!({"name": "triage", "version": 1}));
+    }
+
     #[tokio::test]
     async fn snapshot_endpoint_signs_and_supports_etags() {
         let (seed, public) = generate_signing_key();
@@ -690,5 +872,26 @@ mod tests {
         let (s, etag2, _) = get("Bearer router-secret", etag.clone()).await;
         assert_eq!(s, StatusCode::OK);
         assert_ne!(etag, etag2);
+
+        // Split mode: a revoked key is gone from the next signed snapshot a router fetches.
+        let (_, k) = call(&app, "POST", "/api/v1/tenants/initech/api-keys", Some(json!({})), true).await;
+        let hash = hash_api_key(k["key"].as_str().unwrap());
+        let verify = |body: &[u8]| {
+            let signed: caliban_config::signing::SignedSnapshot = serde_json::from_slice(body).unwrap();
+            SnapshotVerifier::from_b64_list(&public).unwrap().verify(&signed).unwrap()
+        };
+        let (_, etag3, body) = get("Bearer router-secret", None).await;
+        assert!(Snapshot::new(verify(&body).config, "t").tenant_by_key_hash(&hash).is_some());
+        let uri = format!("/api/v1/tenants/initech/api-keys/{}", k["id"].as_str().unwrap());
+        assert_eq!(call(&app, "DELETE", &uri, None, true).await.0, StatusCode::NO_CONTENT);
+        let (s, etag4, body) = get("Bearer router-secret", etag3.clone()).await;
+        assert_eq!(s, StatusCode::OK, "a revoke changes the snapshot (no 304)");
+        assert_ne!(etag3, etag4);
+        let payload = verify(&body);
+        assert!(Snapshot::new(payload.config.clone(), "t").tenant_by_key_hash(&hash).is_none());
+        // A deleted tenant leaves the snapshot entirely.
+        assert_eq!(call(&app, "DELETE", "/api/v1/tenants/initech", None, true).await.0, StatusCode::NO_CONTENT);
+        let (_, _, body) = get("Bearer router-secret", etag4).await;
+        assert!(verify(&body).config.tenants.iter().all(|t| t.id.as_str() != "initech"));
     }
 }

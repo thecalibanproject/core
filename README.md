@@ -44,6 +44,19 @@ The model id `caliban/auto` lets Caliban choose: the request is classified into 
 
 Control-plane endpoints (`:8081`) live under `/api/v1/*` and are specified in [`api/openapi.yaml`](api/openapi.yaml): tenants, tenant API keys, BYOK provider keys, routes, the model catalogue and shared providers (with health checks and model discovery), datasources and introspection, the ontology review queue, nodes, usage, the audit log, health, and signed snapshots for split-mode routers. When a built console is available (`CALIBAN_WEB_DIR` or `[server] web_dir`), it is served at `/`.
 
+Deletes (admin token):
+
+| Endpoint | Effect |
+|---|---|
+| `DELETE /api/v1/tenants/{tenantId}` | Tombstones the tenant (`status: deleted`; the id is never reused), revokes all its API keys, destroys its BYOK credentials, removes its routes, and soft-deletes its datasources and nodes |
+| `DELETE /api/v1/tenants/{tenantId}/api-keys/{keyId}` | Revokes the key: the row is kept with `revoked_at`, and the key is rejected (`401`) on the data plane |
+| `DELETE /api/v1/tenants/{tenantId}/provider-keys/{keyId}` | Removes a BYOK credential (`409` while a route still needs it) |
+| `DELETE /api/v1/tenants/{tenantId}/datasources/{datasourceId}` | Soft-deletes the datasource and wipes its stored connection settings |
+| `DELETE /api/v1/tenants/{tenantId}/nodes/{nodeId}` | Soft-deletes one node version (its version number is not reused) |
+| `DELETE /api/v1/models/{modelId}`, `DELETE /api/v1/providers/{providerId}` | Removes a catalogue model or shared provider (`409` while referenced) |
+
+Every delete returns `204` and writes one audit row. An unknown id, an id that belongs to another tenant, or one that was already deleted returns `404` in the standard error envelope, so a repeat delete is always `404` and is not audited. Revoked keys and deleted tenants are hidden from listings unless asked for (`?include_revoked=true`, `?include_deleted=true`).
+
 ### Request pipeline
 
 One pipeline serves both API shapes. OpenAI and Anthropic requests are decoded into a canonical IR (unknown fields pass through), then:
@@ -184,6 +197,8 @@ With Postgres, the config file seeds the database **once**, on the first start a
 
 Every mutation is one transaction: apply the change, render and validate the data-plane config (an invalid result, such as deleting a model a route uses, rolls back with 409 or 422), append an `audit_log` row (`hash = sha256(prev_hash ‖ canonical row)`, append-only trigger), commit. `GET /api/v1/audit?limit=` returns the newest rows and `chain_verified`. BYOK keys are sealed with AES-256-GCM under `CALIBAN_KEK` before they reach the store; `{env}` and `{file}` references from the file are stored as references.
 
+Deletes keep what audit needs and drop secrets. A revoked API key keeps its row (`revoked_at`); a deleted tenant stays as a tombstone (`status = 'deleted'`, `deleted_at`), and its audit rows are never touched; deleted datasources and nodes keep their rows (`deleted_at`). A deleted tenant's `provider_credential` rows (the sealed BYOK ciphertext) and `tenant_dek` row are deleted, and a deleted datasource's `connection` is replaced with `{}`. Triggers make revocations and tombstones final. Revoked keys and deleted tenants are left out of the rendered snapshot: in `standalone` the data plane rejects them on the next request, and a split-mode router rejects them once it applies its next snapshot poll. With the in-memory store, the config file reseeds tenants and keys at every start, so a revoked config-file key is valid again after a restart until its hash is removed from the file.
+
 Several control-plane replicas can share one database. Writes are serialised with an advisory lock, and each replica reloads when the audit head moves (every 5 s, and on every snapshot request). The control plane connects as the schema owner (or a `BYPASSRLS` role); row-level security policies apply to tenant-scoped roles.
 
 ### Split mode
@@ -230,8 +245,8 @@ docker run -d --rm -p 55432:5432 -e POSTGRES_PASSWORD=x --name caliban-pg-test p
 CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres cargo test -p caliban-cp
 ```
 
-- **`scripts/smoke.sh`** runs `caliban standalone` against `scripts/mock_upstream.py`. It checks that PII never reaches an external model, responses and streams are rehydrated, sovereign models get raw text, the exact cache hits, credentials in prompts are blocked, the Anthropic Messages API works (translated and native passthrough), rate limits return `429` with `retry-after`, and keys and BYOK credentials created through the control plane work on the data plane. Needs `python3`, `curl` and `shasum`. With `CALIBAN_PII_NER_DIR` set, it builds with `ner` and adds name-protection checks.
-- **`scripts/split-smoke.sh`** checks that the control plane seeds Postgres and signs snapshots; that a router with no config file picks up a tenant, key and BYOK credential created on the control plane within the poll interval; that the audit chain verifies; that killing the control plane leaves the router serving; that a router restarted while the control plane is down serves from its snapshot cache; and that a restarted control plane keeps its state. Needs Docker, `python3` and `curl`. Set `SPLIT_DATABASE_URL` to use an existing database.
+- **`scripts/smoke.sh`** runs `caliban standalone` against `scripts/mock_upstream.py`. It checks that PII never reaches an external model, responses and streams are rehydrated, sovereign models get raw text, the exact cache hits, credentials in prompts are blocked, the Anthropic Messages API works (translated and native passthrough), rate limits return `429` with `retry-after`, keys and BYOK credentials created through the control plane work on the data plane, and a revoked key or a deleted tenant's key gets `401`. Needs `python3`, `curl` and `shasum`. With `CALIBAN_PII_NER_DIR` set, it builds with `ner` and adds name-protection checks.
+- **`scripts/split-smoke.sh`** checks that the control plane seeds Postgres and signs snapshots; that a router with no config file picks up a tenant, key and BYOK credential created on the control plane within the poll interval; that the audit chain verifies; that killing the control plane leaves the router serving; that a router restarted while the control plane is down serves from its snapshot cache; that a restarted control plane keeps its state; and that a key revoked and a tenant deleted on the control plane get `401` from the router after its next poll. Needs Docker, `python3` and `curl`. Set `SPLIT_DATABASE_URL` to use an existing database.
 - **`scripts/mongo-it.sh`** starts `mongo:8` as a single-node replica set with auth (container `caliban-mongo-test`, port 27018), runs `cargo test -p caliban-replica --test mongo_it -- --nocapture`, then removes the container. The test ([`crates/caliban-replica/tests/mongo_it.rs`](crates/caliban-replica/tests/mongo_it.rs)) seeds `orders` (embedded `lines`, `customerId` references) and `customers`, creates a read-only user, and checks that:
   1. `verify_read_only` accepts the `read`-role user and refuses the admin user, and the replica set is detected;
   2. introspection and `bootstrap::propose` find `Order`, `OrderLine` (embedded), `Customer`, the attribute bindings, and `Order.customer_id->Customer`;
@@ -247,13 +262,14 @@ Known gaps:
 
 - Usage events stay on each router (its WAL and in-memory ring); in split mode, the control plane's `/usage` only sees its own process.
 - No per-tenant data-encryption keys yet (`tenant_dek` is unused): BYOK keys are sealed directly under `CALIBAN_KEK`.
-- Delete endpoints for tenants, API keys, datasources and nodes are missing.
+- Deleting a tenant removes its sealed BYOK ciphertext from the live tables, but Postgres keeps dead row versions until `VACUUM`, and WAL archives and backups keep their copies. Crypto-shredding needs per-tenant DEKs (above).
+- Revocation in split mode takes effect on the router's next snapshot poll (`CALIBAN_SNAPSHOT_POLL_SECS`, default 10 s), not instantly.
 - Quotas are in-memory per process; the Valkey store for multi-router deployments is stubbed.
 - No Prometheus metrics endpoint yet.
 
 Next, in order:
 
-1. Control plane: per-tenant DEKs, OIDC actors in the audit log, usage shipping from routers to the control plane, push (long-poll) instead of polling, delete endpoints.
+1. Control plane: per-tenant DEKs (so a tenant delete crypto-shreds its BYOK keys), OIDC actors in the audit log, usage shipping from routers to the control plane, push (long-poll) instead of polling (faster revocation in split mode).
 2. MongoDB connector: wire `introspect` and `propose` into the control plane's introspection job; `$jsonSchema`-declared types; map and scalar-array attributes; per-shard sampling.
 3. CDC replica and planner: connect the planner to the `explain` gate and replica lag in a query service; delta Parquet with compaction instead of whole-table rewrites; resume from the manifest after a restart (today it re-snapshots); parallel `_id`-range snapshots; arrays nested in arrays.
 4. PII: tenant-scoped surrogates so pseudonymised requests can hit the cache; licence sign-off on the NER model's fine-tuning data (see `MODELS.md`).

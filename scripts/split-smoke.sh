@@ -4,7 +4,8 @@
 # signs snapshots; the router (no config file) picks up a tenant/key/BYOK credential created on
 # the CP within the poll interval; the audit chain verifies; killing the CP leaves the router
 # serving (fail-static); a router restarted while the CP is down serves from its snapshot cache;
-# a restarted CP keeps its state (Postgres is the source of truth) and the router resyncs.
+# a restarted CP keeps its state (Postgres is the source of truth) and the router resyncs; a key
+# revoked and a tenant deleted on the CP are rejected (401) by the router after its next poll.
 #
 # Needs docker (Postgres 17), python3, curl. Set SPLIT_DATABASE_URL to use an existing database
 # instead of a throwaway container.
@@ -141,4 +142,17 @@ adm /tenants -d '{"name":"Initech"}' >/dev/null
 K3=$(adm /tenants/initech/api-keys -d '{}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
 adm /tenants/initech/routes -X PUT -d '{"routes":[{"intent":"default","models":["local/mock"]}]}' | grep -q 'local/mock' && pass "routes set via CP" || fail "routes"
 wait_key "$K3" $(( POLL * 3 + 2 )) && pass "router resynced after the CP came back" || fail "resync: $(cat "$WORK/out")"
+
+echo "revocation reaches the router"
+# Waits up to N seconds for a key to be rejected (401) by the router.
+wait_401() { for _ in $(seq $(( $2 * 10 ))); do [[ $(chat_code "$1") == 401 ]] && return 0; sleep 0.1; done; return 1; }
+K3_ID=$(adm /tenants/initech/api-keys | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "http://127.0.0.1:$CP/api/v1/tenants/initech/api-keys/$K3_ID" -H "authorization: Bearer $CALIBAN_ADMIN_TOKEN")
+[[ $CODE == 204 ]] || fail "revoke: $CODE"
+START=$(python3 -c 'import time;print(time.time())')
+wait_401 "$K3" $(( POLL * 3 + 2 )) && pass "revoked key rejected by the router (401) within $(python3 -c "import time;print(round(time.time()-$START,1))")s (poll ${POLL}s)" || fail "revoked key still accepted: $(chat_code "$K3")"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "http://127.0.0.1:$CP/api/v1/tenants/globex" -H "authorization: Bearer $CALIBAN_ADMIN_TOKEN")
+[[ $CODE == 204 ]] || fail "tenant delete: $CODE"
+wait_401 "$NEWKEY" $(( POLL * 3 + 2 )) && pass "deleted tenant's key rejected by the router (401)" || fail "deleted tenant key still accepted"
+[[ $(chat_code "$KEY") == 200 ]] && pass "other tenants unaffected" || fail "seeded key after deletes: $(cat "$WORK/out")"
 echo "all split-mode smoke checks passed"

@@ -7,6 +7,13 @@ info:
     - **Data plane** (port 8080): OpenAI-compatible inference API with Caliban extensions.
     - **Control plane** (port 8081): admin API used by the web console and SDKs.
     This file is the contract for `web/`, `sdk-typescript/` and `sdk-python/`.
+
+    **Deletes (control plane).** A successful `DELETE` returns `204` with no body and writes one
+    hash-chained audit row. `404` (standard error envelope, `error.type` = `not_found`) means the
+    id is unknown, belongs to another tenant, or was already deleted: repeat deletes are always
+    `404`, never a second `204`, and write no audit row. Tenants, API keys, datasources and nodes
+    are soft-deleted (rows kept for audit, never returned again by default); secrets they held
+    are destroyed.
 servers:
   - url: http://localhost:8080
     description: Data plane
@@ -274,6 +281,12 @@ paths:
     get:
       tags: [tenants]
       summary: List tenants
+      description: Active tenants. Deleted tenants (tombstones) are included only with `include_deleted=true`.
+      parameters:
+        - name: include_deleted
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
       responses:
         '200':
           description: OK
@@ -300,6 +313,7 @@ paths:
     get:
       tags: [tenants]
       summary: Get a tenant
+      description: A deleted tenant is a 404.
       responses:
         '200':
           description: OK
@@ -307,18 +321,39 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Tenant' }
         '404': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [tenants]
+      summary: Delete a tenant (tombstone)
+      description: |
+        In one audited transaction (`tenant.delete`): the tenant becomes a tombstone
+        (`status: deleted`, `deleted_at` set), all its API keys are revoked, its BYOK provider
+        credentials are destroyed (sealed ciphertext removed), its routes are removed, and its
+        datasources (connection settings wiped) and nodes are soft-deleted. The tenant leaves the
+        data-plane snapshot, so routers reject its keys from their next snapshot. Audit rows are
+        kept. The tenant id cannot be reused (`POST /api/v1/tenants` with the same name is a 409).
+        Every tenant-scoped endpoint returns 404 for a deleted tenant.
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/api-keys:
     parameters: [ { $ref: '#/components/parameters/TenantId' } ]
     get:
       tags: [tenants]
       summary: List the tenant's Caliban API keys (metadata only)
+      description: Active keys. Revoked keys (with `revoked_at`) are included only with `include_revoked=true`.
+      parameters:
+        - name: include_revoked
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
       responses:
         '200':
           description: OK
           content:
             application/json:
               schema: { type: array, items: { $ref: '#/components/schemas/ApiKeyInfo' } }
+        '404': { $ref: '#/components/responses/Error' }
     post:
       tags: [tenants]
       summary: Mint a Caliban API key. The plaintext is returned exactly once.
@@ -335,6 +370,60 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiKeyCreated' }
+
+  /api/v1/tenants/{tenantId}/api-keys/{keyId}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - name: keyId
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [tenants]
+      summary: Revoke a Caliban API key
+      description: |
+        Soft revoke (`api_key.revoke` audit row): the key keeps its row with `revoked_at` set and
+        its hash leaves the data-plane snapshot. A standalone deployment rejects the key (401) on
+        the next request; a split-mode router rejects it after its next snapshot poll
+        (`CALIBAN_SNAPSHOT_POLL_SECS`, default 10 s). A revoked key's hash can never be reused.
+      responses:
+        '204': { description: Revoked }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/datasources/{datasourceId}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - name: datasourceId
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [datasources]
+      summary: Delete a datasource
+      description: |
+        Soft delete (`datasource.delete` audit row), scoped to the tenant in the path: the row is
+        kept with its stored connection settings wiped, it is no longer listed or introspectable,
+        and its name can be used again.
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/nodes/{nodeId}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - name: nodeId
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [nodes]
+      summary: Delete a node version
+      description: |
+        Soft-deletes one node version (`node.delete` audit row), scoped to the tenant in the path.
+        It is no longer listed; its version number is not reused by later versions.
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/provider-keys:
     parameters: [ { $ref: '#/components/parameters/TenantId' } ]
@@ -915,6 +1004,8 @@ components:
         region: { type: [string, 'null'] }
         pii_default: { type: string, enum: [off, mask, reversible] }
         created_at: { type: string, format: date-time }
+        status: { type: string, enum: [active, deleted], description: '`deleted` only appears with `include_deleted=true`.' }
+        deleted_at: { type: [string, 'null'], format: date-time }
     TenantCreate:
       type: object
       required: [name]
@@ -931,6 +1022,7 @@ components:
         name: { type: string }
         prefix: { type: string, description: 'First 8 chars, for display' }
         created_at: { type: string, format: date-time }
+        revoked_at: { type: [string, 'null'], format: date-time, description: 'Set once the key is revoked.' }
     ApiKeyCreated:
       allOf:
         - $ref: '#/components/schemas/ApiKeyInfo'
