@@ -53,6 +53,13 @@ pub struct Launch {
     pub log: Option<String>,
     /// Startup timeout (NER model loading can take a while).
     pub startup_timeout: Option<Duration>,
+    /// Data-plane listen host (default `127.0.0.1`; `0.0.0.0` for a load generator on another
+    /// host). The control plane always listens on `127.0.0.1`.
+    pub bind: Option<String>,
+    /// Host other machines use to reach the data plane (`dp`); default `127.0.0.1`.
+    pub advertise: Option<String>,
+    /// Fixed data-plane port (e.g. one a firewall admits); default: a free port.
+    pub dp_port: Option<u16>,
 }
 
 /// A running `caliban standalone` process; killed on drop.
@@ -97,13 +104,14 @@ impl Caliban {
     }
 
     async fn try_start(bin: &Path, launch: &Launch) -> Result<Self> {
-        let (dp_port, cp_port) = (free_port(), free_port());
+        let (dp_port, cp_port) = (launch.dp_port.unwrap_or_else(free_port), free_port());
         let mut b = [0u8; 8];
         rand::rng().fill_bytes(&mut b);
         let work = std::env::temp_dir().join(format!("caliban-bench-{}", hex::encode(b)));
         std::fs::create_dir_all(&work)?;
         let config = format!(
-            "[server]\nrouter_addr = \"127.0.0.1:{dp_port}\"\ncontrol_plane_addr = \"127.0.0.1:{cp_port}\"\n\n{}",
+            "[server]\nrouter_addr = \"{}:{dp_port}\"\ncontrol_plane_addr = \"127.0.0.1:{cp_port}\"\n\n{}",
+            launch.bind.as_deref().unwrap_or("127.0.0.1"),
             launch.config
         );
         let cfg_path = work.join("caliban.toml");
@@ -137,7 +145,10 @@ impl Caliban {
             .with_context(|| format!("spawning {}", bin.display()))?;
         let mut me = Self {
             child,
-            dp: format!("http://127.0.0.1:{dp_port}"),
+            dp: format!(
+                "http://{}:{dp_port}",
+                launch.advertise.as_deref().unwrap_or("127.0.0.1")
+            ),
             cp: format!("http://127.0.0.1:{cp_port}"),
             work,
             wal,
@@ -246,12 +257,7 @@ impl Caliban {
     }
 
     pub async fn dp_post(&self, path: &str, headers: &[(&str, String)], body: &Value) -> Reply {
-        let mut req = self.http.post(format!("{}{path}", self.dp)).json(body);
-        for (k, v) in headers {
-            req = req.header(*k, v);
-        }
-        let resp = req.send().await.expect("data plane reachable");
-        Reply::read(resp).await
+        post_json(&self.http, &format!("{}{path}", self.dp), headers, body).await
     }
 
     pub async fn dp_get(&self, path: &str, key: &str) -> Reply {
@@ -264,6 +270,21 @@ impl Caliban {
             .expect("data plane reachable");
         Reply::read(resp).await
     }
+}
+
+/// POSTs a JSON body to `url` and reads the whole response (panics if the server is unreachable).
+pub async fn post_json(
+    http: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, String)],
+    body: &Value,
+) -> Reply {
+    let mut req = http.post(url).json(body);
+    for (k, v) in headers {
+        req = req.header(*k, v);
+    }
+    let resp = req.send().await.expect("data plane reachable");
+    Reply::read(resp).await
 }
 
 /// A complete data-plane response.

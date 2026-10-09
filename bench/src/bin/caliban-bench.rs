@@ -7,12 +7,24 @@
 //! direct, gateway, …) after a warm-up of both, so drift affects both sides alike.
 //!
 //! `scripts/bench.sh` builds the binaries and calls this; see `bench/RESULTS.md`.
+//!
+//! Two hosts (load generator on one, mock and gateway on the other):
+//!
+//! ```text
+//! gateway host:  caliban-bench --caliban ./caliban --bind 0.0.0.0 --advertise 10.0.0.10 --serve /tmp/bench.json
+//! load host:     caliban-bench --remote bench.json --out overhead.md     # bench.json copied over
+//! ```
+//!
+//! `--serve` starts the mocks and gateways, writes their URLs and keys, and waits for Ctrl-C or
+//! SIGTERM. The gateway calls the mock over loopback; the load generator reaches both over the
+//! network, so "direct" and "gateway" cross the same link.
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use caliban_bench::harness::{Caliban, Launch, client, free_port, new_key};
+use caliban_bench::harness::{Caliban, Launch, client, free_port, new_key, post_json};
 use caliban_bench::load::{self, Stats, Target, ms};
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -22,9 +34,9 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(about = "Caliban gateway overhead benchmark")]
 struct Args {
-    /// Release `caliban` binary (default features: regex PII tier).
-    #[arg(long)]
-    caliban: PathBuf,
+    /// Release `caliban` binary (default features: regex PII tier). Not needed with `--remote`.
+    #[arg(long, required_unless_present = "remote")]
+    caliban: Option<PathBuf>,
     /// `caliban` built with `--features ner`; used with CALIBAN_PII_NER_DIR for the NER rows.
     #[arg(long)]
     caliban_ner: Option<PathBuf>,
@@ -67,6 +79,45 @@ struct Args {
     /// Free text for the report header (hardware, commit, …), one item per flag.
     #[arg(long)]
     note: Vec<String>,
+    /// Listen host for the mocks and the gateways' data planes (`0.0.0.0` with `--serve`).
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+    /// Host or IP other machines use to reach this one (written to the `--serve` file).
+    #[arg(long)]
+    advertise: Option<String>,
+    /// Serve mode: start the mocks and gateways, write their URLs and keys to this JSON file and
+    /// wait for Ctrl-C or SIGTERM instead of measuring. Measure from another host with `--remote`.
+    #[arg(long, conflicts_with = "remote")]
+    serve: Option<PathBuf>,
+    /// Fixed ports for the mock and the paced mock (default: free ports), e.g. ones a firewall admits.
+    #[arg(long, value_delimiter = ',')]
+    mock_ports: Vec<u16>,
+    /// Fixed data-plane ports for the default, WAL and NER gateways, in that order (default: free ports).
+    #[arg(long, value_delimiter = ',')]
+    gateway_ports: Vec<u16>,
+    /// Remote mode: measure the mocks and gateways described by a `--serve` file; start nothing.
+    #[arg(long)]
+    remote: Option<PathBuf>,
+}
+
+/// Where the mocks and gateways are, and the tenant keys (`--serve` writes it, `--remote` reads it).
+#[derive(Serialize, Deserialize, Clone)]
+struct Endpoints {
+    mock: String,
+    paced: String,
+    default_gw: String,
+    wal_gw: Option<String>,
+    ner_gw: Option<String>,
+    plain_key: String,
+    pii_key: String,
+    skipped: Vec<String>,
+    ner_dir: Option<String>,
+}
+
+/// Processes started by this run (killed on drop).
+struct Local {
+    _mocks: (MockProc, MockProc),
+    _gateways: Vec<Caliban>,
 }
 
 const PROMPT: &str = "Please draft a short follow-up note to our customer about the renewal. Their contact is \
@@ -325,16 +376,21 @@ impl Drop for MockProc {
     }
 }
 
+/// Starts a mock; returns it, its loopback base URL (for a gateway on this host) and its
+/// advertised base URL (for the load generator).
 async fn start_mock(
     bin: &PathBuf,
     latency_ms: f64,
     chunk_delay_ms: f64,
-) -> Result<(MockProc, String)> {
-    let port = free_port();
+    bind: &str,
+    advertise: &str,
+    port: Option<u16>,
+) -> Result<(MockProc, String, String)> {
+    let port = port.unwrap_or_else(free_port);
     let child = Command::new(bin)
         .args([
             "--addr",
-            &format!("127.0.0.1:{port}"),
+            &format!("{bind}:{port}"),
             "--latency-ms",
             &latency_ms.to_string(),
             "--chunk-delay-ms",
@@ -345,15 +401,154 @@ async fn start_mock(
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
     let proc = MockProc(child);
-    let base = format!("http://127.0.0.1:{port}");
+    let local = if bind == "0.0.0.0" { "127.0.0.1" } else { bind };
+    let base = format!("http://{local}:{port}");
     let http = client();
     for _ in 0..200 {
         if http.get(format!("{base}/healthz")).send().await.is_ok() {
-            return Ok((proc, base));
+            return Ok((proc, base, format!("http://{advertise}:{port}")));
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     bail!("mock upstream did not start")
+}
+
+/// Starts the mocks and the gateways this run needs on this host.
+async fn launch(args: &Args, needs: &dyn Fn(Profile) -> bool) -> Result<(Endpoints, Local)> {
+    let caliban = args
+        .caliban
+        .as_ref()
+        .context("--caliban is required unless --remote is given")?;
+    let mock_bin = match &args.mock {
+        Some(p) => p.clone(),
+        None => std::env::current_exe()?.with_file_name("mock-upstream"),
+    };
+    let advertise = args.advertise.clone().unwrap_or_else(|| {
+        if args.bind == "0.0.0.0" {
+            "127.0.0.1".into()
+        } else {
+            args.bind.clone()
+        }
+    });
+    let ner_dir = std::env::var("CALIBAN_PII_NER_DIR")
+        .ok()
+        .filter(|d| !d.trim().is_empty());
+    let (mock, mock_local, mock_public) =
+        start_mock(&mock_bin, args.mock_latency_ms, 0.0, &args.bind, &advertise, args.mock_ports.first().copied()).await?;
+    let (paced_mock, paced_local, paced_public) = start_mock(
+        &mock_bin,
+        args.mock_latency_ms,
+        args.paced_chunk_delay_ms,
+        &args.bind,
+        &advertise,
+        args.mock_ports.get(1).copied(),
+    )
+    .await?;
+    let (plain_key, plain_hash) = new_key("benchplain");
+    let (pii_key, pii_hash) = new_key("benchpii");
+    let cfg = config(
+        &format!("{mock_local}/v1"),
+        &format!("{paced_local}/v1"),
+        &plain_hash,
+        &pii_hash,
+    );
+    let env = vec![("BENCH_UPSTREAM_KEY".to_owned(), UPSTREAM_KEY.to_owned())];
+    let base = Launch {
+        config: cfg,
+        env,
+        bind: Some(args.bind.clone()),
+        advertise: Some(advertise),
+        ..Default::default()
+    };
+
+    let mut skipped: Vec<String> = Vec::new();
+    let port = |i: usize| args.gateway_ports.get(i).copied();
+    let mut gateways = vec![Caliban::start(caliban, &Launch { dp_port: port(0), ..base.clone() }).await?];
+    let default_gw = gateways[0].dp.clone();
+    let wal_gw = if needs(Profile::Wal) {
+        let g = Caliban::start(
+            caliban,
+            &Launch {
+                usage_wal: true,
+                dp_port: port(1),
+                ..base.clone()
+            },
+        )
+        .await?;
+        let dp = g.dp.clone();
+        gateways.push(g);
+        Some(dp)
+    } else {
+        None
+    };
+    let ner_gw = match (&args.caliban_ner, &ner_dir) {
+        _ if !needs(Profile::Ner) => None,
+        (Some(bin), Some(dir)) => {
+            let mut e = base.env.clone();
+            e.push(("CALIBAN_PII_NER_DIR".into(), dir.clone()));
+            let launch = Launch {
+                env: e,
+                startup_timeout: Some(Duration::from_secs(180)),
+                dp_port: port(2),
+                ..base.clone()
+            };
+            match Caliban::start(bin, &launch).await {
+                Ok(c) => {
+                    let dp = c.dp.clone();
+                    gateways.push(c);
+                    Some(dp)
+                }
+                Err(e) => {
+                    skipped.push(format!(
+                        "NER rows: the `ner` build did not start: {}",
+                        e.to_string().lines().next().unwrap_or_default()
+                    ));
+                    None
+                }
+            }
+        }
+        (None, _) => {
+            skipped.push("NER rows: no `ner` build (`cargo build --release -p caliban --features ner` failed or was not requested)".into());
+            None
+        }
+        (_, None) => {
+            skipped.push("NER rows: CALIBAN_PII_NER_DIR is not set".into());
+            None
+        }
+    };
+    let ep = Endpoints {
+        mock: mock_public,
+        paced: paced_public,
+        default_gw,
+        wal_gw,
+        ner_gw,
+        plain_key,
+        pii_key,
+        skipped,
+        ner_dir,
+    };
+    Ok((
+        ep,
+        Local {
+            _mocks: (mock, paced_mock),
+            _gateways: gateways,
+        },
+    ))
+}
+
+/// Waits for Ctrl-C, or SIGTERM on Unix.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 struct Row {
@@ -380,27 +575,6 @@ fn overhead(g: &hdrhistogram::Histogram<u64>, d: &hdrhistogram::Histogram<u64>, 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let mock_bin = match &args.mock {
-        Some(p) => p.clone(),
-        None => std::env::current_exe()?.with_file_name("mock-upstream"),
-    };
-    let ner_dir = std::env::var("CALIBAN_PII_NER_DIR")
-        .ok()
-        .filter(|d| !d.trim().is_empty());
-    let (mock, mock_base) = start_mock(&mock_bin, args.mock_latency_ms, 0.0).await?;
-    let (paced_mock, paced_base) =
-        start_mock(&mock_bin, args.mock_latency_ms, args.paced_chunk_delay_ms).await?;
-    let base_url = format!("{mock_base}/v1");
-    let (plain_key, plain_hash) = new_key("benchplain");
-    let (pii_key, pii_hash) = new_key("benchpii");
-    let cfg = config(
-        &base_url,
-        &format!("{paced_base}/v1"),
-        &plain_hash,
-        &pii_hash,
-    );
-    let env = vec![("BENCH_UPSTREAM_KEY".to_owned(), UPSTREAM_KEY.to_owned())];
-
     // `--only stream` matches every scenario containing "stream"; `--only =stream` only that one.
     let wanted = |name: &str| {
         args.only.is_empty() || args.only.iter().any(|o| o.strip_prefix('=').map_or_else(|| name.contains(o.as_str()), |exact| name == exact))
@@ -408,75 +582,46 @@ async fn main() -> Result<()> {
     let all = scenarios();
     let needs = |p: Profile| all.iter().any(|s| s.profile == p && wanted(s.name));
 
-    let mut skipped: Vec<String> = Vec::new();
-    let default_gw = Caliban::start(
-        &args.caliban,
-        &Launch {
-            config: cfg.clone(),
-            env: env.clone(),
-            ..Default::default()
-        },
-    )
-    .await?;
-    let wal_gw = if needs(Profile::Wal) {
-        Some(
-            Caliban::start(
-                &args.caliban,
-                &Launch {
-                    config: cfg.clone(),
-                    env: env.clone(),
-                    usage_wal: true,
-                    ..Default::default()
-                },
+    let (ep, local) = match &args.remote {
+        Some(p) => {
+            let text =
+                std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+            (
+                serde_json::from_str::<Endpoints>(&text).context("parsing the --remote file")?,
+                None,
             )
-            .await?,
-        )
-    } else {
-        None
-    };
-    let ner_gw = match (&args.caliban_ner, &ner_dir) {
-        _ if !needs(Profile::Ner) => None,
-        (Some(bin), Some(dir)) => {
-            let mut e = env.clone();
-            e.push(("CALIBAN_PII_NER_DIR".into(), dir.clone()));
-            let launch = Launch {
-                config: cfg.clone(),
-                env: e,
-                startup_timeout: Some(Duration::from_secs(180)),
-                ..Default::default()
-            };
-            match Caliban::start(bin, &launch).await {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    skipped.push(format!(
-                        "NER rows: the `ner` build did not start: {}",
-                        e.to_string().lines().next().unwrap_or_default()
-                    ));
-                    None
-                }
-            }
         }
-        (None, _) => {
-            skipped.push("NER rows: no `ner` build (`cargo build --release -p caliban --features ner` failed or was not requested)".into());
-            None
-        }
-        (_, None) => {
-            skipped.push("NER rows: CALIBAN_PII_NER_DIR is not set".into());
-            None
+        None => {
+            let (ep, local) = launch(&args, &needs).await?;
+            (ep, Some(local))
         }
     };
+    if let Some(path) = &args.serve {
+        std::fs::write(path, serde_json::to_string_pretty(&ep)?)?;
+        eprintln!(
+            "serving; endpoints in {} (Ctrl-C or SIGTERM to stop)",
+            path.display()
+        );
+        wait_for_shutdown().await;
+        drop(local);
+        return Ok(());
+    }
+    let (plain_key, pii_key) = (ep.plain_key.clone(), ep.pii_key.clone());
+    let (mock_base, paced_base) = (ep.mock.clone(), ep.paced.clone());
+    let skipped = ep.skipped.clone();
+    let ner_dir = ep.ner_dir.clone();
 
     let http = client();
     let mut rows: Vec<Row> = Vec::new();
     let mut checks: Vec<String> = Vec::new();
     for sc in all.iter().filter(|s| wanted(s.name)) {
-        let gw = match sc.profile {
-            Profile::Default => &default_gw,
-            Profile::Wal => match &wal_gw {
+        let gw_dp = match sc.profile {
+            Profile::Default => &ep.default_gw,
+            Profile::Wal => match &ep.wal_gw {
                 Some(g) => g,
                 None => continue,
             },
-            Profile::Ner => match &ner_gw {
+            Profile::Ner => match &ep.ner_gw {
                 Some(g) => g,
                 None => continue,
             },
@@ -491,7 +636,7 @@ async fn main() -> Result<()> {
         }
         let expect = sc.stream.then(|| "[DONE]".to_owned());
         let gw_t = Target {
-            url: format!("{}{}", gw.dp, sc.gw_path),
+            url: format!("{gw_dp}{}", sc.gw_path),
             headers,
             body: Bytes::from(sc.gw_body.to_string()),
             stream: sc.stream,
@@ -513,17 +658,17 @@ async fn main() -> Result<()> {
         };
 
         // Pre-flight: the gateway handles the scenario the way it claims to.
-        let pre = gw
-            .dp_post(
-                sc.gw_path,
-                &gw_t
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.clone()))
-                    .collect::<Vec<_>>(),
-                &sc.gw_body,
-            )
-            .await;
+        let pre = post_json(
+            &http,
+            &gw_t.url,
+            &gw_t
+                .headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect::<Vec<_>>(),
+            &sc.gw_body,
+        )
+        .await;
         if !pre.status.is_success() {
             bail!(
                 "{}: pre-flight failed: {} {}",
@@ -541,17 +686,17 @@ async fn main() -> Result<()> {
         let pii = pre.header("x-caliban-pii-entities").unwrap_or_default();
         let mut cache = pre.header("x-caliban-cache").unwrap_or_default();
         if sc.cache_hit {
-            let again = gw
-                .dp_post(
-                    sc.gw_path,
-                    &gw_t
-                        .headers
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.clone()))
-                        .collect::<Vec<_>>(),
-                    &sc.gw_body,
-                )
-                .await;
+            let again = post_json(
+                &http,
+                &gw_t.url,
+                &gw_t
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.clone()))
+                    .collect::<Vec<_>>(),
+                &sc.gw_body,
+            )
+            .await;
             cache = again.header("x-caliban-cache").unwrap_or_default();
             if cache != "hit" {
                 bail!("{}: expected a cache hit, got {cache:?}", sc.name);
@@ -569,7 +714,7 @@ async fn main() -> Result<()> {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let background = sc.ner_background.then(|| {
             let t = Target {
-                url: format!("{}/v1/chat/completions", gw.dp),
+                url: format!("{gw_dp}/v1/chat/completions"),
                 headers: vec![
                     ("content-type".into(), "application/json".into()),
                     ("authorization".into(), format!("Bearer {pii_key}")),
@@ -623,8 +768,7 @@ async fn main() -> Result<()> {
             let _ = b.await;
         }
     }
-    drop(mock);
-    drop(paced_mock);
+    drop(local);
 
     let report = render(&args, &all, &rows, &checks, &skipped, ner_dir.as_deref());
     if let Some(dir) = args.out.parent() {

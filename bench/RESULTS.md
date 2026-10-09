@@ -1,5 +1,7 @@
 # P0 measurement results
 
+Linux on AWS (two hosts, `TCP_NODELAY`, the GPU tier with a real model): [`RESULTS-aws-2026-10.md`](RESULTS-aws-2026-10.md).
+
 The P0 exit criteria (reference architecture, section 8) are: **under 3 ms p50 overhead**, **isolation audit passes**, **usage matches provider bills within 1%**. This file records the first full measurement and what it found. Regenerate the raw report with `scripts/bench.sh` (it writes `bench/results/REPORT.md`, which is not committed).
 
 ## Verdict
