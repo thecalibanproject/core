@@ -182,4 +182,10 @@ impl VectorStore for QdrantStore {
         let (status, v) = self.send(self.req(reqwest::Method::POST, &path).json(&body)).await?;
         if status.is_success() || status == StatusCode::NOT_FOUND { Ok(()) } else { Err(StoreError::Backend(format!("delete tenant: {status}: {}", short(&v)))) }
     }
+
+    async fn list_collections(&self) -> Result<Vec<String>, StoreError> {
+        let v = self.ok(self.req(reqwest::Method::GET, "/collections"), "list collections").await?;
+        let names = v.pointer("/result/collections").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(names.iter().filter_map(|c| c.get("name").and_then(Value::as_str).map(str::to_owned)).collect())
+    }
 }

@@ -1,6 +1,8 @@
 //! `caliban` — one binary for every deployment shape (SaaS, VPC, air-gapped).
 
 #[cfg(test)]
+mod purge_tests;
+#[cfg(test)]
 mod revocation_tests;
 mod split;
 
@@ -126,6 +128,7 @@ async fn main() -> Result<()> {
         tokio::spawn(source.run(handle.clone(), every));
         let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default()))?);
         spawn_router_warmup(&gw);
+        gw.spawn_tenant_purge(PURGE_EVERY);
         return serve("router", listen.clone(), caliban_gateway::app(gw)).await;
     }
 
@@ -140,19 +143,24 @@ async fn main() -> Result<()> {
 
     let gw = Arc::new(new_gateway(handle.clone(), Arc::clone(&usage))?);
     spawn_router_warmup(&gw);
+    let purge_gw = Arc::clone(&gw);
     let router_addr = cfg.server.router_addr.clone();
     let router_task = move || serve("router", router_addr.clone(), caliban_gateway::app(Arc::clone(&gw)));
 
     match cli.cmd {
-        Cmd::Router(_) => router_task().await,
+        Cmd::Router(_) => {
+            purge_gw.spawn_tenant_purge(PURGE_EVERY);
+            router_task().await
+        }
         Cmd::ControlPlane => {
             let cp = control_plane(&cfg, &handle, &recent, "control-plane").await?;
             cp.await
         }
         Cmd::Standalone => {
             // The control plane publishes the store's state (Postgres wins over the file) into
-            // `handle` before the data plane starts serving.
+            // `handle` before the data plane starts serving. Tenant purges start from that state.
             let cp = control_plane(&cfg, &handle, &recent, "standalone").await?;
+            purge_gw.spawn_tenant_purge(PURGE_EVERY);
             tokio::try_join!(router_task(), cp).map(|_| ())
         }
         Cmd::CheckConfig | Cmd::Keygen | Cmd::GenKek | Cmd::GenSigningKey | Cmd::Healthcheck { .. } => unreachable!(),
@@ -218,6 +226,10 @@ async fn healthcheck(addr: &str, path: &str) -> bool {
     };
     matches!(tokio::time::timeout(std::time::Duration::from_secs(3), probe).await, Ok(Some(true)))
 }
+
+/// How often a data plane checks its snapshot for deleted tenants whose semantic-cache entries
+/// must be purged (see `caliban_gateway::purge`).
+const PURGE_EVERY: Duration = caliban_gateway::purge::PURGE_EVERY;
 
 /// Builds the `caliban/auto` routing assets (exemplar embeddings, kNN calibration, router profile)
 /// in the background; until they are ready, `caliban/auto` routes by the keyword rules.

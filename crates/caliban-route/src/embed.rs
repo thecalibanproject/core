@@ -1,9 +1,10 @@
 //! The embedder Stage 1 needs, as a trait local to this crate.
 //!
-//! The gateway implements it on top of the provider embeddings path
-//! (`caliban-gateway/src/route_embed.rs`). [`HashEmbedder`] is a deterministic, dependency-free
-//! stand-in for tests and latency measurements: it hashes words and character trigrams into a
-//! fixed-size vector, so it only captures lexical overlap and says nothing about real accuracy.
+//! The gateway implements it as an adapter over its single provider-backed embedder
+//! (`caliban_types::Embedder`, shared-provider path; see `caliban-gateway/src/route_embed.rs`).
+//! [`HashEmbedder`] is a deterministic, dependency-free stand-in for tests and latency
+//! measurements: it hashes words and character trigrams into a fixed-size vector, so it only
+//! captures lexical overlap and says nothing about real accuracy.
 
 use async_trait::async_trait;
 

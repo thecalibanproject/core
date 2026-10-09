@@ -104,6 +104,9 @@ pub trait VectorStore: Send + Sync {
     async fn delete_expired(&self, collection: &str, now: i64) -> Result<(), StoreError>;
     /// Deletes every entry of `tenant` in `collection` (tenant offboarding).
     async fn delete_tenant(&self, collection: &str, tenant: &str) -> Result<(), StoreError>;
+    /// Names of the existing collections (used to purge a tenant from every embedding model's
+    /// collection, including ones from earlier `embedding_model` settings).
+    async fn list_collections(&self) -> Result<Vec<String>, StoreError>;
 }
 
 type Points = HashMap<String, (Vec<f32>, EntryPayload)>;
@@ -203,5 +206,9 @@ impl VectorStore for MemoryStore {
             c.retain(|_, (_, p)| p.tenant_id != tenant);
         }
         Ok(())
+    }
+
+    async fn list_collections(&self) -> Result<Vec<String>, StoreError> {
+        Ok(self.collections.lock().keys().cloned().collect())
     }
 }

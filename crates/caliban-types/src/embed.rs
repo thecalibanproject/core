@@ -39,7 +39,24 @@ pub enum EmbedError {
 ///   callers on the request path treat any error as "no embedding" and carry on.
 #[async_trait]
 pub trait Embedder: Send + Sync {
+    /// Embeds with the tenant's route to `model`: its own (BYOK) provider first, then a shared
+    /// pool that serves the tenant.
     async fn embed(&self, tenant: &TenantId, model: &ModelId, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
+
+    /// Embeds through a **deployment** provider (a shared `[[providers]]` entry) only, never a
+    /// tenant's own credentials. For vectors that must share one deployment-wide space, such as the
+    /// kNN routing exemplars and the prompts compared with them.
+    ///
+    /// `tenant`: whose text this is. The shared provider must serve that tenant, and cached vectors
+    /// stay per tenant, so a later [`Embedder::embed`] of the same text by the same tenant through
+    /// the same endpoint reuses the vector. `None`: deployment-authored text (exemplars), embedded
+    /// off the request path, so a long timeout applies.
+    ///
+    /// The default implementation has no shared path and always fails.
+    async fn embed_shared(&self, tenant: Option<&TenantId>, model: &ModelId, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let _ = (tenant, texts);
+        Err(EmbedError::Unavailable(format!("no shared provider path for '{model}'")))
+    }
 }
 
 /// Cosine similarity in `[-1, 1]`; `0.0` for empty, zero or mismatched vectors.

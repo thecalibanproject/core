@@ -32,7 +32,8 @@ exact_ttl_secs = 3600
 # qdrant_url = "http://qdrant:6333"
 # qdrant_api_key = { env = "CALIBAN_QDRANT_API_KEY" }
 # collection_prefix = "caliban_semcache"
-# embedding_model = "local/qwen3-embedding-0.6b"
+# embedding_model = "local/qwen3-embedding-0.6b"  # the same model as [routing] embedding_model
+#                                  # lets one embedding per request serve both
 # threshold = 0.95                 # starting per-entry cosine threshold
 # min_threshold = 0.90             # learned thresholds never go below
 # grey_band = 0.03                 # just below the threshold: answer fresh, verify, learn

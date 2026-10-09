@@ -817,6 +817,9 @@ mod semantic {
         async fn delete_tenant(&self, c: &str, t: &str) -> Result<(), StoreError> {
             self.0.delete_tenant(c, t).await
         }
+        async fn list_collections(&self) -> Result<Vec<String>, StoreError> {
+            self.0.list_collections().await
+        }
     }
 
     pub(super) struct Sem {
@@ -1400,16 +1403,20 @@ async fn semantic_miss_latency_against_qdrant() {
 mod auto_routing {
     use super::*;
     use crate::route_embed;
+    use caliban_cache::semantic::MemoryStore;
+    use caliban_types::{CacheStatus, CacheTier};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     /// OpenAI-compatible `/v1/embeddings` returning `caliban_route::hash_embed` vectors after
-    /// `delay_ms` (shared, so a test can slow the embedder down after warm-up).
-    async fn mock_embedder(delay_ms: Arc<AtomicU64>) -> String {
+    /// `delay_ms` (shared, so a test can slow the embedder down after warm-up). Every input text
+    /// is recorded in `seen`.
+    async fn mock_embedder(delay_ms: Arc<AtomicU64>, seen: Arc<Mutex<Vec<String>>>) -> String {
         let app = Router::new().route(
             "/v1/embeddings",
             post(move |Json(b): Json<Value>| {
                 let delay = Duration::from_millis(delay_ms.load(Ordering::SeqCst));
+                let seen = Arc::clone(&seen);
                 async move {
                     tokio::time::sleep(delay).await;
                     let inputs: Vec<String> = match &b["input"] {
@@ -1417,6 +1424,7 @@ mod auto_routing {
                         Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
                         _ => vec![],
                     };
+                    seen.lock().unwrap().extend(inputs.iter().cloned());
                     let data: Vec<Value> =
                         inputs.iter().enumerate().map(|(i, t)| json!({"object": "embedding", "index": i, "embedding": caliban_route::hash_embed(t, 256)})).collect();
                     Json(json!({"object": "list", "data": data, "model": b["model"], "usage": {"prompt_tokens": 1, "total_tokens": 1}}))
@@ -1434,12 +1442,17 @@ mod auto_routing {
         gw: Arc<Gateway>,
         usage: RecentUsage,
         delay: Arc<AtomicU64>,
+        /// Texts the embedding server received.
+        seen: Arc<Mutex<Vec<String>>>,
+        /// T2 store (used when `routing` also turns `[cache.semantic]` on).
+        store: Arc<MemoryStore>,
     }
 
     async fn setup(routing: &str) -> Env {
         let (base, _log) = mock_upstream().await;
         let delay = Arc::new(AtomicU64::new(0));
-        let emb = mock_embedder(delay.clone()).await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let emb = mock_embedder(delay.clone(), Arc::clone(&seen)).await;
         let toml = format!(
             r#"
 [routing]
@@ -1486,6 +1499,7 @@ price_out_per_mtok = 0.0
 [[tenants]]
 id = "acme"
 name = "Acme"
+semantic_cache = "on"
 api_key_hashes = ["{acme}"]
   [[tenants.providers]]
   id = "mockext"
@@ -1507,10 +1521,13 @@ api_key_hashes = ["{acme}"]
             acme = hash("cal_acme"),
         );
         let usage = RecentUsage::default();
-        let gw = Arc::new(Gateway::new(ConfigHandle::new(Snapshot::new(Config::from_toml_str(&toml).unwrap(), "test")), Arc::new(usage.clone())));
+        let store = Arc::new(MemoryStore::default());
+        let gw = Arc::new(
+            Gateway::new(ConfigHandle::new(Snapshot::new(Config::from_toml_str(&toml).unwrap(), "test")), Arc::new(usage.clone())).with_semantic_store(store.clone()),
+        );
         gw.warm_router().await;
         assert!(gw.router.knn_ready(), "kNN index built from the mock embedder");
-        Env { app: app(Arc::clone(&gw)), gw, usage, delay }
+        Env { app: app(Arc::clone(&gw)), gw, usage, delay, seen, store }
     }
 
     const TRANSLATE: &str = "please translate this paragraph into french for me";
@@ -1579,6 +1596,62 @@ api_key_hashes = ["{acme}"]
         assert!(ev.routed_model_cost_usd.is_none() && ev.flat_price_usd.is_none() && ev.cost_usd.is_some());
         let json = serde_json::to_value(&ev).unwrap();
         assert!(json.get("flat_price_usd").is_none(), "absent, not null, for older consumers");
+    }
+
+    /// `[cache.semantic]` on, with the routing embedding model (the `[routing]` slot of `setup`
+    /// is followed by other tables, so a whole table fits there).
+    const WITH_T2: &str = "[cache.semantic]\nenabled = true\nstore = \"memory\"\nembedding_model = \"emb/mock\"\nlookup_budget_ms = 2000\n";
+
+    /// Routing (Stage-1 kNN, shared provider) and T2 (tenant route to the same model and endpoint)
+    /// embed the same prompt in one request: the embedder is called once for it.
+    #[tokio::test]
+    async fn routing_and_semantic_cache_embed_a_prompt_once() {
+        let env = setup(WITH_T2).await;
+        let prompt = "please translate the quarterly roadmap memo into german";
+        let body = json!({"model": "caliban/auto", "temperature": 0.2, "messages": [{"role": "user", "content": prompt}]});
+        let (status, h, _) = call(&env.app, "/v1/chat/completions", BEARER, body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(h["x-caliban-intent"].to_str().unwrap().contains(";stage=knn"), "kNN embedded the prompt");
+        assert_eq!(h["x-caliban-cache"], "miss", "T2 applied and looked up");
+        for _ in 0..200 {
+            if !env.store.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(env.store.len(), 1, "T2 stored the answer under the prompt vector");
+        let times = env.seen.lock().unwrap().iter().filter(|t| t.as_str() == prompt).count();
+        assert_eq!(times, 1, "one upstream embedding for routing and T2 together");
+    }
+
+    /// Both cache tiers meter a `caliban/auto` hit the same way: no tokens, zero routed cost and
+    /// zero flat price (whether a hit should charge the flat price is an open pricing question),
+    /// and the answer's tokens as `tokens_saved`.
+    #[tokio::test]
+    async fn exact_and_semantic_hits_meter_auto_the_same_way() {
+        let env = setup(WITH_T2).await;
+        let ask = |temperature: f64| json!({"model": "caliban/auto", "temperature": temperature, "messages": [{"role": "user", "content": TRANSLATE}]});
+        for (temperature, tier) in [(0.0, CacheTier::Exact), (0.2, CacheTier::Semantic)] {
+            let (_, h, _) = call(&env.app, "/v1/chat/completions", BEARER, ask(temperature)).await;
+            assert_eq!(h["x-caliban-cache"], "miss");
+            let miss = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
+            assert!(miss.flat_price_usd.unwrap() > 0.0);
+            for _ in 0..200 {
+                let (_, h, _) = call(&env.app, "/v1/chat/completions", BEARER, ask(temperature)).await;
+                if h["x-caliban-cache"] == "hit" {
+                    assert_eq!(h["x-caliban-cache-tier"], tier.as_str());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let hit = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
+            assert_eq!((hit.cache, hit.cache_tier), (CacheStatus::Hit, Some(tier)), "{tier:?}");
+            assert_eq!(hit.requested_model.as_deref(), Some("caliban/auto"));
+            assert_eq!((hit.prompt_tokens, hit.completion_tokens), (0, 0), "{tier:?}");
+            assert_eq!(hit.tokens_saved, miss.prompt_tokens + miss.completion_tokens, "{tier:?}: saved tokens recorded");
+            assert_eq!((hit.cost_usd, hit.routed_model_cost_usd, hit.flat_price_usd), (Some(0.0), Some(0.0), Some(0.0)), "{tier:?}");
+            assert_eq!(hit.margin_usd(), Some(0.0));
+        }
     }
 
     /// Added routing latency through the real adapter (HTTP to a local mock embedder) versus the

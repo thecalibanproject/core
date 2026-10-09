@@ -153,7 +153,7 @@ TOML
 # With CALIBAN_PII_NER_DIR set, build with the L1 NER model and also check name protection.
 if [[ -n "${CALIBAN_PII_NER_DIR:-}" ]]; then cargo build -q -p caliban --features ner; else cargo build -q -p caliban; fi
 python3 scripts/mock_upstream.py $MOCK_PORT & MOCK_PID=$!
-CALIBAN_CONFIG="$WORK/caliban.toml" CALIBAN_LOG=warn ./target/debug/caliban standalone & CAL_PID=$!
+CALIBAN_CONFIG="$WORK/caliban.toml" CALIBAN_LOG=warn "${CARGO_TARGET_DIR:-target}/debug/caliban" standalone & CAL_PID=$!
 trap 'kill $MOCK_PID $CAL_PID 2>/dev/null; rm -rf "$WORK"' EXIT
 # Up to 60 s: loading + hash-verifying the NER model is slow in debug builds.
 for i in $(seq 300); do curl -sf "http://127.0.0.1:$DP/healthz" >/dev/null && break; [[ $i == 300 ]] && { echo "caliban did not become healthy" >&2; exit 1; }; sleep 0.2; done

@@ -262,6 +262,19 @@ impl SemanticCache {
         }
         Ok(())
     }
+
+    /// Deletes a tenant's entries from every collection of this cache (`{prefix}_*`), whatever
+    /// embedding model and dimension wrote them. Returns the number of collections visited.
+    /// Idempotent: purging a tenant with no entries is a no-op, so several routers may purge the
+    /// same tenant.
+    pub async fn purge_tenant_everywhere(&self, tenant: &str) -> Result<usize, StoreError> {
+        let own = format!("{}_", self.prefix);
+        let collections: Vec<String> = self.store.list_collections().await?.into_iter().filter(|c| c.starts_with(&own)).collect();
+        for c in &collections {
+            self.store.delete_tenant(c, tenant).await?;
+        }
+        Ok(collections.len())
+    }
 }
 
 #[cfg(test)]
@@ -331,6 +344,29 @@ mod tests {
         // Even with tenant B's partition forced to A's, the tenant filter holds.
         let forged = SemanticKey { tenant: "b".into(), ..ka.clone() };
         assert_eq!(c.lookup(&forged, "emb", &v, &P, 0.5, 1001).await.unwrap(), Lookup::Miss);
+    }
+
+    #[tokio::test]
+    async fn purge_everywhere_removes_one_tenant_from_every_own_collection() {
+        let store = Arc::new(MemoryStore::default());
+        let c = SemanticCache::new(store.clone(), "t");
+        // Two embedding models (an old and a new `embedding_model`), two tenants.
+        for (tenant, model, v) in [("a", "emb", vec![1.0f32, 0.0]), ("a", "emb2", vec![1.0, 0.0, 0.0]), ("b", "emb", vec![0.0, 1.0])] {
+            c.insert(&key(tenant, "hi", b""), model, &v, entry(60), &P, 1000).await.unwrap();
+        }
+        // Another deployment's collection in the same store is left alone.
+        let other = SemanticCache::new(store.clone(), "u");
+        other.insert(&key("a", "hi", b""), "emb", &[1.0, 0.0], entry(60), &P, 1000).await.unwrap();
+
+        assert_eq!(c.purge_tenant_everywhere("a").await.unwrap(), 2);
+        let left: Vec<(String, String)> = {
+            let mut l: Vec<_> = store.entries().into_iter().map(|(col, _, p)| (col, p.tenant_id)).collect();
+            l.sort();
+            l
+        };
+        assert_eq!(left, [("t_emb_2".to_owned(), "b".to_owned()), ("u_emb_2".to_owned(), "a".to_owned())]);
+        assert_eq!(c.purge_tenant_everywhere("a").await.unwrap(), 2, "idempotent");
+        assert_eq!(store.len(), 2);
     }
 
     #[tokio::test]

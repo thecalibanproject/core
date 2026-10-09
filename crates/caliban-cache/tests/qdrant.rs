@@ -147,6 +147,15 @@ async fn qdrant_store_isolates_tenants_and_learns() {
     assert_eq!(cache.lookup(&kg, "emb", &near, &P, 0.5, now + 1).await.unwrap(), Lookup::Miss);
     assert!(matches!(cache.lookup(&kb, "emb", &v, &P, 0.5, now + 1).await.unwrap(), Lookup::Hit(_)));
 
+    // Offboarding from every collection (as the data plane does when a snapshot drops a tenant):
+    // globex also has an entry under a second embedding model.
+    let v32 = unit(9, 32);
+    cache.insert(&kb, "emb2", &v32, entry("globex answer, other model"), &P, now).await.unwrap();
+    assert!(matches!(cache.lookup(&kb, "emb2", &v32, &P, 0.5, now + 1).await.unwrap(), Lookup::Hit(_)));
+    assert_eq!(cache.purge_tenant_everywhere("globex").await.unwrap(), 2);
+    assert_eq!(cache.lookup(&kb, "emb", &v, &P, 0.5, now + 1).await.unwrap(), Lookup::Miss);
+    assert_eq!(cache.lookup(&kb, "emb2", &v32, &P, 0.5, now + 1).await.unwrap(), Lookup::Miss);
+
     drop_collections(&base, &prefix).await;
 }
 

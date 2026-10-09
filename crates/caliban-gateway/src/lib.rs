@@ -15,6 +15,7 @@ mod error;
 mod limits;
 mod messages;
 mod pipeline;
+pub mod purge;
 mod quirks;
 mod rerank;
 mod route_embed;
@@ -55,8 +56,9 @@ pub struct Gateway {
     pub cache: ExactCache,
     /// T2 semantic cache; `None` when no store is configured (`[cache.semantic]`).
     pub semantic: Option<Arc<SemanticCache>>,
-    /// Embeddings for internal consumers (semantic cache, kNN routing): the tenant's embedding
-    /// model through its provider ([`embedder::ProviderEmbedder`]).
+    /// The one embedder for internal consumers ([`embedder::ProviderEmbedder`]): the semantic cache
+    /// embeds through the tenant's route to its model, kNN routing through the shared provider only
+    /// (`embed_shared`); both share its LRU.
     pub embedder: Arc<dyn Embedder>,
     pub providers: Arc<Providers>,
     pub usage: Arc<dyn UsageSink>,
