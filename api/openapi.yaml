@@ -52,6 +52,7 @@ paths:
           headers:
             x-caliban-request-id: { schema: { type: string } }
             x-caliban-routed-model: { schema: { type: string } }
+            x-caliban-intent: { schema: { type: string }, description: 'Routing decision: `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` (timeout, embed_error, unavailable, no_text, abstain_oos, abstain_confidence, abstain_margin, abstain_empty) when kNN was on but did not decide. The intent is `pinned` for a named model.' }
             x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] }, description: '`hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request.' }
             x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
@@ -98,6 +99,7 @@ paths:
             request-id: { schema: { type: string } }
             x-caliban-request-id: { schema: { type: string } }
             x-caliban-routed-model: { schema: { type: string } }
+            x-caliban-intent: { schema: { type: string }, description: 'Routing decision: `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` (timeout, embed_error, unavailable, no_text, abstain_oos, abstain_confidence, abstain_margin, abstain_empty) when kNN was on but did not decide. The intent is `pinned` for a named model.' }
             x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] }, description: '`hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request.' }
             x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
@@ -1248,6 +1250,11 @@ components:
         cost_usd: { type: [number, 'null'] }
         latency_ms: { type: integer }
         ts: { type: string, format: date-time }
+        requested_model: { type: string, description: 'Model the client asked for (`caliban/auto` or a pinned id). Chat requests only; absent otherwise.' }
+        intent_confidence: { type: number, description: 'Confidence of the intent decision, 0..1. Chat requests only.' }
+        route_stage: { type: string, enum: [rules, knn, keyword], description: 'Stage that decided the intent. Chat requests only.' }
+        routed_model_cost_usd: { type: number, description: '`caliban/auto` only: real cost of the routed model for this request (its prices times reported usage). Absent when the model has no price.' }
+        flat_price_usd: { type: number, description: '`caliban/auto` only: flat auto price for the same tokens (`[routing] auto_price_*`). Margin = flat_price_usd - routed_model_cost_usd.' }
     UsageReport:
       type: object
       required: [events, totals]
@@ -1263,6 +1270,10 @@ components:
             semantic_cache_hits: { type: integer }
             tokens_saved: { type: integer }
             cost_usd: { type: number }
+            auto_requests: { type: integer, description: 'Requests that asked for `caliban/auto`' }
+            flat_price_usd: { type: number, description: 'Sum over `caliban/auto` events that carry both prices' }
+            routed_model_cost_usd: { type: number, description: 'Sum over the same events' }
+            margin_usd: { type: number, description: 'flat_price_usd - routed_model_cost_usd' }
 
     Route:
       type: object

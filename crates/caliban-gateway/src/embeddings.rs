@@ -91,6 +91,7 @@ async fn run(gw: Arc<Gateway>, headers: HeaderMap, body: Bytes, request_id: Requ
         dialect: Dialect::OpenAi,
         span,
         est_prompt_tokens: est,
+        route: None,
     };
     finish(&gw, &outcome, usage, 0, settlement, 0).await;
     let mut resp = axum::Json(out).into_response();

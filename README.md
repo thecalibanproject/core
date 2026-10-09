@@ -40,7 +40,9 @@ Data-plane endpoints (`:8080`, tenant `cal_…` key as bearer token):
 | `GET /v1/models` | Models this tenant can use |
 | `GET /healthz` | Liveness, config version, and quota store state (`quota.state` is `degraded` while a shared store is unreachable; the probe still returns `200`) |
 
-The model id `caliban/auto` lets Caliban choose: the request is classified into an intent and routed through the tenant's ordered candidates for that intent. Naming a catalogue model id pins the model, subject to the tenant's policy.
+The model id `caliban/auto` lets Caliban choose: the request is classified into an intent (embedding kNN, with keyword rules as the fallback) and served by the cheapest model the tenant may use that meets the intent's quality floor, or by the tenant's ordered candidates when no floor is set. Naming a catalogue model id pins the model, subject to the tenant's policy. See [Routing (`caliban/auto`)](#routing-calibanauto).
+
+Chat responses carry `x-caliban-request-id`, `x-caliban-routed-model`, `x-caliban-intent` (`<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` when kNN was on but did not decide), `x-caliban-cache`, `x-caliban-pii-entities` and, on non-streaming responses, `x-caliban-cost-usd`.
 
 Control-plane endpoints (`:8081`) live under `/api/v1/*` and are specified in [`api/openapi.yaml`](api/openapi.yaml): tenants, tenant API keys, BYOK provider keys, routes, the model catalogue and shared providers (with health checks and model discovery), datasources and introspection, the ontology review queue, nodes, usage, the audit log, health, and signed snapshots for split-mode routers. When a built console is available (`CALIBAN_WEB_DIR` or `[server] web_dir`), it is served at `/`.
 
@@ -73,7 +75,7 @@ One pipeline serves both API shapes. OpenAI and Anthropic requests are decoded i
    - `session`: a random key per request. Nothing links two requests, and requests carrying PII bypass the exact cache.
 
    Surrogates never cross tenants. No surrogate-to-original table is stored: each request's reverse map is built from the values seen in that request, and only those values are restored in the response (any other surrogate, for example in a cached answer, is left as it is). Within a request, two values never share a surrogate (deterministic re-draw, then a typed placeholder). Across requests, small formats such as names can collide; that never breaks rehydration. Derivation, formats and collision probabilities are documented in [`crates/caliban-pii/src/surrogate.rs`](crates/caliban-pii/src/surrogate.rs). Without `CALIBAN_KEK`, the key comes from a random per-process secret, so surrogates are stable within one process only.
-3. **Routing.** Rules and policy (pinned model, trust tier, licence), then intent classification (a placeholder keyword classifier today), then the tenant's ordered candidates with fallbacks.
+3. **Routing.** Rules and policy (pinned model, trust tier), then Stage-1 intent classification (embedding kNN over labelled exemplars within a latency budget, falling back to keyword rules), then model selection: the cheapest eligible model at or above the intent's quality floor, else the tenant's default route. Details in [Routing (`caliban/auto`)](#routing-calibanauto).
 4. **Cache.** Two tiers, checked in order. Entries of both are stored pseudonymised and rehydrated with the vault of the request that hits them, and never cross tenants.
    - **T1 exact** (in-process moka): the protected upstream body (never raw PII sent outside), keyed by tenant, ACL and datasource epoch. Needs `temperature = 0`, no tools, non-streaming.
    - **T2 semantic** (Qdrant, or an in-memory store for one process): answers with the response to an earlier, *semantically similar* request of the same tenant. Off unless `[cache.semantic] enabled` and the tenant has `semantic_cache = "on"`.
@@ -109,7 +111,7 @@ The binary is in `apps/caliban`; everything else is in `crates/`.
 | `caliban-ir` | Done (OpenAI, Anthropic) | Canonical request IR, unknown-field passthrough, canonical hashing for cache keys, Anthropic Messages codecs (requests, responses, stream events), SSE parser |
 | `caliban-pii` | L0 done; L1 NER done behind `ner` | Regexes and validators, tenant dictionaries, in-process multilingual NER (ONNX, MIT-licensed weights, hash-verified artifact; see [`crates/caliban-pii/MODELS.md`](crates/caliban-pii/MODELS.md)), surrogates, vault, streaming rehydration |
 | `caliban-cache` | Exact and semantic caches done; plan cache planned | T1 exact cache (moka) with tenant, ACL and datasource-epoch keys; T2 semantic cache: `VectorStore` trait with Qdrant (REST) and in-memory stores, per-entry learned thresholds, tenant error budgets |
-| `caliban-route` | Rules and placeholder classifier done; kNN and ONNX classifier planned | Intent to ordered candidates, trust-tier constraints, fallbacks |
+| `caliban-route` | Rules, Stage-1 kNN and quality-floor selection done; ONNX classifier and LLM fallback planned | Staged router: pinned rules, embedding kNN with ml-calibrated thresholds, keyword fallback, cheapest model above a per-intent quality floor (ml router profiles or config), allow-lists, BYOK and trust-tier filters, fallbacks |
 | `caliban-providers` | OpenAI-compatible and Anthropic done; Bedrock and Vertex planned | BYOK upstream calls; Anthropic native passthrough or translation |
 | `caliban-meter` | Done | Usage events, cost, in-memory ring and JSONL WAL; GCRA rate limits and token and USD budgets, in memory (`governor`) or shared in Valkey (atomic Lua scripts, local fallback) |
 | `caliban-ontology` | Compiler done; store and retrieval planned | Caliban Semantic Model (CSM) types and the **CQIR compiler**: typed queries lowered to a MongoDB aggregation pipeline (with lint) or to SQL for the CDC replica; a pure-function lane planner |
@@ -187,11 +189,51 @@ Global flags: `--config` (`CALIBAN_CONFIG`, default `/etc/caliban/caliban.toml`)
 - `[cache.semantic]`: `enabled`, `store` (`qdrant` or `memory`), `qdrant_url`, `qdrant_api_key`, `collection_prefix`, `embedding_model`, `threshold`, `min_threshold`, `grey_band`, `max_error_rate`, `verify_rate`, `verify_answer_similarity`, `max_temperature`, `ttl_secs`, `lookup_budget_ms`, `embed_timeout_ms` (see [Cache](#request-pipeline) above and the annotated example). Caliban talks to Qdrant's REST port (6333), not gRPC (6334). The store and its URL are read at start-up; the switches, thresholds and budgets follow the live snapshot (split-mode routers get them from the control plane).
 - `[pii]`: `default_mode` (`off`, `mask` or `reversible`).
 - `[limits]` and `[limits.tenants.<id>]`: `requests_per_minute`, `key_requests_per_minute`, `tokens_per_minute`, `tokens_per_day`, `usd_per_day`. Unset means unlimited. `[limits]` also takes `store` (`memory` or `valkey`), `valkey_key_prefix` and `valkey_timeout_ms` (see [Shared quotas](#shared-quotas-valkey)).
+- `[routing]` and `[routing.tenants.<id>]`: `caliban/auto` routing (embedder, kNN, floors, quality, flat price). See [Routing (`caliban/auto`)](#routing-calibanauto).
 - `[[providers]]`: deployment-wide model servers shared by tenants (see `open-models.example.toml`).
 - `[[models]]`: the catalogue (provider, `upstream_model`, trust tier, licence, context window, prices, capabilities).
 - `[[tenants]]`, with `pii_mode`, `pii_surrogate_scope` (`tenant` or `session`), `semantic_cache` (`off` or `on`, default `off`), `[[tenants.providers]]` (BYOK) and `[[tenants.routes]]` (intent to ordered models).
 
 Secrets are never written inline: use `{ env = "VAR" }`, `{ file = "/path" }`, or a value sealed under `CALIBAN_KEK`. Trust tiers run from `t0_sovereign` to `t3_public`.
+
+### Routing (`caliban/auto`)
+
+Stages, in order (`crates/caliban-route`):
+
+1. **Rules.** A pinned model id exits here, subject to the tenant's catalogue and the trust-tier constraint.
+2. **Embedding kNN.** The last user message (first 2,000 characters) is embedded and compared, by brute-force cosine, with labelled exemplars held in memory: the built-in set ([`crates/caliban-route/data/exemplars.default.json`](crates/caliban-route/data/exemplars.default.json), 30 synthetic prompts each for `chat`, `code`, `analytics`, `summarize`, `extraction`, `translate` and `reasoning`), plus deployment and tenant exemplars from config. The k nearest neighbours vote with temperature-softmax weights; the classifier abstains below the OOS gate (top-1 similarity), below the intent's confidence threshold, or below the margin threshold. The semantics match ml's `KnnIntentClassifier`, so ml calibrations apply unchanged. Embed plus kNN must finish within `budget_ms` (default 25); on abstain, timeout, embedder error or a missing index, the keyword rules decide.
+3. **Model selection.** Candidates are the tenant's route for the intent (else its `default` route; a tenant without routes gets every chat model it can reach), filtered to chat models reachable through its own or a shared provider, with a credential (or a keyless OpenAI-compatible endpoint), within the trust-tier constraint and healthy, then narrowed by tools, vision and context-window fit. With a floor for the intent, models whose quality is at or above it are ordered by estimated request cost (cheapest first, unpriced last), then quality, route position and id; if none qualifies, the tenant's `default` route is used in its own order. Without a floor, the route order is kept.
+
+```toml
+[routing]
+embedding_model = "local/bge-small"        # catalogue embedding model on a shared [[providers]] entry
+embedder_artifact = "bge-small@1.0.0"      # the ml embedder artifact it corresponds to (gates the calibration)
+budget_ms = 25
+calibration_dir = "/opt/caliban/artifacts/intent_head/knn-default/1.0.0"   # ml `router knn-eval` output
+profile_dir = "/opt/caliban/artifacts/router_profile/core/1.0.0"         # ml `router profile` output (cluster id = intent)
+exemplar_cache_dir = "/var/lib/caliban/knn"  # exemplar vectors cached by vector space and exemplar set
+# k, temperature, abstain_threshold, margin_threshold and oos_threshold override the calibration.
+auto_price_in_per_mtok = 3.0               # flat price of caliban/auto, metered next to the real cost
+auto_price_out_per_mtok = 12.0
+
+[routing.floors]                            # quality floor per intent, 0..1; "*" covers the rest
+code = 0.8
+reasoning = 0.85
+"*" = 0.6
+
+[routing.quality."openai/gpt-5-mini"]      # per-model quality per intent; overrides the profile
+code = 0.86
+
+[routing.tenants.acme]                      # floors, prices, `knn = false`, and the tenant's own exemplars
+floors = { code = 0.9 }
+exemplars = { "legal.review" = ["review this NDA clause for risky terms", "check the liability cap in this MSA"] }
+```
+
+- The routing embedder must be served by a shared (deployment) provider, typically an on-prem TEI or vLLM embedding server: exemplars are embedded once for the deployment, never with a tenant's BYOK key. If that provider is outside the trust boundary, prompts are PII-masked before embedding, which adds latency; prefer a `t0_sovereign` embedder.
+- Routing assets are built at startup in the background and rebuilt when the snapshot changes the exemplar set, the embedder or the artifact paths. Floors, quality, thresholds and prices apply per request and never re-embed anything. Until the index is ready, or if the embedder is down (retried every 30 s), `caliban/auto` routes by the keyword rules. Artifacts are verified against their `manifest.json` hashes; a calibration whose `requires` embedder does not match `embedder_artifact` is not applied (built-in defaults are used, with a warning).
+- The decision trace (stage, kNN outcome and timing, floor, each candidate's verdict, quality and estimated cost) is logged at debug level under the `caliban_route` target, without prompt text. The `route` span carries the intent, confidence, stage, policy, kNN fallback reason and kNN time.
+- Metering: usage events for chat requests add `requested_model`, `intent_confidence` and `route_stage`; `caliban/auto` events add `routed_model_cost_usd` (the routed model's real cost from token usage) and `flat_price_usd` (the flat auto price for the same tokens). `GET /api/v1/usage` totals include `auto_requests`, `flat_price_usd`, `routed_model_cost_usd` and `margin_usd`. Fields are omitted when unset, so older consumers are unaffected; migration `0005` adds matching nullable columns to `usage_event`.
+- Offline check of an exemplar set under a real embedder (leave-one-out kNN accuracy, per-intent accuracy, confusions, OOS similarity): `CALIBAN_KNN_EVAL_URL=http://host:port/v1 CALIBAN_KNN_EVAL_MODEL=<model> cargo test -p caliban-route --test knn_eval -- --nocapture`. Without the variable the test is skipped.
 
 ### Environment variables
 
@@ -331,6 +373,7 @@ Known gaps:
 - Quotas default to in-memory per router process; set `[limits] store = "valkey"` to share them. While Valkey is unreachable each router limits on its own (see [Shared quotas](#shared-quotas-valkey)), and changing `store` needs a router restart.
 - No Prometheus metrics endpoint yet.
 - Semantic cache: the starting threshold (0.95) is not calibrated per embedding model yet; some models place unrelated text close together (bge-small scored random-word prompts above 0.95), so calibrate on your traffic before switching tenants on. The verifier is an answer-embedding comparison, not an LLM judge (Krites-style judging of grey-zone pairs is next); thresholds are not yet per intent category (the note's category-aware caching), and there is no near-hit-as-hint tier (T2b). Datasource epochs and ACL fingerprints are not wired into T2 keys yet (no grounded answers reach it today). Entries are not encrypted per tenant, and deleting a tenant does not purge its Qdrant entries (they expire with `ttl_secs`; `SemanticCache::purge_tenant` exists but is not called by the control plane). No per-tenant entry quota. Internal embedding calls are not metered. The tenant error budget is per router, and concurrent stat updates to one entry are last-writer-wins. Hits replay instantly, which is a timing signal within a tenant (research note, open question 6).
+- Routing: Stage 2 (ONNX classifier) and Stage 3 (LLM fallback) are not built; kNN abstentions go straight to the keyword rules. The built-in kNN defaults (k 5, temperature 0.05, abstain below 0.5, no OOS gate) are not calibrated for any particular embedder until ml ships an `intent_head` calibration for it. Model health is not tracked on the data plane yet (the policy has a hook; every model counts as healthy). Router-profile centroids are ignored (clusters are matched by intent id). Tenant exemplars come from config only, not yet from the control plane. Artifact signatures (`manifest.json.minisig`) are not checked, only file hashes. Exact-cache hits meter a flat price of 0 because they report no tokens.
 
 Next, in order:
 
@@ -338,7 +381,7 @@ Next, in order:
 2. MongoDB connector: wire `introspect` and `propose` into the control plane's introspection job; `$jsonSchema`-declared types; map and scalar-array attributes; per-shard sampling.
 3. CDC replica and planner: connect the planner to the `explain` gate and replica lag in a query service; delta Parquet with compaction instead of whole-table rewrites; resume from the manifest after a restart (today it re-snapshots); parallel `_id`-range snapshots; arrays nested in arrays.
 4. PII: licence sign-off on the NER model's fine-tuning data (see `MODELS.md`); FF1 format-preserving encryption for structured IDs; coreference so a first name maps to the surrogate's first name.
-5. Gateway: tokenizer-based estimates, rate-limit headers on successful responses, tool-call argument rehydration in streams, `Idempotency-Key`, the embedding kNN and ONNX intent classifiers, and for the semantic cache an async LLM judge, per-intent thresholds, tenant purge on delete and per-tenant entry encryption.
+5. Gateway: tokenizer-based estimates, rate-limit headers on successful responses, tool-call argument rehydration in streams, `Idempotency-Key`, the ONNX intent classifier (Stage 2), model health on the data plane, control-plane management of routing exemplars and floors, and for the semantic cache an async LLM judge, per-intent thresholds, tenant purge on delete and per-tenant entry encryption.
 
 ## Related repositories
 

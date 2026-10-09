@@ -903,10 +903,19 @@ dependencies = [
 name = "caliban-route"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "async-trait",
  "caliban-config",
  "caliban-ir",
  "caliban-types",
+ "hex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

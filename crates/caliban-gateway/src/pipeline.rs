@@ -11,6 +11,7 @@
 //! `cache_control` breakpoints, server tools and thinking signatures survive.
 
 use crate::error::Dialect;
+use crate::route_embed::{self, RouteMeta};
 use crate::{ApiError, Gateway, auth, limits, quirks, semantic, stream, telemetry};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -46,6 +47,8 @@ pub(crate) struct Outcome {
     pub span: Span,
     /// Prompt estimate used for the reservation (settles streams that end without usage).
     pub est_prompt_tokens: u64,
+    /// Routing facts for `x-caliban-intent` and metering (chat only).
+    pub route: Option<RouteMeta>,
 }
 
 /// Entry point for both chat dialects.
@@ -97,16 +100,14 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
 
     let decision = {
         let s = telemetry::child("route");
-        let _g = s.enter();
-        let d = gw.router.route(&snap, &tenant, &req, caliban_route::Constraints::default()).map_err(|e| match e {
+        let d = route_embed::route(&gw, &snap, &tenant, &req).instrument(s.clone()).await.map_err(|e| match e {
             RouteError::UnknownModel(_) => CalibanError::InvalidRequest(e.to_string()),
             _ => CalibanError::PolicyViolation(e.to_string()),
         })?;
-        s.record("caliban.route.intent", d.intent.as_str());
-        s.record("caliban.route.stage", d.stage);
-        s.record("caliban.route.candidates", d.candidates.len());
+        telemetry::record_route(&s, &d);
         d
     };
+    let route_meta = RouteMeta::new(&decision, &snap, &tenant, &req);
     span.record("caliban.route.intent", decision.intent.as_str());
     span.record("caliban.route.stage", decision.stage);
 
@@ -236,6 +237,7 @@ async fn run(gw: Arc<Gateway>, headers: &HeaderMap, body: &[u8], dialect: Dialec
             dialect,
             span: span.clone(),
             est_prompt_tokens: est_prompt,
+            route: Some(route_meta.clone()),
         };
 
         if let Some(k) = &key {
@@ -475,6 +477,9 @@ pub(crate) fn caliban_headers(h: &mut HeaderMap, o: &Outcome) {
     };
     set("x-caliban-request-id", o.request_id.to_string());
     set("x-caliban-routed-model", o.model.id.to_string());
+    if let Some(r) = &o.route {
+        set("x-caliban-intent", r.header.clone());
+    }
     set("x-caliban-cache", o.cache.as_str().to_owned());
     if let Some(t) = o.cache_tier {
         set("x-caliban-cache-tier", t.as_str().to_owned());
@@ -523,6 +528,8 @@ pub(crate) async fn finish(gw: &Gateway, o: &Outcome, usage: Usage, tokens_saved
 }
 
 pub(crate) async fn record(gw: &Gateway, o: &Outcome, usage: Usage, tokens_saved: u64) {
+    let cost = cost_usd(usage.prompt_tokens, usage.completion_tokens, o.model.price_in_per_mtok, o.model.price_out_per_mtok);
+    let auto = o.route.as_ref().filter(|r| r.auto);
     let event = UsageEvent {
         request_id: o.request_id.to_string(),
         tenant_id: o.tenant_id.clone(),
@@ -535,9 +542,14 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, usage: Usage, tokens_saved
         cache: o.cache,
         cache_tier: o.cache_tier,
         pii_entities: o.pii_entities,
-        cost_usd: cost_usd(usage.prompt_tokens, usage.completion_tokens, o.model.price_in_per_mtok, o.model.price_out_per_mtok),
+        cost_usd: cost,
         latency_ms: u64::try_from(o.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         ts: chrono::Utc::now(),
+        requested_model: o.route.as_ref().map(|r| r.requested_model.clone()),
+        intent_confidence: o.route.as_ref().map(|r| r.confidence),
+        route_stage: o.route.as_ref().map(|r| r.stage.to_owned()),
+        routed_model_cost_usd: auto.and(cost),
+        flat_price_usd: auto.and_then(|r| cost_usd(usage.prompt_tokens, usage.completion_tokens, r.flat_price.0, r.flat_price.1)),
     };
     gw.usage.record(event).await;
 }

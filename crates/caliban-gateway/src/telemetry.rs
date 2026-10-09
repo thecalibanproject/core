@@ -171,11 +171,36 @@ pub(crate) fn upstream_span(op: &'static str, model: &ModelEntry, provider: &Pro
 
 pub(crate) fn child(name: &'static str) -> Span {
     match name {
-        "route" => tracing::info_span!(target: TARGET, "route", caliban.route.intent = Empty, caliban.route.stage = Empty, caliban.route.candidates = Empty),
+        "route" => tracing::info_span!(
+            target: TARGET,
+            "route",
+            caliban.route.intent = Empty,
+            caliban.route.confidence = Empty,
+            caliban.route.stage = Empty,
+            caliban.route.policy = Empty,
+            caliban.route.knn_fallback = Empty,
+            caliban.route.knn_us = Empty,
+            caliban.route.candidates = Empty
+        ),
         "pii" => tracing::info_span!(target: TARGET, "pii", caliban.pii.mode = Empty, caliban.pii.surrogate_scope = Empty, caliban.pii.entities = Empty),
         "semantic" => tracing::info_span!(target: TARGET, "cache.semantic", caliban.cache = Empty, caliban.cache.similarity = Empty, caliban.cache.lookup_ms = Empty),
         _ => tracing::info_span!(target: TARGET, "cache", caliban.cache = Empty),
     }
+}
+
+/// Routing decision on the `route` span (no prompt content).
+pub(crate) fn record_route(s: &Span, d: &caliban_route::RouteDecision) {
+    s.record("caliban.route.intent", d.intent.as_str());
+    s.record("caliban.route.confidence", f64::from(d.confidence));
+    s.record("caliban.route.stage", d.stage);
+    s.record("caliban.route.policy", d.policy);
+    if let Some(f) = d.knn_fallback {
+        s.record("caliban.route.knn_fallback", f);
+    }
+    if let Some(k) = &d.knn {
+        s.record("caliban.route.knn_us", k.elapsed_us);
+    }
+    s.record("caliban.route.candidates", d.candidates.len());
 }
 
 /// Usage + response model on a span (request or upstream).

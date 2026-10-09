@@ -37,6 +37,30 @@ pub struct UsageEvent {
     pub cost_usd: Option<f64>,
     pub latency_ms: u64,
     pub ts: DateTime<Utc>,
+    /// The model the client asked for: `caliban/auto` or a pinned catalogue id (chat only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    /// Confidence of the intent decision, 0..=1 (chat only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_confidence: Option<f32>,
+    /// Stage that decided the intent: `rules` (pinned), `knn` or `keyword` (chat only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_stage: Option<String>,
+    /// `caliban/auto` only: real cost of the routed model for this request (its prices times the
+    /// reported usage; the same number as `cost_usd`), recorded next to `flat_price_usd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_model_cost_usd: Option<f64>,
+    /// `caliban/auto` only: the flat auto price for this request's tokens
+    /// (`[routing] auto_price_in_per_mtok` / `auto_price_out_per_mtok`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flat_price_usd: Option<f64>,
+}
+
+impl UsageEvent {
+    /// `flat_price_usd - routed_model_cost_usd`, when both are known.
+    pub fn margin_usd(&self) -> Option<f64> {
+        Some(self.flat_price_usd? - self.routed_model_cost_usd?)
+    }
 }
 
 pub fn cost_usd(prompt: u64, completion: u64, price_in_per_mtok: Option<f64>, price_out_per_mtok: Option<f64>) -> Option<f64> {

@@ -17,6 +17,7 @@ mod messages;
 mod pipeline;
 mod quirks;
 mod rerank;
+mod route_embed;
 mod semantic;
 mod stream;
 pub mod telemetry;
@@ -103,6 +104,16 @@ impl Gateway {
         self
     }
 
+    /// Builds the `caliban/auto` routing assets (exemplar index, calibration, router profile) for
+    /// the current snapshot and waits for it. Call once at startup; config changes are picked up
+    /// in the background on the next request.
+    pub async fn warm_router(&self) {
+        let snap = self.config.load();
+        if self.router.needs_refresh(&snap) {
+            route_embed::refresh(self, &snap).await;
+        }
+    }
+
     /// Replaces the quota store (e.g. a shared Valkey store for multi-router deployments).
     pub fn with_quota(mut self, quota: Arc<dyn QuotaStore>) -> Self {
         self.quota = quota;
@@ -131,6 +142,7 @@ fn cors() -> CorsLayer {
             HeaderName::from_static("x-caliban-ratelimit-scope"),
             HeaderName::from_static("x-caliban-request-id"),
             HeaderName::from_static("x-caliban-routed-model"),
+            HeaderName::from_static("x-caliban-intent"),
             HeaderName::from_static("x-caliban-cache"),
             HeaderName::from_static("x-caliban-cache-tier"),
             HeaderName::from_static("x-caliban-pii-entities"),

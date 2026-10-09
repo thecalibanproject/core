@@ -641,6 +641,11 @@ async fn usage(State(cp): State<Cp>, Query(q): Query<UsageQuery>) -> Json<Value>
         "semantic_cache_hits": all.iter().filter(|e| e.cache_tier == Some(caliban_types::CacheTier::Semantic)).count(),
         "tokens_saved": all.iter().map(|e| e.tokens_saved + e.cached_prompt_tokens).sum::<u64>(),
         "cost_usd": all.iter().filter_map(|e| e.cost_usd).sum::<f64>(),
+        // caliban/auto: flat price billed vs the routed models' real cost, over events with both.
+        "auto_requests": all.iter().filter(|e| e.requested_model.as_deref() == Some("caliban/auto")).count(),
+        "flat_price_usd": all.iter().filter(|e| e.margin_usd().is_some()).filter_map(|e| e.flat_price_usd).sum::<f64>(),
+        "routed_model_cost_usd": all.iter().filter(|e| e.margin_usd().is_some()).filter_map(|e| e.routed_model_cost_usd).sum::<f64>(),
+        "margin_usd": all.iter().filter_map(caliban_meter::UsageEvent::margin_usd).sum::<f64>(),
     });
     Json(json!({ "events": events, "totals": totals }))
 }
