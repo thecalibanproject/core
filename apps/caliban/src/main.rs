@@ -219,8 +219,10 @@ async fn healthcheck(addr: &str, path: &str) -> bool {
 
 /// Builds the data plane. With `CALIBAN_PII_NER_DIR` set, the L1 NER detector is loaded (and its
 /// artifact hashes verified); a failure refuses to start rather than silently running without it.
+/// The quota store follows `[limits] store` (`valkey` needs `CALIBAN_VALKEY_URL`).
 fn new_gateway(handle: ConfigHandle, usage: Arc<dyn UsageSink>) -> Result<caliban_gateway::Gateway> {
-    let mut gw = caliban_gateway::Gateway::new(handle, usage);
+    let quota = caliban_gateway::quota_store(&handle.load().config.limits).map_err(anyhow::Error::msg)?;
+    let mut gw = caliban_gateway::Gateway::new(handle, usage).with_quota(quota);
     if let Some(dir) = std::env::var("CALIBAN_PII_NER_DIR").ok().filter(|d| !d.trim().is_empty()) {
         gw.pii = load_ner(&dir)?;
     }

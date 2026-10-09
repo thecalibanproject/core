@@ -25,6 +25,11 @@ default_mode = "reversible"
 
 # Rate limits and token budgets (all optional; unset = unlimited). 429 + retry-after when exceeded.
 # [limits]
+# store = "memory"                 # "memory" (per router process) or "valkey" (shared by all
+#                                  # routers; needs CALIBAN_VALKEY_URL, falls back to local limits
+#                                  # while Valkey is unreachable). Read at start-up.
+# valkey_key_prefix = "caliban"    # key namespace, so deployments can share one Valkey
+# valkey_timeout_ms = 30           # max wait per quota call before limiting locally (1-1000)
 # requests_per_minute = 600        # GCRA, per tenant
 # key_requests_per_minute = 120    # GCRA, per API key
 # tokens_per_minute = 400000       # reserved: prompt estimate + max_tokens, settled to actual usage
