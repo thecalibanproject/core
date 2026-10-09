@@ -21,6 +21,10 @@ struct Args {
     /// Keep a request log, bills and simulated prompt caches (GET /__mock/log).
     #[arg(long)]
     record: bool,
+    /// Cut or pad every reply to this many characters, so its length (and the number of stream
+    /// chunks) does not depend on the prompt. Unset: echo the last user message.
+    #[arg(long)]
+    reply_chars: Option<usize>,
 }
 
 #[tokio::main]
@@ -31,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
         chunk_delay: Duration::from_secs_f64(a.chunk_delay_ms / 1000.0),
         chunk_chars: a.chunk_chars,
         record: a.record,
+        reply_chars: a.reply_chars,
     };
     let mock = Mock::start(&a.addr, cfg).await?;
     println!("mock upstream listening on {}", mock.addr);

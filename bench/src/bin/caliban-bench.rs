@@ -124,6 +124,9 @@ const PROMPT: &str = "Please draft a short follow-up note to our customer about 
 jane.doe@acme.com and the card on file is 4111 1111 1111 1111. Keep it friendly and under one hundred words, \
 and mention that the invoice is attached.";
 
+/// Characters of every mock reply (see `start_mock`).
+const REPLY_CHARS: usize = 248;
+
 const UPSTREAM_KEY: &str = "sk-bench-upstream-0000";
 
 /// Which gateway process a scenario runs against.
@@ -367,6 +370,11 @@ async fn start_mock(
             &latency_ms.to_string(),
             "--chunk-delay-ms",
             &chunk_delay_ms.to_string(),
+            // Same reply on both sides: through the gateway with PII on, the prompt the mock
+            // echoes is in surrogate form and longer. 248 = "You said: " + PROMPT, so PII-off rows
+            // stay as before; the PII rows' surrogates all fall within it.
+            "--reply-chars",
+            &REPLY_CHARS.to_string(),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

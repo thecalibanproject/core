@@ -8,7 +8,11 @@
 //!   [`prompt_tokens`] and [`completion_tokens`]), so the gateway's metering can be compared with
 //!   the "provider bill" exactly. Every billed request is recorded in [`Bill`] form.
 //! - **Echo replies** (`"You said: <last user text>"`), so PII tests can check what the upstream
-//!   received (surrogates) and what the client got back (rehydrated).
+//!   received (surrogates) and what the client got back (rehydrated). With `reply_chars` set,
+//!   the echo is cut or padded to exactly that many characters, so the reply (and the number of
+//!   stream chunks) no longer depends on the prompt's length: a prompt in surrogate form is longer
+//!   than the original, and paced PII streams would otherwise run longer through the gateway than
+//!   direct (the benchmark sets it).
 //! - **Simulated provider-side prompt caches**, scoped like the real thing: OpenAI-compatible
 //!   prefix caches are keyed by `cache_salt` (vLLM) or, without a salt, by the credential; the
 //!   Anthropic cache by `x-api-key`. A repeat reports `cached_tokens` /
@@ -44,11 +48,13 @@ pub struct MockConfig {
     pub chunk_chars: usize,
     /// Keep a request log, provider bills and the simulated prompt caches.
     pub record: bool,
+    /// Cut or pad every reply to exactly this many characters (`None`: the plain echo).
+    pub reply_chars: Option<usize>,
 }
 
 impl Default for MockConfig {
     fn default() -> Self {
-        Self { latency: Duration::ZERO, chunk_delay: Duration::ZERO, chunk_chars: 4, record: true }
+        Self { latency: Duration::ZERO, chunk_delay: Duration::ZERO, chunk_chars: 4, record: true, reply_chars: None }
     }
 }
 
@@ -220,8 +226,12 @@ pub fn completion_tokens(reply: &str) -> u64 {
     reply.split_whitespace().count() as u64 + 1
 }
 
-fn reply_text(body: &Value) -> String {
-    format!("You said: {}", last_user_text(body))
+fn reply_text(body: &Value, reply_chars: Option<usize>) -> String {
+    let echo = format!("You said: {}", last_user_text(body));
+    match reply_chars {
+        None => echo,
+        Some(n) => echo.chars().chain(" pad".chars().cycle()).take(n).collect(),
+    }
 }
 
 fn prompt_hash(body: &Value) -> String {
@@ -283,7 +293,7 @@ async fn chat(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
         }
         return (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":{"message":"mock failure"}}"#).into_response();
     }
-    let text = reply_text(&body);
+    let text = reply_text(&body, s.cfg.reply_chars);
     let prompt = prompt_tokens(&body);
     let completion = completion_tokens(&text);
     let mut cached = 0;
@@ -383,7 +393,7 @@ async fn messages(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
     let model = body.get("model").cloned().unwrap_or(Value::Null);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let key = header(&headers, "x-api-key");
-    let text = reply_text(&body);
+    let text = reply_text(&body, s.cfg.reply_chars);
     let total = prompt_tokens(&body);
     let output = completion_tokens(&text);
     let cacheable = anthropic_cacheable_tokens(&body).min(total);
@@ -517,6 +527,17 @@ mod tests {
         let b = json!({"messages": [{"role": "user", "content": "hello world"}]});
         assert_eq!(prompt_tokens(&b), 8 + 4); // (11 + 4) bytes → 4 tokens
         assert_eq!(completion_tokens("You said: hello world"), 5);
+    }
+
+    #[test]
+    fn fixed_length_replies_do_not_depend_on_the_prompt() {
+        let short = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let long = json!({"messages": [{"role": "user", "content": "x".repeat(500)}]});
+        assert_eq!(reply_text(&short, None), "You said: hi");
+        for b in [&short, &long] {
+            assert_eq!(reply_text(b, Some(64)).chars().count(), 64);
+        }
+        assert!(reply_text(&short, Some(64)).starts_with("You said: hi pad pad"));
     }
 
     #[test]
