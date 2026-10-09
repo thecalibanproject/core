@@ -657,7 +657,13 @@ dependencies = [
  "bytes",
  "caliban-types",
  "moka",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -726,6 +732,7 @@ dependencies = [
 name = "caliban-gateway"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "blake3",
  "bytes",
@@ -739,10 +746,12 @@ dependencies = [
  "caliban-types",
  "chrono",
  "futures",
+ "moka",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "rand 0.9.5",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",
@@ -752,6 +761,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -885,6 +895,7 @@ dependencies = [
 name = "caliban-types"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hex",
  "serde",
  "serde_json",

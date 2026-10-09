@@ -19,6 +19,31 @@ exact_enabled = true
 exact_max_entries = 100000
 exact_ttl_secs = 3600
 
+# T2 semantic cache: reuses the answer to an earlier, semantically similar request of the SAME
+# tenant (same model, system prompt, history and parameters; only the last user message may
+# differ). Off unless enabled here AND `semantic_cache = "on"` on the tenant. Store: Qdrant over
+# REST (port 6333; CALIBAN_QDRANT_URL wins over qdrant_url), or "memory" for one process.
+# Thresholds start conservative and are learned per entry from verification (see the README).
+# Needs an embedding model in [[models]] (kind = "embedding"), e.g. Qwen3-Embedding-0.6B on TEI;
+# see open-models.example.toml for a working setup.
+# [cache.semantic]
+# enabled = false
+# store = "qdrant"
+# qdrant_url = "http://qdrant:6333"
+# qdrant_api_key = { env = "CALIBAN_QDRANT_API_KEY" }
+# collection_prefix = "caliban_semcache"
+# embedding_model = "local/qwen3-embedding-0.6b"
+# threshold = 0.95                 # starting per-entry cosine threshold
+# min_threshold = 0.90             # learned thresholds never go below
+# grey_band = 0.03                 # just below the threshold: answer fresh, verify, learn
+# max_error_rate = 0.02            # error budget: tighten a tenant's thresholds above this
+# verify_rate = 0.05               # share of would-be hits answered fresh to measure errors
+# verify_answer_similarity = 0.90  # answers this close (cosine) count as the same answer
+# max_temperature = 0.3            # hotter (or unset) requests are not cached unless they opt in
+# ttl_secs = 86400
+# lookup_budget_ms = 50            # embed + search; slower means a miss
+# embed_timeout_ms = 2000
+
 [pii]
 # Default for tenants that don't override it: off | mask | reversible
 default_mode = "reversible"
@@ -74,6 +99,8 @@ pii_mode = "reversible"
 # their surrogates. "session": fresh surrogates per request (unlinkable, PII requests bypass the
 # cache). Surrogates never cross tenants.
 # pii_surrogate_scope = "tenant"
+# T2 semantic cache for this tenant: "off" (default) or "on" (also needs [cache.semantic] enabled).
+# semantic_cache = "off"
 # SHA-256 hex of each API key. Generate a key with `caliban keygen`.
 api_key_hashes = [
   # "3f5c…",

@@ -1,4 +1,5 @@
-//! Response caches (docs/research/01-semantic-caching-and-rust-vector-stack.md).
+//! Response caches (docs/research/01-semantic-caching-and-rust-vector-stack.md): T1 exact
+//! (below) and T2 semantic ([`semantic`]).
 //!
 //! Rules that hold for every tier:
 //! - **No cross-tenant entries.** The tenant id is part of every key.
@@ -7,11 +8,12 @@
 //! - Keys are computed over **pseudonymized** text; hits are rehydrated with the current
 //!   request's vault.
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use caliban_types::{PiiMode, TenantId};
 use std::sync::Arc;
 use std::time::Duration;
+
+pub mod semantic;
 
 /// Inputs that determine whether two requests may share a cached response.
 #[derive(Debug, Clone)]
@@ -72,16 +74,6 @@ impl ExactCache {
     pub async fn put(&self, key: CacheKey, value: CachedResponse) {
         self.inner.insert(key, Arc::new(value)).await;
     }
-}
-
-/// T2: semantic cache over embeddings of the pseudonymized last user turn.
-///
-/// TODO(P4): Qdrant/usearch implementation with vCache-style per-entry learned thresholds,
-/// an error budget per tenant, slot-equality guards, and an async judge for grey-zone matches.
-#[async_trait]
-pub trait SemanticCache: Send + Sync {
-    async fn lookup(&self, tenant: &TenantId, intent: &str, embedding: &[f32]) -> Option<Arc<CachedResponse>>;
-    async fn insert(&self, tenant: &TenantId, intent: &str, embedding: Vec<f32>, value: CachedResponse);
 }
 
 #[cfg(test)]

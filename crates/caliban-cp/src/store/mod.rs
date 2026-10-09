@@ -33,7 +33,7 @@ use audit::{AuditDraft, AuditEntry};
 use caliban_config::{Config, ConfigHandle, ModelEntry, ProviderConfig, RouteConfig, SecretRef, SharedProvider, Snapshot, TenantConfig};
 use caliban_meter::RecentUsage;
 use caliban_ontology::{Element, Ontology, Status};
-use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, TrustTier};
+use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, SemanticCacheMode, TrustTier};
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::Serialize;
@@ -69,6 +69,8 @@ pub struct Tenant {
     /// `tenant` (default): the same value always gets the same surrogate in this tenant, so
     /// pseudonymised requests can hit the cache. `session`: fresh surrogates per request.
     pub pii_surrogate_scope: PiiSurrogateScope,
+    /// T2 semantic cache for this tenant (`off` by default; also needs `[cache.semantic] enabled`).
+    pub semantic_cache: SemanticCacheMode,
     pub created_at: DateTime<Utc>,
     pub status: TenantStatus,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -169,6 +171,7 @@ impl State {
                 region: None,
                 pii_default: t.pii_mode.unwrap_or(base.pii.default_mode),
                 pii_surrogate_scope: t.pii_surrogate_scope,
+                semantic_cache: t.semantic_cache,
                 created_at: now,
                 status: TenantStatus::Active,
                 deleted_at: None,
@@ -258,7 +261,7 @@ impl NodeRecord {
 }
 
 /// `TenantConfig` fields the store models explicitly; anything else is kept in `settings`.
-const TENANT_FIELDS: &[&str] = &["id", "name", "pii_mode", "pii_surrogate_scope", "api_key_hashes", "providers", "routes"];
+const TENANT_FIELDS: &[&str] = &["id", "name", "pii_mode", "pii_surrogate_scope", "semantic_cache", "api_key_hashes", "providers", "routes"];
 
 fn tenant_settings(t: &TenantConfig) -> Map<String, Value> {
     match serde_json::to_value(t) {
@@ -303,6 +306,7 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
             obj.insert("name".into(), json!(t.name));
             obj.insert("pii_mode".into(), json!(t.pii_default));
             obj.insert("pii_surrogate_scope".into(), json!(t.pii_surrogate_scope));
+            obj.insert("semantic_cache".into(), json!(t.semantic_cache));
             obj.insert(
                 "api_key_hashes".into(),
                 json!(st.api_keys.iter().filter(|k| k.tenant_id == t.id && k.is_active()).map(|k| &k.hash).collect::<Vec<_>>()),
@@ -343,8 +347,13 @@ pub enum Mutation {
     /// Tombstones the tenant and, in the same transaction, revokes its API keys, destroys its
     /// BYOK credentials, removes its routes and soft-deletes its datasources and nodes.
     DeleteTenant { id: String, at: DateTime<Utc> },
-    /// Changes an active tenant's PII settings; `None` keeps the current value.
-    UpdateTenantPii { id: String, pii_default: Option<PiiMode>, pii_surrogate_scope: Option<PiiSurrogateScope> },
+    /// Changes an active tenant's settings; `None` keeps the current value.
+    UpdateTenant {
+        id: String,
+        pii_default: Option<PiiMode>,
+        pii_surrogate_scope: Option<PiiSurrogateScope>,
+        semantic_cache: Option<SemanticCacheMode>,
+    },
     CreateProviderKey(ProviderKeyRecord),
     DeleteProviderKey { tenant_id: String, id: String },
     CreateModel(ModelEntry),
@@ -380,9 +389,9 @@ impl Mutation {
                 Some(&t.id),
                 "tenant.create",
                 &t.id,
-                json!({"name": t.name, "pii_default": t.pii_default, "pii_surrogate_scope": t.pii_surrogate_scope}),
+                json!({"name": t.name, "pii_default": t.pii_default, "pii_surrogate_scope": t.pii_surrogate_scope, "semantic_cache": t.semantic_cache}),
             ),
-            Mutation::UpdateTenantPii { id, pii_default, pii_surrogate_scope } => {
+            Mutation::UpdateTenant { id, pii_default, pii_surrogate_scope, semantic_cache } => {
                 let t = before.tenant(id);
                 d(
                     Some(id),
@@ -391,6 +400,7 @@ impl Mutation {
                     json!({
                         "pii_default": {"from": t.map(|t| t.pii_default), "to": pii_default},
                         "pii_surrogate_scope": {"from": t.map(|t| t.pii_surrogate_scope), "to": pii_surrogate_scope},
+                        "semantic_cache": {"from": t.map(|t| t.semantic_cache), "to": semantic_cache},
                     }),
                 )
             }

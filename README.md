@@ -44,7 +44,9 @@ The model id `caliban/auto` lets Caliban choose: the request is classified into 
 
 Control-plane endpoints (`:8081`) live under `/api/v1/*` and are specified in [`api/openapi.yaml`](api/openapi.yaml): tenants, tenant API keys, BYOK provider keys, routes, the model catalogue and shared providers (with health checks and model discovery), datasources and introspection, the ontology review queue, nodes, usage, the audit log, health, and signed snapshots for split-mode routers. When a built console is available (`CALIBAN_WEB_DIR` or `[server] web_dir`), it is served at `/`.
 
-`PATCH /api/v1/tenants/{tenantId}` changes a tenant's `pii_default` and `pii_surrogate_scope` (audited as `tenant.update`; routers apply it with their next snapshot).
+`PATCH /api/v1/tenants/{tenantId}` changes a tenant's `pii_default`, `pii_surrogate_scope` and `semantic_cache` (audited as `tenant.update`; routers apply it with their next snapshot).
+
+Every chat response carries `x-caliban-request-id`, `x-caliban-routed-model`, `x-caliban-cache` (`hit`, `miss` or `bypass`), `x-caliban-pii-entities` and, when non-streaming and priced, `x-caliban-cost-usd`. On a hit, `x-caliban-cache-tier` says which tier answered: `exact` or `semantic`. `x-caliban-cache` stays `hit` for both tiers, so SDKs and dashboards that count `hit | miss | bypass` keep working (the Python SDK's usage model and the console's filters only accept those three values); usage events add `cache_tier` the same way.
 
 Deletes (admin token):
 
@@ -72,7 +74,27 @@ One pipeline serves both API shapes. OpenAI and Anthropic requests are decoded i
 
    Surrogates never cross tenants. No surrogate-to-original table is stored: each request's reverse map is built from the values seen in that request, and only those values are restored in the response (any other surrogate, for example in a cached answer, is left as it is). Within a request, two values never share a surrogate (deterministic re-draw, then a typed placeholder). Across requests, small formats such as names can collide; that never breaks rehydration. Derivation, formats and collision probabilities are documented in [`crates/caliban-pii/src/surrogate.rs`](crates/caliban-pii/src/surrogate.rs). Without `CALIBAN_KEK`, the key comes from a random per-process secret, so surrogates are stable within one process only.
 3. **Routing.** Rules and policy (pinned model, trust tier, licence), then intent classification (a placeholder keyword classifier today), then the tenant's ordered candidates with fallbacks.
-4. **Cache.** Exact cache over the protected upstream body (never raw PII sent outside), keyed by tenant, ACL and datasource epoch. Entries are stored pseudonymised and rehydrated with the vault of the request that hits them.
+4. **Cache.** Two tiers, checked in order. Entries of both are stored pseudonymised and rehydrated with the vault of the request that hits them, and never cross tenants.
+   - **T1 exact** (in-process moka): the protected upstream body (never raw PII sent outside), keyed by tenant, ACL and datasource epoch. Needs `temperature = 0`, no tools, non-streaming.
+   - **T2 semantic** (Qdrant, or an in-memory store for one process): answers with the response to an earlier, *semantically similar* request of the same tenant. Off unless `[cache.semantic] enabled` and the tenant has `semantic_cache = "on"`.
+     - *What must match exactly* (a hash used as a store filter, together with `tenant_id`): the routed model and response shape; the whole protected request except the last user message (system prompt, earlier turns, temperature and every other parameter), so different system prompts, histories or temperatures never share answers; the numeric tokens of the last user message ("Q3 2025" never matches "Q3 2026"); the set of PII surrogates in the request (tenant-scoped surrogates are deterministic, so an answer about one person is never served for another, and every surrogate in a hit is restorable); the PII mode.
+     - *What is embedded*: the last user message in surrogate form, with the deployment's `embedding_model` (one Qdrant collection per embedding model and dimension).
+     - *Eligible requests*: T1's PII rules (no PII, tenant-scoped surrogates or masking; session-scoped PII bypasses); no tools, tool calls or tool results; `n` unset or 1; a text-only last user message; not `zdr`; `temperature <= max_temperature` (default 0.3; unset means sampling), unless the request sends `caliban.cache = "semantic"`, which opts in at any temperature. `caliban.cache = "exact"` or `"off"` skips T2. Streaming and non-streaming both qualify: a streamed miss is captured and cached, and a hit on a streaming request is replayed as a stream (one content delta, then the finish chunk with usage).
+     - *Threshold policy* (vCache-style, [research note 01](https://github.com/thecalibanproject/docs/blob/main/research/01-semantic-caching-and-rust-vector-stack.md), "Threshold strategy"): every entry starts at a conservative cosine threshold (`threshold`, 0.95) and learns its own from verification. Matches just below it (`grey_band`, 0.03) are answered fresh and the fresh answer is compared with the cached one in the background; two agreements let the entry serve down to the lowest verified-correct similarity (never below `min_threshold`, 0.90). A wrong answer moves the entry's threshold above that similarity for good. A share of would-be hits (`verify_rate`, 5%) is also answered fresh and checked; those samples measure each tenant's false-hit rate, and when a window of 50 samples holds more wrong answers than `max_error_rate` (2%) allows, all of that tenant's thresholds tighten by 0.01 (up to 0.04), relaxing again after a clean window. Answers count as the same when their texts match or their embeddings have cosine at least `verify_answer_similarity` (0.90). Compared with vCache, the per-entry signal is the same (similarity, was the cached answer right), but the threshold is the non-parametric bound instead of a fitted sigmoid, and the error budget is enforced by measurement and tightening rather than a formal bound. Entry statistics live in the Qdrant payload (shared by routers, last writer wins); the tenant budget is per router.
+     - *Failure policy*: embedding plus search must finish within `lookup_budget_ms` (50 ms), or the request goes on as a miss. A late embedding is still used to cache the fresh answer. Errors never fail a request.
+     - *Measured* on an Apple-silicon laptop (release build; Qdrant 1.19.1 and TEI 1.9.4 CPU in Docker):
+
+       | What | p50 | p99 |
+       |---|---|---|
+       | Qdrant lookup (1,024-d, 2,000 points over 20 tenants, tenant and partition filter) | 0.7 ms | 1.7 ms |
+       | Added on a miss, embedding mocked (HTTP round trip and search only) | 0.5 to 1.0 ms | 1.6 to 2.5 ms |
+       | Embedding one prompt, `BAAI/bge-small-en-v1.5` (384-d, ONNX) | 6.1 ms | 10.8 ms |
+       | Added on a miss, bge-small plus Qdrant, end to end | 10.3 ms | 23.0 ms |
+       | Embedding one prompt, `Qwen/Qwen3-Embedding-0.6B` (1,024-d, candle) | 275 ms | 304 ms |
+
+       So on CPU, a small embedding model fits the budget and Qwen3-Embedding-0.6B does not: with it every lookup times out (50 ms added, no hits on rephrasings) until it runs on a GPU. Pick a small model for cache keys on CPU-only sites, or raise `lookup_budget_ms` knowingly.
+     - *Embeddings* go through `ProviderEmbedder` ([`crates/caliban-gateway/src/embedder.rs`](crates/caliban-gateway/src/embedder.rs)): the tenant's provider for the embedding model (its own, or a shared pool it may use), one batched call per request, a 2 s timeout (`embed_timeout_ms`), and an in-process LRU. The `Embedder` trait is in `caliban-types` for other consumers such as kNN routing.
+     - Headers and metering: a T2 hit returns `x-caliban-cache: hit` and `x-caliban-cache-tier: semantic`, costs nothing, and its usage event has `cache_tier: "semantic"` and `tokens_saved`. The control plane's usage totals add `semantic_cache_hits`.
 5. **Upstream.** BYOK calls to OpenAI-compatible servers (OpenAI, vLLM, SGLang, llama.cpp, Ollama, TEI) or to Anthropic, either as native passthrough (`cache_control` kept) or translated. `security.egress = "deny_by_default"` limits calls to declared `base_url`s. Shared vLLM and SGLang pools can receive a per-tenant `cache_salt` for prefix-cache isolation.
 6. **Metering and tracing.** Usage events with cost go to an in-memory ring and, optionally, a JSONL write-ahead log. OpenTelemetry GenAI spans are exported only when configured, and prompt and response content is never recorded.
 
@@ -86,7 +108,7 @@ The binary is in `apps/caliban`; everything else is in `crates/`.
 | `caliban-config` | Done | TOML config to an indexed `Snapshot` behind `ArcSwap`; secret references (`env`, `file`, and `sealed` with AES-256-GCM under `CALIBAN_KEK`); Ed25519 snapshot signing |
 | `caliban-ir` | Done (OpenAI, Anthropic) | Canonical request IR, unknown-field passthrough, canonical hashing for cache keys, Anthropic Messages codecs (requests, responses, stream events), SSE parser |
 | `caliban-pii` | L0 done; L1 NER done behind `ner` | Regexes and validators, tenant dictionaries, in-process multilingual NER (ONNX, MIT-licensed weights, hash-verified artifact; see [`crates/caliban-pii/MODELS.md`](crates/caliban-pii/MODELS.md)), surrogates, vault, streaming rehydration |
-| `caliban-cache` | Exact cache done; semantic cache planned | Exact cache (moka) with tenant, ACL and datasource-epoch keys; semantic cache trait |
+| `caliban-cache` | Exact and semantic caches done; plan cache planned | T1 exact cache (moka) with tenant, ACL and datasource-epoch keys; T2 semantic cache: `VectorStore` trait with Qdrant (REST) and in-memory stores, per-entry learned thresholds, tenant error budgets |
 | `caliban-route` | Rules and placeholder classifier done; kNN and ONNX classifier planned | Intent to ordered candidates, trust-tier constraints, fallbacks |
 | `caliban-providers` | OpenAI-compatible and Anthropic done; Bedrock and Vertex planned | BYOK upstream calls; Anthropic native passthrough or translation |
 | `caliban-meter` | Done; Valkey quota store stubbed | Usage events, cost, in-memory ring and JSONL WAL; GCRA rate limits (`governor`), token and USD budgets (in-memory) |
@@ -162,11 +184,12 @@ Global flags: `--config` (`CALIBAN_CONFIG`, default `/etc/caliban/caliban.toml`)
 - `[server]`: `router_addr`, `control_plane_addr`, `web_dir`.
 - `[security]`: `egress = "deny_by_default"` and `admin_token`.
 - `[cache]`: exact cache on or off, size and TTL.
+- `[cache.semantic]`: `enabled`, `store` (`qdrant` or `memory`), `qdrant_url`, `qdrant_api_key`, `collection_prefix`, `embedding_model`, `threshold`, `min_threshold`, `grey_band`, `max_error_rate`, `verify_rate`, `verify_answer_similarity`, `max_temperature`, `ttl_secs`, `lookup_budget_ms`, `embed_timeout_ms` (see [Cache](#request-pipeline) above and the annotated example). Caliban talks to Qdrant's REST port (6333), not gRPC (6334). The store and its URL are read at start-up; the switches, thresholds and budgets follow the live snapshot (split-mode routers get them from the control plane).
 - `[pii]`: `default_mode` (`off`, `mask` or `reversible`).
 - `[limits]` and `[limits.tenants.<id>]`: `requests_per_minute`, `key_requests_per_minute`, `tokens_per_minute`, `tokens_per_day`, `usd_per_day`. Unset means unlimited.
 - `[[providers]]`: deployment-wide model servers shared by tenants (see `open-models.example.toml`).
 - `[[models]]`: the catalogue (provider, `upstream_model`, trust tier, licence, context window, prices, capabilities).
-- `[[tenants]]`, with `pii_mode`, `pii_surrogate_scope` (`tenant` or `session`), `[[tenants.providers]]` (BYOK) and `[[tenants.routes]]` (intent to ordered models).
+- `[[tenants]]`, with `pii_mode`, `pii_surrogate_scope` (`tenant` or `session`), `semantic_cache` (`off` or `on`, default `off`), `[[tenants.providers]]` (BYOK) and `[[tenants.routes]]` (intent to ordered models).
 
 Secrets are never written inline: use `{ env = "VAR" }`, `{ file = "/path" }`, or a value sealed under `CALIBAN_KEK`. Trust tiers run from `t0_sovereign` to `t3_public`.
 
@@ -180,6 +203,8 @@ Secrets are never written inline: use `{ env = "VAR" }`, `{ file = "/path" }`, o
 | `CALIBAN_DATABASE_URL` | control plane | Postgres store; unset means in-memory |
 | `CALIBAN_WEB_DIR` | control plane | Built web console (overrides `[server] web_dir`) |
 | `CALIBAN_USAGE_WAL` | data plane | JSONL usage log path |
+| `CALIBAN_QDRANT_URL` | data plane | Qdrant REST endpoint for the semantic cache, e.g. `http://qdrant:6333` (overrides `[cache.semantic] qdrant_url`) |
+| `CALIBAN_QDRANT_API_KEY` | data plane | Qdrant API key, used when `[cache.semantic] qdrant_api_key` is unset |
 | `CALIBAN_LOG` | all | Log filter (default `info,tower_http=info`) |
 | `CALIBAN_PII_NER_DIR` | data plane | Verified NER artifact directory; needs a `ner` build |
 | `CALIBAN_PII_NER_SESSIONS` | data plane | Number of NER inference sessions |
@@ -251,9 +276,14 @@ cargo clippy --all-targets
 # Postgres store parity tests (the memory store's suite, run against Postgres):
 docker run -d --rm -p 55432:5432 -e POSTGRES_PASSWORD=x --name caliban-pg-test postgres:17-alpine
 CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres cargo test -p caliban-cp
+
+# Semantic cache against a real Qdrant (tenant isolation, TTL, learning, latency):
+docker run -d --rm -p 56333:6333 --name caliban-qdrant-test qdrant/qdrant:v1.19.1-unprivileged
+CALIBAN_TEST_QDRANT_URL=http://127.0.0.1:56333 cargo test -p caliban-cache --test qdrant -- --nocapture
+CALIBAN_TEST_QDRANT_URL=http://127.0.0.1:56333 cargo test --release -p caliban-gateway semantic_miss_latency -- --nocapture
 ```
 
-- **`scripts/smoke.sh`** runs `caliban standalone` against `scripts/mock_upstream.py`. It checks that PII never reaches an external model, responses and streams are rehydrated, sovereign models get raw text, the exact cache hits, credentials in prompts are blocked, the Anthropic Messages API works (translated and native passthrough), rate limits return `429` with `retry-after`, keys and BYOK credentials created through the control plane work on the data plane, and a revoked key or a deleted tenant's key gets `401`. Needs `python3`, `curl` and `shasum`. With `CALIBAN_PII_NER_DIR` set, it builds with `ner` and adds name-protection checks.
+- **`scripts/smoke.sh`** runs `caliban standalone` against `scripts/mock_upstream.py`. It checks that PII never reaches an external model, responses and streams are rehydrated, sovereign models get raw text, the exact cache hits, credentials in prompts are blocked, the semantic cache (in-memory store) serves a rephrased question, replays it as a stream and keeps it from another tenant, the Anthropic Messages API works (translated and native passthrough), rate limits return `429` with `retry-after`, keys and BYOK credentials created through the control plane work on the data plane, and a revoked key or a deleted tenant's key gets `401`. Needs `python3`, `curl` and `shasum`. With `CALIBAN_PII_NER_DIR` set, it builds with `ner` and adds name-protection checks.
 - **`scripts/split-smoke.sh`** checks that the control plane seeds Postgres and signs snapshots; that a router with no config file picks up a tenant, key and BYOK credential created on the control plane within the poll interval; that the audit chain verifies; that killing the control plane leaves the router serving; that a router restarted while the control plane is down serves from its snapshot cache; that a restarted control plane keeps its state; and that a key revoked and a tenant deleted on the control plane get `401` from the router after its next poll. Needs Docker, `python3` and `curl`. Set `SPLIT_DATABASE_URL` to use an existing database.
 - **`scripts/mongo-it.sh`** starts `mongo:8` as a single-node replica set with auth (container `caliban-mongo-test`, port 27018), runs `cargo test -p caliban-replica --test mongo_it -- --nocapture`, then removes the container. The test ([`crates/caliban-replica/tests/mongo_it.rs`](crates/caliban-replica/tests/mongo_it.rs)) seeds `orders` (embedded `lines`, `customerId` references) and `customers`, creates a read-only user, and checks that:
   1. `verify_read_only` accepts the `read`-role user and refuses the admin user, and the replica set is detected;
@@ -274,6 +304,7 @@ Known gaps:
 - Revocation in split mode takes effect on the router's next snapshot poll (`CALIBAN_SNAPSHOT_POLL_SECS`, default 10 s), not instantly.
 - Quotas are in-memory per process; the Valkey store for multi-router deployments is stubbed.
 - No Prometheus metrics endpoint yet.
+- Semantic cache: the starting threshold (0.95) is not calibrated per embedding model yet; some models place unrelated text close together (bge-small scored random-word prompts above 0.95), so calibrate on your traffic before switching tenants on. The verifier is an answer-embedding comparison, not an LLM judge (Krites-style judging of grey-zone pairs is next); thresholds are not yet per intent category (the note's category-aware caching), and there is no near-hit-as-hint tier (T2b). Datasource epochs and ACL fingerprints are not wired into T2 keys yet (no grounded answers reach it today). Entries are not encrypted per tenant, and deleting a tenant does not purge its Qdrant entries (they expire with `ttl_secs`; `SemanticCache::purge_tenant` exists but is not called by the control plane). No per-tenant entry quota. Internal embedding calls are not metered. The tenant error budget is per router, and concurrent stat updates to one entry are last-writer-wins. Hits replay instantly, which is a timing signal within a tenant (research note, open question 6).
 
 Next, in order:
 
@@ -281,7 +312,7 @@ Next, in order:
 2. MongoDB connector: wire `introspect` and `propose` into the control plane's introspection job; `$jsonSchema`-declared types; map and scalar-array attributes; per-shard sampling.
 3. CDC replica and planner: connect the planner to the `explain` gate and replica lag in a query service; delta Parquet with compaction instead of whole-table rewrites; resume from the manifest after a restart (today it re-snapshots); parallel `_id`-range snapshots; arrays nested in arrays.
 4. PII: licence sign-off on the NER model's fine-tuning data (see `MODELS.md`); FF1 format-preserving encryption for structured IDs; coreference so a first name maps to the surrogate's first name.
-5. Gateway: Valkey quota store, tokenizer-based estimates, rate-limit headers on successful responses, tool-call argument rehydration in streams, `Idempotency-Key`, the semantic cache, and the embedding kNN and ONNX intent classifiers.
+5. Gateway: Valkey quota store, tokenizer-based estimates, rate-limit headers on successful responses, tool-call argument rehydration in streams, `Idempotency-Key`, the embedding kNN and ONNX intent classifiers, and for the semantic cache an async LLM judge, per-intent thresholds, tenant purge on delete and per-tenant entry encryption.
 
 ## Related repositories
 

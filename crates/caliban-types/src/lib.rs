@@ -1,5 +1,9 @@
 //! Shared identifiers, enums and errors used across Caliban crates.
 
+mod embed;
+
+pub use embed::{EmbedError, Embedder, cosine};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -129,6 +133,49 @@ pub enum CacheMode {
     #[default]
     Exact,
     Semantic,
+}
+
+/// Per-tenant switch for the T2 semantic cache (`[[tenants]] semantic_cache`). Off by default:
+/// a tenant opts in once its hit quality has been measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticCacheMode {
+    #[default]
+    Off,
+    On,
+}
+
+impl SemanticCacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SemanticCacheMode::Off => "off",
+            SemanticCacheMode::On => "on",
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == SemanticCacheMode::Off
+    }
+}
+
+/// Which cache tier served a hit (`x-caliban-cache-tier`, `UsageEvent.cache_tier`).
+/// `x-caliban-cache` stays `hit | miss | bypass` for clients that predate the semantic tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTier {
+    /// T1: byte-identical (protected) request.
+    Exact,
+    /// T2: a semantically similar earlier request of the same tenant.
+    Semantic,
+}
+
+impl CacheTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheTier::Exact => "exact",
+            CacheTier::Semantic => "semantic",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

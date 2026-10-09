@@ -1,6 +1,6 @@
 [package]
 name = "caliban-cache"
-description = "Tenant-scoped response caches: T1 exact, T2 semantic (trait), plan cache (TODO)."
+description = "Tenant-scoped response caches: T1 exact (moka), T2 semantic (Qdrant REST or in-memory, per-entry learned thresholds), plan cache (TODO)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,12 @@ async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 moka.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

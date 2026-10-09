@@ -52,7 +52,8 @@ paths:
           headers:
             x-caliban-request-id: { schema: { type: string } }
             x-caliban-routed-model: { schema: { type: string } }
-            x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] } }
+            x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] }, description: '`hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request.' }
+            x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
             x-caliban-cost-usd: { schema: { type: string }, description: 'Cost of this request in USD (non-streaming only; absent when the model has no price).' }
           content:
@@ -97,7 +98,8 @@ paths:
             request-id: { schema: { type: string } }
             x-caliban-request-id: { schema: { type: string } }
             x-caliban-routed-model: { schema: { type: string } }
-            x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] } }
+            x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] }, description: '`hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request.' }
+            x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
             x-caliban-cost-usd: { schema: { type: string } }
           content:
@@ -323,12 +325,14 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
     patch:
       tags: [tenants]
-      summary: Change a tenant's PII settings
+      summary: Change a tenant's PII and cache settings
       description: |
         Absent fields keep their value; other fields are rejected. Audited as `tenant.update`
         (old and new values). Routers apply the change with their next snapshot.
         `pii_surrogate_scope: session` opts the tenant out of per-tenant surrogates: every request
-        gets fresh surrogates (unlinkable), and requests carrying PII bypass the exact cache.
+        gets fresh surrogates (unlinkable), and requests carrying PII bypass the exact and semantic
+        caches. `semantic_cache: on` lets the tenant's eligible requests use the semantic cache
+        (also needs `[cache.semantic] enabled`).
       requestBody:
         required: true
         content:
@@ -886,7 +890,7 @@ components:
       description: Caliban-specific request options. Unknown to OpenAI clients; safe to omit.
       properties:
         pii: { type: string, enum: [off, mask, reversible], default: reversible }
-        cache: { type: string, enum: [off, exact, semantic], default: exact }
+        cache: { type: string, enum: [off, exact, semantic], default: exact, description: '`off`: no cache. `exact`: exact cache only. `semantic`: exact, then the semantic cache when the tenant has it on, whatever the temperature (without it, the semantic cache applies only up to `[cache.semantic] max_temperature`). Unset: exact, plus semantic within the temperature limit when the tenant has it on.' }
         datasources: { type: array, items: { type: string } }
         node: { type: string }
         max_cost_usd: { type: number }
@@ -1023,6 +1027,7 @@ components:
         name: { type: string }
         region: { type: [string, 'null'] }
         pii_default: { type: string, enum: [off, mask, reversible] }
+        semantic_cache: { type: string, enum: ['off', 'on'], default: 'off', description: 'T2 semantic cache for this tenant. `on`: eligible requests may be answered with the response to an earlier, semantically similar request of the same tenant (per-entry learned thresholds, deployment error budget). Entries never cross tenants. Also needs `[cache.semantic] enabled`.' }
         pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant, description: 'Surrogate consistency for reversible PII. `tenant`: the same value always gets the same surrogate in this tenant (keyed HMAC per tenant, derived from CALIBAN_KEK), so pseudonymised requests can hit the exact cache; sessions of the tenant become linkable through their surrogates. `session`: fresh surrogates per request. Surrogates never cross tenants.' }
         created_at: { type: string, format: date-time }
         status: { type: string, enum: [active, deleted], description: '`deleted` only appears with `include_deleted=true`.' }
@@ -1035,12 +1040,14 @@ components:
         region: { type: string }
         pii_default: { type: string, enum: [off, mask, reversible], default: reversible }
         pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant }
+        semantic_cache: { type: string, enum: ['off', 'on'], default: 'off' }
     TenantUpdate:
       type: object
       additionalProperties: false
       properties:
         pii_default: { type: string, enum: [off, mask, reversible] }
         pii_surrogate_scope: { type: string, enum: [tenant, session] }
+        semantic_cache: { type: string, enum: ['off', 'on'] }
 
     ApiKeyInfo:
       type: object
@@ -1236,6 +1243,7 @@ components:
         tokens_saved: { type: integer, description: 'Tokens not sent upstream thanks to Caliban (e.g. cache hits)' }
         intent: { type: string }
         cache: { type: string, enum: [hit, miss, bypass] }
+        cache_tier: { type: string, enum: [exact, semantic], description: 'Only on hits: which cache tier answered.' }
         pii_entities: { type: integer }
         cost_usd: { type: [number, 'null'] }
         latency_ms: { type: integer }
@@ -1251,7 +1259,8 @@ components:
             requests: { type: integer }
             prompt_tokens: { type: integer }
             completion_tokens: { type: integer }
-            cache_hits: { type: integer }
+            cache_hits: { type: integer, description: 'Hits of both tiers.' }
+            semantic_cache_hits: { type: integer }
             tokens_saved: { type: integer }
             cost_usd: { type: number }
 

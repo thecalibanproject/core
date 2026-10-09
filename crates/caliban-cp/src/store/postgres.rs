@@ -28,6 +28,8 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (2, "control_plane_store", include_str!("../../../../migrations/0002_control_plane_store.sql")),
     (3, "soft_delete", include_str!("../../../../migrations/0003_soft_delete.sql")),
     (4, "pii_surrogate_scope", include_str!("../../../../migrations/0004_pii_surrogate_scope.sql")),
+    // 0005 is reserved.
+    (6, "tenant_semantic_cache", include_str!("../../../../migrations/0006_tenant_semantic_cache.sql")),
 ];
 
 /// Advisory lock keys ("calibn" + n).
@@ -253,10 +255,10 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
             exec(c, sqlx::query(q).bind(tenant_id).bind(id).bind(at)).await
         }
         Mutation::DeleteTenant { id, at } => delete_tenant(c, id, *at).await,
-        Mutation::UpdateTenantPii { id, .. } => {
+        Mutation::UpdateTenant { id, .. } => {
             let t = next.tenant(id).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
-            let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3 WHERE id = $1 AND status = 'active'";
-            exec(c, sqlx::query(q).bind(id).bind(enum_str(&t.pii_default)).bind(t.pii_surrogate_scope.as_str())).await
+            let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3, semantic_cache = $4 WHERE id = $1 AND status = 'active'";
+            exec(c, sqlx::query(q).bind(id).bind(enum_str(&t.pii_default)).bind(t.pii_surrogate_scope.as_str()).bind(t.semantic_cache.as_str())).await
         }
         Mutation::CreateProviderKey(p) => insert_provider_key(c, p).await,
         Mutation::DeleteProviderKey { tenant_id, id } => {
@@ -321,14 +323,15 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
     exec(
         c,
         sqlx::query(
-            "INSERT INTO tenant (id, name, region, pii_default, pii_surrogate_scope, settings, created_at, status, deleted_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "INSERT INTO tenant (id, name, region, pii_default, pii_surrogate_scope, semantic_cache, settings, created_at, status, deleted_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(&t.id)
         .bind(&t.name)
         .bind(&t.region)
         .bind(enum_str(&t.pii_default))
         .bind(t.pii_surrogate_scope.as_str())
+        .bind(t.semantic_cache.as_str())
         .bind(Json(Value::Object(t.settings.clone())))
         .bind(t.created_at)
         .bind(t.status.as_str())
@@ -574,13 +577,14 @@ async fn rows(c: &mut PgConnection, sql: &'static str) -> Result<Vec<PgRow>, Sto
 async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     let mut st = State::default();
 
-    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
         st.tenants.push(Tenant {
             id: get(&r, "id")?,
             name: get(&r, "name")?,
             region: get(&r, "region")?,
             pii_default: parse_enum(get(&r, "pii_default")?)?,
             pii_surrogate_scope: parse_enum(get(&r, "pii_surrogate_scope")?)?,
+            semantic_cache: parse_enum(get(&r, "semantic_cache")?)?,
             created_at: get(&r, "created_at")?,
             status: match get::<String>(&r, "status")?.as_str() {
                 "deleted" => TenantStatus::Deleted,
