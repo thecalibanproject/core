@@ -841,6 +841,9 @@ pub enum StoreError {
     /// The mutation would make the data-plane config invalid; nothing was written.
     #[error("{0}")]
     Invalid(String),
+    /// A node version cannot be published or promoted, for these reasons; nothing was written.
+    #[error("{0}")]
+    Rejected(caliban_nodes::publish::PublishError),
     #[error("store backend error: {0}")]
     Backend(String),
 }

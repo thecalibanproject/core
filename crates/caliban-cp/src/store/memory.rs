@@ -477,7 +477,7 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             }
             let spec = parse_spec(n)?;
             caliban_nodes::publish::validate_for_publish(name, *version, &spec, &TenantNodes { st, tenant: tenant_id })
-                .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                .map_err(StoreError::Rejected)?;
             if !st.deks.contains_key(tenant_id) {
                 return Err(StoreError::Invalid(format!(
                     "{name}@v{version} is sealed under a tenant key that does not exist"
@@ -508,7 +508,12 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             }
             let over = st.node_caps(tenant_id).violations(&parse_spec(n)?);
             if !over.is_empty() {
-                return Err(StoreError::Invalid(format!("cannot promote {name}@v{version}: {}", over.join("; "))));
+                return Err(StoreError::Rejected(caliban_nodes::publish::PublishError {
+                    action: "promote",
+                    name: name.clone(),
+                    version: *version,
+                    problems: caliban_nodes::publish::Problem::budgets(over),
+                }));
             }
             promote_to(st, tenant_id, name, *version, *at, by);
         }

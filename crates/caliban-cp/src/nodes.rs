@@ -14,6 +14,7 @@ use axum::Json;
 use axum::extract::{Extension, Path, Query, State as AxState};
 use axum::http::StatusCode;
 use caliban_nodes::NodeSpec;
+use caliban_nodes::publish::Problem;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -28,19 +29,63 @@ fn invalid(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg.into())
 }
 
+/// The error of the routes that validate a version: a refusal (`422`) carries the list of problems
+/// next to the message, `{"error": {"message", "type", "code": "validation_failed", "problems":
+/// [{"kind", "message", "path"?}]}}`, so the console does not have to split the message.
+pub(crate) enum NodeError {
+    Api(ApiError),
+    Problems(String, Vec<Problem>),
+}
+
+impl From<ApiError> for NodeError {
+    fn from(e: ApiError) -> Self {
+        Self::Api(e)
+    }
+}
+
+impl From<crate::StoreError> for NodeError {
+    fn from(e: crate::StoreError) -> Self {
+        match e {
+            crate::StoreError::Rejected(p) => Self::Problems(p.to_string(), p.problems),
+            other => Self::Api(other.into()),
+        }
+    }
+}
+
+impl axum::response::IntoResponse for NodeError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Api(e) => e.into_response(),
+            Self::Problems(message, problems) => {
+                let body = json!({"error": {"message": message, "type": "invalid_request_error",
+                                            "code": "validation_failed", "problems": problems}});
+                (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+            }
+        }
+    }
+}
+
+type NodeResult<T> = Result<T, NodeError>;
+
 /// Parses and statically validates a spec.
-fn checked(spec: &Value) -> ApiResult<NodeSpec> {
-    let parsed: NodeSpec =
-        serde_json::from_value(spec.clone()).map_err(|e| invalid(format!("invalid node spec: {e}")))?;
-    parsed.validate().map_err(|e| invalid(e.to_string()))?;
+fn checked(spec: &Value) -> NodeResult<NodeSpec> {
+    let parsed: NodeSpec = serde_json::from_value(spec.clone()).map_err(|e| {
+        let m = format!("invalid node spec: {e}");
+        NodeError::Problems(m.clone(), vec![Problem::new("spec", m, None)])
+    })?;
+    parsed
+        .validate()
+        .map_err(|e| NodeError::Problems(e.to_string(), vec![Problem::new("spec", e.to_string(), None)]))?;
     Ok(parsed)
 }
 
 /// Creates a draft version of node `name` (version = latest + 1).
-async fn draft(cp: &Cp, p: &Principal, tenant_id: String, name: String, spec: Value) -> ApiResult<Value> {
+async fn draft(cp: &Cp, p: &Principal, tenant_id: String, name: String, spec: Value) -> NodeResult<Value> {
     crate::ensure_tenant(cp, &tenant_id)?;
     if !caliban_nodes::valid_node_name(&name) {
-        return Err(invalid(format!("'{name}' is not a node name (1 to 64 characters of a-z, 0-9, '-' and '_')")));
+        return Err(
+            invalid(format!("'{name}' is not a node name (1 to 64 characters of a-z, 0-9, '-' and '_')")).into()
+        );
     }
     checked(&spec)?;
     let id = new_id("node");
@@ -60,7 +105,7 @@ async fn draft(cp: &Cp, p: &Principal, tenant_id: String, name: String, spec: Va
         deleted_at: None,
     };
     let st = cp.store.apply(&p.actor, Mutation::CreateNode(rec)).await?;
-    st.nodes.iter().find(|n| n.id == id).map(|n| view(&st, n)).ok_or_else(|| not_found("node"))
+    Ok(st.nodes.iter().find(|n| n.id == id).map(|n| view(&st, n)).ok_or_else(|| not_found("node"))?)
 }
 
 #[derive(Deserialize)]
@@ -75,7 +120,7 @@ pub(crate) async fn create_node(
     AxState(cp): AxState<Cp>,
     Extension(p): Extension<Principal>,
     Json(body): Json<NodeCreate>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
+) -> NodeResult<(StatusCode, Json<Value>)> {
     Ok((StatusCode::CREATED, Json(draft(&cp, &p, body.tenant_id, body.name, body.spec).await?)))
 }
 
@@ -89,7 +134,7 @@ pub(crate) async fn create_version(
     Extension(p): Extension<Principal>,
     Path((tenant_id, name)): Path<(String, String)>,
     Json(body): Json<VersionCreate>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
+) -> NodeResult<(StatusCode, Json<Value>)> {
     Ok((StatusCode::CREATED, Json(draft(&cp, &p, tenant_id, name, body.spec).await?)))
 }
 
@@ -132,7 +177,7 @@ pub(crate) async fn publish(
     Extension(p): Extension<Principal>,
     Path((tenant_id, name, version)): Path<(String, String, u32)>,
     body: axum::body::Bytes,
-) -> ApiResult<Json<Value>> {
+) -> NodeResult<Json<Value>> {
     // The body is optional (an empty POST publishes and promotes).
     let body: PublishBody = if body.iter().all(u8::is_ascii_whitespace) {
         PublishBody::default()
@@ -142,7 +187,9 @@ pub(crate) async fn publish(
     crate::ensure_tenant(&cp, &tenant_id)?;
     let n = version_of(&cp.store.state(), &tenant_id, &name, version)?;
     if n.state != NodeState::Draft {
-        return Err(ApiError(StatusCode::CONFLICT, format!("{name}@v{version} is {}, not a draft", n.state.as_str())));
+        return Err(
+            ApiError(StatusCode::CONFLICT, format!("{name}@v{version} is {}, not a draft", n.state.as_str())).into()
+        );
     }
     // Sealed like BYOK keys: routers and workers open it with their keyring.
     let keyring = cp.keyring("node versions").map_err(|_| bad("cannot publish nodes: CALIBAN_KEK is not set"))?;
@@ -171,7 +218,7 @@ pub(crate) async fn promote(
     Extension(p): Extension<Principal>,
     Path((tenant_id, name)): Path<(String, String)>,
     Json(body): Json<PromoteBody>,
-) -> ApiResult<Json<Value>> {
+) -> NodeResult<Json<Value>> {
     let m = Mutation::PromoteNode {
         tenant_id: tenant_id.clone(),
         name: name.clone(),
@@ -405,6 +452,10 @@ mod tests {
         let (s, e) = call(&app, "POST", &format!("{V}/versions"), Some(json!({"spec": code}))).await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(e["error"]["message"].as_str().unwrap().contains("not yet supported"), "{e}");
+        assert_eq!(
+            (e["error"]["code"].as_str(), e["error"]["problems"][0]["kind"].as_str()),
+            (Some("validation_failed"), Some("spec"))
+        );
         let (s, _) =
             call(&app, "POST", "/api/v1/tenants/acme/nodes/BadName/versions", Some(json!({"spec": spec(3)}))).await;
         assert!(s.is_client_error());
@@ -416,6 +467,13 @@ mod tests {
         let (s, e) = call(&app, "POST", &format!("{V}/versions/1/publish"), None).await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(e["error"]["message"].as_str().unwrap().contains("no datasource named 'erp'"), "{e}");
+        // The problems, one by one, for the console.
+        assert_eq!(
+            e["error"]["problems"],
+            json!([{"kind": "datasource_scope", "path": "datasources.scopes[0]",
+                    "message": e["error"]["problems"][0]["message"]}])
+        );
+        assert!(e["error"]["problems"][0]["message"].as_str().unwrap().contains("no datasource named 'erp'"));
         let ds = json!({"tenant_id": "acme", "kind": "postgres", "name": "erp", "connection": {}});
         assert_eq!(call(&app, "POST", "/api/v1/datasources", Some(ds)).await.0, StatusCode::CREATED);
         let (s, e) = call(&app, "POST", &format!("{V}/versions/1/publish"), None).await;

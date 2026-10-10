@@ -227,6 +227,7 @@ impl From<StoreError> for ApiError {
             StoreError::NotFound(what) => not_found(&what),
             StoreError::Conflict(m) => ApiError(StatusCode::CONFLICT, m),
             StoreError::Invalid(m) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, m),
+            StoreError::Rejected(e) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
             StoreError::Backend(m) => {
                 tracing::error!(error = %m, "store backend error");
                 ApiError(StatusCode::INTERNAL_SERVER_ERROR, "store error".into())

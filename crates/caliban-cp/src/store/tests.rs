@@ -1091,6 +1091,8 @@ async fn node_lifecycle(s: &Store) {
     let conflict = |r: Result<Arc<State>, StoreError>| assert!(matches!(r, Err(StoreError::Conflict(_))), "{r:?}");
     let invalid = |r: Result<Arc<State>, StoreError>, want: &str| match r {
         Err(StoreError::Invalid(m)) => assert!(m.contains(want), "{m}"),
+        // Publish and promote refusals list their problems.
+        Err(StoreError::Rejected(e)) => assert!(e.problems.iter().any(|p| p.message.contains(want)), "{e}"),
         other => panic!("expected Invalid({want}), got {other:?}"),
     };
 

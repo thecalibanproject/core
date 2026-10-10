@@ -105,7 +105,9 @@ run without a version runs.
 | Delete a draft or retired version | `DELETE /api/v1/tenants/{t}/nodes/{record id}` | `nodes.write` | `node.delete` |
 
 **Publish-time validation**, against the tenant, in the same transaction as the publish (a failure
-is a `422` listing every problem):
+is a `422` listing every problem: `error.message` joins them, and `error.problems` lists them one
+by one as `{"kind", "message", "path"?}` with `kind` one of `spec`, `tool`, `datasource_scope`,
+`budget`, `node_ref`, `cycle`; creating a version and promoting one answer the same way):
 
 - the static checks again;
 - every `node://name@vN` the version calls (tools and `subnode` vertices) is a **published** version

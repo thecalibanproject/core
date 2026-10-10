@@ -99,12 +99,50 @@ pub trait PublishContext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
-#[error("cannot publish {name}@v{version}: {}", problems.join("; "))]
+/// One reason a version cannot be created, published or promoted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Problem {
+    /// `spec` (the static checks), `tool`, `datasource_scope`, `budget` (a tenant cap), `node_ref`,
+    /// `cycle`.
+    pub kind: &'static str,
+    pub message: String,
+    /// Where in the spec, when it is one place: `tools[0]`, `datasources.scopes[1]`,
+    /// `budgets.steps`, `node://risk@v2`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl Problem {
+    pub fn new(kind: &'static str, message: impl Into<String>, path: Option<String>) -> Self {
+        Self { kind, message: message.into(), path }
+    }
+
+    /// The tenant's caps a spec's budgets exceed, as problems (`budgets.<field>`).
+    pub fn budgets(violations: Vec<String>) -> Vec<Self> {
+        violations
+            .into_iter()
+            .map(|m| {
+                let path = m.split_whitespace().next().filter(|w| w.starts_with("budgets.")).map(str::to_owned);
+                Self::new("budget", m, path)
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("cannot {action} {name}@v{version}: {}", problems.iter().map(|p| p.message.as_str()).collect::<Vec<_>>().join("; "))]
 pub struct PublishError {
+    /// `publish` or `promote`.
+    pub action: &'static str,
     pub name: String,
     pub version: u32,
-    pub problems: Vec<String>,
+    pub problems: Vec<Problem>,
 }
 
 /// Every reason `spec` (version `version` of node `name`) cannot be published; `Ok` when none.
@@ -116,42 +154,42 @@ pub fn validate_for_publish(
 ) -> Result<(), PublishError> {
     let mut problems = Vec::new();
     if let Err(e) = spec.validate() {
-        problems.push(e.to_string());
+        problems.push(Problem::new("spec", e.to_string(), None));
     }
-    for t in &spec.tools {
+    for (i, t) in spec.tools.iter().enumerate() {
         if let Ok(target) = ToolTarget::parse(&t.reference)
             && let Err(e) = ctx.check_tool(&target)
         {
-            problems.push(format!("tool '{}': {e}", t.reference));
+            problems.push(Problem::new("tool", format!("tool '{}': {e}", t.reference), Some(format!("tools[{i}]"))));
         }
     }
-    for scope in spec.datasource_scopes() {
+    for (i, scope) in spec.datasource_scopes().into_iter().enumerate() {
         if let Err(e) = ctx.scope_exists(&scope) {
-            problems.push(format!("datasource scope '{scope}': {e}"));
+            let path = Some(format!("datasources.scopes[{i}]"));
+            problems.push(Problem::new("datasource_scope", format!("datasource scope '{scope}': {e}"), path));
         }
     }
-    problems.extend(ctx.caps().violations(spec));
+    problems.extend(Problem::budgets(ctx.caps().violations(spec)));
     let refs = spec.node_refs();
     for (n, v) in &refs {
-        if n == name && *v == version {
-            problems.push(format!("node://{n}@v{v} refers to this version itself"));
-            continue;
-        }
-        match ctx.version(n, *v) {
-            RefState::Published(_) => {}
-            RefState::Missing => problems.push(format!("node://{n}@v{v} does not exist in this tenant")),
-            RefState::Draft => problems.push(format!("node://{n}@v{v} is a draft; publish it first")),
-            RefState::Retired => problems.push(format!("node://{n}@v{v} is retired")),
-        }
+        let path = Some(format!("node://{n}@v{v}"));
+        let message = match ctx.version(n, *v) {
+            _ if n == name && *v == version => format!("node://{n}@v{v} refers to this version itself"),
+            RefState::Published(_) => continue,
+            RefState::Missing => format!("node://{n}@v{v} does not exist in this tenant"),
+            RefState::Draft => format!("node://{n}@v{v} is a draft; publish it first"),
+            RefState::Retired => format!("node://{n}@v{v} is retired"),
+        };
+        problems.push(Problem::new("node_ref", message, path));
     }
     if let Some(cycle) = find_cycle(name, version, &refs, ctx) {
-        problems.push(format!("node references form a cycle: {cycle}"));
+        problems.push(Problem::new("cycle", format!("node references form a cycle: {cycle}"), None));
     }
     if problems.is_empty() {
         Ok(())
     } else {
         problems.dedup();
-        Err(PublishError { name: name.to_owned(), version, problems })
+        Err(PublishError { action: "publish", name: name.to_owned(), version, problems })
     }
 }
 
@@ -243,7 +281,17 @@ mod tests {
     fn every_problem_is_reported() {
         let s = spec(&["node://risk@v2", "node://old@v1", "node://ghost@v1"], &["erp.orders:read"], 500);
         let e = validate_for_publish("triage", 1, &s, &ctx()).unwrap_err();
-        let all = e.problems.join("\n");
+        let all = e.problems.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            e.problems.iter().find(|p| p.kind == "budget").and_then(|p| p.path.as_deref()),
+            Some("budgets.steps")
+        );
+        assert!(
+            e.problems
+                .iter()
+                .any(|p| p.kind == "datasource_scope" && p.path.as_deref() == Some("datasources.scopes[0]"))
+        );
+        assert!(e.problems.iter().any(|p| p.kind == "node_ref" && p.path.as_deref() == Some("node://risk@v2")));
         for want in ["is a draft", "is retired", "does not exist", "erp.orders:read", "budgets.steps = 500 exceeds"] {
             assert!(all.contains(want), "missing '{want}' in {all}");
         }
@@ -256,7 +304,10 @@ mod tests {
         c.versions.insert(("b".to_owned(), 1), RefState::Published(Box::new(spec(&["node://a@v3"], &[], 3))));
         let s = spec(&["node://b@v1"], &[], 3);
         let e = validate_for_publish("a", 3, &s, &c).unwrap_err();
-        assert!(e.problems.iter().any(|p| p.contains("cycle: a@v3 -> b@v1 -> a@v3")), "{e}");
+        assert!(
+            e.problems.iter().any(|p| p.kind == "cycle" && p.message.contains("cycle: a@v3 -> b@v1 -> a@v3")),
+            "{e}"
+        );
         let me = spec(&["node://a@v3"], &[], 3);
         assert!(validate_for_publish("a", 3, &me, &c).unwrap_err().to_string().contains("itself"));
     }

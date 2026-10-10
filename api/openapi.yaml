@@ -2080,7 +2080,17 @@ components:
           properties:
             message: { type: string }
             type: { type: string, description: 'e.g. invalid_request_error, authentication_error, permission_error, policy_violation, upstream_error, rate_limited' }
-            code: { type: [string, 'null'], description: 'For rate_limited: the limit that was hit (e.g. tokens_per_minute).' }
+            code: { type: [string, 'null'], description: 'For rate_limited: the limit that was hit (e.g. tokens_per_minute). `validation_failed` when a node version cannot be created, published or promoted (see `problems`).' }
+            problems:
+              type: array
+              description: 'Node version refusals (`422`, `validation_failed`): every reason, one by one, next to `message` (which joins them).'
+              items:
+                type: object
+                required: [kind, message]
+                properties:
+                  kind: { type: string, enum: [spec, tool, datasource_scope, budget, node_ref, cycle] }
+                  message: { type: string }
+                  path: { type: string, description: 'Where in the spec: `tools[0]`, `datasources.scopes[1]`, `budgets.steps`, `node://risk@v2`' }
 
     Health:
       type: object
