@@ -169,3 +169,66 @@ async fn redirects_are_not_followed() {
     assert!(c.list_tools(&ServerTarget { url, auth: ServerAuth::None }).await.is_err());
     assert!(server.authorizations().is_empty(), "the redirect target was never contacted");
 }
+
+#[tokio::test]
+async fn server_credentials_api_keys_and_oauth_client_credentials() {
+    use caliban_config::ToolAuth;
+    let c = client(Script::new(&[&["127.0.0.1"]]));
+    let url = "http://127.0.0.1:1/mcp";
+    // An API key goes as a bearer token, or in the header the server asked for.
+    let a = c.auth_for(url, &ToolAuth::ApiKey { header: None }, Some("sk-1"), |_| None).await.unwrap();
+    assert_eq!(a, ServerAuth::Bearer("sk-1".into()));
+    let a =
+        c.auth_for(url, &ToolAuth::ApiKey { header: Some("x-api-key".into()) }, Some("sk-1"), |_| None).await.unwrap();
+    assert_eq!(a, ServerAuth::Header { name: "x-api-key".into(), value: "sk-1".into() });
+    assert!(c.auth_for(url, &ToolAuth::ApiKey { header: None }, None, |_| None).await.is_err(), "no credential");
+    // Caliban tokens are minted for the server's audience (its origin by default).
+    let a = c
+        .auth_for(url, &ToolAuth::CalibanToken { audience: None }, None, |aud| Some(format!("token-for-{aud}")))
+        .await
+        .unwrap();
+    assert_eq!(a, ServerAuth::Bearer("token-for-http://127.0.0.1:1".into()));
+    assert!(c.auth_for(url, &ToolAuth::CalibanToken { audience: None }, None, |_| None).await.is_err(), "no key");
+
+    // OAuth client credentials: a token from the token endpoint (through the egress guard), cached.
+    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+    let h = Arc::clone(&hits);
+    let app = axum::Router::new().route(
+        "/token",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let h = Arc::clone(&h);
+            async move {
+                let basic = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+                h.lock().push(format!("{basic} {body}"));
+                axum::Json(json!({"access_token": "at-123", "token_type": "Bearer", "expires_in": 3600}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let token_url = format!("http://{}/token", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let auth = ToolAuth::OauthClientCredentials {
+        token_url: token_url.clone(),
+        client_id: "caliban".into(),
+        scope: Some("crm.read".into()),
+    };
+    for _ in 0..2 {
+        let a = c.auth_for(url, &auth, Some("client-secret"), |_| None).await.unwrap();
+        assert_eq!(a, ServerAuth::Bearer("at-123".into()));
+    }
+    let seen = hits.lock().clone();
+    assert_eq!(seen.len(), 1, "the access token is cached");
+    assert!(
+        seen[0].starts_with("Basic ")
+            && seen[0].contains("grant_type=client_credentials")
+            && seen[0].contains("scope=crm.read"),
+        "{seen:?}"
+    );
+    // The token endpoint goes through the egress guard too.
+    let meta = ToolAuth::OauthClientCredentials {
+        token_url: "http://169.254.169.254/token".into(),
+        client_id: "x".into(),
+        scope: None,
+    };
+    assert!(matches!(c.auth_for(url, &meta, Some("s"), |_| None).await, Err(McpError::Egress(_))));
+}
