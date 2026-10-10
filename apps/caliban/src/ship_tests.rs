@@ -239,8 +239,11 @@ async fn an_unreachable_control_plane_loses_nothing_across_a_router_restart() {
     let (cp, server) = control_plane(&cfg, tokio::net::TcpListener::bind(addr).await.unwrap());
     until("the backlog to arrive", async || totals(&cp).await["totals"]["requests"] == 8).await;
     until("an empty backlog", async || r2.shipper.stats().backlog.load(Ordering::Relaxed) == 0).await;
+    // The control plane stores a batch before its acknowledgement reaches the router, so wait
+    // for the router's count too.
     let s: &ShipStats = r2.shipper.stats();
-    assert_eq!((s.delivered.load(Ordering::Relaxed), s.dropped.load(Ordering::Relaxed)), (8, 0));
+    until("every event acknowledged", async || s.delivered.load(Ordering::Relaxed) == 8).await;
+    assert_eq!((s.duplicates.load(Ordering::Relaxed), s.dropped.load(Ordering::Relaxed)), (0, 0));
     assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0, "delivered segments are deleted");
     let mut events: Vec<UsageEvent> = r1.ring.snapshot(None, 100);
     events.extend(r2.ring.snapshot(None, 100));
