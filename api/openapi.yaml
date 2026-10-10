@@ -1040,9 +1040,10 @@ paths:
       tags: [nodes]
       summary: Retire a published version
       description: |
-        The version leaves the data-plane snapshot (new runs of it are refused; runs in flight fail
-        when they next need it). If it was live, the node has no live version until another is
-        promoted. A version still called (`node://`) by another published version is a 409.
+        The version leaves the data-plane snapshot: new runs of it are refused (`404`), and runs
+        already started finish on the version they started on (each run keeps the specs of the
+        versions it can reach, sealed in the journal). If it was live, the node has no live version
+        until another is promoted. A version still called (`node://`) by another published version is a 409.
         Retirement is final. Needs `nodes.publish`; audited as `node.retire`.
       responses:
         '200':
@@ -1532,7 +1533,7 @@ paths:
                     properties:
                       name: { type: string }
                       description: { type: string }
-                      input_schema: { type: object }
+                      input_schema: { type: object, additionalProperties: {}, description: 'The tool''s input JSON Schema (any JSON object)' }
       responses:
         '200':
           description: The recorded manifests
@@ -2740,6 +2741,7 @@ components:
         scope: { type: string, description: 'oauth_client_credentials: requested scope (down-scoping)' }
     ToolServer:
       type: object
+      required: [id, tenant_id, name, url, auth, trusted, created_at, created_by]
       properties:
         id: { type: string }
         tenant_id: { type: string }
@@ -2747,7 +2749,7 @@ components:
         url: { type: string }
         auth: { $ref: '#/components/schemas/ToolAuth' }
         trusted: { type: boolean, description: 'Trusted with personal data: PII surrogates in arguments are rehydrated for it' }
-        has_credential: { type: boolean }
+        has_credential: { type: boolean, description: 'A credential is stored (absent: none)' }
         created_at: { type: string, format: date-time }
         created_by: { type: string }
     ToolServerCreate:
@@ -2762,17 +2764,20 @@ components:
         trusted: { type: boolean, default: false }
     ToolManifest:
       type: object
+      required: [id, tenant_id, server, name, description, input_schema, pin, findings, status, discovered_at, approved_at, approved_by, findings_acknowledged]
       properties:
         id: { type: string }
+        tenant_id: { type: string }
         server: { type: string }
         name: { type: string }
         description: { type: string }
-        input_schema: { type: object }
+        input_schema: { type: object, additionalProperties: {}, description: 'The tool''s input JSON Schema, as the server lists it (any JSON object)' }
         pin: { type: string, description: 'sha256 over the canonical [name, description, input_schema]' }
         findings:
           type: array
           items:
             type: object
+            required: [kind, location, excerpt]
             properties:
               kind: { type: string, enum: [instruction, hidden_unicode, url, exfiltration] }
               location: { type: string }
