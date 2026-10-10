@@ -58,6 +58,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The store parity suite, and SSO sessions shared by two control-plane replicas.
       - run: cargo test -p caliban-cp -- store::tests::postgres auth::tests::postgres
+      # The node journal parity suite and the executor on the Postgres journal (claims with
+      # SKIP LOCKED, lease takeover, human input, durable sleeps), then the end-to-end node tests
+      # (workers, crash and replay, exactly-once runs, split mode, usage shipping).
+      - run: cargo test -p caliban-nodes
+      - run: cargo test -p caliban --bin caliban -- nodes_tests
 
   valkey:
     name: Valkey quota store

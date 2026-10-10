@@ -7,7 +7,8 @@
 # a restarted CP keeps its state (Postgres is the source of truth) and the router resyncs; a key
 # revoked and a tenant deleted on the CP are rejected (401) by the router after its next poll;
 # the router's usage events reach the CP's /usage (also those served while the CP was down, across
-# a router restart, exactly once); the router reports the KEK of the snapshot it serves.
+# a router restart, exactly once); the router reports the KEK of the snapshot it serves; a node
+# published on the CP runs on a `caliban worker` through the router (human step included).
 #
 # Needs docker (Postgres 17), python3, curl. Set SPLIT_DATABASE_URL to use an existing database
 # instead of a throwaway container.
@@ -15,10 +16,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 WORK=$(mktemp -d)
-MOCK_PORT=19000; DP=19080; CP=19081; PG_PORT=55433; PG_NAME=caliban-split-smoke-pg
+MOCK_PORT=19000; DP=19080; CP=19081; WP=19082; PG_PORT=55433; PG_NAME=caliban-split-smoke-pg
 POLL=1
 BIN="${CARGO_TARGET_DIR:-target}/debug/caliban"
 export MOCK_LOG="$WORK/mock.jsonl" CALIBAN_ADMIN_TOKEN=split-admin CALIBAN_ROUTER_TOKEN=split-router-token CALIBAN_LOG=warn
+# Routers forward node runs to the worker.
+export CALIBAN_WORKER_URLS="http://127.0.0.1:$WP" CALIBAN_WORKER_TOKEN=split-worker-token
 CALIBAN_KEK=$(python3 -c 'import base64,os;print(base64.b64encode(os.urandom(32)).decode())'); export CALIBAN_KEK
 KEY=cal_split_$(python3 -c 'import secrets;print(secrets.token_hex(16))')
 HASH=$(printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1)
@@ -94,6 +97,12 @@ start_router() {
     --listen "127.0.0.1:$DP" --snapshot-cache "$WORK/snapshot.json" >>"$WORK/router.log" 2>&1 & DP_PID=$!; PIDS+=($DP_PID)
   wait_http "http://127.0.0.1:$DP/healthz" || fail "router did not start"
 }
+start_worker() {
+  CALIBAN_CONFIG=/nonexistent CALIBAN_SNAPSHOT_SIGNING_KEY= CALIBAN_DATABASE_URL="$DB_URL" CALIBAN_WORKER_ADDR="127.0.0.1:$WP" \
+    CALIBAN_SNAPSHOT_POLL_SECS=$POLL CALIBAN_NODE_POLL_MS=100 CALIBAN_LOG=info,tower_http=warn \
+    "$BIN" worker --control-plane-url "http://127.0.0.1:$CP" >>"$WORK/worker.log" 2>&1 & PIDS+=($!)
+  wait_http "http://127.0.0.1:$WP/healthz" || fail "worker did not start"
+}
 adm() { curl -s "http://127.0.0.1:$CP/api/v1$1" -H "authorization: Bearer $CALIBAN_ADMIN_TOKEN" -H 'content-type: application/json' "${@:2}"; }
 chat_code() {
   curl -s -o "$WORK/out" -w '%{http_code}' "http://127.0.0.1:$DP/v1/chat/completions" -H "authorization: Bearer $1" \
@@ -143,6 +152,24 @@ KEK_ID=$(adm /keys/status | python3 -c 'import sys,json;print(json.load(sys.stdi
 adm /keys/status | python3 -c "import sys,json;r=json.load(sys.stdin)['routers'];assert r and r[0]['active'] and '$KEK_ID' in r[0]['snapshot_kek_ids'],r" \
   && pass "router reported the KEK of the snapshot it serves (keys status)" || fail "check-in: $(adm /keys/status)"
 curl -s "http://127.0.0.1:$DP/metrics" | grep -q "kek_ids=\"$KEK_ID\"" && pass "router /metrics exposes the snapshot KEK" || fail "metrics: $(curl -s "http://127.0.0.1:$DP/metrics" | head -5)"
+
+echo "node runs (router -> worker)"
+start_worker
+NODE='{"spec":{"kind":"workflow","model_policy":{"model":"local/mock"},"budgets":{"steps":5,"tokens":5000,"wall_clock_s":60},"graph":{"vertices":[{"id":"draft","type":"llm","config":{"prompt":"draft {{input}}"}},{"id":"ok","type":"human","config":{"question":"Approve: {{input}}?"}}],"edges":[{"from":"draft","to":"ok"}]}}}'
+adm /tenants/acme/nodes/smoke/versions -d "$NODE" | grep -q '"state":"draft"' && pass "node draft created" || fail "node draft"
+adm /tenants/acme/nodes/smoke/versions/1/publish -X POST | grep -q '"state":"published"' && pass "node published (sealed into the snapshot)" || fail "node publish"
+run_node() { curl -s -o "$WORK/run" -w '%{http_code}' "http://127.0.0.1:$DP/v1/nodes/smoke/runs" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"input":"the plan"}'; }
+for _ in $(seq $(( POLL * 30 ))); do [[ $(run_node) == 202 ]] && break; sleep 0.1; done
+python3 -c 'import sys,json;d=json.load(open(sys.argv[1]));assert d["status"]=="input_required" and d["awaiting"]["question"]=="Approve: You said: draft the plan?",d' "$WORK/run" \
+  && pass "run forwarded to the worker, waits for the human step" || fail "node run: $(cat "$WORK/run")"
+RUN=$(python3 -c 'import sys,json;print(json.load(open(sys.argv[1]))["id"])' "$WORK/run")
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DP/v1/runs/$RUN/input" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"answer":"yes"}')
+[[ $CODE == 202 ]] || fail "input: $CODE"
+run_status() { curl -s "http://127.0.0.1:$DP/v1/runs/$RUN" -H "authorization: Bearer $KEY" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])'; }
+for _ in $(seq 50); do [[ $(run_status) == succeeded ]] && break; sleep 0.1; done
+[[ $(run_status) == succeeded ]] && pass "answered through the router, the run completed" || fail "run: $(run_status)"
+[[ $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WP/v1/runs/$RUN" -H "authorization: Bearer $KEY") == 401 ]] \
+  && pass "the worker refuses requests without the worker token" || fail "worker token"
 
 echo "fail-static"
 kill $CP_PID; wait $CP_PID 2>/dev/null || true

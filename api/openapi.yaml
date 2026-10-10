@@ -279,6 +279,115 @@ paths:
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
 
+  /v1/nodes/{nodeName}/runs:
+    parameters: [ { $ref: '#/components/parameters/NodeName' } ]
+    post:
+      tags: [nodes]
+      summary: Run a published node
+      description: |
+        Starts a run of the node's live version (or `version`). The API key must be allowed to run
+        the node (its node allowlist; no allowlist: every published node of the tenant). The input
+        is checked against the node's `prompt.input_schema`.
+
+        **Sync** (default): waits until the run ends or waits for a human, at most the server's
+        `CALIBAN_NODE_SYNC_WAIT_SECS` (default 60) or `wait_s`; `200` when the run ended, `202`
+        with the run so far otherwise. **Async** (`"async": true`): `202` at once; poll
+        `GET /v1/runs/{id}` (also in `Location`).
+
+        `Idempotency-Key` (1 to 255 visible ASCII characters, per tenant, kept with the run):
+        a repeat returns the run the first request created (`Idempotent-Replayed: true`) and starts
+        nothing; the same key with another body is a `422` (`idempotency_key_reused`).
+
+        Every model call the run makes goes through the gateway pipeline as the invoking key (PII,
+        caches, routing, quotas, metering), with an Idempotency-Key per step. Streaming, MCP and
+        `model: "node/<name>"` come later. Split-mode routers forward this request to a worker.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, minLength: 1, maxLength: 255 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                input: { description: 'Any JSON value: the run input' }
+                version: { type: integer, minimum: 1, description: 'A published version; default: the live one' }
+                async: { type: boolean, default: false }
+                wait_s: { type: number, minimum: 0, description: 'Sync runs: wait at most this long (capped by the server)' }
+      responses:
+        '200':
+          description: The run ended (succeeded, failed or budget_exhausted)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeRun' }
+        '202':
+          description: The run is pending, running, sleeping or waiting for input
+          headers:
+            Location: { schema: { type: string } }
+            Idempotent-Replayed: { schema: { type: string, enum: ['true'] } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeRun' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/runs/{runId}:
+    parameters:
+      - { name: runId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [nodes]
+      summary: Get a node run
+      description: A run of the key's tenant, of a node the key may run.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeRun' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/runs/{runId}/input:
+    parameters:
+      - { name: runId, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [nodes]
+      summary: Answer the human step a run waits for
+      description: |
+        Records the answer (sealed in the journal) and resumes the run. `step` defaults to the step
+        the run waits for (`awaiting.step`). `409` (`run_not_awaiting_input`) when the run is not
+        waiting for input, or not for that step.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [answer]
+              additionalProperties: false
+              properties:
+                answer: { description: 'Any JSON value' }
+                step: { type: string }
+      responses:
+        '202':
+          description: Accepted; the run resumes
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeRun' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
   # ──────────────────────────── Control plane ───────────────────────────
   /api/v1/health:
     get:
@@ -1766,6 +1875,51 @@ components:
         created_by: { type: [string, 'null'] }
         published_at: { type: [string, 'null'], format: date-time }
         retired_at: { type: [string, 'null'], format: date-time }
+    NodeRun:
+      type: object
+      required: [id, object, node, version, hash, status, steps, budget, created_at]
+      properties:
+        id: { type: string }
+        object: { type: string, enum: [node.run] }
+        node: { type: string }
+        version: { type: integer }
+        hash: { type: string, description: 'Content hash of the version that runs' }
+        status: { type: string, enum: [pending, running, sleeping, input_required, succeeded, failed, budget_exhausted] }
+        output: { description: 'The run output; on budget_exhausted (and failed, when there is one) the partial result' }
+        partial: { type: boolean, description: 'The run ended on a budget overrun: output is partial' }
+        error: { type: [string, 'null'] }
+        stop_reason: { type: [string, 'null'], description: 'Why a run stopped early (a budget), or a note on a run that succeeded (a loop that hit max_iterations)' }
+        awaiting:
+          type: [object, 'null']
+          properties:
+            step: { type: string }
+            question: { type: [string, 'null'] }
+        budget:
+          type: object
+          properties:
+            steps_limit: { type: integer }
+            steps_used: { type: integer }
+            tokens_limit: { type: integer }
+            tokens_used: { type: integer }
+            wall_clock_ms_limit: { type: integer }
+            wall_clock_ms_used: { type: integer, description: 'Execution time only (not waiting for a human or a timer)' }
+            usd: { type: number }
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, description: 'Deterministic step id, e.g. classify#0, fanout#0/3, agent#2.1' }
+              vertex: { type: string }
+              kind: { type: string }
+              status: { type: string, enum: [completed, failed] }
+              tokens: { type: integer }
+              usd: { type: number }
+              duration_ms: { type: integer }
+        claims: { type: integer, description: 'How many times a worker claimed the run (more than 1 after a takeover or a resume)' }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
     NodeCreate:
       type: object
       required: [tenant_id, name, spec]
