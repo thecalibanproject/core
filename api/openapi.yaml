@@ -1383,11 +1383,48 @@ paths:
     delete:
       tags: [tools]
       summary: Delete a tool server (tools.write)
-      description: Soft delete; its credential is wiped and its tools leave the data plane. `409` while a published node version uses it.
+      description: Soft delete; its credential is wiped and its tools leave the data plane. `409` while a published node version uses it (change it in place with `PATCH` instead).
       responses:
         '204': { description: Deleted }
         '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [tools]
+      summary: Change a tool server (tools.write)
+      description: |
+        Absent fields are kept. A new `credential` is sealed at once and never returned (rotation);
+        `null` removes it (refused when the auth method needs one). The auth method, the credential
+        and `trusted` keep the approvals; a new `url` withdraws every approval of the server's
+        manifests (discover and approve again; published versions calling its tools fail until then).
+        The URL (and an OAuth token URL) must pass the egress rules (`422`). Audited as
+        `tool_server.update`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                url: { type: string }
+                auth: { $ref: '#/components/schemas/ToolAuth' }
+                credential: { type: [string, 'null'] }
+                trusted: { type: boolean }
+      responses:
+        '200':
+          description: The server
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ToolServer'
+                  - type: object
+                    required: [approvals_withdrawn]
+                    properties:
+                      approvals_withdrawn: { type: integer, description: 'Approvals the URL change withdrew' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/tool-servers/{server}/discover:
     parameters:

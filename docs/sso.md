@@ -147,6 +147,7 @@ tenants the caller may see. A refusal is `403` with `error.type = "permission_er
 | `GET /api/v1/tenants/{tenantId}/nodes/{nodeName}/diff` | `nodes.read` | owner, admin, auditor, tenant_admin, developer, viewer |
 | `GET /api/v1/tenants/{tenantId}/tool-servers` | `tools.read` | owner, admin, auditor, tenant_admin, developer, viewer |
 | `POST /api/v1/tenants/{tenantId}/tool-servers` | `tools.write` | owner, admin, tenant_admin, developer |
+| `PATCH /api/v1/tenants/{tenantId}/tool-servers/{server}` | `tools.write` | owner, admin, tenant_admin, developer |
 | `DELETE /api/v1/tenants/{tenantId}/tool-servers/{server}` | `tools.write` | owner, admin, tenant_admin, developer |
 | `POST /api/v1/tenants/{tenantId}/tool-servers/{server}/discover` | `tools.write` | owner, admin, tenant_admin, developer |
 | `GET /api/v1/tenants/{tenantId}/tool-servers/{server}/tools` | `tools.read` | owner, admin, auditor, tenant_admin, developer, viewer |

@@ -947,6 +947,18 @@ pub enum Mutation {
     },
     /// Registers an MCP tool server (its credential already sealed under the tenant DEK).
     CreateToolServer(ToolServerRecord),
+    /// Changes a live server in place: `None` keeps a value. A credential (`secret`, already sealed
+    /// under the tenant DEK) replaces the stored one; `Some(None)` removes it. A new URL withdraws
+    /// the approvals of the server's manifests (another endpoint must be discovered and approved
+    /// again).
+    UpdateToolServer {
+        tenant_id: String,
+        name: String,
+        url: Option<String>,
+        auth: Option<caliban_config::ToolAuth>,
+        trusted: Option<bool>,
+        secret: Option<Option<String>>,
+    },
     /// Soft-deletes a server: its credential is wiped and its tools leave the data plane.
     DeleteToolServer {
         tenant_id: String,
@@ -1274,6 +1286,29 @@ impl Mutation {
                 &s.id,
                 json!({"name": s.name, "url": s.url, "auth": s.auth, "trusted": s.trusted, "has_credential": s.secret.is_some()}),
             ),
+            Mutation::UpdateToolServer { tenant_id, name, url, auth, trusted, secret } => {
+                let s = before.tool_server(tenant_id, name);
+                let mut detail = json!({"name": name});
+                if let Some(u) = url {
+                    let withdrawn = before
+                        .tool_manifests
+                        .iter()
+                        .filter(|m| &m.tenant_id == tenant_id && &m.server == name && m.status == ToolStatus::Approved)
+                        .count();
+                    detail["url"] = json!({"from": s.map(|s| &s.url), "to": u});
+                    detail["approvals_withdrawn"] = json!(withdrawn);
+                }
+                if let Some(a) = auth {
+                    detail["auth"] = json!({"from": s.map(|s| &s.auth), "to": a});
+                }
+                if let Some(t) = trusted {
+                    detail["trusted"] = json!({"from": s.map(|s| s.trusted), "to": t});
+                }
+                if let Some(c) = secret {
+                    detail["credential"] = json!(if c.is_some() { "rotated" } else { "removed" });
+                }
+                d(Some(tenant_id), "tool_server.update", s.map_or(name.as_str(), |s| s.id.as_str()), detail)
+            }
             Mutation::DeleteToolServer { tenant_id, name, .. } => {
                 let s = before.tool_server(tenant_id, name);
                 d(

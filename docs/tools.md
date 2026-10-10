@@ -16,7 +16,8 @@ stores behave the same).
 |---|---|---|---|
 | Register a server | `POST /api/v1/tenants/{t}/tool-servers` `{"name", "url", "auth"?, "credential"?, "trusted"?}` | `tools.write` | `tool_server.create` |
 | List servers | `GET /api/v1/tenants/{t}/tool-servers` | `tools.read` | |
-| Delete a server | `DELETE /api/v1/tenants/{t}/tool-servers/{server}` (`409` while a published version uses it) | `tools.write` | `tool_server.delete` |
+| Change a server | `PATCH /api/v1/tenants/{t}/tool-servers/{server}` `{"url"?, "auth"?, "credential"?, "trusted"?}`: a new credential is sealed at once (rotation), `"credential": null` removes it. The auth method, the credential and `trusted` keep the approvals; **a new URL withdraws every approval of the server's manifests** (another endpoint: discover and approve again; published versions calling its tools fail until then). The answer says how many (`approvals_withdrawn`) | `tools.write` | `tool_server.update` (what changed, never the credential) |
+| Delete a server | `DELETE /api/v1/tenants/{t}/tool-servers/{server}` (`409` while a published version uses it: change it in place instead) | `tools.write` | `tool_server.delete` |
 | Discover its tools | `POST .../tool-servers/{server}/discover` | `tools.write` | `tool.discover` |
 | Import manifests (a server the control plane cannot reach) | `POST .../tool-servers/{server}/tools` `{"manifests": [{"name", "description", "input_schema"}]}` | `tools.write` | `tool.discover` |
 | List manifests (pins, findings, status) | `GET .../tool-servers/{server}/tools` | `tools.read` | |

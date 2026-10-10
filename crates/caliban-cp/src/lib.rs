@@ -271,7 +271,7 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/tenants/{tenant_id}/nodes/{id}/promote", post(nodes::promote))
         .route("/tenants/{tenant_id}/nodes/{id}/diff", get(nodes::diff))
         .route("/tenants/{tenant_id}/tool-servers", get(tools::list_servers).post(tools::create_server))
-        .route("/tenants/{tenant_id}/tool-servers/{server}", delete(tools::delete_server))
+        .route("/tenants/{tenant_id}/tool-servers/{server}", delete(tools::delete_server).patch(tools::update_server))
         .route("/tenants/{tenant_id}/tool-servers/{server}/discover", post(tools::discover))
         .route("/tenants/{tenant_id}/tool-servers/{server}/tools", get(tools::list_tools).post(tools::import))
         .route("/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/approve", post(tools::approve))
@@ -574,7 +574,7 @@ struct TenantUpdate {
 }
 
 /// Tells an explicit `null` (`Some(None)`) from an absent field (`None`, with `#[serde(default)]`).
-fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,

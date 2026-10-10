@@ -113,6 +113,80 @@ pub(crate) async fn create_server(
     Ok((StatusCode::CREATED, Json(rec)))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServerUpdate {
+    /// A new endpoint: the approvals of the server's manifests are withdrawn (discover and approve
+    /// again).
+    url: Option<String>,
+    auth: Option<ToolAuth>,
+    /// A new credential (sealed at once; never returned); `null` removes it.
+    #[serde(default, deserialize_with = "crate::present")]
+    credential: Option<Option<String>>,
+    trusted: Option<bool>,
+}
+
+/// `PATCH /api/v1/tenants/{t}/tool-servers/{server}`: changes the URL, the auth method, the
+/// credential (rotation) and the trusted flag without deleting the server (which is refused while
+/// a published version calls it). Auth, credential and trust changes keep the approvals; a URL
+/// change withdraws them. Audited as `tool_server.update` (never with the credential).
+pub(crate) async fn update_server(
+    AxState(cp): AxState<Cp>,
+    Extension(p): Extension<Principal>,
+    Path((tenant_id, server)): Path<(String, String)>,
+    Json(body): Json<ServerUpdate>,
+) -> ApiResult<Json<Value>> {
+    crate::ensure_tenant(&cp, &tenant_id)?;
+    let st = cp.store.state();
+    let current = st.tool_server(&tenant_id, &server).cloned().ok_or_else(|| not_found("tool server"))?;
+    let tools = cp.tools();
+    if let Some(u) = &body.url {
+        caliban_mcp::egress::check_url(u, tools.client.policy).map_err(|e| invalid(e.to_string()))?;
+    }
+    let auth = body.auth.clone().unwrap_or_else(|| current.auth.clone());
+    if let ToolAuth::OauthClientCredentials { token_url, .. } = &auth {
+        caliban_mcp::egress::check_url(token_url, tools.client.policy).map_err(|e| invalid(e.to_string()))?;
+    }
+    let secret = match &body.credential {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(c)) if c.is_empty() => return Err(bad("the credential is empty (null removes it)")),
+        Some(Some(c)) => {
+            let keyring = cp.keyring("tool server credentials")?;
+            let dek = keys::tenant_dek(&cp.store, keyring, &tenant_id, &p.actor).await?;
+            Some(Some(dek.seal(&tenant_id, c)))
+        }
+    };
+    let has_secret = match &secret {
+        Some(s) => s.is_some(),
+        None => current.has_credential,
+    };
+    if matches!(auth, ToolAuth::ApiKey { .. } | ToolAuth::OauthClientCredentials { .. }) && !has_secret {
+        return Err(bad("this auth method needs a credential"));
+    }
+    let withdrawn = if body.url.as_ref().is_some_and(|u| *u != current.url) {
+        st.tool_manifests
+            .iter()
+            .filter(|m| m.tenant_id == tenant_id && m.server == server && m.status == ToolStatus::Approved)
+            .count()
+    } else {
+        0
+    };
+    let m = Mutation::UpdateToolServer {
+        tenant_id: tenant_id.clone(),
+        name: server.clone(),
+        url: body.url,
+        auth: body.auth,
+        trusted: body.trusted,
+        secret,
+    };
+    let st = cp.store.apply(&p.actor, m).await?;
+    let rec = st.tool_server(&tenant_id, &server).cloned().ok_or_else(|| not_found("tool server"))?;
+    let mut v = serde_json::to_value(rec).unwrap_or_default();
+    v["approvals_withdrawn"] = json!(withdrawn);
+    Ok(Json(v))
+}
+
 pub(crate) async fn delete_server(
     AxState(cp): AxState<Cp>,
     Extension(p): Extension<Principal>,
@@ -471,6 +545,53 @@ mod tests {
             call(&app, "POST", &format!("{T}/catalogue/tools/notes/revoke"), Some(json!({"pin": bad["pin"]}))).await;
         assert_eq!(s, StatusCode::NO_CONTENT);
         assert_eq!(c.store.config.load().tenant(&"acme".into()).unwrap().tools.len(), 1);
+
+        // Changed in place (no delete, which is refused while a published version uses it):
+        // trust and a rotated credential keep the approvals, a new URL withdraws them.
+        let (s, v) =
+            call(&app, "PATCH", &format!("{T}/crm"), Some(json!({"trusted": false, "credential": "sk-crm-rotated"})))
+                .await;
+        assert_eq!(
+            (s, v["trusted"].as_bool(), v["approvals_withdrawn"].as_u64()),
+            (StatusCode::OK, Some(false), Some(0)),
+            "{v}"
+        );
+        assert!(!v.to_string().contains("sk-crm-rotated"));
+        let crm = c
+            .store
+            .config
+            .load()
+            .tenant(&"acme".into())
+            .unwrap()
+            .tool_servers
+            .iter()
+            .find(|s| s.name == "crm")
+            .cloned()
+            .unwrap();
+        assert_eq!(crm.credential.as_ref().unwrap().resolve_with(&ring()).unwrap().expose(), "sk-crm-rotated");
+        let (s, _) = call(&app, "PATCH", &format!("{T}/crm"), Some(json!({"credential": null}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "an API key server keeps a credential");
+        let (s, _) =
+            call(&app, "PATCH", &format!("{T}/catalogue"), Some(json!({"url": "http://169.254.169.254/mcp"}))).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "the egress rules apply");
+        let (s, v) =
+            call(&app, "PATCH", &format!("{T}/catalogue"), Some(json!({"url": "https://catalogue.example/mcp"}))).await;
+        assert_eq!((s, v["approvals_withdrawn"].as_u64()), (StatusCode::OK, Some(1)), "{v}");
+        assert!(
+            c.store.config.load().tenant(&"acme".into()).unwrap().tools.is_empty(),
+            "withdrawn from the data plane"
+        );
+        let (_, audit) = call(&app, "GET", "/api/v1/audit?limit=3", None).await;
+        let e = &audit["entries"][0];
+        assert_eq!(
+            (e["action"].as_str(), e["detail"]["approvals_withdrawn"].as_u64()),
+            (Some("tool_server.update"), Some(1))
+        );
+        assert_eq!(audit["entries"][1]["detail"]["credential"], "rotated", "the refused change wrote nothing");
+        assert_eq!(
+            call(&app, "PATCH", &format!("{T}/nope"), Some(json!({"trusted": true}))).await.0,
+            StatusCode::NOT_FOUND
+        );
 
         // The JWKS is public.
         let resp = app

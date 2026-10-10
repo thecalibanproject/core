@@ -472,6 +472,7 @@ pub const ROUTES: &[RouteRule] = &[
     r("GET", "/tenants/{tenant_id}/tool-servers", Perm::ToolsRead, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/tool-servers", Perm::ToolsWrite, TenantFrom::Path),
     r("DELETE", "/tenants/{tenant_id}/tool-servers/{server}", Perm::ToolsWrite, TenantFrom::Path),
+    r("PATCH", "/tenants/{tenant_id}/tool-servers/{server}", Perm::ToolsWrite, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/tool-servers/{server}/discover", Perm::ToolsWrite, TenantFrom::Path),
     r("GET", "/tenants/{tenant_id}/tool-servers/{server}/tools", Perm::ToolsRead, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools", Perm::ToolsWrite, TenantFrom::Path),

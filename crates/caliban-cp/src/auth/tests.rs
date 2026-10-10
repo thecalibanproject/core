@@ -877,6 +877,14 @@ fn cases() -> Vec<Case> {
             "owner admin tenant_admin developer",
         ),
         c(
+            "PATCH",
+            "/tenants/{tenant_id}/tool-servers/{server}",
+            "/api/v1/tenants/{t}/tool-servers/nope",
+            Some(json!({"trusted": true})),
+            true,
+            "owner admin tenant_admin developer",
+        ),
+        c(
             "POST",
             "/tenants/{tenant_id}/tool-servers/{server}/discover",
             "/api/v1/tenants/{t}/tool-servers/nope/discover",

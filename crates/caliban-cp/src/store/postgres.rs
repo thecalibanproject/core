@@ -988,6 +988,25 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
             .await
         }
         Mutation::CreateToolServer(s) => insert_tool_server(c, s).await,
+        Mutation::UpdateToolServer { tenant_id, name, .. } => {
+            let s = next.tool_server(tenant_id, name).ok_or_else(|| StoreError::NotFound("tool server".into()))?;
+            let sealed = s
+                .secret
+                .as_deref()
+                .map(|b| {
+                    B64.decode(b).map_err(|e| StoreError::Invalid(format!("sealed credential is not base64: {e}")))
+                })
+                .transpose()?;
+            let q = "UPDATE tool_server SET url = $3, auth = $4, sealed_secret = $5, trusted = $6
+                     WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL";
+            let auth = Json(serde_json::to_value(&s.auth).map_err(|e| StoreError::Backend(e.to_string()))?);
+            exec(c, sqlx::query(q).bind(tenant_id).bind(name).bind(&s.url).bind(auth).bind(sealed).bind(s.trusted))
+                .await?;
+            for m in next.tool_manifests.iter().filter(|m| &m.tenant_id == tenant_id && &m.server == name) {
+                upsert_tool_manifest(c, m).await?;
+            }
+            Ok(())
+        }
         Mutation::DeleteToolServer { tenant_id, name, at } => {
             let q = "UPDATE tool_server SET deleted_at = $3, sealed_secret = NULL
                      WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL";

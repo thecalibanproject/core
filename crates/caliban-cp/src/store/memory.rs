@@ -574,6 +574,40 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             }
             st.tool_servers.push(super::ToolServerRecord { has_credential: s.secret.is_some(), ..s.clone() });
         }
+        Mutation::UpdateToolServer { tenant_id, name, url, auth, trusted, secret } => {
+            need_tenant(st, tenant_id)?;
+            if matches!(secret, Some(Some(_))) && !st.deks.contains_key(tenant_id) {
+                return Err(StoreError::Invalid(
+                    "the credential is sealed under a tenant key that does not exist".into(),
+                ));
+            }
+            let s = st
+                .tool_servers
+                .iter_mut()
+                .find(|s| &s.tenant_id == tenant_id && &s.name == name && s.is_live())
+                .ok_or_else(|| StoreError::NotFound("tool server".into()))?;
+            let moved = url.as_ref().is_some_and(|u| *u != s.url);
+            if let Some(u) = url {
+                s.url.clone_from(u);
+            }
+            if let Some(a) = auth {
+                s.auth = a.clone();
+            }
+            if let Some(t) = trusted {
+                s.trusted = *t;
+            }
+            if let Some(c) = secret {
+                s.secret.clone_from(c);
+                s.has_credential = c.is_some();
+            }
+            if moved {
+                for m in st.tool_manifests.iter_mut().filter(|m| &m.tenant_id == tenant_id && &m.server == name) {
+                    if m.status == super::ToolStatus::Approved {
+                        m.status = super::ToolStatus::Revoked;
+                    }
+                }
+            }
+        }
         Mutation::DeleteToolServer { tenant_id, name, at } => {
             need_tenant(st, tenant_id)?;
             st.tool_server(tenant_id, name).ok_or_else(|| StoreError::NotFound("tool server".into()))?;

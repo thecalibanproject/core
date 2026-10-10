@@ -2173,6 +2173,23 @@ async fn tool_registry(s: &Store) -> Value {
     )
     .await
     .unwrap();
+    // Changed in place: a rotated credential and trust keep the approvals; a new URL withdraws them.
+    let update = |name: &str, url: Option<&str>, secret: Option<Option<String>>| Mutation::UpdateToolServer {
+        tenant_id: "acme".into(),
+        name: name.into(),
+        url: url.map(str::to_owned),
+        auth: None,
+        trusted: Some(false),
+        secret,
+    };
+    s.apply(A, update("crm", None, Some(Some(dek.seal("acme", "sk-2"))))).await.unwrap();
+    assert!(!s.state().tool_server("acme", "crm").unwrap().trusted);
+    s.apply(A, update("catalogue", None, None)).await.unwrap();
+    assert!(s.state().approved_tool("acme", "catalogue", "search", &good.pin).is_some(), "kept");
+    s.apply(A, update("catalogue", Some("https://catalogue.example/mcp"), None)).await.unwrap();
+    assert!(s.state().approved_tool("acme", "catalogue", "search", &good.pin).is_none(), "withdrawn");
+    assert_eq!(s.apply(A, update("nope", None, None)).await.unwrap_err(), StoreError::NotFound("tool server".into()));
+    s.apply(A, approve(&good, false)).await.unwrap();
     s.apply(A, Mutation::DeleteToolServer { tenant_id: "acme".into(), name: "crm".into(), at: del_ts() })
         .await
         .unwrap();
