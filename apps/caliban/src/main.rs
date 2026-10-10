@@ -317,6 +317,7 @@ async fn main() -> Result<()> {
     if let Cmd::Worker(args) = &cli.cmd {
         let keyring = keyring.context("a node worker needs CALIBAN_KEK (it opens node specs and tenant data keys)")?;
         let url = database_url().context("a node worker needs CALIBAN_DATABASE_URL (the node run journal)")?;
+        let worker_token = cli.nodes.worker_token()?;
         let token = std::env::var("CALIBAN_ROUTER_TOKEN").context("CALIBAN_ROUTER_TOKEN is required for a worker")?;
         let keys = std::env::var("CALIBAN_SNAPSHOT_PUBLIC_KEY")
             .context("CALIBAN_SNAPSHOT_PUBLIC_KEY is required for a worker")?;
@@ -347,7 +348,6 @@ async fn main() -> Result<()> {
         spawn_router_warmup(&gw);
         let journal = nodes::postgres_journal(&url, true).await?;
         let stop = cli.nodes.run_locally(&gw, journal, Arc::new(keyring.clone()), worker_id)?;
-        let worker_token = cli.nodes.worker_token()?;
         let res = serve("worker", args.listen.clone(), caliban_gateway::nodes::worker_app(gw, worker_token)).await;
         stop.notify_waiters();
         flush_wal(wal.as_deref()).await;
