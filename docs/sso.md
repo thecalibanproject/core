@@ -158,6 +158,7 @@ tenants the caller may see. A refusal is `403` with `error.type = "permission_er
 | `GET /api/v1/tenants/{tenantId}/runs/{runId}` | `runs.read` (content with `runs.data`) | owner, admin, auditor, tenant_admin, developer, viewer |
 | `POST /api/v1/tenants/{tenantId}/runs/{runId}/input` | `runs.answer` | owner, admin, tenant_admin |
 | `GET /api/v1/tenants/{tenantId}/inbox` | `runs.read` (questions with `runs.data`) | owner, admin, auditor, tenant_admin, developer, viewer |
+| `GET /api/v1/tenants/{tenantId}/node-spend` | `usage.read` | every role |
 | `GET /api/v1/models` | `catalog.read` | every role |
 | `POST /api/v1/models` | `catalog.write` | owner, admin |
 | `DELETE /api/v1/models/{modelId}` | `catalog.write` | owner, admin |

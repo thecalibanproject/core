@@ -482,6 +482,7 @@ pub const ROUTES: &[RouteRule] = &[
     r("GET", "/tenants/{tenant_id}/runs/{id}", Perm::RunsRead, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/runs/{id}/input", Perm::RunsAnswer, TenantFrom::Path),
     r("GET", "/tenants/{tenant_id}/inbox", Perm::RunsRead, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/node-spend", Perm::UsageRead, TenantFrom::Path),
     r("GET", "/models", Perm::CatalogRead, TenantFrom::None),
     r("POST", "/models", Perm::CatalogWrite, TenantFrom::None),
     r("DELETE", "/models/{*id}", Perm::CatalogWrite, TenantFrom::None),

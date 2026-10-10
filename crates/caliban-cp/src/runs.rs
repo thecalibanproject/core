@@ -199,6 +199,27 @@ pub(crate) async fn inbox(
     Ok(Json(json!({"object": "list", "data": items, "content_visible": content})))
 }
 
+/// `GET /api/v1/tenants/{t}/node-spend`: what the tenant's node runs spent on model calls today and
+/// this month (UTC), across every worker, against its node spend caps (`usage.read`).
+pub(crate) async fn spend(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiResult<Json<Value>> {
+    let t = cp.store.state().tenant(&tenant_id).cloned().ok_or_else(|| not_found("tenant"))?;
+    let j = journal(&cp)?;
+    let spent = j.tenant_spend(&tenant_id).await.map_err(journal_error)?;
+    let caps = t.node_spend_caps.unwrap_or_default();
+    let left = |cap: Option<f64>, used: f64| cap.map(|c| (c - used).max(0.0));
+    let now = Utc::now();
+    Ok(Json(json!({
+        "tenant_id": tenant_id,
+        "day": now.format("%Y-%m-%d").to_string(),
+        "month": now.format("%Y-%m").to_string(),
+        "today_usd": spent.today_usd,
+        "month_usd": spent.month_usd,
+        "caps": {"daily_usd": caps.daily_usd, "monthly_usd": caps.monthly_usd},
+        "remaining": {"daily_usd": left(caps.daily_usd, spent.today_usd), "monthly_usd": left(caps.monthly_usd, spent.month_usd)},
+        "capped": caps.daily_usd.is_some_and(|c| spent.today_usd >= c) || caps.monthly_usd.is_some_and(|c| spent.month_usd >= c),
+    })))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AnswerBody {

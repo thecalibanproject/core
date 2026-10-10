@@ -548,7 +548,9 @@ call paid once is counted once).
 snapshot). Days and months are UTC. Every step's cost is added to `node_spend` (tenant, day) in the
 same transaction that checkpoints the step, and before every model call the executor compares the
 tenant's spend today and this month with the caps: the journal is the source of truth, so the caps
-hold across workers. Calls already in flight when the cap is reached complete (the overshoot is at
+hold across workers. `GET /api/v1/tenants/{t}/node-spend` (`usage.read`) shows the spend today and
+this month against the caps (`today_usd`, `month_usd`, `caps`, `remaining`, `capped`); the control
+plane reads it from the journal, so it needs the database (or a standalone process). Calls already in flight when the cap is reached complete (the overshoot is at
 most one call per run in flight).
 
 **Overruns end gracefully.** Status `budget_exhausted`, the last completed value in `output`

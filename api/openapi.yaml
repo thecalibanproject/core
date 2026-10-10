@@ -851,6 +851,44 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
 
+  /api/v1/tenants/{tenantId}/node-spend:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [usage]
+      summary: The tenant's node spend today and this month, against its caps
+      description: |
+        What the tenant's node runs spent on model calls (USD, priced like the metering) today and
+        this month (UTC), across every worker, from the node journal (`503` without one), next to
+        its `node_spend_caps`. Permission `usage.read`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenant_id, day, month, today_usd, month_usd, caps, remaining, capped]
+                properties:
+                  tenant_id: { type: string }
+                  day: { type: string, description: 'YYYY-MM-DD (UTC)' }
+                  month: { type: string, description: 'YYYY-MM (UTC)' }
+                  today_usd: { type: number }
+                  month_usd: { type: number }
+                  caps:
+                    type: object
+                    properties:
+                      daily_usd: { type: [number, 'null'] }
+                      monthly_usd: { type: [number, 'null'] }
+                  remaining:
+                    type: object
+                    properties:
+                      daily_usd: { type: [number, 'null'], description: '`null`: no cap' }
+                      monthly_usd: { type: [number, 'null'] }
+                  capped: { type: boolean, description: 'A cap is reached: runs stop at their next model call' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
   /api/v1/tenants/{tenantId}/datasources/{datasourceId}:
     parameters:
       - { $ref: '#/components/parameters/TenantId' }

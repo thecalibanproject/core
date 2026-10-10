@@ -935,6 +935,7 @@ fn cases() -> Vec<Case> {
             "owner admin tenant_admin",
         ),
         c("GET", "/tenants/{tenant_id}/inbox", "/api/v1/tenants/{t}/inbox", None, true, RUN_READERS),
+        c("GET", "/tenants/{tenant_id}/node-spend", "/api/v1/tenants/{t}/node-spend", None, true, EVERYONE),
         c("GET", "/models", "/api/v1/models", None, false, EVERYONE),
         c("POST", "/models", "/api/v1/models", Some(json!({})), false, "owner admin"),
         c("DELETE", "/models/{*id}", "/api/v1/models/nope/none", None, false, "owner admin"),
@@ -1428,4 +1429,55 @@ async fn run_content_and_answers_follow_the_roles() {
         ("node.run.answer", by.as_str(), Some("run_1"))
     );
     assert!(verify_chain(&log).is_ok());
+
+    // The tenant's node spend against its caps, for every role that reads usage (billing too).
+    let other = journal.get_run("acme", "run_1").await.unwrap().unwrap();
+    journal
+        .create_run(NewRun {
+            id: "run_2".into(),
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: 1,
+            spec_hash: "sha256:00".into(),
+            invoker: "api_key:abc".into(),
+            invoker_key_hash: None,
+            input: other.input,
+            budget: BudgetState::new(5, 100, 60),
+            idempotency: None,
+            specs: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+    journal.claim("run_2", "w", Duration::from_secs(30)).await.unwrap().unwrap();
+    let at = chrono::Utc::now();
+    let step = caliban_nodes::journal::StepRecord {
+        run_id: "run_2".into(),
+        tenant_id: "acme".into(),
+        step_id: "a#0".into(),
+        attempt: 1,
+        vertex: "a".into(),
+        kind: "llm".into(),
+        input_hash: "h".into(),
+        status: caliban_nodes::journal::StepStatus::Completed,
+        result: None,
+        tokens: 10,
+        prompt_tokens: 7,
+        completion_tokens: 3,
+        usd: 0.25,
+        labels: vec![],
+        started_at: at,
+        finished_at: at,
+    };
+    journal.put_step("w", step, &BudgetState::new(5, 100, 60)).await.unwrap();
+    let caps = Some(json!({"node_spend_caps": {"daily_usd": 1.0}}));
+    assert_eq!(as_role(&["acme-admins"], "PATCH", "/api/v1/tenants/acme", caps).await.status, StatusCode::OK);
+    let r = as_role(&["acme-billing"], "GET", "/api/v1/tenants/acme/node-spend", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!((r.body["today_usd"].as_f64(), r.body["month_usd"].as_f64()), (Some(0.25), Some(0.25)));
+    assert_eq!(
+        (r.body["caps"]["daily_usd"].as_f64(), r.body["remaining"]["daily_usd"].as_f64()),
+        (Some(1.0), Some(0.75))
+    );
+    assert_eq!((r.body["caps"]["monthly_usd"].clone(), r.body["capped"].as_bool()), (Value::Null, Some(false)));
 }
