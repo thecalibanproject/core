@@ -207,8 +207,11 @@ kind = "chat"
 family = "qwen3.8"
 trust_tier = "t0_sovereign"
 licence = "apache-2.0"
-# Native 262144 (YaRN to 1M). 131072 fits 1×48 GB with fp8 KV; use 262144 on 1×80 GB.
-context_window = 131072
+# Native 262144 (YaRN to 1M). Served at 32768 by default (deploy's QWEN3_LARGE_MAX_MODEL_LEN):
+# on a 48 GB GPU shared with the embedder and reranker, 131072 left too little KV cache and vLLM
+# crash-looped in the AWS run (bench/RESULTS-aws-2026-10b.md, caveats). On a dedicated GPU raise
+# both: 131072 fits 1×48 GB with fp8 KV, 262144 fits 1×80 GB.
+context_window = 32768
 price_in_per_mtok = 0.0
 price_out_per_mtok = 0.0
 [models.capabilities]
