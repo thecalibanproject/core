@@ -591,13 +591,16 @@ pub struct SemanticCacheConfig {
     /// Catalogue id of the embedding model (`kind = "embedding"`) used for cache keys. Each tenant
     /// must reach it through its own or a shared provider; otherwise T2 is skipped for that tenant.
     pub embedding_model: Option<ModelId>,
-    /// Starting per-entry cosine threshold. Conservative on purpose: entries only go below it after
-    /// verified-correct matches.
-    #[serde(default = "default_sem_threshold")]
-    pub threshold: f32,
-    /// Learned thresholds never go below this.
-    #[serde(default = "default_sem_min_threshold")]
-    pub min_threshold: f32,
+    /// Starting per-entry cosine threshold; entries only go below it after verified-correct
+    /// matches. Unset: [`SEM_THRESHOLD_WITH_DEFAULT_PREFIX`] (0.91) with the default
+    /// `query_prefix`, [`SEM_THRESHOLD`] (0.95) without a prefix or with another one. Read it with
+    /// [`SemanticCacheConfig::threshold`] or [`Config::semantic_cache_settings`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
+    /// Learned thresholds never go below this. Unset: 0.91 with the default `query_prefix`, 0.93
+    /// otherwise (never above `threshold`). Read it with [`SemanticCacheConfig::min_threshold`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_threshold: Option<f32>,
     /// Matches in `[threshold - grey_band, threshold)` are answered fresh and the fresh answer is
     /// compared with the cached one in the background; agreement lowers the entry's threshold.
     #[serde(default = "default_sem_grey_band")]
@@ -626,11 +629,14 @@ pub struct SemanticCacheConfig {
     /// slower embedding is kept for the insert after the upstream answers).
     #[serde(default = "default_sem_embed_timeout")]
     pub embed_timeout_ms: u64,
-    /// Instruction prepended to the prompt before it is embedded for the cache (off by default).
-    /// Qwen3-Embedding expects one for queries: with
-    /// `"Instruct: Given a user question, retrieve questions that ask exactly the same thing\nQuery: "`
-    /// the AWS run measured 81% paraphrase hits at 5% false hits with `threshold = 0.91`
-    /// (`bench/RESULTS-aws-2026-10.md`). Entries embedded with another prefix are never compared
+    /// Instruction prepended to the prompt before it is embedded for the cache. Unset:
+    /// [`DEFAULT_SEM_QUERY_PREFIX`], the Qwen3-Embedding query instruction calibrated in the AWS
+    /// runs, when `embedding_model` is of family `qwen3-embedding` (no prefix for other
+    /// embedders); `""` turns it off; any other text replaces it. Read it with
+    /// [`SemanticCacheConfig::effective_query_prefix`] or [`Config::semantic_cache_settings`]. With the default prefix and
+    /// `threshold = min_threshold = 0.91`, the second AWS run measured 24 of 36 paraphrases hit and
+    /// 0 of 38 near-misses (against 14 of 36 without a prefix at 0.95 / 0.93;
+    /// `bench/RESULTS-aws-2026-10b.md`). Entries embedded with another prefix are never compared
     /// (the prefix is part of the key). Unless it equals `[routing] query_prefix`, a request that
     /// is routed by kNN and looked up here embeds its prompt twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -646,8 +652,8 @@ impl Default for SemanticCacheConfig {
             qdrant_api_key: None,
             collection_prefix: default_collection_prefix(),
             embedding_model: None,
-            threshold: default_sem_threshold(),
-            min_threshold: default_sem_min_threshold(),
+            threshold: None,
+            min_threshold: None,
             grey_band: default_sem_grey_band(),
             max_error_rate: default_sem_max_error_rate(),
             verify_rate: default_sem_verify_rate(),
@@ -661,9 +667,58 @@ impl Default for SemanticCacheConfig {
     }
 }
 
+/// Default `[cache.semantic] query_prefix`: the query instruction Qwen3-Embedding expects, worded
+/// for "the same question" (`bench/RESULTS-aws-2026-10.md` and `-10b.md`).
+pub const DEFAULT_SEM_QUERY_PREFIX: &str =
+    "Instruct: Given a user question, retrieve questions that ask exactly the same thing\nQuery: ";
+/// Catalogue `family` of the Qwen3-Embedding models, for which [`DEFAULT_SEM_QUERY_PREFIX`] is the
+/// default.
+pub const QWEN3_EMBEDDING_FAMILY: &str = "qwen3-embedding";
+/// Default `threshold` and `min_threshold` with [`DEFAULT_SEM_QUERY_PREFIX`].
+pub const SEM_THRESHOLD_WITH_DEFAULT_PREFIX: f32 = 0.91;
+/// Default `threshold` without a prefix, or with a prefix of your own (not calibrated).
+pub const SEM_THRESHOLD: f32 = 0.95;
+/// Default `min_threshold` without a prefix, or with a prefix of your own: below 0.93 the false
+/// hits doubled without a prefix in the first AWS run.
+pub const SEM_MIN_THRESHOLD: f32 = 0.93;
+
 impl SemanticCacheConfig {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The instruction prepended before embedding, for an embedding model of catalogue `family`:
+    /// when unset, [`DEFAULT_SEM_QUERY_PREFIX`] for [`QWEN3_EMBEDDING_FAMILY`] models (the only
+    /// embedder it is written and calibrated for) and none for others; none when set to `""`.
+    pub fn effective_query_prefix(&self, family: Option<&str>) -> Option<&str> {
+        match self.query_prefix.as_deref() {
+            None if family == Some(QWEN3_EMBEDDING_FAMILY) => Some(DEFAULT_SEM_QUERY_PREFIX),
+            None | Some("") => None,
+            Some(p) => Some(p),
+        }
+    }
+
+    /// Whether the thresholds calibrated for [`DEFAULT_SEM_QUERY_PREFIX`] apply.
+    fn calibrated_prefix(&self, family: Option<&str>) -> bool {
+        self.effective_query_prefix(family) == Some(DEFAULT_SEM_QUERY_PREFIX)
+    }
+
+    /// Starting per-entry threshold (see the field) for an embedding model of `family`.
+    pub fn threshold(&self, family: Option<&str>) -> f32 {
+        self.threshold.unwrap_or(if self.calibrated_prefix(family) {
+            SEM_THRESHOLD_WITH_DEFAULT_PREFIX
+        } else {
+            SEM_THRESHOLD
+        })
+    }
+
+    /// Floor of learned thresholds (see the field) for an embedding model of `family`. When unset
+    /// it never exceeds `threshold`.
+    pub fn min_threshold(&self, family: Option<&str>) -> f32 {
+        self.min_threshold.unwrap_or_else(|| {
+            let d = if self.calibrated_prefix(family) { SEM_THRESHOLD_WITH_DEFAULT_PREFIX } else { SEM_MIN_THRESHOLD };
+            d.min(self.threshold(family))
+        })
     }
 
     /// `CALIBAN_QDRANT_URL`, then `qdrant_url`.
@@ -690,13 +745,14 @@ impl SemanticCacheConfig {
                 Err(ConfigError::Invalid(format!("cache.semantic.{name} must be in [0, 1]")))
             }
         };
-        unit("threshold", self.threshold)?;
-        unit("min_threshold", self.min_threshold)?;
+        let family = self.embedding_model.as_ref().and_then(|m| models.get(m)).and_then(|e| e.family.as_deref());
+        unit("threshold", self.threshold(family))?;
+        unit("min_threshold", self.min_threshold(family))?;
         unit("grey_band", self.grey_band)?;
         unit("max_error_rate", self.max_error_rate)?;
         unit("verify_rate", self.verify_rate)?;
         unit("verify_answer_similarity", self.verify_answer_similarity)?;
-        if self.min_threshold > self.threshold {
+        if self.min_threshold(family) > self.threshold(family) {
             return Err(ConfigError::Invalid("cache.semantic.min_threshold must be <= threshold".into()));
         }
         if !self.max_temperature.is_finite() || self.max_temperature < 0.0 {
@@ -730,12 +786,6 @@ impl SemanticCacheConfig {
 
 fn default_collection_prefix() -> String {
     "caliban_semcache".into()
-}
-fn default_sem_threshold() -> f32 {
-    0.95
-}
-fn default_sem_min_threshold() -> f32 {
-    0.93
 }
 fn default_sem_grey_band() -> f32 {
     0.03
@@ -1001,7 +1051,33 @@ pub struct RouteConfig {
     pub models: Vec<ModelId>,
 }
 
+/// `[cache.semantic]` values that depend on the embedding model (see
+/// [`Config::semantic_cache_settings`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticCacheSettings {
+    /// Instruction prepended before embedding; `None` embeds the prompt as is.
+    pub query_prefix: Option<String>,
+    pub threshold: f32,
+    pub min_threshold: f32,
+}
+
 impl Config {
+    /// The semantic cache's effective `query_prefix`, `threshold` and `min_threshold`, with the
+    /// defaults of its embedding model's catalogue family.
+    pub fn semantic_cache_settings(&self) -> SemanticCacheSettings {
+        let c = &self.cache.semantic;
+        let family = c
+            .embedding_model
+            .as_ref()
+            .and_then(|id| self.models.iter().find(|m| &m.id == id))
+            .and_then(|m| m.family.as_deref());
+        SemanticCacheSettings {
+            query_prefix: c.effective_query_prefix(family).map(str::to_owned),
+            threshold: c.threshold(family),
+            min_threshold: c.min_threshold(family),
+        }
+    }
+
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         let cfg: Config = toml::from_str(s)?;
         cfg.validate()?;
@@ -1271,7 +1347,9 @@ mod tests {
         let t = &snap.config.tenants[0];
         assert!(snap.models_for(t).any(|m| m.kind == ModelKind::Embedding));
         assert!(snap.models_for(t).any(|m| m.capabilities.reasoning_control != ReasoningControl::None));
-        assert_eq!(snap.config.cache.semantic.min_threshold, 0.93);
+        let c = snap.config.semantic_cache_settings();
+        assert_eq!(c.query_prefix.as_deref(), Some(DEFAULT_SEM_QUERY_PREFIX), "Qwen3-Embedding: prefix on");
+        assert_eq!((c.threshold, c.min_threshold), (0.91, 0.91));
     }
 
     /// The opt-in blocks of the open-models example (`[routing]` and the cache `query_prefix`)
@@ -1302,7 +1380,8 @@ mod tests {
             (r.k, r.temperature, r.abstain_threshold, r.oos_threshold),
             (Some(5), Some(0.1), Some(0.6), Some(0.64))
         );
-        assert!(cfg.cache.semantic.query_prefix.as_deref().is_some_and(|p| p.ends_with("\nQuery: ")));
+        assert_eq!(cfg.cache.semantic.query_prefix.as_deref(), Some(DEFAULT_SEM_QUERY_PREFIX));
+        assert_eq!(cfg.semantic_cache_settings().threshold, 0.91);
     }
 
     #[test]
@@ -1328,10 +1407,31 @@ mod tests {
     fn semantic_cache_defaults_validation_and_tenant_switch() {
         let c = SemanticCacheConfig::default();
         assert!(!c.enabled);
+        let q = Some(QWEN3_EMBEDDING_FAMILY);
         assert_eq!(
-            (c.threshold, c.min_threshold, c.lookup_budget_ms, c.store),
-            (0.95, 0.93, 50, SemanticStoreKind::Qdrant)
+            (c.effective_query_prefix(q), c.threshold(q), c.min_threshold(q), c.lookup_budget_ms, c.store),
+            (Some(DEFAULT_SEM_QUERY_PREFIX), 0.91, 0.91, 50, SemanticStoreKind::Qdrant)
         );
+        // Other embedders: the instruction is Qwen3-Embedding's, so no prefix and the
+        // conservative defaults of the unprefixed run.
+        for f in [None, Some("bge")] {
+            assert_eq!((c.effective_query_prefix(f), c.threshold(f), c.min_threshold(f)), (None, 0.95, 0.93));
+        }
+        // Prefix off, or a prefix of your own (not calibrated): 0.95 / 0.93. Explicit values win.
+        let sem = |extra: &str| -> SemanticCacheConfig { toml::from_str(extra).unwrap() };
+        let off = sem("query_prefix = \"\"");
+        assert_eq!((off.effective_query_prefix(q), off.threshold(q), off.min_threshold(q)), (None, 0.95, 0.93));
+        let own = sem("query_prefix = \"query: \"");
+        assert_eq!(
+            (own.effective_query_prefix(None), own.threshold(q), own.min_threshold(q)),
+            (Some("query: "), 0.95, 0.93)
+        );
+        let set = sem("threshold = 0.97\nmin_threshold = 0.92");
+        assert_eq!((set.threshold(q), set.min_threshold(q)), (0.97, 0.92));
+        assert_eq!(sem("query_prefix = \"\"\nthreshold = 0.9").min_threshold(q), 0.9, "unset floor never above it");
+        // Unset values stay out of the rendered snapshot, so routers apply the same defaults.
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(json.get("threshold").is_none() && json.get("query_prefix").is_none());
         let on = |extra: &str| format!("{SHARED}\n[cache.semantic]\nenabled = true\n{extra}");
         let cfg = Config::from_toml_str(&on("embedding_model = \"local/b\"\nstore = \"memory\"")).unwrap();
         assert_eq!(cfg.cache.semantic.store, SemanticStoreKind::Memory);

@@ -916,6 +916,12 @@ mod semantic {
         pub real_embedder: bool,
         pub embed_base: Option<String>,
         pub prefix: String,
+        /// `[cache.semantic] query_prefix`; `None` leaves it unset (the default instruction). The
+        /// suite runs with the prefix off: `FakeEmbedder`'s bag of words would count the
+        /// instruction's words in every prompt.
+        pub query_prefix: Option<String>,
+        /// Catalogue `family` of the embedding model (`qwen3-embedding` gets the default prefix).
+        pub embed_family: Option<&'static str>,
     }
 
     impl Default for Opts {
@@ -930,6 +936,8 @@ mod semantic {
                 real_embedder: false,
                 embed_base: None,
                 prefix: "caliban_semcache".into(),
+                query_prefix: Some(String::new()),
+                embed_family: None,
             }
         }
     }
@@ -947,6 +955,7 @@ embedding_model = "local/embed"
 verify_rate = {verify_rate}
 lookup_budget_ms = {budget}
 collection_prefix = "{prefix}"
+{query_prefix}
 
 [[models]]
 id = "ext/mock"
@@ -968,6 +977,7 @@ provider = "mocklocal"
 upstream_model = "embed"
 kind = "embedding"
 trust_tier = "t0_sovereign"
+{embed_family}
 
 [[providers]]
 id = "mocklocal"
@@ -1028,6 +1038,8 @@ api_key_hashes = ["{limited}"]
             verify_rate = o.verify_rate,
             budget = o.budget_ms,
             prefix = o.prefix,
+            query_prefix = o.query_prefix.as_ref().map(|p| format!("query_prefix = {p:?}")).unwrap_or_default(),
+            embed_family = o.embed_family.map(|f| format!("family = {f:?}")).unwrap_or_default(),
             embed_base = o.embed_base.clone().unwrap_or_else(|| base.clone()),
             acme = hash("cal_acme"),
             globex = hash("cal_globex"),
@@ -1356,6 +1368,42 @@ api_key_hashes = ["{limited}"]
         let (status, h, _) = call(&s.app, "/v1/chat/completions", BEARER, q("Explain HNSW")).await;
         assert_eq!((status, h["x-caliban-cache"].to_str().unwrap()), (StatusCode::OK, "miss"));
         assert!(t0.elapsed() < Duration::from_millis(350));
+    }
+
+    /// With `query_prefix` unset and a Qwen3-Embedding model, T2 embeds the prompt after the
+    /// default instruction, starts entries at 0.91, and hits a paraphrase at 0.92 that the
+    /// unprefixed defaults (0.95) would miss.
+    #[tokio::test]
+    async fn default_query_prefix_and_its_threshold() {
+        use caliban_config::DEFAULT_SEM_QUERY_PREFIX as P;
+        let s = setup(Opts { query_prefix: None, embed_family: Some("qwen3-embedding"), ..Default::default() }).await;
+        let (a, b) = ("how do i rotate the api key", "what are the steps to rotate the api key");
+        {
+            let mut o = s.embedder.overrides.lock().unwrap();
+            o.insert(format!("{P}{a}"), at(1.0, 10));
+            o.insert(format!("{P}{b}"), at(0.92, 1));
+        }
+        let (_, h, _) = call(&s.app, "/v1/chat/completions", BEARER, q(a)).await;
+        assert_eq!(h["x-caliban-cache"], "miss");
+        wait_entries(&s.store, 1).await;
+        assert!((s.store.entries()[0].2.threshold - 0.91).abs() < 1e-6, "starts at 0.91 with the default prefix");
+        let (_, h, out) = call(&s.app, "/v1/chat/completions", BEARER, q(b)).await;
+        assert_eq!(h["x-caliban-cache-tier"], "semantic");
+        assert_eq!(reply_text(&out), format!("You said: {a}"));
+    }
+
+    /// Entries written without the prefix are never compared with prefixed queries: the same
+    /// prompt and store, but the partition differs.
+    #[tokio::test]
+    async fn entries_without_the_prefix_never_meet_prefixed_queries() {
+        let off = setup(Opts::default()).await;
+        call(&off.app, "/v1/chat/completions", BEARER, q("how do i rotate the api key")).await;
+        wait_entries(&off.store, 1).await;
+        let on = setup(Opts { query_prefix: None, embed_family: Some("qwen3-embedding"), ..Default::default() }).await;
+        call(&on.app, "/v1/chat/completions", BEARER, q("how do i rotate the api key")).await;
+        wait_entries(&on.store, 1).await;
+        let (p_off, p_on) = (off.store.entries()[0].2.partition.clone(), on.store.entries()[0].2.partition.clone());
+        assert_ne!(p_off, p_on);
     }
 
     #[tokio::test]

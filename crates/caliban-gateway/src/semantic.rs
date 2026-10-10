@@ -28,7 +28,7 @@ use axum::response::Response;
 use caliban_cache::semantic::{
     KeyParts, Lookup, Match, NewEntry, ResponseShape, SemanticCache, SemanticKey, ThresholdPolicy, VerifyKind,
 };
-use caliban_config::{ModelEntry, SemanticCacheConfig, Snapshot, TenantConfig};
+use caliban_config::{ModelEntry, SemanticCacheConfig, SemanticCacheSettings, Snapshot, TenantConfig};
 use caliban_ir::anthropic;
 use caliban_ir::{ChatRequest, Usage};
 use caliban_meter::quota::Settlement;
@@ -80,10 +80,10 @@ pub(crate) struct Semantic {
     probe: Option<Match>,
 }
 
-pub(crate) fn policy(c: &SemanticCacheConfig) -> ThresholdPolicy {
+pub(crate) fn policy(c: &SemanticCacheConfig, s: &SemanticCacheSettings) -> ThresholdPolicy {
     ThresholdPolicy {
-        threshold: c.threshold,
-        min_threshold: c.min_threshold,
+        threshold: s.threshold,
+        min_threshold: s.min_threshold,
         grey_band: c.grey_band,
         max_error_rate: c.max_error_rate,
         verify_rate: c.verify_rate,
@@ -180,6 +180,7 @@ pub(crate) fn prepare(gw: &Gateway, snap: &Snapshot, tenant: &TenantConfig, i: I
     }
     let cfg = &snap.config.cache.semantic;
     let embed_model = cfg.embedding_model.clone()?;
+    let settings = snap.config.semantic_cache_settings();
     let ext = i.req.ext();
     if matches!(ext.cache, Some(CacheMode::Off | CacheMode::Exact)) || ext.zdr {
         return None;
@@ -212,17 +213,19 @@ pub(crate) fn prepare(gw: &Gateway, snap: &Snapshot, tenant: &TenantConfig, i: I
         prompt: &prompt,
         surrogates: &surrogates,
         pii_mode: i.pii_mode,
-        embed_prefix: cfg.query_prefix.as_deref().unwrap_or_default(),
+        // Part of the partition: vectors embedded with different instructions (or none) are
+        // never compared.
+        embed_prefix: settings.query_prefix.as_deref().unwrap_or_default(),
     });
-    // The text that is embedded: the prompt, after the optional instruction.
-    let embed_text = match cfg.query_prefix.as_deref() {
-        Some(p) if !p.is_empty() => format!("{p}{prompt}"),
-        _ => prompt,
+    // The text that is embedded: the prompt, after the instruction (the default one when unset).
+    let embed_text = match settings.query_prefix.as_deref() {
+        Some(p) => format!("{p}{prompt}"),
+        None => prompt,
     };
     Some(Semantic {
         cache: Arc::clone(cache),
         embedder: Arc::clone(&gw.embedder),
-        policy: policy(cfg),
+        policy: policy(cfg, &settings),
         cfg: cfg.clone(),
         tenant: tenant.id.clone(),
         embed_model,

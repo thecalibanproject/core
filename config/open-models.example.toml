@@ -49,16 +49,21 @@ enabled = false
 store = "qdrant"
 qdrant_url = "http://qdrant:6333"
 embedding_model = "local/qwen3-embedding-0.6b"
-threshold = 0.95       # 47% of paraphrases, 8% false hits on the adversarial AWS set
-min_threshold = 0.93   # below 0.93 the false-hit rate doubles (16% at 0.92, 21% at 0.90)
+# Thresholds: unset means 0.91 / 0.91 with the default query_prefix, 0.95 / 0.93 with none ("")
+# or with a prefix of your own. With the default prefix the second AWS run (end to end, real
+# model, guards on) hit 24 of 36 paraphrases and 0 of 38 adversarial near-misses; without a
+# prefix at 0.95 / 0.93, 14 of 36 and 0 of 38 (bench/RESULTS-aws-2026-10b.md).
+# threshold = 0.91
+# min_threshold = 0.91
 max_error_rate = 0.02
 ttl_secs = 86400
 lookup_budget_ms = 50
-# Optional instruction for the cache embedder (Qwen3-Embedding expects one for queries). Measured
-# on the AWS set: 81% of paraphrases hit at 5% false hits with threshold 0.91. Off by default:
-# entries embedded with and without it do not mix (purge or let them expire when switching), and
-# because it differs from [routing] query_prefix every request then embeds twice (about 5 ms each
-# on a GPU). See bench/RESULTS-aws-2026-10.md.
+# Instruction prepended before embedding (Qwen3-Embedding expects one for queries). Unset means
+# this default for embedding models of family "qwen3-embedding" (no prefix for other embedders);
+# "" turns it off; another text replaces it (and the thresholds above fall back to
+# 0.95 / 0.93 unless set). Entries embedded with different prefixes never mix. Because it differs
+# from [routing] query_prefix, a kNN-routed request embeds its prompt twice (about 5 ms each on a
+# GPU; a miss cost +5.3 ms p50 with it, +5.1 ms without).
 # query_prefix = "Instruct: Given a user question, retrieve questions that ask exactly the same thing\nQuery: "
 
 [pii]

@@ -61,8 +61,10 @@ exact_ttl_secs = 3600
 # collection_prefix = "caliban_semcache"
 # embedding_model = "local/qwen3-embedding-0.6b"  # the same model as [routing] embedding_model
 #                                  # lets one embedding per request serve both
-# threshold = 0.95                 # starting per-entry cosine threshold
-# min_threshold = 0.93             # learned thresholds never go below
+# threshold = 0.91                 # starting per-entry cosine threshold (unset: 0.91 with the
+#                                  # default query_prefix, 0.95 with none or your own)
+# min_threshold = 0.91             # learned thresholds never go below (unset: 0.91 with the
+#                                  # default query_prefix, 0.93 with none or your own)
 # grey_band = 0.03                 # just below the threshold: answer fresh, verify, learn
 # max_error_rate = 0.02            # error budget: tighten a tenant's thresholds above this
 # verify_rate = 0.05               # share of would-be hits answered fresh to measure errors
@@ -71,8 +73,11 @@ exact_ttl_secs = 3600
 # ttl_secs = 86400
 # lookup_budget_ms = 50            # embed + search; slower means a miss
 # embed_timeout_ms = 2000
-# query_prefix = "..."             # optional instruction prepended before embedding (off by
-#                                  # default); see open-models.example.toml. Costs a second
+# query_prefix = ""                # instruction prepended before embedding. Unset: the
+#                                  # Qwen3-Embedding default ("Instruct: Given a user question,
+#                                  # retrieve questions that ask exactly the same thing\nQuery: ")
+#                                  # for models of family "qwen3-embedding", none for others;
+#                                  # "" turns it off; see open-models.example.toml. Costs a second
 #                                  # embedding when it differs from [routing] query_prefix.
 
 [pii]
