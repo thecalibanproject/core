@@ -213,6 +213,7 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/nodes", get(list_nodes).post(create_node))
         .route("/usage", get(usage))
         .route("/audit", get(audit))
+        .route("/keys/status", get(keys_status))
         .route("/roles", get(auth::admin::roles))
         .route("/users", get(auth::admin::list_users))
         .route("/users/{id}/sessions", delete(auth::admin::revoke_sessions))
@@ -266,6 +267,7 @@ async fn snapshot(State(cp): State<Cp>, headers: HeaderMap) -> Response {
     if !bearer_is(&headers, token) {
         return ApiError(StatusCode::UNAUTHORIZED, "invalid router token".into()).into_response();
     }
+    record_checkin(&cp, &headers).await;
     // Pick up commits from other control-plane replicas (one cheap query on Postgres).
     if let Err(e) = cp.store.refresh().await {
         tracing::warn!(error = %e, "store refresh failed; exporting cached state");
@@ -291,7 +293,10 @@ async fn snapshot(State(cp): State<Cp>, headers: HeaderMap) -> Response {
             Some(e) => Arc::clone(e),
             None => {
                 let issued_at_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
-                let payload = SnapshotPayload { version: snap.version.clone(), issued_at_ms, config };
+                // The KEKs a router needs to open this snapshot's secrets; routers report them
+                // back, so `keys status` can tell when a retired KEK is no longer served.
+                let kek_ids = caliban_config::sealed_kek_ids(&config, cp.keyring.as_deref());
+                let payload = SnapshotPayload { version: snap.version.clone(), issued_at_ms, config, kek_ids };
                 let signed = match signer.sign(&payload) {
                     Ok(s) => s,
                     Err(e) => return ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -318,6 +323,50 @@ async fn snapshot(State(cp): State<Cp>, headers: HeaderMap) -> Response {
         h.insert("x-caliban-snapshot-version", v);
     }
     resp
+}
+
+/// Records what the polling router serves (see `caliban_config::signing::checkin`). Routers of
+/// older releases send no id and are not recorded. A failed write is logged; the poll succeeds.
+async fn record_checkin(cp: &ControlPlane, headers: &HeaderMap) {
+    use caliban_config::signing::checkin;
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+    let Some(router_id) = get(checkin::ROUTER_ID).filter(|id| valid_router_id(id)) else { return };
+    let list = |name: &str| -> Vec<String> {
+        get(name)
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .take(16)
+                    .map(|s| s.chars().take(64).collect())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let r = store::RouterStatus {
+        router_id: router_id.to_owned(),
+        last_seen: chrono::Utc::now(),
+        snapshot_version: get(checkin::SNAPSHOT_VERSION).unwrap_or_default().chars().take(64).collect(),
+        snapshot_kek_ids: list(checkin::SNAPSHOT_KEK_IDS),
+        keyring: list(checkin::KEYRING),
+    };
+    if let Err(e) = cp.store.router_checkin(r).await {
+        tracing::warn!(error = %e, router = router_id, "cannot record router check-in");
+    }
+}
+
+/// Router ids: 1 to 128 characters of `[A-Za-z0-9._:-]`.
+fn valid_router_id(id: &str) -> bool {
+    (1..=128).contains(&id.len()) && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
+/// `caliban keys status` over the API: which KEK wraps each tenant data key, whether the retired
+/// keys are still needed by stored data, and which routers still serve a snapshot sealed under one.
+async fn keys_status(State(cp): State<Cp>) -> ApiResult<Json<Value>> {
+    let mut out = keys::status(&cp.store.state(), cp.keyring.as_deref());
+    let routers = cp.store.routers().await?;
+    keys::add_routers(&mut out, &routers, cp.keyring.as_deref(), chrono::Utc::now());
+    Ok(Json(out))
 }
 
 // ───────────────────────────── audit ─────────────────────────────

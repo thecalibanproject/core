@@ -100,6 +100,37 @@ impl SecretRef {
     }
 }
 
+/// Ids of the KEKs that sealed the secrets in `config`, sorted and deduplicated: the `kek_id` of
+/// every `tenant_sealed` envelope, and for values sealed directly under a KEK (`{ sealed }`) the
+/// id of the key of `keyring` that opens them (`"unknown"` when none does or there is no
+/// keyring). This is what a data plane needs in its keyring to open everything in `config`.
+pub fn sealed_kek_ids(config: &crate::Config, keyring: Option<&Keyring>) -> Vec<String> {
+    fn walk(v: &serde_json::Value, keyring: Option<&Keyring>, out: &mut std::collections::BTreeSet<String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(id) = m.get("tenant_sealed").and_then(|t| t.get("kek_id")).and_then(|i| i.as_str()) {
+                    out.insert(id.to_owned());
+                    return;
+                }
+                if m.len() == 1
+                    && let Some(sealed) = m.get("sealed").and_then(|s| s.as_str())
+                {
+                    out.insert(keyring.and_then(|k| k.opener_id(sealed)).unwrap_or("unknown").to_owned());
+                    return;
+                }
+                m.values().for_each(|x| walk(x, keyring, out));
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, keyring, out)),
+            _ => {}
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    if let Ok(v) = serde_json::to_value(config) {
+        walk(&v, keyring, &mut out);
+    }
+    out.into_iter().collect()
+}
+
 /// A resolved secret. `Debug` never prints the value; the memory is zeroized on drop.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
@@ -387,6 +418,36 @@ mod tests {
         assert!(ring.opens_with_current(&ring.seal("x")));
         assert!(Keyring::parse(&b(3), "").unwrap().open(&sealed).is_err());
         assert!(!format!("{ring:?}").contains(&b(2)));
+    }
+
+    #[test]
+    fn sealed_kek_ids_lists_what_a_router_needs() {
+        let old = Keyring::new([1; 32], []);
+        let ring = Keyring::new([2; 32], [[1; 32]]);
+        let mut cfg = crate::Config::from_toml_str(include_str!("../../../config/caliban.example.toml")).unwrap();
+        assert!(sealed_kek_ids(&cfg, Some(&ring)).is_empty(), "the example has no sealed secret");
+        // A tenant envelope still wrapped by the old KEK, and a shared value sealed under it.
+        let dek = Dek::generate();
+        let w = old.wrap_dek("acme", &dek);
+        cfg.tenants[0].providers[0].api_key = Some(SecretRef::TenantSealed {
+            tenant_sealed: TenantSealed {
+                tenant: "acme".into(),
+                kek_id: w.kek_id.clone(),
+                wrapped_dek: w.wrapped,
+                sealed: dek.seal("acme", "sk-test"),
+            },
+        });
+        cfg.security.admin_token = Some(SecretRef::Sealed { sealed: old.seal("x") });
+        assert_eq!(sealed_kek_ids(&cfg, Some(&ring)), [old.current_id()]);
+        // After rotation both are under the new KEK.
+        let w = ring.wrap_dek("acme", &dek);
+        if let Some(SecretRef::TenantSealed { tenant_sealed }) = &mut cfg.tenants[0].providers[0].api_key {
+            tenant_sealed.kek_id = w.kek_id;
+        }
+        cfg.security.admin_token = Some(SecretRef::Sealed { sealed: ring.seal("x") });
+        assert_eq!(sealed_kek_ids(&cfg, Some(&ring)), [ring.current_id()]);
+        // Without the keyring, a directly sealed value cannot be attributed.
+        assert_eq!(sealed_kek_ids(&cfg, None), [ring.current_id().to_owned(), "unknown".into()]);
     }
 
     #[test]

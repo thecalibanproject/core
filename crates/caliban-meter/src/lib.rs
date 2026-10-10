@@ -189,10 +189,20 @@ pub fn cost_usd(
 pub trait UsageSink: Send + Sync {
     async fn record(&self, event: UsageEvent);
 
-    /// Health counters for `/healthz` (the WAL reports its queue, drops and errors).
-    fn status(&self) -> Option<serde_json::Value> {
-        None
+    /// Health counters for `/healthz`, as `(field, value)` pairs (the WAL reports its queue, drops
+    /// and errors under `usage_wal`).
+    fn status(&self) -> Vec<(&'static str, serde_json::Value)> {
+        Vec::new()
     }
+
+    /// Appends Prometheus text-format metrics (`# HELP`, `# TYPE` and samples) to `out`.
+    fn metrics(&self, _out: &mut String) {}
+}
+
+/// Appends one Prometheus sample with its `# HELP` and `# TYPE` lines.
+pub fn prometheus_sample(out: &mut String, name: &str, kind: &str, help: &str, value: f64) {
+    use std::fmt::Write;
+    let _ = write!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n");
 }
 
 /// Bounded in-memory ring buffer, read by the control plane's `/api/v1/usage`.
@@ -238,8 +248,14 @@ impl UsageSink for Tee {
         }
     }
 
-    fn status(&self) -> Option<serde_json::Value> {
-        self.0.iter().find_map(|s| s.status())
+    fn status(&self) -> Vec<(&'static str, serde_json::Value)> {
+        self.0.iter().flat_map(|s| s.status()).collect()
+    }
+
+    fn metrics(&self, out: &mut String) {
+        for s in &self.0 {
+            s.metrics(out);
+        }
     }
 }
 

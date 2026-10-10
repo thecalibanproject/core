@@ -24,6 +24,27 @@ pub struct SnapshotSource {
     /// Anti-rollback: never accept a snapshot issued before the one being served.
     issued_at_ms: u64,
     version: String,
+    /// KEKs that sealed the secrets of the snapshot being served (reported on every poll).
+    kek_ids: Vec<String>,
+    /// Reported on every poll: this router's id and keyring ids (current first).
+    router_id: String,
+    keyring_ids: Vec<String>,
+}
+
+/// This router's id for check-ins: `CALIBAN_ROUTER_ID`, else `HOSTNAME`, else `/etc/hostname`,
+/// else a random id for this process. Characters outside `[A-Za-z0-9._:-]` become `-`.
+pub fn router_id() -> String {
+    let from_env = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let raw = from_env("CALIBAN_ROUTER_ID")
+        .or_else(|| from_env("HOSTNAME"))
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname").ok().map(|h| h.trim().to_owned()).filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| format!("router-{:08x}", rand::rng().random::<u32>()));
+    raw.chars()
+        .take(128)
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') { c } else { '-' })
+        .collect()
 }
 
 impl SnapshotSource {
@@ -32,6 +53,8 @@ impl SnapshotSource {
         token: String,
         verifier: SnapshotVerifier,
         cache: Option<PathBuf>,
+        router_id: String,
+        keyring_ids: Vec<String>,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -47,6 +70,9 @@ impl SnapshotSource {
             etag: None,
             issued_at_ms: 0,
             version: String::new(),
+            kek_ids: Vec::new(),
+            router_id,
+            keyring_ids,
         })
     }
 
@@ -61,6 +87,7 @@ impl SnapshotSource {
         }
         self.issued_at_ms = p.issued_at_ms;
         self.version.clone_from(&p.version);
+        self.kek_ids.clone_from(&p.kek_ids);
         // The CP's ETag is the config digest; recompute it if the header is missing (cache load).
         self.etag = etag.or_else(|| Some(format!("\"{}\"", &config_digest(&p.config)[..32])));
         Ok(())
@@ -95,7 +122,17 @@ impl SnapshotSource {
 
     /// `Ok(None)` when unchanged (304).
     pub async fn fetch(&mut self) -> Result<Option<SnapshotPayload>> {
-        let mut req = self.client.get(&self.url).header(AUTHORIZATION, format!("Bearer {}", self.token));
+        use caliban_config::signing::checkin;
+        // Check-in: what this router serves, so `caliban keys status` can tell when no router
+        // needs a retired KEK any more.
+        let mut req = self
+            .client
+            .get(&self.url)
+            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+            .header(checkin::ROUTER_ID, &self.router_id)
+            .header(checkin::SNAPSHOT_VERSION, &self.version)
+            .header(checkin::SNAPSHOT_KEK_IDS, self.kek_ids.join(","))
+            .header(checkin::KEYRING, self.keyring_ids.join(","));
         if let Some(e) = &self.etag {
             req = req.header(IF_NONE_MATCH, e);
         }
@@ -154,8 +191,12 @@ impl SnapshotSource {
             tokio::time::sleep(every.mul_f64(jitter)).await;
             match self.fetch().await {
                 Ok(Some(p)) => {
-                    tracing::info!(version = %p.version, tenants = p.config.tenants.len(), "applied new config snapshot");
-                    handle.store(Snapshot::new(p.config, p.version));
+                    tracing::info!(version = %p.version, tenants = p.config.tenants.len(), kek_ids = ?p.kek_ids, "applied new config snapshot");
+                    handle.store(Snapshot::new(p.config, p.version).with_kek_ids(p.kek_ids));
+                    // Report the new snapshot right away (a 304), not one poll interval later.
+                    if let Err(e) = self.fetch().await {
+                        tracing::debug!(error = %format!("{e:#}"), "check-in after applying a snapshot failed");
+                    }
                 }
                 Ok(None) => tracing::debug!(version = %self.version, "snapshot unchanged"),
                 Err(e) => {
@@ -189,12 +230,19 @@ mod tests {
 
     fn payload(at: u64) -> SnapshotPayload {
         let config = Config::from_toml_str(include_str!("../../../config/caliban.example.toml")).unwrap();
-        SnapshotPayload { version: format!("cp-{at}"), issued_at_ms: at, config }
+        SnapshotPayload { version: format!("cp-{at}"), issued_at_ms: at, config, kek_ids: vec![format!("kek_{at}")] }
     }
 
     fn source(public: &str, cache: Option<PathBuf>) -> SnapshotSource {
-        SnapshotSource::new("http://127.0.0.1:9", "t".into(), SnapshotVerifier::from_b64_list(public).unwrap(), cache)
-            .unwrap()
+        SnapshotSource::new(
+            "http://127.0.0.1:9",
+            "t".into(),
+            SnapshotVerifier::from_b64_list(public).unwrap(),
+            cache,
+            "r1".into(),
+            vec![],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -203,7 +251,7 @@ mod tests {
         let mut s = source(&public, None);
         s.accept(&payload(200), None).unwrap();
         assert!(s.accept(&payload(100), None).is_err());
-        assert_eq!(s.version, "cp-200");
+        assert_eq!((s.version.as_str(), s.kek_ids.as_slice()), ("cp-200", ["kek_200".to_owned()].as_slice()));
         assert!(s.accept(&payload(300), None).is_ok());
     }
 

@@ -38,7 +38,8 @@ Data-plane endpoints (`:8080`, tenant `cal_…` key as bearer token):
 | `POST /v1/embeddings` | Embeddings |
 | `POST /v1/rerank` | Reranking |
 | `GET /v1/models` | Models this tenant can use |
-| `GET /healthz` | Liveness, config version, and quota store state (`quota.state` is `degraded` while a shared store is unreachable; the probe still returns `200`) |
+| `GET /healthz` | Liveness, config version, the snapshot served (`snapshot.version`, and `snapshot.kek_ids` in split mode), and quota store state (`quota.state` is `degraded` while a shared store is unreachable; the probe still returns `200`) |
+| `GET /metrics` | Prometheus text format: `caliban_snapshot_info{version,kek_ids}`, and the usage WAL and usage shipping counters. No tenant data, no authentication (like `/healthz`) |
 
 The model id `caliban/auto` lets Caliban choose: the request is classified into an intent (embedding kNN, with keyword rules as the fallback) and served by the cheapest model the tenant may use that meets the intent's quality floor, or by the tenant's ordered candidates when no floor is set. Naming a catalogue model id pins the model, subject to the tenant's policy. See [Routing (`caliban/auto`)](#routing-calibanauto).
 
@@ -187,7 +188,7 @@ For container images, compose and Kubernetes, see [deploy](https://github.com/th
 | `caliban check-config` | Validate `$CALIBAN_CONFIG` and exit |
 | `caliban keygen` | New tenant API key and its hash |
 | `caliban gen-kek` | New base64 32-byte key-encryption key for `CALIBAN_KEK` |
-| `caliban keys status` | Postgres store: which KEK wraps each tenant data key, what still waits for migration, and whether the keys in `CALIBAN_KEK_PREVIOUS` are still needed (read-only, JSON) |
+| `caliban keys status` | Postgres store: which KEK wraps each tenant data key, what still waits for migration, whether the keys in `CALIBAN_KEK_PREVIOUS` are still needed by stored data, and which split-mode routers still serve a snapshot sealed under one (read-only, JSON; also `GET /api/v1/keys/status`) |
 | `caliban keys rotate` | Postgres store: re-wrap every tenant data key and re-seal shared provider keys under the current `CALIBAN_KEK`; all or nothing, idempotent, audited as `keys.rotate`. See [KEK rotation](#kek-rotation) |
 | `caliban gen-signing-key` | New Ed25519 snapshot signing key (control plane) and its public key (routers) |
 | `caliban healthcheck [--addr 127.0.0.1:8080] [--path /healthz]` | Exit 0 on a 2xx response, 1 otherwise; for container healthchecks in the shell-less image |
@@ -417,7 +418,7 @@ Rotating the KEK is what makes a deleted tenant unrecoverable from older backups
 
 1. `caliban gen-kek` for a new key. On every router and control plane set `CALIBAN_KEK=<new>` and `CALIBAN_KEK_PREVIOUS=<old>`, and restart the routers first, then the control planes. Everything keeps working: retired keys still open what they wrap.
 2. Run `caliban keys rotate` once (for example `docker compose exec control-plane caliban keys rotate`, or `kubectl exec` into a control-plane pod). It re-wraps every live DEK and re-seals shared provider keys under the new KEK, in one audited transaction, and refuses to start if anything cannot be opened.
-3. `caliban keys status` should show `"previous_keks_still_needed": []`. Wait until every router has polled the new snapshot (`CALIBAN_SNAPSHOT_POLL_SECS`), then remove `CALIBAN_KEK_PREVIOUS` everywhere and restart.
+3. `caliban keys status` (or `GET /api/v1/keys/status`) shows `"previous_keks_still_needed": []` once stored data no longer needs the old KEK, and `"routers_on_previous_keks": []` once every active router serves the re-wrapped snapshot; `rotation_complete` is true when both hold. Then remove `CALIBAN_KEK_PREVIOUS` everywhere and restart. `routers_without_current_kek` lists routers that still lack the new KEK (step 1 not done there).
 4. Destroy the old KEK when your backup retention allows (below).
 
 The trade-off: after rotation, every backup taken before it needs the retired KEK for **every** tenant, not only the deleted one, because all DEKs in it are wrapped by the old key. Keep a retired KEK (offline, like the current one) only as long as you keep backups that predate the rotation, and destroy it when the last of them expires. If you destroy it earlier, restoring such a backup restores tenants whose BYOK keys, datasource credentials and shared provider keys cannot be opened: delete and re-enter them after the restore. To shred a deleted tenant promptly, rotate right after deleting it and shorten the retention of older backups accordingly.
@@ -440,7 +441,9 @@ CALIBAN_SNAPSHOT_PUBLIC_KEY=… CALIBAN_ROUTER_TOKEN=… CALIBAN_KEK=… \
   caliban router --control-plane-url http://cp:8081 --snapshot-cache /var/lib/caliban/snapshot.json
 ```
 
-`GET /api/v1/snapshot` (router token, not the admin token) returns `{key_id, payload, signature}`. The payload is base64 of `{version, issued_at_ms, config}`, signed with Ed25519 (domain-separated). The ETag is the config digest, so a router sending `If-None-Match` gets `304` while nothing has changed. A router verifies the signature, validates the config, refuses snapshots issued before the one it serves (anti-rollback), then swaps the new one in.
+`GET /api/v1/snapshot` (router token, not the admin token) returns `{key_id, payload, signature}`. The payload is base64 of `{version, issued_at_ms, config, kek_ids}`, signed with Ed25519 (domain-separated). `kek_ids` names the KEKs (`kek_` fingerprints) that sealed the snapshot's secrets: the KEK of each `tenant_sealed` envelope, and of each value sealed directly under a KEK. The ETag is the config digest, so a router sending `If-None-Match` gets `304` while nothing has changed. A router verifies the signature, validates the config, refuses snapshots issued before the one it serves (anti-rollback), then swaps the new one in.
+
+**Router check-in.** With every poll a router sends its id (`CALIBAN_ROUTER_ID`, else its host name), the version and `kek_ids` of the snapshot it serves, and its own keyring ids (`x-caliban-router-*` headers; after applying a new snapshot it polls once more right away to report it). The control plane records them (Postgres table `router_status`, migration `0011`; at most one write a minute per router while nothing changes) for `caliban keys status`. The router also shows them on `/healthz` (`snapshot`) and `/metrics` (`caliban_snapshot_info`). Telemetry only: a failed write never fails the poll.
 
 **Fail-static.** On any error (control plane down, bad signature, invalid config) the router logs it and keeps serving its last good snapshot. With `CALIBAN_SNAPSHOT_CACHE`, that snapshot is persisted (mode 0600, re-verified on load), so a router restarted while the control plane is down still serves. Sealed secrets stay sealed inside the snapshot (BYOK keys as tenant envelopes, opened with the router's keyring); `{env}` and `{file}` references resolve on the router host. When a release adds config fields, upgrade routers before the control plane.
 
@@ -453,6 +456,7 @@ CALIBAN_SNAPSHOT_PUBLIC_KEY=… CALIBAN_ROUTER_TOKEN=… CALIBAN_KEK=… \
 | `CALIBAN_SNAPSHOT_POLL_SECS` | routers | Poll interval, default 10 (±20% jitter) |
 | `CALIBAN_SNAPSHOT_CACHE` | routers | Path for the last good signed snapshot |
 | `CALIBAN_ROUTER_ADDR` | routers | Listen address in split mode, default `0.0.0.0:8080` |
+| `CALIBAN_ROUTER_ID` | routers | Id reported to the control plane (default: the host name, `HOSTNAME`) |
 
 ## Testing
 
@@ -513,7 +517,7 @@ Known gaps:
 - Datasource credentials are detected by field name and URI shape; a secret in a field with an unusual name is stored as given (use an `{ env }` or `{ file }` reference for those).
 - Revocation in split mode takes effect on the router's next snapshot poll (`CALIBAN_SNAPSHOT_POLL_SECS`, default 10 s), not instantly.
 - Quotas default to in-memory per router process; set `[limits] store = "valkey"` to share them. While Valkey is unreachable each router limits on its own (see [Shared quotas](#shared-quotas-valkey)), and changing `store` needs a router restart.
-- No Prometheus metrics endpoint yet.
+- The data plane's `/metrics` covers the snapshot and usage delivery only (no request, latency or quota metrics yet), and the control plane has none.
 - SSO: roles come from token claims only (no userinfo or Microsoft Graph calls, so Entra group overage is not followed); no refresh tokens, back-channel logout or multiple issuers. Another control-plane replica sees a role binding change within its 5 s refresh.
 - Semantic cache: the default thresholds (0.91 with the default prefix) are calibrated for Qwen3-Embedding-0.6B on one hand-written set of 74 pairs, not per embedding model; some models place unrelated text close together (bge-small scored random-word prompts above 0.95), so calibrate on your traffic before switching tenants on. The verifier is an answer-embedding comparison, not an LLM judge (Krites-style judging of grey-zone pairs is next); thresholds are not yet per intent category (the note's category-aware caching), and there is no near-hit-as-hint tier (T2b). Datasource epochs and ACL fingerprints are not wired into T2 keys yet (no grounded answers reach it today). Entries are not encrypted per tenant. A deleted tenant's entries are purged only by routers running at the time (see [Tenant offboarding](#tenant-offboarding-semantic-cache)). No per-tenant entry quota. Internal embedding calls are not metered. The tenant error budget is per router, and concurrent stat updates to one entry are last-writer-wins. Hits replay instantly, which is a timing signal within a tenant (research note, open question 6).
 - Routing: Stage 2 (ONNX classifier) and Stage 3 (LLM fallback) are not built; kNN abstentions go straight to the keyword rules. The built-in kNN defaults (k 5, temperature 0.05, abstain below 0.5, no OOS gate) are not calibrated for any particular embedder until ml ships an `intent_head` calibration for it. Model health is not tracked on the data plane yet (the policy has a hook; every model counts as healthy). Router-profile centroids are ignored (clusters are matched by intent id). Tenant exemplars come from config only, not yet from the control plane. Artifact signatures (`manifest.json.minisig`) are not checked, only file hashes.

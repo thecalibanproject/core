@@ -1,6 +1,8 @@
 //! `caliban` — one binary for every deployment shape (SaaS, VPC, air-gapped).
 
 #[cfg(test)]
+mod kek_checkin_tests;
+#[cfg(test)]
 mod purge_tests;
 #[cfg(test)]
 mod revocation_tests;
@@ -166,11 +168,15 @@ async fn main() -> Result<()> {
             .context("CALIBAN_SNAPSHOT_PUBLIC_KEY is required with --control-plane-url")?;
         let verifier = SnapshotVerifier::from_b64_list(&keys).context("CALIBAN_SNAPSHOT_PUBLIC_KEY")?;
         let every = Duration::from_secs((*poll_interval_secs).max(1));
-        let mut source = split::SnapshotSource::new(url, token, verifier, snapshot_cache.clone())?;
-        tracing::info!(control_plane = %url, poll_secs = every.as_secs(), cache = ?snapshot_cache, "router in split mode");
+        let router_id = split::router_id();
+        let keyring_ids =
+            keyring.as_ref().map(|k| k.ids().into_iter().map(str::to_owned).collect()).unwrap_or_default();
+        let mut source =
+            split::SnapshotSource::new(url, token, verifier, snapshot_cache.clone(), router_id.clone(), keyring_ids)?;
+        tracing::info!(control_plane = %url, router_id, poll_secs = every.as_secs(), cache = ?snapshot_cache, "router in split mode");
         let first = source.initial(every).await;
-        tracing::info!(version = %first.version, tenants = first.config.tenants.len(), "serving config snapshot");
-        let handle = ConfigHandle::new(Snapshot::new(first.config, first.version));
+        tracing::info!(version = %first.version, tenants = first.config.tenants.len(), kek_ids = ?first.kek_ids, "serving config snapshot");
+        let handle = ConfigHandle::new(Snapshot::new(first.config, first.version).with_kek_ids(first.kek_ids));
         tokio::spawn(source.run(handle.clone(), every));
         let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default()))?);
         spawn_router_warmup(&gw);
@@ -373,7 +379,9 @@ async fn keys_command(cmd: &KeysCmd, cfg: &Config) -> Result<()> {
         .context("opening the Postgres control-plane store (CALIBAN_DATABASE_URL)")?;
     match cmd {
         KeysCmd::Status => {
-            let status = caliban_cp::keys::status(&store.state(), keyring.as_ref());
+            let mut status = caliban_cp::keys::status(&store.state(), keyring.as_ref());
+            let routers = store.routers().await.context("reading router check-ins")?;
+            caliban_cp::keys::add_routers(&mut status, &routers, keyring.as_ref(), chrono::Utc::now());
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         KeysCmd::Rotate => {
@@ -387,9 +395,10 @@ async fn keys_command(cmd: &KeysCmd, cfg: &Config) -> Result<()> {
             let status = caliban_cp::keys::status(&store.state(), Some(&k));
             if status["previous_keks_still_needed"].as_array().is_some_and(Vec::is_empty) {
                 println!(
-                    "No live key depends on CALIBAN_KEK_PREVIOUS any more. Once every control plane and router has \
-                     reloaded the snapshot, remove the retired keys from CALIBAN_KEK_PREVIOUS and destroy them when your \
-                     backup retention allows (see README, KEK rotation)."
+                    "No stored key depends on CALIBAN_KEK_PREVIOUS any more. Run `caliban keys status` until \
+                     routers_on_previous_keks is empty (every router serves the re-wrapped snapshot), then remove the \
+                     retired keys from CALIBAN_KEK_PREVIOUS and destroy them when your backup retention allows (see \
+                     README, KEK rotation)."
                 );
             } else {
                 println!("{}", serde_json::to_string_pretty(&status)?);

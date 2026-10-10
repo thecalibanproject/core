@@ -411,6 +411,7 @@ pub const ROUTES: &[RouteRule] = &[
     r("POST", "/nodes", Perm::NodesWrite, TenantFrom::Body),
     r("GET", "/usage", Perm::UsageRead, TenantFrom::QueryOrList),
     r("GET", "/audit", Perm::AuditRead, TenantFrom::None),
+    r("GET", "/keys/status", Perm::AuditRead, TenantFrom::None),
     r("GET", "/roles", Perm::RbacRead, TenantFrom::None),
     r("GET", "/users", Perm::RbacRead, TenantFrom::None),
     r("DELETE", "/users/{id}/sessions", Perm::RbacWrite, TenantFrom::None),

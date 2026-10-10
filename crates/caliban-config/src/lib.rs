@@ -11,7 +11,7 @@ pub mod signing;
 
 pub use secret::{
     Dek, KEK_ENV, KEK_PREVIOUS_ENV, Keyring, Secret, SecretRef, TenantSealed, WrappedDek, kek_id, open, process_kek,
-    process_keyring, seal,
+    process_keyring, seal, sealed_kek_ids,
 };
 
 use arc_swap::ArcSwap;
@@ -1148,6 +1148,9 @@ impl Config {
 pub struct Snapshot {
     pub config: Config,
     pub version: String,
+    /// KEKs that sealed the secrets of this snapshot (split-mode routers: from the signed
+    /// snapshot, see [`signing::SnapshotPayload::kek_ids`]); empty when unknown.
+    pub kek_ids: Vec<String>,
     by_key_hash: HashMap<String, usize>,
     by_tenant: HashMap<TenantId, usize>,
     models: HashMap<ModelId, usize>,
@@ -1164,7 +1167,14 @@ impl Snapshot {
             }
         }
         let models = config.models.iter().enumerate().map(|(i, m)| (m.id.clone(), i)).collect();
-        Self { config, version: version.into(), by_key_hash, by_tenant, models }
+        Self { config, version: version.into(), kek_ids: Vec::new(), by_key_hash, by_tenant, models }
+    }
+
+    /// Sets the KEK ids this snapshot's secrets were sealed with.
+    #[must_use]
+    pub fn with_kek_ids(mut self, kek_ids: Vec<String>) -> Self {
+        self.kek_ids = kek_ids;
+        self
     }
 
     pub fn tenant_by_key_hash(&self, hash: &str) -> Option<&TenantConfig> {

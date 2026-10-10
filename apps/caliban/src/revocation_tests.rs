@@ -94,9 +94,15 @@ async fn split_router_rejects_a_revoked_key_after_its_next_snapshot_poll() {
     let (key, id) = mint(&cp_app, "globex").await;
 
     // Router: config only from verified snapshots (what `SnapshotSource::run` does on each poll).
-    let mut source =
-        SnapshotSource::new(&url, "router-secret".into(), SnapshotVerifier::from_b64_list(&public).unwrap(), None)
-            .unwrap();
+    let mut source = SnapshotSource::new(
+        &url,
+        "router-secret".into(),
+        SnapshotVerifier::from_b64_list(&public).unwrap(),
+        None,
+        "router-a".into(),
+        vec![],
+    )
+    .unwrap();
     let first = source.fetch().await.unwrap().expect("first snapshot");
     let router_handle = ConfigHandle::new(Snapshot::new(first.config, first.version));
     let dp = gateway(router_handle.clone());

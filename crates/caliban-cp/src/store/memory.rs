@@ -1,7 +1,7 @@
 //! In-memory backend (dev/demo): state and audit chain live in the process.
 
 use super::audit::{AuditEntry, now_micros};
-use super::{Backend, Check, Mutation, PendingLogin, SessionRecord, State, StoreError, SubjectKind};
+use super::{Backend, Check, Mutation, PendingLogin, RouterStatus, SessionRecord, State, StoreError, SubjectKind};
 use caliban_ontology::Ontology;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -12,6 +12,8 @@ pub struct MemoryBackend {
     inner: Mutex<(State, Vec<AuditEntry>)>,
     /// Sessions (by id) and pending logins (by state). Locked after `inner`, never before.
     auth: Mutex<AuthTables>,
+    /// Router check-ins by router id (not part of the audited state).
+    routers: Mutex<BTreeMap<String, RouterStatus>>,
 }
 
 #[derive(Default)]
@@ -25,7 +27,7 @@ impl MemoryBackend {
     pub fn seeded(mut seed: State) -> Self {
         let entry = AuditEntry::next(None, "system", &seed_draft(&seed), now_micros());
         seed.audit_head = entry.seq;
-        Self { inner: Mutex::new((seed, vec![entry])), auth: Mutex::default() }
+        Self { inner: Mutex::new((seed, vec![entry])), auth: Mutex::default(), routers: Mutex::default() }
     }
 
     pub fn state(&self) -> State {
@@ -125,6 +127,20 @@ impl Backend for MemoryBackend {
         a.sessions.retain(|_, s| s.expires_at >= now);
         a.logins.retain(|_, l| l.expires_at >= now);
         Ok((before - a.sessions.len() - a.logins.len()) as u64)
+    }
+
+    async fn put_router(&self, r: &RouterStatus) -> Result<(), StoreError> {
+        let mut routers = self.routers.lock();
+        if routers.get(&r.router_id).is_none_or(|old| old.last_seen <= r.last_seen) {
+            routers.insert(r.router_id.clone(), r.clone());
+        }
+        Ok(())
+    }
+
+    async fn routers(&self) -> Result<Vec<RouterStatus>, StoreError> {
+        let mut v: Vec<RouterStatus> = self.routers.lock().values().cloned().collect();
+        v.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then_with(|| a.router_id.cmp(&b.router_id)));
+        Ok(v)
     }
 }
 

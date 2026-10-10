@@ -51,7 +51,7 @@ use caliban_ontology::{Element, Ontology, Status};
 use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, SemanticCacheMode, TrustTier};
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -899,7 +899,33 @@ pub trait Backend: Send + Sync {
     async fn take_login(&self, state: &str) -> Result<Option<PendingLogin>, StoreError>;
     /// Deletes sessions and pending logins that expired before `now`. Returns how many.
     async fn purge_auth(&self, now: DateTime<Utc>) -> Result<u64, StoreError>;
+
+    // Router check-ins (split mode): telemetry, not audited.
+
+    /// Upserts a router's check-in (an older `last_seen` never overwrites a newer one).
+    async fn put_router(&self, r: &RouterStatus) -> Result<(), StoreError>;
+    /// Every router that ever checked in, most recently seen first.
+    async fn routers(&self) -> Result<Vec<RouterStatus>, StoreError>;
 }
+
+/// What a split-mode router reported on its last snapshot poll.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterStatus {
+    pub router_id: String,
+    pub last_seen: DateTime<Utc>,
+    /// Version label of the snapshot the router serves.
+    pub snapshot_version: String,
+    /// KEKs that sealed the secrets of that snapshot.
+    pub snapshot_kek_ids: Vec<String>,
+    /// The router's keyring, current KEK first.
+    pub keyring: Vec<String>,
+}
+
+/// A router is reported as active when it checked in within this window (routers poll every
+/// `CALIBAN_SNAPSHOT_POLL_SECS`, default 10 s).
+pub const ROUTER_ACTIVE_SECS: i64 = 600;
+/// While nothing changes, a check-in is written at most this often per router.
+const ROUTER_WRITE_EVERY_SECS: i64 = 60;
 
 pub struct Store {
     backend: Arc<dyn Backend>,
@@ -908,6 +934,8 @@ pub struct Store {
     base: Config,
     pub config: ConfigHandle,
     pub usage: RecentUsage,
+    /// Last check-in written per router (throttles writes while nothing changes).
+    router_writes: parking_lot::Mutex<std::collections::HashMap<String, RouterStatus>>,
 }
 
 impl Store {
@@ -955,7 +983,14 @@ impl Store {
         config: ConfigHandle,
         usage: RecentUsage,
     ) -> Self {
-        let s = Self { backend, cache: RwLock::new(Arc::new(State::default())), base, config, usage };
+        let s = Self {
+            backend,
+            cache: RwLock::new(Arc::new(State::default())),
+            base,
+            config,
+            usage,
+            router_writes: parking_lot::Mutex::default(),
+        };
         s.install(state);
         s
     }
@@ -1007,6 +1042,35 @@ impl Store {
 
     pub async fn purge_auth(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
         self.backend.purge_auth(now).await
+    }
+
+    /// Records a router check-in. Written when anything but `last_seen` changed, or at most once
+    /// every [`ROUTER_WRITE_EVERY_SECS`] otherwise.
+    pub async fn router_checkin(&self, r: RouterStatus) -> Result<(), StoreError> {
+        let due = {
+            let mut w = self.router_writes.lock();
+            let due = w.get(&r.router_id).is_none_or(|last| {
+                last.snapshot_version != r.snapshot_version
+                    || last.snapshot_kek_ids != r.snapshot_kek_ids
+                    || last.keyring != r.keyring
+                    || (r.last_seen - last.last_seen).num_seconds() >= ROUTER_WRITE_EVERY_SECS
+            });
+            if due {
+                w.insert(r.router_id.clone(), r.clone());
+            }
+            due
+        };
+        if due && let Err(e) = self.backend.put_router(&r).await {
+            // Retried on the next poll.
+            self.router_writes.lock().remove(&r.router_id);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Router check-ins, most recently seen first.
+    pub async fn routers(&self) -> Result<Vec<RouterStatus>, StoreError> {
+        self.backend.routers().await
     }
 
     /// Reloads from the backend if another control-plane replica committed changes.

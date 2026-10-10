@@ -196,17 +196,47 @@ impl UsageSink for JsonlSink {
         }
     }
 
-    fn status(&self) -> Option<serde_json::Value> {
+    fn status(&self) -> Vec<(&'static str, serde_json::Value)> {
         let s = &self.stats;
-        Some(serde_json::json!({
-            "written": s.written.load(Ordering::Relaxed),
-            "dropped": s.dropped.load(Ordering::Relaxed),
-            "write_errors": s.write_errors.load(Ordering::Relaxed),
-            "backpressure_waits": s.backpressure_waits.load(Ordering::Relaxed),
-            "queue_depth": self.queue_depth(),
-            "queue_capacity": self.tx.max_capacity(),
-            "fsync": self.opts.fsync.as_str(),
-        }))
+        vec![(
+            "usage_wal",
+            serde_json::json!({
+                "written": s.written.load(Ordering::Relaxed),
+                "dropped": s.dropped.load(Ordering::Relaxed),
+                "write_errors": s.write_errors.load(Ordering::Relaxed),
+                "backpressure_waits": s.backpressure_waits.load(Ordering::Relaxed),
+                "queue_depth": self.queue_depth(),
+                "queue_capacity": self.tx.max_capacity(),
+                "fsync": self.opts.fsync.as_str(),
+            }),
+        )]
+    }
+
+    fn metrics(&self, out: &mut String) {
+        let s = &self.stats;
+        #[allow(clippy::cast_precision_loss)]
+        let n = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64;
+        crate::prometheus_sample(
+            out,
+            "caliban_usage_wal_written_total",
+            "counter",
+            "Usage events appended to the WAL.",
+            n(&s.written),
+        );
+        crate::prometheus_sample(
+            out,
+            "caliban_usage_wal_dropped_total",
+            "counter",
+            "Usage events the WAL lost.",
+            n(&s.dropped),
+        );
+        crate::prometheus_sample(
+            out,
+            "caliban_usage_wal_write_errors_total",
+            "counter",
+            "Failed WAL open, write or sync calls.",
+            n(&s.write_errors),
+        );
     }
 }
 
@@ -461,9 +491,14 @@ mod tests {
         assert_eq!(s.written.load(Ordering::Relaxed), 0);
         assert_eq!(s.dropped.load(Ordering::Relaxed), 200, "every event is accounted for as dropped");
         assert!(s.write_errors.load(Ordering::Relaxed) > 0);
-        let st = sink.status().unwrap();
+        let status = sink.status();
+        let (key, st) = status.first().unwrap();
+        assert_eq!(*key, "usage_wal");
         assert_eq!(st["dropped"], 200);
         assert_eq!(st["queue_capacity"], 1);
+        let mut m = String::new();
+        sink.metrics(&mut m);
+        assert!(m.contains("caliban_usage_wal_dropped_total 200\n"), "{m}");
     }
 
     #[tokio::test]

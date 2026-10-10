@@ -1016,6 +1016,47 @@ fn normalize(st: &State) -> Value {
     v
 }
 
+/// Router check-ins: upserted by id, newest first, an older check-in never overwrites a newer one,
+/// and unchanged polls are throttled.
+async fn router_checkins(s: &Store) {
+    let r = |id: &str, version: &str, at: DateTime<Utc>| RouterStatus {
+        router_id: id.into(),
+        last_seen: at,
+        snapshot_version: version.into(),
+        snapshot_kek_ids: vec!["kek_aaaaaaaaaaaaaaaa".into()],
+        keyring: vec!["kek_bbbbbbbbbbbbbbbb".into(), "kek_aaaaaaaaaaaaaaaa".into()],
+    };
+    assert!(s.routers().await.unwrap().is_empty());
+    s.router_checkin(r("router-a", "cp-1", ts())).await.unwrap();
+    s.router_checkin(r("router-b", "cp-1", ts() + chrono::Duration::seconds(1))).await.unwrap();
+    let got = s.routers().await.unwrap();
+    assert_eq!(got.iter().map(|r| r.router_id.as_str()).collect::<Vec<_>>(), ["router-b", "router-a"]);
+    assert_eq!(got[1], r("router-a", "cp-1", ts()));
+    // A new snapshot is written at once; an unchanged poll 10 s later is not.
+    s.router_checkin(r("router-a", "cp-2", ts() + chrono::Duration::seconds(5))).await.unwrap();
+    s.router_checkin(r("router-a", "cp-2", ts() + chrono::Duration::seconds(15))).await.unwrap();
+    let a = s.routers().await.unwrap().into_iter().find(|r| r.router_id == "router-a").unwrap();
+    assert_eq!((a.snapshot_version.as_str(), a.last_seen), ("cp-2", ts() + chrono::Duration::seconds(5)));
+    // An older check-in (a slow replica) never wins.
+    s.backend.put_router(&r("router-a", "cp-1", ts())).await.unwrap();
+    let a = s.routers().await.unwrap().into_iter().find(|r| r.router_id == "router-a").unwrap();
+    assert_eq!(a.snapshot_version, "cp-2");
+}
+
+#[tokio::test]
+async fn memory_router_checkins() {
+    let cfg = base();
+    router_checkins(&Store::new(cfg.clone(), handle(&cfg), RecentUsage::default())).await;
+}
+
+#[tokio::test]
+async fn postgres_router_checkins() {
+    let Some(pg) = pg_backend().await else { return };
+    let cfg = base();
+    let s = Store::open_postgres(pg, cfg.clone(), handle(&cfg), RecentUsage::default()).await.unwrap();
+    router_checkins(&s).await;
+}
+
 #[tokio::test]
 async fn memory_backend_behaviour() {
     let cfg = base();

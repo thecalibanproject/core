@@ -35,6 +35,18 @@ pub enum SnapshotError {
     Invalid(String),
 }
 
+/// Headers a router sends with every snapshot poll, so the control plane knows what it serves.
+pub mod checkin {
+    /// The router's id (`CALIBAN_ROUTER_ID`, else its host name).
+    pub const ROUTER_ID: &str = "x-caliban-router-id";
+    /// Version label of the snapshot it serves.
+    pub const SNAPSHOT_VERSION: &str = "x-caliban-router-snapshot";
+    /// KEK ids of the snapshot it serves, comma separated ([`super::SnapshotPayload::kek_ids`]).
+    pub const SNAPSHOT_KEK_IDS: &str = "x-caliban-router-snapshot-kek-ids";
+    /// The router's own keyring ids, current first, comma separated.
+    pub const KEYRING: &str = "x-caliban-router-keyring";
+}
+
 /// The signed content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotPayload {
@@ -43,6 +55,13 @@ pub struct SnapshotPayload {
     /// Unix milliseconds. Routers reject a snapshot older than the one they serve (anti-rollback).
     pub issued_at_ms: u64,
     pub config: Config,
+    /// Ids (`kek_...`) of the KEKs that sealed the secrets in `config`: the KEK of every
+    /// `tenant_sealed` envelope and of every value sealed directly under a KEK (see
+    /// [`crate::sealed_kek_ids`]). Routers report it back, so operators can tell when no router
+    /// serves a snapshot that still needs a retired KEK. Empty when the config holds no sealed
+    /// secret, and absent from snapshots of older control planes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kek_ids: Vec<String>,
 }
 
 /// Wire envelope served by `GET /api/v1/snapshot` and persisted by routers as their cache.
@@ -188,7 +207,7 @@ mod tests {
 
     fn payload() -> SnapshotPayload {
         let config = Config::from_toml_str(include_str!("../../../config/caliban.example.toml")).unwrap();
-        SnapshotPayload { version: "cp-7".into(), issued_at_ms: 1_700_000_000_000, config }
+        SnapshotPayload { version: "cp-7".into(), issued_at_ms: 1_700_000_000_000, config, kek_ids: vec![] }
     }
 
     fn pair() -> (SnapshotSigner, SnapshotVerifier) {

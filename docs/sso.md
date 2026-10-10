@@ -126,6 +126,7 @@ tenants the caller may see. A refusal is `403` with `error.type = "permission_er
 | `POST /api/v1/nodes` | `nodes.write` (body `tenant_id`) | owner, admin, tenant_admin, developer |
 | `GET /api/v1/usage` | `usage.read` (`?tenant_id=` or all visible tenants) | every role |
 | `GET /api/v1/audit` | `audit.read` | owner, admin, auditor |
+| `GET /api/v1/keys/status` | `audit.read` | owner, admin, auditor |
 | `GET /api/v1/roles` | `rbac.read` | owner, admin, auditor |
 | `GET /api/v1/users` | `rbac.read` | owner, admin, auditor |
 | `DELETE /api/v1/users/{userId}/sessions` | `rbac.write` | owner, admin |

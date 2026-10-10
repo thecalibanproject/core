@@ -126,9 +126,15 @@ async fn split_router_purges_after_the_snapshot_that_drops_the_tenant() {
     create_tenant(&cp_app, "initech").await;
 
     // The control plane holds no semantic cache; the router does (its own in-memory store).
-    let mut source =
-        SnapshotSource::new(&url, "router-secret".into(), SnapshotVerifier::from_b64_list(&public).unwrap(), None)
-            .unwrap();
+    let mut source = SnapshotSource::new(
+        &url,
+        "router-secret".into(),
+        SnapshotVerifier::from_b64_list(&public).unwrap(),
+        None,
+        "router-a".into(),
+        vec![],
+    )
+    .unwrap();
     let first = source.fetch().await.unwrap().expect("first snapshot");
     let router_handle = ConfigHandle::new(Snapshot::new(first.config, first.version));
     let vectors = Arc::new(MemoryStore::default());

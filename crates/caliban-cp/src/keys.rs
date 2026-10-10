@@ -417,9 +417,105 @@ pub fn status(st: &State, keyring: Option<&Keyring>) -> Value {
     out
 }
 
+/// Adds what split-mode routers reported on their snapshot polls to a [`status`] report:
+///
+/// - `routers`: every router that checked in, with `active` (seen within
+///   [`crate::store::ROUTER_ACTIVE_SECS`]), the snapshot it serves and the KEKs that snapshot
+///   needs (`snapshot_kek_ids`), its own keyring, `needs_previous_kek` (its snapshot still needs a
+///   retired KEK of `keyring`) and `has_current_kek` (its keyring holds the current KEK).
+/// - `routers_on_previous_keks`: active routers whose snapshot still needs a retired KEK. They
+///   have not polled since `keys rotate`; removing `CALIBAN_KEK_PREVIOUS` from them now would
+///   break their BYOK keys until they do.
+/// - `routers_without_current_kek`: active routers that do not hold the current KEK yet (step 1 of
+///   the rotation is not done on them).
+/// - `rotation_complete` additionally requires `routers_on_previous_keks` to be empty.
+///
+/// Inactive routers are listed but do not hold up the rotation: when one comes back it polls
+/// before serving.
+pub fn add_routers(
+    out: &mut Value,
+    routers: &[crate::store::RouterStatus],
+    keyring: Option<&Keyring>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let previous: Vec<&str> = keyring.map(|k| k.ids().into_iter().skip(1).collect()).unwrap_or_default();
+    let current = keyring.map(Keyring::current_id);
+    let mut on_previous = Vec::new();
+    let mut without_current = Vec::new();
+    let list: Vec<Value> = routers
+        .iter()
+        .map(|r| {
+            let active = (now - r.last_seen).num_seconds() <= crate::store::ROUTER_ACTIVE_SECS;
+            let needs_previous = r.snapshot_kek_ids.iter().any(|id| previous.contains(&id.as_str()));
+            let has_current = current.map(|c| r.keyring.iter().any(|id| id == c));
+            if active && needs_previous {
+                on_previous.push(r.router_id.clone());
+            }
+            if active && has_current == Some(false) {
+                without_current.push(r.router_id.clone());
+            }
+            json!({
+                "router_id": r.router_id,
+                "last_seen": r.last_seen,
+                "active": active,
+                "snapshot_version": r.snapshot_version,
+                "snapshot_kek_ids": r.snapshot_kek_ids,
+                "keyring": r.keyring,
+                "needs_previous_kek": needs_previous,
+                "has_current_kek": has_current,
+            })
+        })
+        .collect();
+    out["routers"] = json!(list);
+    if keyring.is_some() {
+        out["routers_on_previous_keks"] = json!(on_previous);
+        out["routers_without_current_kek"] = json!(without_current);
+        if let Some(done) = out.get("rotation_complete").and_then(Value::as_bool) {
+            out["rotation_complete"] = json!(done && on_previous.is_empty());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routers_hold_up_the_rotation_until_they_serve_the_new_snapshot() {
+        use crate::store::RouterStatus;
+        let ring = Keyring::new([2; 32], [[1; 32]]);
+        let (new, old) = (ring.current_id().to_owned(), ring.ids()[1].to_owned());
+        let now = chrono::Utc::now();
+        let r = |id: &str, kek: &str, ago: i64| RouterStatus {
+            router_id: id.into(),
+            last_seen: now - chrono::Duration::seconds(ago),
+            snapshot_version: "cp-49".into(),
+            snapshot_kek_ids: vec![kek.into()],
+            keyring: vec![new.clone(), old.clone()],
+        };
+        let base = || json!({"previous_keks_still_needed": [], "rotation_complete": true});
+        let mut out = base();
+        add_routers(&mut out, &[r("a", &new, 5), r("b", &old, 5), r("gone", &old, 3600)], Some(&ring), now);
+        assert_eq!(out["routers_on_previous_keks"], json!(["b"]), "the inactive router does not count");
+        assert_eq!(out["rotation_complete"], false);
+        assert_eq!(out["routers"][2]["active"], false);
+        assert_eq!(out["routers"][1]["needs_previous_kek"], true);
+
+        // b polls the re-wrapped snapshot.
+        let mut out = base();
+        add_routers(&mut out, &[r("a", &new, 5), r("b", &new, 1)], Some(&ring), now);
+        assert_eq!(
+            (out["routers_on_previous_keks"].clone(), out["rotation_complete"].clone()),
+            (json!([]), json!(true))
+        );
+
+        // A router without the new KEK in its keyring is reported.
+        let mut lagging = r("c", &old, 1);
+        lagging.keyring = vec![old.clone()];
+        let mut out = base();
+        add_routers(&mut out, &[lagging], Some(&ring), now);
+        assert_eq!(out["routers_without_current_kek"], json!(["c"]));
+    }
 
     #[test]
     fn secret_fields_and_pointers() {

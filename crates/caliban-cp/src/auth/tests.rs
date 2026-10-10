@@ -841,6 +841,7 @@ fn cases() -> Vec<Case> {
         c("GET", "/usage", "/api/v1/usage?tenant_id={t}", None, true, EVERYONE),
         c("GET", "/usage", "/api/v1/usage", None, false, EVERYONE),
         c("GET", "/audit", "/api/v1/audit", None, false, "owner admin auditor"),
+        c("GET", "/keys/status", "/api/v1/keys/status", None, false, "owner admin auditor"),
         c("GET", "/roles", "/api/v1/roles", None, false, "owner admin auditor"),
         c("GET", "/users", "/api/v1/users", None, false, "owner admin auditor"),
         c("DELETE", "/users/{id}/sessions", "/api/v1/users/usr_nope/sessions", None, false, "owner admin"),

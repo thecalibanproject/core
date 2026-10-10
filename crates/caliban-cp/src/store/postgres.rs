@@ -9,7 +9,8 @@
 use super::audit::{AuditDraft, AuditEntry, now_micros};
 use super::{
     ApiKeyRecord, Backend, Check, DatasourceRecord, DekRecord, Mutation, NodeRecord, PendingLogin, ProviderKeyRecord,
-    Rekey, RoleBinding, SessionRecord, State, StoreError, StoredSecret, SubjectKind, Tenant, TenantStatus, UserRecord,
+    Rekey, RoleBinding, RouterStatus, SessionRecord, State, StoreError, StoredSecret, SubjectKind, Tenant,
+    TenantStatus, UserRecord,
 };
 use crate::auth::rbac::Role;
 use base64::Engine;
@@ -44,6 +45,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (8, "tenant_data_keys", include_str!("../../../../migrations/0008_tenant_data_keys.sql")),
     (9, "sso_rbac", include_str!("../../../../migrations/0009_sso_rbac.sql")),
     (10, "cache_hit_billing", include_str!("../../../../migrations/0010_cache_hit_billing.sql")),
+    (11, "router_status", include_str!("../../../../migrations/0011_router_status.sql")),
 ];
 
 /// Advisory lock keys ("calibn" + n).
@@ -437,6 +439,47 @@ impl Backend for PgBackend {
             .rows_affected();
         tx.commit().await.map_err(db)?;
         Ok(a + b)
+    }
+
+    async fn put_router(&self, r: &RouterStatus) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO router_status (router_id, last_seen, snapshot_version, snapshot_kek_ids, keyring_ids)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (router_id) DO UPDATE SET last_seen = EXCLUDED.last_seen,
+                 snapshot_version = EXCLUDED.snapshot_version, snapshot_kek_ids = EXCLUDED.snapshot_kek_ids,
+                 keyring_ids = EXCLUDED.keyring_ids
+             WHERE router_status.last_seen <= EXCLUDED.last_seen",
+        )
+        .bind(&r.router_id)
+        .bind(r.last_seen)
+        .bind(&r.snapshot_version)
+        .bind(&r.snapshot_kek_ids)
+        .bind(&r.keyring)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    async fn routers(&self) -> Result<Vec<RouterStatus>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT router_id, last_seen, snapshot_version, snapshot_kek_ids, keyring_ids FROM router_status
+             ORDER BY last_seen DESC, router_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|r| {
+                Ok(RouterStatus {
+                    router_id: get(r, "router_id")?,
+                    last_seen: get(r, "last_seen")?,
+                    snapshot_version: get(r, "snapshot_version")?,
+                    snapshot_kek_ids: get(r, "snapshot_kek_ids")?,
+                    keyring: get(r, "keyring_ids")?,
+                })
+            })
+            .collect()
     }
 }
 

@@ -264,6 +264,7 @@ pub fn app(gw: Arc<Gateway>) -> Router {
         .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/models", get(chat::list_models))
         .route("/healthz", get(health))
+        .route("/metrics", get(metrics))
         .layer(RequestBodyLimitLayer::new(MAX_BODY))
         .layer(cors())
         .layer(TraceLayer::new_for_http())
@@ -274,9 +275,34 @@ async fn health(axum::extract::State(gw): axum::extract::State<Arc<Gateway>>) ->
     let snap = gw.config.load();
     // A degraded quota store does not fail the probe: limits are then enforced locally. Neither
     // do usage WAL drops; they are reported under `usage_wal` (absent without a WAL).
-    let mut body = serde_json::json!({ "status": "ok", "mode": "router", "config_version": snap.version, "quota": gw.quota.status() });
-    if let Some(wal) = gw.usage.status() {
-        body["usage_wal"] = wal;
+    let mut body = serde_json::json!({
+        "status": "ok",
+        "mode": "router",
+        "config_version": snap.version,
+        // The KEKs that sealed the secrets of the snapshot being served (split mode; see
+        // `caliban keys status`).
+        "snapshot": { "version": snap.version, "kek_ids": snap.kek_ids },
+        "quota": gw.quota.status(),
+    });
+    // Usage sinks: `usage_wal` (with a WAL), `usage_shipping` (split mode).
+    for (k, v) in gw.usage.status() {
+        body[k] = v;
     }
     axum::Json(body)
+}
+
+/// Prometheus text format: the snapshot being served (version and KEK ids as labels) and the
+/// usage sinks' counters. No tenant data. Unauthenticated, like `/healthz`.
+async fn metrics(axum::extract::State(gw): axum::extract::State<Arc<Gateway>>) -> impl axum::response::IntoResponse {
+    let snap = gw.config.load();
+    let label = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+    let mut out = format!(
+        "# HELP caliban_snapshot_info The config snapshot being served; kek_ids lists the KEKs that sealed its secrets.\n\
+         # TYPE caliban_snapshot_info gauge\n\
+         caliban_snapshot_info{{version=\"{}\",kek_ids=\"{}\"}} 1\n",
+        label(&snap.version),
+        label(&snap.kek_ids.join(","))
+    );
+    gw.usage.metrics(&mut out);
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)
 }

@@ -791,6 +791,27 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AuditLog' }
 
+  /api/v1/keys/status:
+    get:
+      tags: [system]
+      summary: KEK rotation status (the same report as `caliban keys status`)
+      description: |
+        Which KEK wraps each tenant data key and seals each shared provider key, what still waits for migration,
+        whether the retired keys in `CALIBAN_KEK_PREVIOUS` are still needed by stored data
+        (`previous_keks_still_needed`), and what each split-mode router reported on its last snapshot poll
+        (`routers`: `active` when seen within 10 minutes, `snapshot_version`, `snapshot_kek_ids`, `keyring`,
+        `needs_previous_kek`, `has_current_kek`). `routers_on_previous_keks` lists the active routers whose snapshot
+        still needs a retired KEK; `rotation_complete` is true when neither stored data nor an active router does,
+        which is when `CALIBAN_KEK_PREVIOUS` can be removed. Needs `audit.read`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+
   /api/v1/roles:
     get:
       tags: [auth]
@@ -965,10 +986,33 @@ paths:
         control plane has `CALIBAN_SNAPSHOT_SIGNING_KEY` and `CALIBAN_ROUTER_TOKEN`. The ETag is a digest of the
         config; send it back in `If-None-Match` to get 304 while nothing changed. Verify `signature` (Ed25519 over
         `"caliban-snapshot-v1\0" ‖ base64-decoded payload`) before parsing `payload`. Sealed BYOK keys stay sealed.
+
+        Routers check in with every poll through the `x-caliban-router-*` headers (what they serve); the control
+        plane records them for `GET /api/v1/keys/status`. Polls without `x-caliban-router-id` are not recorded.
       parameters:
         - name: If-None-Match
           in: header
           required: false
+          schema: { type: string }
+        - name: x-caliban-router-id
+          in: header
+          required: false
+          description: The router's id (`CALIBAN_ROUTER_ID`, else its host name); 1 to 128 of `[A-Za-z0-9._:-]`.
+          schema: { type: string }
+        - name: x-caliban-router-snapshot
+          in: header
+          required: false
+          description: Version label of the snapshot the router serves.
+          schema: { type: string }
+        - name: x-caliban-router-snapshot-kek-ids
+          in: header
+          required: false
+          description: Comma-separated `kek_ids` of the snapshot the router serves.
+          schema: { type: string }
+        - name: x-caliban-router-keyring
+          in: header
+          required: false
+          description: Comma-separated ids of the router's own keyring, current KEK first.
           schema: { type: string }
       responses:
         '200':
@@ -1655,5 +1699,10 @@ components:
       required: [key_id, payload, signature]
       properties:
         key_id: { type: string, description: 'First 16 hex chars of sha256(public key)' }
-        payload: { type: string, description: 'base64 of JSON {version, issued_at_ms, config}; config has the caliban.toml structure' }
+        payload:
+          type: string
+          description: |
+            base64 of JSON {version, issued_at_ms, config, kek_ids}; config has the caliban.toml structure. kek_ids
+            (omitted when empty) lists the KEKs (`kek_` fingerprints) that sealed the secrets in config: what a router
+            needs in its keyring to open them.
         signature: { type: string, description: 'base64 Ed25519 signature' }
