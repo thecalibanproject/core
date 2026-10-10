@@ -11,10 +11,11 @@ use std::sync::Arc;
 
 pub async fn chat_completions(
     State(gw): State<Arc<Gateway>>,
+    internal: Option<axum::Extension<auth::InternalCaller>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    pipeline::handle(gw, headers, body, Dialect::OpenAi).await
+    pipeline::handle(gw, headers, body, Dialect::OpenAi, internal.map(|e| e.0)).await
 }
 
 pub async fn list_models(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Result<Response, ApiError> {

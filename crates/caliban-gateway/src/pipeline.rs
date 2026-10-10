@@ -62,11 +62,13 @@ pub(crate) async fn handle(
     headers: HeaderMap,
     body: Bytes,
     dialect: Dialect,
+    internal: Option<auth::InternalCaller>,
 ) -> Result<Response, ApiError> {
     let request_id = RequestId::new();
     let span = telemetry::request_span("chat", dialect, &request_id);
     telemetry::link_parent(&span, &headers);
-    let res = run(gw, &headers, &body, dialect, request_id, span.clone()).instrument(span.clone()).await;
+    let res =
+        run(gw, &headers, &body, dialect, request_id, span.clone(), internal.as_ref()).instrument(span.clone()).await;
     res.map_err(|e| {
         telemetry::record_error(&span, e.error.kind());
         e.with_dialect(dialect)
@@ -97,10 +99,11 @@ async fn run(
     dialect: Dialect,
     request_id: RequestId,
     span: Span,
+    internal: Option<&auth::InternalCaller>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let snap = gw.config.load();
-    let caller = auth::caller(&snap, headers)?;
+    let caller = auth::resolve(&snap, headers, internal)?;
     let tenant = caller.tenant.clone();
     span.record("caliban.tenant", tenant.id.as_str());
 

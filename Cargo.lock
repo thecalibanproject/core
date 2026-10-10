@@ -667,7 +667,9 @@ dependencies = [
  "caliban-config",
  "caliban-cp",
  "caliban-gateway",
+ "caliban-mcp",
  "caliban-meter",
+ "caliban-nodes",
  "caliban-pii",
  "caliban-types",
  "chrono",
@@ -678,6 +680,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -801,6 +804,7 @@ dependencies = [
  "caliban-config",
  "caliban-ir",
  "caliban-meter",
+ "caliban-nodes",
  "caliban-pii",
  "caliban-providers",
  "caliban-route",

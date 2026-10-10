@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 pub async fn messages(State(gw): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes) -> Response {
-    match pipeline::handle(gw, headers, body, Dialect::Anthropic).await {
+    match pipeline::handle(gw, headers, body, Dialect::Anthropic, None).await {
         Ok(r) => r,
         Err(e) => e.with_dialect(Dialect::Anthropic).into_response(),
     }

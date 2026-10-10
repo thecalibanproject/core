@@ -165,6 +165,7 @@ impl fmt::Debug for Secret {
 // ───────────────────────────── KEK keyring ─────────────────────────────
 
 /// Key-encryption keys: the current one (seals and wraps) first, then retired ones (open only).
+#[derive(Clone)]
 pub struct Keyring {
     keys: Vec<(String, Zeroizing<[u8; 32]>)>,
 }

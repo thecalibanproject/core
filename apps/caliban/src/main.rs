@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod kek_checkin_tests;
+mod nodes;
 #[cfg(test)]
 mod purge_tests;
 #[cfg(test)]
@@ -40,6 +41,8 @@ struct Cli {
     usage_wal_queue: usize,
     #[command(flatten)]
     ship: ShipArgs,
+    #[command(flatten)]
+    nodes: nodes::NodeArgs,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -145,8 +148,11 @@ enum Cmd {
     Router(RouterArgs),
     /// Control plane only (admin API + web console).
     ControlPlane,
-    /// Data plane + control plane in one process (on-prem default).
+    /// Data plane + control plane in one process (on-prem default). Node runs execute in-process.
     Standalone,
+    /// Node worker (split mode): executes node runs that routers forward to it, with the Postgres
+    /// journal (CALIBAN_DATABASE_URL) and the control plane's signed snapshots, like a router.
+    Worker(nodes::WorkerArgs),
     /// Validate the config file and exit.
     CheckConfig,
     /// Generate a tenant API key and print it with its hash (put the hash in the config).
@@ -297,9 +303,51 @@ async fn main() -> Result<()> {
             None
         };
         let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default(), shipper.as_ref()))?);
+        cli.nodes.forward_to_workers(&gw)?;
         spawn_router_warmup(&gw);
         gw.spawn_tenant_purge(PURGE_EVERY);
         let res = serve("router", listen.clone(), caliban_gateway::app(gw)).await;
+        flush_wal(wal.as_deref()).await;
+        flush_shipper(shipper.as_deref()).await;
+        return res;
+    }
+
+    if let Cmd::Worker(args) = &cli.cmd {
+        let keyring = keyring.context("a node worker needs CALIBAN_KEK (it opens node specs and tenant data keys)")?;
+        let url = database_url().context("a node worker needs CALIBAN_DATABASE_URL (the node run journal)")?;
+        let token = std::env::var("CALIBAN_ROUTER_TOKEN").context("CALIBAN_ROUTER_TOKEN is required for a worker")?;
+        let keys = std::env::var("CALIBAN_SNAPSHOT_PUBLIC_KEY")
+            .context("CALIBAN_SNAPSHOT_PUBLIC_KEY is required for a worker")?;
+        let verifier = SnapshotVerifier::from_b64_list(&keys).context("CALIBAN_SNAPSHOT_PUBLIC_KEY")?;
+        let worker_id = nodes::worker_id();
+        let every = Duration::from_secs(args.poll_interval_secs.max(1));
+        let keyring_ids = keyring.ids().into_iter().map(str::to_owned).collect();
+        let mut source = split::SnapshotSource::new(
+            &args.control_plane_url,
+            token.clone(),
+            verifier,
+            args.snapshot_cache.clone(),
+            worker_id.clone(),
+            keyring_ids,
+        )?;
+        tracing::info!(control_plane = %args.control_plane_url, worker_id, "node worker");
+        let first = source.initial(every).await;
+        let handle = ConfigHandle::new(Snapshot::new(first.config, first.version).with_kek_ids(first.kek_ids));
+        tokio::spawn(source.run(handle.clone(), every));
+        let shipper = if cli.ship.usage_ship {
+            let transport =
+                Arc::new(split::HttpUsageTransport::new(&args.control_plane_url, token, worker_id.clone())?);
+            Some(cli.ship.start(transport, args.snapshot_cache.as_deref())?)
+        } else {
+            None
+        };
+        let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default(), shipper.as_ref()))?);
+        spawn_router_warmup(&gw);
+        let journal = nodes::postgres_journal(&url, true).await?;
+        let stop = cli.nodes.run_locally(&gw, journal, Arc::new(keyring.clone()), worker_id)?;
+        let worker_token = cli.nodes.worker_token()?;
+        let res = serve("worker", args.listen.clone(), caliban_gateway::nodes::worker_app(gw, worker_token)).await;
+        stop.notify_waiters();
         flush_wal(wal.as_deref()).await;
         flush_shipper(shipper.as_deref()).await;
         return res;
@@ -330,6 +378,7 @@ async fn main() -> Result<()> {
 
     let res = match cli.cmd {
         Cmd::Router(_) => {
+            cli.nodes.forward_to_workers(&purge_gw)?;
             purge_gw.spawn_tenant_purge(PURGE_EVERY);
             router_task().await
         }
@@ -342,13 +391,34 @@ async fn main() -> Result<()> {
             // `handle` before the data plane starts serving. Tenant purges start from that state.
             let cp = control_plane(&cfg, &handle, &recent, "standalone", local_ship.as_deref()).await?;
             purge_gw.spawn_tenant_purge(PURGE_EVERY);
-            tokio::try_join!(router_task(), cp).map(|_| ())
+            // Node runs execute in this process: Postgres journal with a database (the control
+            // plane migrated it), else in memory. Publishing needs a KEK, so without one there is
+            // nothing to run.
+            let stop = match keyring {
+                Some(k) => {
+                    let journal: Arc<dyn caliban_nodes::journal::Journal> = match database_url() {
+                        Some(url) => nodes::postgres_journal(&url, false).await?,
+                        None => Arc::new(caliban_nodes::journal::memory::MemoryJournal::new()),
+                    };
+                    Some(cli.nodes.run_locally(&purge_gw, journal, Arc::new(k.clone()), nodes::worker_id())?)
+                }
+                None => {
+                    tracing::warn!("node runs disabled: CALIBAN_KEK is not set (nodes cannot be published without it)");
+                    None
+                }
+            };
+            let res = tokio::try_join!(router_task(), cp).map(|_| ());
+            if let Some(s) = stop {
+                s.notify_waiters();
+            }
+            res
         }
         Cmd::CheckConfig
         | Cmd::Keygen
         | Cmd::GenKek
         | Cmd::Keys { .. }
         | Cmd::GenSigningKey
+        | Cmd::Worker(_)
         | Cmd::Healthcheck { .. } => unreachable!(),
     };
     flush_wal(wal.as_deref()).await;

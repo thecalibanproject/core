@@ -8,6 +8,30 @@ pub struct Caller<'a> {
     pub key_hash: String,
 }
 
+/// A caller authenticated inside this process (a request extension; never set from the network):
+/// node workers make their model calls through the pipeline as the run's tenant and invoking API
+/// key. The key must still be active in the snapshot, so a revoked key stops its runs' calls.
+#[derive(Debug, Clone)]
+pub struct InternalCaller {
+    pub tenant: String,
+    pub key_hash: String,
+}
+
+/// The caller of a request: the in-process caller when there is one, else the API key in the
+/// headers.
+pub fn resolve<'a>(
+    snap: &'a Snapshot,
+    headers: &HeaderMap,
+    internal: Option<&InternalCaller>,
+) -> Result<Caller<'a>, CalibanError> {
+    let Some(i) = internal else { return caller(snap, headers) };
+    let tenant = snap
+        .tenant_by_key_hash(&i.key_hash)
+        .filter(|t| t.id.as_str() == i.tenant)
+        .ok_or(CalibanError::Unauthenticated)?;
+    Ok(Caller { tenant, key_hash: i.key_hash.clone() })
+}
+
 /// Resolves the tenant API key to a tenant. Accepts `Authorization: Bearer cal_…` (OpenAI SDKs)
 /// and `x-api-key: cal_…` (Anthropic SDKs). Only key hashes are stored.
 pub fn caller<'a>(snap: &'a Snapshot, headers: &HeaderMap) -> Result<Caller<'a>, CalibanError> {

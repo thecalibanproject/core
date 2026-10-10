@@ -7,7 +7,9 @@
 //!
 //! `Idempotency-Key` on the inference POSTs: see [`idempotency`].
 //!
-//! TODO: ontology grounding, nodes, Prometheus metrics.
+//! Node runs (`/v1/nodes/{name}/runs`, `/v1/runs/{id}`): see [`nodes`].
+//!
+//! TODO: ontology grounding, Prometheus metrics.
 
 mod auth;
 mod chat;
@@ -20,6 +22,9 @@ mod messages;
 mod metering;
 #[cfg(test)]
 mod metering_tests;
+pub mod nodes;
+#[cfg(test)]
+mod nodes_tests;
 mod passthrough;
 pub mod pii_pool;
 mod pipeline;
@@ -33,6 +38,7 @@ pub mod telemetry;
 #[cfg(test)]
 mod tests;
 
+pub use auth::InternalCaller;
 pub use error::{ApiError, Dialect};
 pub use limits::{idempotency_store, quota_store};
 
@@ -56,7 +62,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 /// Max request body (bytes). Long-context requests are large; images should go via URLs.
-const MAX_BODY: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_BODY: usize = 32 * 1024 * 1024;
 
 pub struct Gateway {
     pub config: ConfigHandle,
@@ -89,6 +95,9 @@ pub struct Gateway {
     pub pii_keys: SurrogateKeys,
     /// Models already warned about (cache tokens reported, no cache prices); once per process.
     cache_price_warned: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Node runs: executed here or forwarded to workers ([`Gateway::set_nodes`]); unset: the
+    /// run API answers 503.
+    nodes: std::sync::OnceLock<nodes::NodeRuns>,
 }
 
 impl Gateway {
@@ -118,6 +127,7 @@ impl Gateway {
             salt_key: salt_key(),
             pii_keys: pii_keys(),
             cache_price_warned: Default::default(),
+            nodes: std::sync::OnceLock::new(),
         }
     }
 
@@ -261,6 +271,7 @@ pub fn app(gw: Arc<Gateway>) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&gw), idempotency::middleware));
     Router::new()
         .merge(billed)
+        .merge(nodes::routes())
         .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/models", get(chat::list_models))
         .route("/healthz", get(health))
@@ -271,7 +282,9 @@ pub fn app(gw: Arc<Gateway>) -> Router {
         .with_state(gw)
 }
 
-async fn health(axum::extract::State(gw): axum::extract::State<Arc<Gateway>>) -> axum::Json<serde_json::Value> {
+pub(crate) async fn health(
+    axum::extract::State(gw): axum::extract::State<Arc<Gateway>>,
+) -> axum::Json<serde_json::Value> {
     let snap = gw.config.load();
     // A degraded quota store does not fail the probe: limits are then enforced locally. Neither
     // do usage WAL drops; they are reported under `usage_wal` (absent without a WAL).
@@ -293,7 +306,9 @@ async fn health(axum::extract::State(gw): axum::extract::State<Arc<Gateway>>) ->
 
 /// Prometheus text format: the snapshot being served (version and KEK ids as labels) and the
 /// usage sinks' counters. No tenant data. Unauthenticated, like `/healthz`.
-async fn metrics(axum::extract::State(gw): axum::extract::State<Arc<Gateway>>) -> impl axum::response::IntoResponse {
+pub(crate) async fn metrics(
+    axum::extract::State(gw): axum::extract::State<Arc<Gateway>>,
+) -> impl axum::response::IntoResponse {
     let snap = gw.config.load();
     let label = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
     let mut out = format!(

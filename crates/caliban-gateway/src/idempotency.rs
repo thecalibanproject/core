@@ -75,7 +75,7 @@ pub(crate) async fn middleware(State(gw): State<Arc<Gateway>>, req: Request, nex
     };
     let tenant = {
         let snap = gw.config.load();
-        match auth::caller(&snap, req.headers()) {
+        match auth::resolve(&snap, req.headers(), req.extensions().get::<auth::InternalCaller>()) {
             Ok(c) => c.tenant.id.to_string(),
             Err(_) => return next.run(req).await,
         }

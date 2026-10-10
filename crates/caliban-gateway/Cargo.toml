@@ -15,6 +15,7 @@ caliban-cache.workspace = true
 caliban-route.workspace = true
 caliban-providers.workspace = true
 caliban-meter.workspace = true
+caliban-nodes.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 blake3.workspace = true
@@ -23,10 +24,12 @@ chrono.workspace = true
 futures.workspace = true
 moka.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 tokio.workspace = true
 tokio-stream.workspace = true
+tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -38,8 +41,6 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = ["
 tracing-opentelemetry = { version = "0.34", default-features = false }
 
 [dev-dependencies]
-reqwest.workspace = true
-tower.workspace = true
 uuid.workspace = true
 
 [lints]
