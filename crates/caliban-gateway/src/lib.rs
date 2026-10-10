@@ -19,10 +19,12 @@ mod embeddings;
 mod error;
 mod idempotency;
 mod limits;
+mod mcp_server;
 mod messages;
 mod metering;
 #[cfg(test)]
 mod metering_tests;
+pub mod node_chat;
 pub mod nodes;
 #[cfg(test)]
 mod nodes_tests;
@@ -33,6 +35,7 @@ pub mod purge;
 mod quirks;
 mod rerank;
 mod route_embed;
+mod runs;
 mod semantic;
 mod stream;
 pub mod telemetry;
@@ -43,6 +46,8 @@ pub mod tools;
 pub use auth::{InternalCaller, NodeTag};
 pub use error::{ApiError, Dialect};
 pub use limits::{idempotency_store, quota_store};
+pub use mcp_server::McpSettings;
+pub use runs::{RUN_ID_HEADER, decode_cursor, encode_cursor, run_query};
 
 use axum::Router;
 use axum::http::{HeaderName, Method, header};
@@ -100,6 +105,11 @@ pub struct Gateway {
     /// Node runs: executed here or forwarded to workers ([`Gateway::set_nodes`]); unset: the
     /// run API answers 503.
     nodes: std::sync::OnceLock<nodes::NodeRuns>,
+    /// The KEK keyring, when this process has one: opens published node specs (the MCP server's
+    /// tool descriptions and input schemas).
+    keyring: std::sync::OnceLock<Arc<caliban_config::Keyring>>,
+    /// MCP server settings ([`Gateway::set_mcp`]); default: no Tasks, any `Host`.
+    mcp: std::sync::OnceLock<McpSettings>,
 }
 
 impl Gateway {
@@ -130,7 +140,35 @@ impl Gateway {
             pii_keys: pii_keys(),
             cache_price_warned: Default::default(),
             nodes: std::sync::OnceLock::new(),
+            keyring: std::sync::OnceLock::new(),
+            mcp: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The KEK keyring (once; later calls are ignored).
+    pub fn set_keyring(&self, keyring: Arc<caliban_config::Keyring>) {
+        let _ = self.keyring.set(keyring);
+    }
+
+    /// MCP server settings; set before [`app`] is built (once).
+    pub fn set_mcp(&self, settings: McpSettings) {
+        let _ = self.mcp.set(settings);
+    }
+
+    pub(crate) fn mcp_settings(&self) -> McpSettings {
+        self.mcp.get().cloned().unwrap_or_default()
+    }
+
+    /// A published node version opened from the snapshot (needs the keyring).
+    pub(crate) fn resolve_node(
+        &self,
+        tenant: &str,
+        name: &str,
+        version: Option<u32>,
+    ) -> Option<caliban_nodes::executor::ResolvedNode> {
+        use caliban_nodes::executor::NodeSource;
+        let keyring = Arc::clone(self.keyring.get()?);
+        nodes::SnapshotNodes::new(self.config.clone(), keyring).resolve(tenant, name, version).ok()
     }
 
     /// Replaces the T2 store (tests, or a store built elsewhere).
@@ -265,6 +303,7 @@ fn pii_keys() -> SurrogateKeys {
 }
 
 pub fn app(gw: Arc<Gateway>) -> Router {
+    let mcp = mcp_server::routes(&gw);
     // Billed endpoints honour `Idempotency-Key`.
     let billed = Router::new()
         .route("/v1/chat/completions", post(chat::chat_completions))
@@ -274,7 +313,8 @@ pub fn app(gw: Arc<Gateway>) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&gw), idempotency::middleware));
     Router::new()
         .merge(billed)
-        .merge(nodes::routes())
+        .merge(runs::routes())
+        .merge(mcp)
         .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/models", get(chat::list_models))
         .route("/healthz", get(health))

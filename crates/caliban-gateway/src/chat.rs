@@ -15,6 +15,9 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    if let Some(r) = crate::node_chat::maybe_handle(&gw, &headers, &body, Dialect::OpenAi, internal.is_some()).await {
+        return Ok(r);
+    }
     pipeline::handle(gw, headers, body, Dialect::OpenAi, internal.map(|e| e.0)).await
 }
 

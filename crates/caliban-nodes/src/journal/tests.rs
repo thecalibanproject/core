@@ -35,6 +35,7 @@ pub(crate) fn new_run(id: &str, tenant: &str, key: Option<(&str, &str)>) -> NewR
         budget: BudgetState::new(10, 1000, 60),
         idempotency: key.map(|(k, f)| (k.to_owned(), f.to_owned())),
         specs: Some("sealed-specs".into()),
+        origin: None,
     }
 }
 
@@ -51,7 +52,10 @@ fn step(run: &str, id: &str) -> StepRecord {
         status: StepStatus::Completed,
         result: Some(format!("result of {id}")),
         tokens: 12,
+        prompt_tokens: 9,
+        completion_tokens: 3,
         usd: 0.001,
+        labels: vec!["pii".into()],
         started_at: now,
         finished_at: now,
     }
@@ -198,14 +202,26 @@ async fn human_input_and_timers_wake_runs() {
         );
         assert!(j.claim_next("w1", TTL).await.unwrap().is_none(), "{n}: waiting for a human");
 
-        assert_eq!(j.deliver_input("acme", "run_1", "other#0", "x".into()).await.unwrap(), Delivered::NotAwaiting);
-        assert_eq!(j.deliver_input("globex", "run_1", "ask#0", "x".into()).await.unwrap(), Delivered::NotFound);
-        assert_eq!(j.deliver_input("acme", "nope", "ask#0", "x".into()).await.unwrap(), Delivered::NotFound);
         assert_eq!(
-            j.deliver_input("acme", "run_1", "ask#0", "sealed-answer".into()).await.unwrap(),
+            j.deliver_input("acme", "run_1", "other#0", "x".into(), None, None).await.unwrap(),
+            Delivered::NotAwaiting
+        );
+        assert_eq!(
+            j.deliver_input("globex", "run_1", "ask#0", "x".into(), None, None).await.unwrap(),
+            Delivered::NotFound
+        );
+        assert_eq!(
+            j.deliver_input("acme", "nope", "ask#0", "x".into(), None, None).await.unwrap(),
+            Delivered::NotFound
+        );
+        assert_eq!(
+            j.deliver_input("acme", "run_1", "ask#0", "sealed-answer".into(), None, None).await.unwrap(),
             Delivered::Accepted
         );
-        assert_eq!(j.deliver_input("acme", "run_1", "ask#0", "again".into()).await.unwrap(), Delivered::NotAwaiting);
+        assert_eq!(
+            j.deliver_input("acme", "run_1", "ask#0", "again".into(), None, None).await.unwrap(),
+            Delivered::NotAwaiting
+        );
         let ev = j.event("run_1", "ask#0").await.unwrap().expect(n);
         assert_eq!((ev.kind, ev.payload.as_deref()), (EventKind::Input, Some("sealed-answer")), "{n}");
         let r = j.claim_next("w2", TTL).await.unwrap().expect(n);
@@ -327,5 +343,259 @@ async fn retention_purges_finished_runs_with_their_steps_and_events() {
                 && j.get_run("acme", "run_busy").await.unwrap().is_some()
         );
         assert_eq!(j.tenant_spend("acme").await.unwrap(), spent, "{n}: the spend totals are not purged");
+    }
+}
+
+fn kinds(evs: &[RunEvent]) -> Vec<&str> {
+    evs.iter().map(|e| e.kind.as_str()).collect()
+}
+
+#[tokio::test]
+async fn run_events_are_numbered_in_order_and_resume_after_any_number() {
+    for j in journals().await {
+        let n = j.name();
+        let Created::New(r) = j.create_run(new_run("run_1", "acme", None)).await.unwrap() else { panic!("{n}") };
+        assert_eq!(r.last_event, 1, "{n}: run.created");
+        j.claim("run_1", "w1", TTL).await.unwrap().unwrap();
+        let start =
+            serde_json::json!({"step": "classify#0", "vertex": "classify", "kind": "router", "labels": ["pii"]});
+        assert_eq!(j.start_step("run_1", "w2", start.clone()).await.unwrap(), StepStart::LeaseLost, "{n}");
+        assert_eq!(j.start_step("run_1", "w1", start).await.unwrap(), StepStart::Started, "{n}");
+        let b = BudgetState { usd: 0.001, ..BudgetState::new(10, 1000, 60) };
+        j.put_step("w1", step("run_1", "classify#0"), &b).await.unwrap();
+        // A duplicate checkpoint writes no second event.
+        j.put_step("w1", step("run_1", "classify#0"), &b).await.unwrap();
+        let ask = Suspend {
+            status: RunStatus::InputRequired,
+            awaiting: Some("ask#0".into()),
+            prompt: Some("sealed-question".into()),
+            wake_at: None,
+            budget: b,
+        };
+        assert!(j.suspend("run_1", "w1", ask).await.unwrap());
+        j.deliver_input("acme", "run_1", "ask#0", "sealed".into(), Some("api_key:abc"), None).await.unwrap();
+        j.claim("run_1", "w2", TTL).await.unwrap().unwrap();
+        let f = Finish { status: RunStatus::Succeeded, output: None, error: None, stop_reason: None, budget: b };
+        assert!(j.finish("run_1", "w2", f).await.unwrap());
+
+        let all = j.events("acme", "run_1", 0, 100).await.unwrap();
+        assert_eq!(
+            kinds(&all),
+            [
+                event::RUN_CREATED,
+                event::STEP_STARTED,
+                event::STEP_FINISHED,
+                event::RUN_INPUT_REQUIRED,
+                event::RUN_INPUT_RECEIVED,
+                event::RUN_FINISHED
+            ],
+            "{n}"
+        );
+        assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6], "{n}");
+        let fin = &all[2].data;
+        assert_eq!(
+            (&fin["step"], &fin["tokens"], &fin["prompt_tokens"], &fin["labels"], &fin["cost_usd"]),
+            (
+                &serde_json::json!("classify#0"),
+                &serde_json::json!(12),
+                &serde_json::json!(9),
+                &serde_json::json!(["pii"]),
+                &serde_json::json!(0.001)
+            ),
+            "{n}"
+        );
+        assert_eq!(all[3].data["sealed_question"], "sealed-question", "{n}: opened by the reader only");
+        assert_eq!(all[4].data["by"], "api_key:abc", "{n}");
+        assert_eq!(all[5].data["status"], "succeeded", "{n}");
+        // Resume after any event; other tenants see nothing.
+        assert_eq!(
+            kinds(&j.events("acme", "run_1", 4, 100).await.unwrap()),
+            [event::RUN_INPUT_RECEIVED, event::RUN_FINISHED]
+        );
+        assert_eq!(j.events("acme", "run_1", 1, 2).await.unwrap().len(), 2, "{n}: limit");
+        assert!(j.events("globex", "run_1", 0, 100).await.unwrap().is_empty(), "{n}");
+        assert_eq!(j.get_run("acme", "run_1").await.unwrap().unwrap().last_event, 6, "{n}");
+        // Steps keep their usage split and labels.
+        let s = &j.steps("run_1").await.unwrap()[0];
+        assert_eq!((s.prompt_tokens, s.completion_tokens, s.labels.clone()), (9, 3, vec!["pii".to_owned()]), "{n}");
+    }
+}
+
+#[tokio::test]
+async fn cancel_ends_waiting_runs_and_stops_running_ones_at_the_next_step() {
+    for j in journals().await {
+        let n = j.name();
+        let b = BudgetState::new(10, 1000, 60);
+        let audit = |id: &str| AuditEvent {
+            id: format!("{id}/cancel"),
+            tenant_id: "acme".into(),
+            actor: "api_key:abc".into(),
+            action: "node.run.cancel".into(),
+            target: Some(id.into()),
+            detail: serde_json::json!({}),
+            at: Utc::now(),
+        };
+        // Pending: cancelled at once, never claimed.
+        j.create_run(new_run("run_p", "acme", None)).await.unwrap();
+        assert_eq!(j.cancel("globex", "run_p", "x", None).await.unwrap(), Cancelled::NotFound, "{n}");
+        assert_eq!(j.cancel("acme", "run_p", "api_key:abc", Some(audit("run_p"))).await.unwrap(), Cancelled::Ended);
+        let r = j.get_run("acme", "run_p").await.unwrap().unwrap();
+        assert_eq!((r.status, r.cancelled_by.as_deref()), (RunStatus::Cancelled, Some("api_key:abc")), "{n}");
+        assert!(r.finished_at.is_some() && r.stop_reason.as_deref() == Some("cancelled by api_key:abc"), "{n}");
+        assert!(j.claim_next("w1", TTL).await.unwrap().is_none(), "{n}");
+        assert_eq!(
+            j.cancel("acme", "run_p", "api_key:abc", Some(audit("run_p"))).await.unwrap(),
+            Cancelled::AlreadyEnded(RunStatus::Cancelled),
+            "{n}"
+        );
+        assert_eq!(j.events("acme", "run_p", 1, 10).await.unwrap()[0].data["status"], "cancelled", "{n}");
+
+        // Waiting for a human: cancelled at once, the answer is refused.
+        j.create_run(new_run("run_h", "acme", None)).await.unwrap();
+        j.claim("run_h", "w1", TTL).await.unwrap().unwrap();
+        let ask = Suspend {
+            status: RunStatus::InputRequired,
+            awaiting: Some("ask#0".into()),
+            prompt: None,
+            wake_at: None,
+            budget: b,
+        };
+        assert!(j.suspend("run_h", "w1", ask).await.unwrap());
+        assert_eq!(j.cancel("acme", "run_h", "user:jo", None).await.unwrap(), Cancelled::Ended, "{n}");
+        assert_eq!(
+            j.deliver_input("acme", "run_h", "ask#0", "x".into(), None, None).await.unwrap(),
+            Delivered::NotAwaiting,
+            "{n}"
+        );
+
+        // Running: asked to stop; the worker sees it at its next step, and cannot suspend.
+        j.create_run(new_run("run_r", "acme", None)).await.unwrap();
+        j.claim("run_r", "w1", TTL).await.unwrap().unwrap();
+        assert!(!j.cancel_requested("run_r").await.unwrap());
+        assert_eq!(j.cancel("acme", "run_r", "api_key:abc", Some(audit("run_r"))).await.unwrap(), Cancelled::Requested);
+        assert_eq!(j.cancel("acme", "run_r", "api_key:abc", None).await.unwrap(), Cancelled::Requested, "{n}");
+        assert!(j.cancel_requested("run_r").await.unwrap(), "{n}");
+        let r = j.get_run("acme", "run_r").await.unwrap().unwrap();
+        assert_eq!((r.status, r.cancel_requested_at.is_some()), (RunStatus::Running, true), "{n}");
+        // The step in flight is still checkpointed (it was paid for).
+        assert_eq!(j.put_step("w1", step("run_r", "a#0"), &b).await.unwrap(), StepWrite::Written, "{n}");
+        assert_eq!(
+            j.start_step("run_r", "w1", serde_json::json!({"step": "b#0"})).await.unwrap(),
+            StepStart::Cancelled,
+            "{n}"
+        );
+        assert!(!j.suspend("run_r", "w1", sleep_until(Utc::now(), b)).await.unwrap(), "{n}");
+        let f = Finish {
+            status: RunStatus::Cancelled,
+            output: None,
+            error: None,
+            stop_reason: Some("cancelled by api_key:abc".into()),
+            budget: b,
+        };
+        assert!(j.finish("run_r", "w1", f).await.unwrap(), "{n}");
+        let evs = j.events("acme", "run_r", 0, 100).await.unwrap();
+        assert_eq!(
+            kinds(&evs),
+            [event::RUN_CREATED, event::RUN_CANCEL_REQUESTED, event::STEP_FINISHED, event::RUN_FINISHED],
+            "{n}"
+        );
+        // Finished cancelled runs are purged like any finished run.
+        assert_eq!(j.purge_finished(Duration::ZERO, 100).await.unwrap(), 3, "{n}");
+
+        // The audit outbox: once per id, each entry held by one worker at a time, gone once
+        // acknowledged.
+        let first = j.claim_audit("w1", TTL, 1).await.unwrap();
+        assert_eq!(first.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["run_p/cancel"], "{n}");
+        let second = j.claim_audit("w2", TTL, 10).await.unwrap();
+        assert_eq!(
+            second.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["run_r/cancel"],
+            "{n}: the repeated cancel was not recorded twice, and w1's entry is not taken"
+        );
+        assert_eq!((second[0].action.as_str(), second[0].actor.as_str()), ("node.run.cancel", "api_key:abc"));
+        j.ack_audit(&["run_p/cancel".to_owned(), "run_r/cancel".to_owned()]).await.unwrap();
+        assert!(j.claim_audit("w3", TTL, 10).await.unwrap().is_empty(), "{n}");
+        // A worker that dies before the acknowledgement: another one ships the entry after the hold.
+        j.create_run(new_run("run_x", "acme", None)).await.unwrap();
+        j.cancel("acme", "run_x", "api_key:abc", Some(audit("run_x"))).await.unwrap();
+        assert_eq!(j.claim_audit("w1", Duration::ZERO, 10).await.unwrap().len(), 1, "{n}");
+        let mut again = Vec::new();
+        until("w1's hold to expire", async || {
+            again = j.claim_audit("w2", TTL, 10).await.unwrap();
+            !again.is_empty()
+        })
+        .await;
+        assert_eq!(again[0].id, "run_x/cancel", "{n}");
+    }
+}
+
+#[tokio::test]
+async fn runs_are_listed_newest_first_with_filters_and_a_cursor() {
+    for j in journals().await {
+        let n = j.name();
+        for i in 0..7 {
+            let mut r = new_run(&format!("run_{i}"), "acme", None);
+            r.node = if i % 2 == 0 { "triage".into() } else { "summary".into() };
+            j.create_run(r).await.unwrap();
+        }
+        j.create_run(new_run("run_other", "globex", None)).await.unwrap();
+        j.cancel("acme", "run_6", "x", None).await.unwrap();
+        let q = |f: &dyn Fn(&mut RunQuery)| {
+            let mut q = RunQuery { tenant: "acme".into(), limit: 100, ..RunQuery::default() };
+            f(&mut q);
+            q
+        };
+        let ids = |v: Vec<RunRecord>| v.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        let all = ids(j.list_runs(&q(&|_| {})).await.unwrap());
+        assert_eq!(
+            all,
+            ["run_6", "run_5", "run_4", "run_3", "run_2", "run_1", "run_0"],
+            "{n}: newest first, one tenant"
+        );
+        assert_eq!(
+            ids(j.list_runs(&q(&|q| q.node = Some("summary".into()))).await.unwrap()),
+            ["run_5", "run_3", "run_1"],
+            "{n}"
+        );
+        assert_eq!(
+            ids(j.list_runs(&q(&|q| q.nodes = Some(vec!["summary".into(), "nope".into()]))).await.unwrap()).len(),
+            3,
+            "{n}: an allowlist"
+        );
+        assert!(j.list_runs(&q(&|q| q.nodes = Some(vec![]))).await.unwrap().is_empty(), "{n}: an empty allowlist");
+        assert_eq!(ids(j.list_runs(&q(&|q| q.statuses = vec![RunStatus::Cancelled])).await.unwrap()), ["run_6"], "{n}");
+        // Pages of three: the cursor is the last (created_at, id) of the previous page.
+        let mut pages = Vec::new();
+        let mut before = None;
+        loop {
+            let page = j
+                .list_runs(&q(&|q| {
+                    q.limit = 3;
+                    q.before.clone_from(&before);
+                }))
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            before = page.last().map(|r| (r.created_at, r.id.clone()));
+            pages.push(ids(page));
+        }
+        assert_eq!(pages.concat(), all, "{n}");
+        assert_eq!(pages.len(), 3, "{n}");
+        // A creation range.
+        let r3 = j.get_run("acme", "run_3").await.unwrap().unwrap();
+        let r5 = j.get_run("acme", "run_5").await.unwrap().unwrap();
+        assert_eq!(
+            ids(j
+                .list_runs(&q(&|q| {
+                    q.created_after = Some(r3.created_at);
+                    q.created_before = Some(r5.created_at);
+                }))
+                .await
+                .unwrap()),
+            ["run_4", "run_3"],
+            "{n}"
+        );
     }
 }

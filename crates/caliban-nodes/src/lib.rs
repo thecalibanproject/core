@@ -15,6 +15,7 @@
 //! vertices.
 
 pub mod budget;
+pub mod chat;
 pub mod diff;
 pub mod executor;
 pub mod hash;

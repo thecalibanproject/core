@@ -1,6 +1,8 @@
 //! `caliban` — one binary for every deployment shape (SaaS, VPC, air-gapped).
 
 #[cfg(test)]
+mod exposure_tests;
+#[cfg(test)]
 mod kek_checkin_tests;
 mod nodes;
 #[cfg(test)]
@@ -685,6 +687,16 @@ fn new_gateway(handle: ConfigHandle, usage: Arc<dyn UsageSink>) -> Result<caliba
     if let Some(dir) = std::env::var("CALIBAN_PII_NER_DIR").ok().filter(|d| !d.trim().is_empty()) {
         let (engine, pool) = load_ner(&dir)?;
         gw = gw.with_pii(engine, pool);
+    }
+    // The MCP server at /mcp (Tasks behind CALIBAN_MCP_TASKS), and the keyring that opens node
+    // specs for its tool list.
+    let mcp = caliban_gateway::McpSettings::from_env(|k| std::env::var(k).ok()).map_err(anyhow::Error::msg)?;
+    if mcp.tasks {
+        tracing::info!("MCP server: Tasks enabled (experimental in the MCP spec)");
+    }
+    gw.set_mcp(mcp);
+    if let Ok(Some(k)) = caliban_config::process_keyring() {
+        gw.set_keyring(Arc::new(k.clone()));
     }
     Ok(gw)
 }

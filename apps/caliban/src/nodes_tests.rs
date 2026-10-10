@@ -38,19 +38,19 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
-const ADMIN: &str = "admin-secret";
-const ROUTER_TOKEN: &str = "router-secret";
-const WORKER_TOKEN: &str = "worker-secret";
-const KEY: &str = "cal_nodes_e2e_test_key_00000000000";
-const EMAIL: &str = "jane.roe@example.com";
-const LONG: Duration = Duration::from_secs(30);
-const SHORT: Duration = Duration::from_secs(1);
+pub(crate) const ADMIN: &str = "admin-secret";
+pub(crate) const ROUTER_TOKEN: &str = "router-secret";
+pub(crate) const WORKER_TOKEN: &str = "worker-secret";
+pub(crate) const KEY: &str = "cal_nodes_e2e_test_key_00000000000";
+pub(crate) const EMAIL: &str = "jane.roe@example.com";
+pub(crate) const LONG: Duration = Duration::from_secs(30);
+pub(crate) const SHORT: Duration = Duration::from_secs(1);
 
-fn ring() -> Keyring {
+pub(crate) fn ring() -> Keyring {
     Keyring::new([7; 32], [])
 }
 
-fn config(upstream: &str) -> Config {
+pub(crate) fn config(upstream: &str) -> Config {
     Config::from_toml_str(&format!(
         r#"
 [[models]]
@@ -107,17 +107,17 @@ async fn catalogue_server() -> TestMcpServer {
 }
 
 /// The key that signs minted tool tokens (control plane and workers share it).
-fn tool_signer() -> Arc<ToolTokenSigner> {
+pub(crate) fn tool_signer() -> Arc<ToolTokenSigner> {
     Arc::new(ToolTokenSigner::new(&[3; 32], "caliban", vec![]))
 }
 
-fn mcp_client() -> Arc<McpClient> {
+pub(crate) fn mcp_client() -> Arc<McpClient> {
     // The test server listens on loopback.
     Arc::new(McpClient::system(EgressPolicy { allow_loopback: true }))
 }
 
 /// Scripted model answers for the nodes in these tests (anything else gets the echo).
-fn responder() -> Responder {
+pub(crate) fn responder() -> Responder {
     Responder::new(|body| {
         let system = body["messages"][0]["content"].as_str().unwrap_or_default();
         let user = caliban_bench::mock::last_user_text(body);
@@ -134,14 +134,14 @@ fn responder() -> Responder {
     })
 }
 
-struct Env {
-    mock: Mock,
-    cp: Arc<ControlPlane>,
-    cp_app: Router,
-    handle: ConfigHandle,
+pub(crate) struct Env {
+    pub(crate) mock: Mock,
+    pub(crate) cp: Arc<ControlPlane>,
+    pub(crate) cp_app: Router,
+    pub(crate) handle: ConfigHandle,
 }
 
-async fn env(latency: Duration) -> Env {
+pub(crate) async fn env(latency: Duration) -> Env {
     let cfg = MockConfig { latency, responder: Some(responder()), ..MockConfig::default() };
     let mock = Mock::start("127.0.0.1:0", cfg).await.unwrap();
     let cfg = config(&mock.base_url());
@@ -156,7 +156,7 @@ async fn env(latency: Duration) -> Env {
     Env { mock, cp, cp_app, handle }
 }
 
-async fn send(
+pub(crate) async fn send(
     app: &Router,
     method: &str,
     uri: &str,
@@ -181,7 +181,7 @@ async fn send(
 
 impl Env {
     /// Creates, publishes and promotes a version of `name`.
-    async fn publish(&self, name: &str, spec: Value) {
+    pub(crate) async fn publish(&self, name: &str, spec: Value) {
         let uri = format!("/api/v1/tenants/acme/nodes/{name}/versions");
         let (s, v) = send(&self.cp_app, "POST", &uri, ADMIN, Some(json!({"spec": spec})), &[]).await;
         assert_eq!(s, StatusCode::CREATED, "{v}");
@@ -193,7 +193,7 @@ impl Env {
 
 /// Short leases only where a test waits for one to expire; a long lease elsewhere, so a slow
 /// machine never loses one by accident.
-fn options(lease: Duration) -> ExecutorOptions {
+pub(crate) fn options(lease: Duration) -> ExecutorOptions {
     ExecutorOptions {
         lease_ttl: lease,
         heartbeat: Duration::from_millis(100),
@@ -203,15 +203,15 @@ fn options(lease: Duration) -> ExecutorOptions {
     }
 }
 
-struct Worker {
-    gw: Arc<Gateway>,
-    ex: Arc<Executor>,
-    app: Router,
-    usage: RecentUsage,
+pub(crate) struct Worker {
+    pub(crate) gw: Arc<Gateway>,
+    pub(crate) ex: Arc<Executor>,
+    pub(crate) app: Router,
+    pub(crate) usage: RecentUsage,
 }
 
 /// A worker: a gateway on the shared snapshot that executes runs from `journal`.
-fn worker(
+pub(crate) fn worker(
     e: &Env,
     journal: &Arc<dyn Journal>,
     idem: &Arc<dyn IdempotencyStore>,
@@ -230,7 +230,7 @@ fn worker(
     Worker { gw, ex, app, usage }
 }
 
-async fn journal() -> Arc<dyn Journal> {
+pub(crate) async fn journal() -> Arc<dyn Journal> {
     match std::env::var("CALIBAN_TEST_DATABASE_URL").ok() {
         Some(url) => Arc::new(PgJournal::isolated(&url).await.expect("CALIBAN_TEST_DATABASE_URL must be reachable")),
         None => {
@@ -240,11 +240,11 @@ async fn journal() -> Arc<dyn Journal> {
     }
 }
 
-fn idem() -> Arc<dyn IdempotencyStore> {
+pub(crate) fn idem() -> Arc<dyn IdempotencyStore> {
     Arc::new(MemoryIdempotency::default())
 }
 
-async fn until(what: &str, mut f: impl AsyncFnMut() -> bool) {
+pub(crate) async fn until(what: &str, mut f: impl AsyncFnMut() -> bool) {
     for _ in 0..1500 {
         if f().await {
             return;
@@ -254,7 +254,7 @@ async fn until(what: &str, mut f: impl AsyncFnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-async fn run_status(app: &Router, id: &str) -> Value {
+pub(crate) async fn run_status(app: &Router, id: &str) -> Value {
     let (s, v) = send(app, "GET", &format!("/v1/runs/{id}"), KEY, None, &[]).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     v

@@ -149,7 +149,7 @@ fn exec_vertex<'a>(
     ledger: &'a Ledger,
     depth: u32,
 ) -> BoxFuture<'a, Result<(StepOut, Taint), Stop>> {
-    Box::pin(async move {
+    Box::pin(super::consuming(in_taint.clone(), async move {
         let scope = Scope { input, outputs };
         let c = &v.config;
         // A model call passes on the labels of what it consumed.
@@ -181,7 +181,7 @@ fn exec_vertex<'a>(
             }
             None => Err(Stop::Fail(format!("vertex '{}': unknown type '{}'", v.id, v.vertex_type))),
         }
-    })
+    }))
 }
 
 /// The chat request of an `llm`-like vertex.
@@ -229,13 +229,7 @@ async fn model_step(
     let input = body.clone();
     cx.step(ledger, step_id, vertex, kind, &input, async {
         let r = cx.model(step_id, body).await?;
-        Ok(StepOut {
-            output: Value::String(content_of(&r.message)),
-            label: None,
-            tokens: r.tokens,
-            usd: r.usd,
-            taint: Taint::new(),
-        })
+        Ok(StepOut::model(Value::String(content_of(&r.message)), &r))
     })
     .await
 }
@@ -365,10 +359,12 @@ pub(super) async fn call_tool(
         && !taint::untrusted(&args_taint).is_empty()
         && !taint::allowed(&args_taint, &t.allow_tainted)
     {
-        approve_write(cx, vertex, reference, &args, &args_taint, step_id, ledger).await?;
+        super::consuming(args_taint.clone(), approve_write(cx, vertex, reference, &args, &args_taint, step_id, ledger))
+            .await?;
     }
     let input = json!({"tool": reference, "args": args});
-    cx.step(ledger, step_id, vertex, "tool", &input, async {
+    let consumed = args_taint.clone();
+    let call = cx.step(ledger, step_id, vertex, "tool", &input, async {
         let mut out_taint = args_taint.clone();
         let out = match ToolTarget::parse(reference) {
             Ok(ToolTarget::Node { .. }) => {
@@ -396,8 +392,8 @@ pub(super) async fn call_tool(
             }
         };
         Ok(StepOut { taint: out_taint, ..StepOut::value(out) })
-    })
-    .await
+    });
+    super::consuming(consumed, call).await
 }
 
 /// A write whose arguments carry untrusted labels: waits for a human (`<step>@approve`, the run
@@ -588,13 +584,14 @@ async fn map(
     });
     let results = futures::future::join_all(branches).await;
     let mut out = Vec::with_capacity(results.len());
-    let (mut tokens, mut usd) = (0, 0.0);
-    // A lost lease wins over everything, then failures, then budget stops.
+    let (mut tokens, mut prompt, mut completion, mut usd) = (0, 0, 0, 0.0);
+    // A lost lease wins over everything, then a cancellation, failures, then budget stops.
     let rank = |s: &Stop| match s {
         Stop::LeaseLost => 0,
-        Stop::Fail(_) => 1,
-        Stop::Budget(_) => 2,
-        _ => 3,
+        Stop::Cancelled(_) => 1,
+        Stop::Fail(_) => 2,
+        Stop::Budget(_) => 3,
+        _ => 4,
     };
     let mut stop: Option<Stop> = None;
     let mut taint = in_taint.clone();
@@ -603,6 +600,8 @@ async fn map(
             Ok((s, t)) => {
                 taint.extend(t);
                 tokens += s.tokens;
+                prompt += s.prompt_tokens;
+                completion += s.completion_tokens;
                 usd += s.usd;
                 out.push(s.output);
             }
@@ -617,7 +616,14 @@ async fn map(
         cx.set_last(&Value::Array(out));
         return Err(s);
     }
-    Ok((StepOut { output: Value::Array(out), label: None, tokens, usd, taint: Taint::new() }, taint))
+    let out = StepOut {
+        tokens,
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        usd,
+        ..StepOut::value(Value::Array(out))
+    };
+    Ok((out, taint))
 }
 
 async fn reduce(

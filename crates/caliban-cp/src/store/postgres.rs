@@ -55,6 +55,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (18, "usage_nodes", include_str!("../../../../migrations/0018_usage_nodes.sql")),
     (19, "tool_registry", include_str!("../../../../migrations/0019_tool_registry.sql")),
     (20, "api_key_datasource_scopes", include_str!("../../../../migrations/0020_api_key_datasource_scopes.sql")),
+    (21, "node_exposure", include_str!("../../../../migrations/0021_node_exposure.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.

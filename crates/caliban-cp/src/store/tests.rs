@@ -1912,7 +1912,9 @@ async fn postgres_rejects_edited_migrations() {
 async fn postgres_worker_grants_are_enough() {
     use caliban_nodes::budget::BudgetState;
     use caliban_nodes::journal::postgres::PgJournal;
-    use caliban_nodes::journal::{EventKind, Finish, Journal, NewRun, RunStatus, StepRecord, StepStatus};
+    use caliban_nodes::journal::{
+        AuditEvent, EventKind, Finish, Journal, NewRun, RunQuery, RunStatus, StepRecord, StepStatus,
+    };
     use std::time::Duration;
     let Some(url) = std::env::var("CALIBAN_TEST_DATABASE_URL").ok() else { return };
     let Some(pg) = pg_backend().await else { return };
@@ -1923,7 +1925,7 @@ async fn postgres_worker_grants_are_enough() {
         "CREATE ROLE {role} LOGIN PASSWORD 'worker-test' BYPASSRLS;
          GRANT USAGE ON SCHEMA {schema} TO {role};
          GRANT SELECT ON caliban_schema_migrations TO {role};
-         GRANT SELECT, INSERT, UPDATE, DELETE ON node_run, node_step, node_event TO {role};
+         GRANT SELECT, INSERT, UPDATE, DELETE ON node_run, node_step, node_event, node_run_event, node_audit TO {role};
          GRANT SELECT, INSERT, UPDATE ON node_spend TO {role};"
     );
     sqlx::raw_sql(AssertSqlSafe(grants)).execute(pg.pool()).await.unwrap();
@@ -1949,9 +1951,14 @@ async fn postgres_worker_grants_are_enough() {
             budget: BudgetState::new(5, 100, 60),
             idempotency: Some(("k".into(), "fp".into())),
             specs: None,
+            origin: Some("auto:triage".into()),
         };
+        j.create_run(NewRun { id: "run_h".into(), idempotency: None, ..run.clone() })
+            .await
+            .map_err(|e| e.to_string())?;
         j.create_run(run).await.map_err(|e| e.to_string())?;
-        j.claim_next("w", Duration::from_secs(30)).await.map_err(|e| e.to_string())?.ok_or("nothing claimed")?;
+        j.claim("run_g", "w", Duration::from_secs(30)).await.map_err(|e| e.to_string())?.ok_or("nothing claimed")?;
+        j.start_step("run_g", "w", serde_json::json!({"step": "a#0"})).await.map_err(|e| e.to_string())?;
         j.heartbeat("run_g", "w", Duration::from_secs(30)).await.map_err(|e| e.to_string())?;
         let now = Utc::now();
         let step = StepRecord {
@@ -1965,11 +1972,31 @@ async fn postgres_worker_grants_are_enough() {
             status: StepStatus::Completed,
             result: None,
             tokens: 3,
+            prompt_tokens: 2,
+            completion_tokens: 1,
             usd: 0.01,
+            labels: vec![],
             started_at: now,
             finished_at: now,
         };
         j.put_step("w", step, &BudgetState::new(5, 100, 60)).await.map_err(|e| e.to_string())?;
+        let audit = AuditEvent {
+            id: "run_h/cancel".into(),
+            tenant_id: "acme".into(),
+            actor: "api_key:x".into(),
+            action: "node.run.cancel".into(),
+            target: Some("run_h".into()),
+            detail: serde_json::json!({}),
+            at: now,
+        };
+        j.cancel("acme", "run_h", "api_key:x", Some(audit)).await.map_err(|e| e.to_string())?;
+        let q = RunQuery { tenant: "acme".into(), limit: 10, ..RunQuery::default() };
+        if j.list_runs(&q).await.map_err(|e| e.to_string())?.len() != 2 {
+            return Err("listing runs".to_owned());
+        }
+        j.events("acme", "run_g", 0, 10).await.map_err(|e| e.to_string())?;
+        let shipped = j.claim_audit("w", Duration::from_secs(30), 10).await.map_err(|e| e.to_string())?;
+        j.ack_audit(&shipped.into_iter().map(|a| a.id).collect::<Vec<_>>()).await.map_err(|e| e.to_string())?;
         j.tenant_spend("acme").await.map_err(|e| e.to_string())?;
         j.put_event("acme", "run_g", "t", EventKind::Timer, None).await.map_err(|e| e.to_string())?;
         let f = Finish {

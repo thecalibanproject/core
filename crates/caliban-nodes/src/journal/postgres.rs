@@ -19,13 +19,23 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../../../migrations/0014_node_run_specs.sql"),
     include_str!("../../../../migrations/0015_node_spend.sql"),
     include_str!("../../../../migrations/0017_node_run_retention.sql"),
+    include_str!("../../../../migrations/0021_node_exposure.sql"),
 ];
+
+/// Columns of `node_step` rows ([`step_row`]).
+macro_rules! step_columns {
+    () => {
+        "run_id, tenant_id, step_id, attempt, vertex, kind, input_hash, status, result, tokens, prompt_tokens, \
+         completion_tokens, usd, labels, started_at, finished_at"
+    };
+}
 
 macro_rules! run_columns {
     () => {
         "id, tenant_id, node, version, spec_hash, invoker, invoker_key_hash, input, specs, output, status, wake_at, awaiting, \
          prompt, budget, lease_owner, lease_expires_at, claims, error, stop_reason, idempotency_key, \
-         idempotency_fingerprint, created_at, updated_at, started_at, finished_at"
+         idempotency_fingerprint, created_at, updated_at, started_at, finished_at, cancel_requested_at, \
+         cancelled_by, origin, event_seq"
     };
 }
 
@@ -100,7 +110,54 @@ fn run_row(r: &PgRow) -> JResult<RunRecord> {
         updated_at: get(r, "updated_at")?,
         started_at: get(r, "started_at")?,
         finished_at: get(r, "finished_at")?,
+        cancel_requested_at: get(r, "cancel_requested_at")?,
+        cancelled_by: get(r, "cancelled_by")?,
+        origin: get(r, "origin")?,
+        last_event: u64::try_from(get::<i64>(r, "event_seq")?).unwrap_or_default(),
     })
+}
+
+fn u64_of(r: &PgRow, col: &str) -> JResult<u64> {
+    Ok(u64::try_from(get::<i64>(r, col)?).unwrap_or_default())
+}
+
+fn i64_of(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Appends an event to a run inside `tx` (which holds or takes the run row's lock): the run's
+/// `event_seq` numbers it, so numbers follow commit order.
+async fn push_event(tx: &mut sqlx::PgConnection, run_id: &str, kind: &str, data: &serde_json::Value) -> JResult<()> {
+    sqlx::query(
+        "WITH r AS (UPDATE node_run SET event_seq = event_seq + 1 WHERE id = $1 RETURNING id, tenant_id, event_seq)
+         INSERT INTO node_run_event (run_id, seq, tenant_id, kind, data) SELECT id, event_seq, tenant_id, $2, $3 FROM r",
+    )
+    .bind(run_id)
+    .bind(kind)
+    .bind(Json(data))
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+async fn push_audit(tx: &mut sqlx::PgConnection, a: Option<&AuditEvent>) -> JResult<()> {
+    let Some(a) = a else { return Ok(()) };
+    sqlx::query(
+        "INSERT INTO node_audit (id, tenant_id, actor, action, target, detail, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(&a.id)
+    .bind(&a.tenant_id)
+    .bind(&a.actor)
+    .bind(&a.action)
+    .bind(&a.target)
+    .bind(Json(&a.detail))
+    .bind(a.at)
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
+    Ok(())
 }
 
 fn step_row(r: &PgRow) -> JResult<StepRecord> {
@@ -115,8 +172,11 @@ fn step_row(r: &PgRow) -> JResult<StepRecord> {
         input_hash: get(r, "input_hash")?,
         status: if status == "completed" { StepStatus::Completed } else { StepStatus::Failed },
         result: get(r, "result")?,
-        tokens: u64::try_from(get::<i64>(r, "tokens")?).unwrap_or_default(),
+        tokens: u64_of(r, "tokens")?,
+        prompt_tokens: u64_of(r, "prompt_tokens")?,
+        completion_tokens: u64_of(r, "completion_tokens")?,
         usd: get(r, "usd")?,
+        labels: serde_json::from_value(get::<Json<serde_json::Value>>(r, "labels")?.0).unwrap_or_default(),
         started_at: get(r, "started_at")?,
         finished_at: get(r, "finished_at")?,
     })
@@ -186,10 +246,11 @@ impl Journal for PgJournal {
 
     async fn create_run(&self, run: NewRun) -> JResult<Created> {
         let (key, fp) = run.idempotency.clone().map_or((None, None), |(k, f)| (Some(k), Some(f)));
+        let mut tx = self.pool.begin().await.map_err(db)?;
         let inserted = sqlx::query(concat!(
             "INSERT INTO node_run (id, tenant_id, node, version, spec_hash, invoker, invoker_key_hash, input, status,
-                                   budget, idempotency_key, idempotency_fingerprint, specs)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12)
+                                   budget, idempotency_key, idempotency_fingerprint, specs, origin, event_seq)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12, $13, 1)
              ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
              RETURNING ",
             run_columns!()
@@ -206,12 +267,24 @@ impl Journal for PgJournal {
         .bind(&key)
         .bind(&fp)
         .bind(&run.specs)
-        .fetch_optional(&self.pool)
+        .bind(&run.origin)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db)?;
         if let Some(r) = inserted {
-            return Ok(Created::New(run_row(&r)?));
+            let rec = run_row(&r)?;
+            sqlx::query("INSERT INTO node_run_event (run_id, seq, tenant_id, kind, data) VALUES ($1, 1, $2, $3, $4)")
+                .bind(&rec.id)
+                .bind(&rec.tenant_id)
+                .bind(event::RUN_CREATED)
+                .bind(Json(serde_json::json!({"node": rec.node, "version": rec.version})))
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            tx.commit().await.map_err(db)?;
+            return Ok(Created::New(rec));
         }
+        tx.rollback().await.map_err(db)?;
         // The key was used before by this tenant.
         let existing = sqlx::query(concat!(
             "SELECT ",
@@ -240,15 +313,11 @@ impl Journal for PgJournal {
     }
 
     async fn steps(&self, run_id: &str) -> JResult<Vec<StepRecord>> {
-        let rows = sqlx::query(
-            "SELECT run_id, tenant_id, step_id, attempt, vertex, kind, input_hash, status, result, tokens, usd,
-                    started_at, finished_at
-             FROM node_step WHERE run_id = $1 ORDER BY seq",
-        )
-        .bind(run_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db)?;
+        let rows = sqlx::query(concat!("SELECT ", step_columns!(), " FROM node_step WHERE run_id = $1 ORDER BY seq"))
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
         rows.iter().map(step_row).collect()
     }
 
@@ -321,8 +390,8 @@ impl Journal for PgJournal {
         }
         let inserted = sqlx::query(
             "INSERT INTO node_step (run_id, step_id, tenant_id, attempt, vertex, kind, input_hash, status, result, tokens,
-                                    usd, started_at, finished_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                                    usd, started_at, finished_at, prompt_tokens, completion_tokens, labels)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
              ON CONFLICT (run_id, step_id) DO NOTHING",
         )
         .bind(&step.run_id)
@@ -341,10 +410,14 @@ impl Journal for PgJournal {
         .bind(step.usd)
         .bind(step.started_at)
         .bind(step.finished_at)
+        .bind(i64_of(step.prompt_tokens))
+        .bind(i64_of(step.completion_tokens))
+        .bind(Json(&step.labels))
         .execute(&mut *tx)
         .await
         .map_err(db)?;
         let out = if inserted.rows_affected() == 1 {
+            push_event(&mut tx, &step.run_id, event::STEP_FINISHED, &step_event(&step, budget.usd)).await?;
             // The step's cost counts towards the tenant's spend once: the step is written once.
             if step.usd > 0.0 {
                 sqlx::query(
@@ -359,16 +432,13 @@ impl Journal for PgJournal {
             }
             StepWrite::Written
         } else {
-            let r = sqlx::query(
-                "SELECT run_id, tenant_id, step_id, attempt, vertex, kind, input_hash, status, result, tokens, usd,
-                        started_at, finished_at
-                 FROM node_step WHERE run_id = $1 AND step_id = $2",
-            )
-            .bind(&step.run_id)
-            .bind(&step.step_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db)?;
+            let r =
+                sqlx::query(concat!("SELECT ", step_columns!(), " FROM node_step WHERE run_id = $1 AND step_id = $2"))
+                    .bind(&step.run_id)
+                    .bind(&step.step_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db)?;
             StepWrite::Existing(Box::new(step_row(&r)?))
         };
         tx.commit().await.map_err(db)?;
@@ -379,10 +449,12 @@ impl Journal for PgJournal {
         if !matches!(s.status, RunStatus::Sleeping | RunStatus::InputRequired) {
             return Err(JournalError(format!("cannot suspend a run as {}", s.status.as_str())));
         }
+        let (kind, data) = suspend_event(&s);
+        let mut tx = self.pool.begin().await.map_err(db)?;
         let r = sqlx::query(
             "UPDATE node_run SET status = $3, awaiting = $4, prompt = $5, wake_at = $6, budget = $7,
                                  lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
-             WHERE id = $1 AND lease_owner = $2 AND status = 'running'",
+             WHERE id = $1 AND lease_owner = $2 AND status = 'running' AND cancel_requested_at IS NULL",
         )
         .bind(run_id)
         .bind(worker)
@@ -391,16 +463,23 @@ impl Journal for PgJournal {
         .bind(&s.prompt)
         .bind(s.wake_at)
         .bind(budget_json(&s.budget)?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(db)?;
-        Ok(r.rows_affected() == 1)
+        if r.rows_affected() != 1 {
+            return Ok(false);
+        }
+        push_event(&mut tx, run_id, kind, &data).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
     }
 
     async fn finish(&self, run_id: &str, worker: &str, f: Finish) -> JResult<bool> {
         if !f.status.is_terminal() {
             return Err(JournalError(format!("cannot finish a run as {}", f.status.as_str())));
         }
+        let data = finish_event(f.status, f.error.as_deref(), f.stop_reason.as_deref(), f.budget.usd);
+        let mut tx = self.pool.begin().await.map_err(db)?;
         let r = sqlx::query(
             "UPDATE node_run SET status = $3, output = $4, error = $5, stop_reason = $6, budget = $7,
                                  lease_owner = NULL, lease_expires_at = NULL, wake_at = NULL,
@@ -414,10 +493,15 @@ impl Journal for PgJournal {
         .bind(&f.error)
         .bind(&f.stop_reason)
         .bind(budget_json(&f.budget)?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(db)?;
-        Ok(r.rows_affected() == 1)
+        if r.rows_affected() != 1 {
+            return Ok(false);
+        }
+        push_event(&mut tx, run_id, event::RUN_FINISHED, &data).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
     }
 
     async fn purge_finished(&self, older_than: Duration, batch: usize) -> JResult<u64> {
@@ -425,7 +509,7 @@ impl Journal for PgJournal {
         let r = sqlx::query(
             "DELETE FROM node_run WHERE id IN (
                  SELECT id FROM node_run
-                 WHERE status IN ('succeeded', 'failed', 'budget_exhausted') AND finished_at IS NOT NULL
+                 WHERE status IN ('succeeded', 'failed', 'budget_exhausted', 'cancelled') AND finished_at IS NOT NULL
                        AND finished_at < now() - make_interval(secs => $1)
                  ORDER BY finished_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
         )
@@ -502,7 +586,15 @@ impl Journal for PgJournal {
         Ok(false)
     }
 
-    async fn deliver_input(&self, tenant: &str, run_id: &str, step: &str, payload: String) -> JResult<Delivered> {
+    async fn deliver_input(
+        &self,
+        tenant: &str,
+        run_id: &str,
+        step: &str,
+        payload: String,
+        by: Option<&str>,
+        audit: Option<AuditEvent>,
+    ) -> JResult<Delivered> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         let woken = sqlx::query(
             "UPDATE node_run SET status = 'pending', wake_at = NULL, awaiting = NULL, prompt = NULL, updated_at = now()
@@ -534,7 +626,186 @@ impl Journal for PgJournal {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+        push_event(&mut tx, run_id, event::RUN_INPUT_RECEIVED, &serde_json::json!({"step": step, "by": by})).await?;
+        push_audit(&mut tx, audit.as_ref()).await?;
         tx.commit().await.map_err(db)?;
         Ok(Delivered::Accepted)
+    }
+
+    async fn start_step(&self, run_id: &str, worker: &str, data: serde_json::Value) -> JResult<StepStart> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        // Fenced like a checkpoint; the row lock orders the event.
+        let held: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
+            "SELECT cancel_requested_at FROM node_run WHERE id = $1 AND lease_owner = $2 AND status = 'running'
+             FOR UPDATE",
+        )
+        .bind(run_id)
+        .bind(worker)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let out = match held {
+            None => StepStart::LeaseLost,
+            Some(Some(_)) => StepStart::Cancelled,
+            Some(None) => {
+                push_event(&mut tx, run_id, event::STEP_STARTED, &data).await?;
+                StepStart::Started
+            }
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(out)
+    }
+
+    async fn cancel_requested(&self, run_id: &str) -> JResult<bool> {
+        let r: Option<bool> = sqlx::query_scalar("SELECT cancel_requested_at IS NOT NULL FROM node_run WHERE id = $1")
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(r.unwrap_or(false))
+    }
+
+    async fn cancel(&self, tenant: &str, run_id: &str, by: &str, audit: Option<AuditEvent>) -> JResult<Cancelled> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let row: Option<(String, Option<DateTime<Utc>>, Json<serde_json::Value>)> = sqlx::query_as(
+            "SELECT status, cancel_requested_at, budget FROM node_run WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(run_id)
+        .bind(tenant)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let Some((status, requested, budget)) = row else { return Ok(Cancelled::NotFound) };
+        let status = RunStatus::parse(&status).ok_or_else(|| JournalError(format!("unknown run status {status}")))?;
+        let out = match status {
+            s if s.is_terminal() => return Ok(Cancelled::AlreadyEnded(s)),
+            RunStatus::Running if requested.is_some() => return Ok(Cancelled::Requested),
+            RunStatus::Running => {
+                sqlx::query(
+                    "UPDATE node_run SET cancel_requested_at = now(), cancelled_by = $2, updated_at = now() WHERE id = $1",
+                )
+                .bind(run_id)
+                .bind(by)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+                push_event(&mut tx, run_id, event::RUN_CANCEL_REQUESTED, &serde_json::json!({"by": by})).await?;
+                Cancelled::Requested
+            }
+            _ => {
+                let reason = format!("cancelled by {by}");
+                sqlx::query(
+                    "UPDATE node_run SET status = 'cancelled', cancel_requested_at = now(), cancelled_by = $2,
+                                         stop_reason = $3, wake_at = NULL, awaiting = NULL, prompt = NULL,
+                                         updated_at = now(), finished_at = now()
+                     WHERE id = $1",
+                )
+                .bind(run_id)
+                .bind(by)
+                .bind(&reason)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+                let usd = budget.0.get("usd").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                let data = finish_event(RunStatus::Cancelled, None, Some(&reason), usd);
+                push_event(&mut tx, run_id, event::RUN_FINISHED, &data).await?;
+                Cancelled::Ended
+            }
+        };
+        push_audit(&mut tx, audit.as_ref()).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(out)
+    }
+
+    async fn events(&self, tenant: &str, run_id: &str, after: u64, limit: usize) -> JResult<Vec<RunEvent>> {
+        let rows = sqlx::query(
+            "SELECT run_id, seq, kind, data, created_at FROM node_run_event
+             WHERE run_id = $1 AND tenant_id = $2 AND seq > $3 ORDER BY seq LIMIT $4",
+        )
+        .bind(run_id)
+        .bind(tenant)
+        .bind(i64_of(after))
+        .bind(i64_of(limit as u64))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|r| {
+                Ok(RunEvent {
+                    run_id: get(r, "run_id")?,
+                    seq: u64_of(r, "seq")?,
+                    kind: get(r, "kind")?,
+                    data: get::<Json<serde_json::Value>>(r, "data")?.0,
+                    created_at: get(r, "created_at")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_runs(&self, q: &RunQuery) -> JResult<Vec<RunRecord>> {
+        let statuses: Vec<&str> = q.statuses.iter().map(|s| s.as_str()).collect();
+        let (before_at, before_id) = q.before.clone().map_or((None, None), |(t, id)| (Some(t), Some(id)));
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            run_columns!(),
+            " FROM node_run
+             WHERE tenant_id = $1
+               AND ($2::TEXT[] IS NULL OR node = ANY($2))
+               AND ($3::TEXT IS NULL OR node = $3)
+               AND (cardinality($4::TEXT[]) = 0 OR status = ANY($4))
+               AND ($5::TIMESTAMPTZ IS NULL OR created_at >= $5)
+               AND ($6::TIMESTAMPTZ IS NULL OR created_at < $6)
+               AND ($7::TIMESTAMPTZ IS NULL OR (created_at, id) < ($7, $8))
+             ORDER BY created_at DESC, id DESC LIMIT $9"
+        ))
+        .bind(&q.tenant)
+        .bind(&q.nodes)
+        .bind(&q.node)
+        .bind(&statuses)
+        .bind(q.created_after)
+        .bind(q.created_before)
+        .bind(before_at)
+        .bind(before_id)
+        .bind(i64_of(q.limit as u64))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter().map(run_row).collect()
+    }
+
+    async fn claim_audit(&self, worker: &str, ttl: Duration, limit: usize) -> JResult<Vec<AuditEvent>> {
+        let rows = sqlx::query(
+            "UPDATE node_audit SET claimed_by = $1, claimed_until = now() + make_interval(secs => $2)
+             WHERE id IN (SELECT id FROM node_audit WHERE claimed_until IS NULL OR claimed_until < now()
+                          ORDER BY created_at LIMIT $3 FOR UPDATE SKIP LOCKED)
+             RETURNING id, tenant_id, actor, action, target, detail, created_at",
+        )
+        .bind(worker)
+        .bind(secs(ttl))
+        .bind(i64_of(limit as u64))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let mut out: Vec<AuditEvent> = rows
+            .iter()
+            .map(|r| {
+                Ok(AuditEvent {
+                    id: get(r, "id")?,
+                    tenant_id: get(r, "tenant_id")?,
+                    actor: get(r, "actor")?,
+                    action: get(r, "action")?,
+                    target: get(r, "target")?,
+                    detail: get::<Json<serde_json::Value>>(r, "detail")?.0,
+                    at: get(r, "created_at")?,
+                })
+            })
+            .collect::<JResult<_>>()?;
+        out.sort_by_key(|a| a.at);
+        Ok(out)
+    }
+
+    async fn ack_audit(&self, ids: &[String]) -> JResult<()> {
+        sqlx::query("DELETE FROM node_audit WHERE id = ANY($1)").bind(ids).execute(&self.pool).await.map_err(db)?;
+        Ok(())
     }
 }

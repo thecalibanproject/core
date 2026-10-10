@@ -15,6 +15,9 @@ use serde_json::Value;
 use std::sync::Arc;
 
 pub async fn messages(State(gw): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(r) = crate::node_chat::maybe_handle(&gw, &headers, &body, Dialect::Anthropic, false).await {
+        return r;
+    }
     match pipeline::handle(gw, headers, body, Dialect::Anthropic, None).await {
         Ok(r) => r,
         Err(e) => e.with_dialect(Dialect::Anthropic).into_response(),

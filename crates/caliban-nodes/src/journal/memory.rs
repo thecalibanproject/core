@@ -14,6 +14,37 @@ struct Tables {
     events: HashMap<(String, String), EventRecord>,
     /// (tenant, UTC day) to USD.
     spend: HashMap<(String, chrono::NaiveDate), f64>,
+    /// Run id to its events, in order.
+    run_events: HashMap<String, Vec<RunEvent>>,
+    /// The audit outbox, in creation order, with who holds each entry and until when.
+    audit: Vec<(AuditEvent, Option<Hold>)>,
+}
+
+/// Who holds an outbox entry, and until when.
+type Hold = (String, DateTime<Utc>);
+
+impl Tables {
+    /// Appends an event to a run (numbered after its last one).
+    fn push_event(&mut self, run_id: &str, kind: &str, data: serde_json::Value) {
+        let Some(r) = self.runs.iter_mut().find(|r| r.id == run_id) else { return };
+        r.last_event += 1;
+        let ev = RunEvent {
+            run_id: run_id.to_owned(),
+            seq: r.last_event,
+            kind: kind.to_owned(),
+            data,
+            created_at: Utc::now(),
+        };
+        self.run_events.entry(run_id.to_owned()).or_default().push(ev);
+    }
+
+    fn push_audit(&mut self, a: Option<AuditEvent>) {
+        if let Some(a) = a
+            && !self.audit.iter().any(|(x, _)| x.id == a.id)
+        {
+            self.audit.push((a, None));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -112,8 +143,15 @@ impl Journal for MemoryJournal {
             updated_at: now,
             started_at: None,
             finished_at: None,
+            cancel_requested_at: None,
+            cancelled_by: None,
+            origin: run.origin,
+            last_event: 0,
         };
+        let data = serde_json::json!({"node": rec.node, "version": rec.version});
         t.runs.push(rec.clone());
+        t.push_event(&rec.id, event::RUN_CREATED, data);
+        let rec = t.runs.last().cloned().unwrap_or(rec);
         Ok(Created::New(rec))
     }
 
@@ -178,6 +216,8 @@ impl Journal for MemoryJournal {
         if step.usd > 0.0 {
             *t.spend.entry((step.tenant_id.clone(), Utc::now().date_naive())).or_default() += step.usd;
         }
+        let data = step_event(&step, budget.usd);
+        t.push_event(&step.run_id, event::STEP_FINISHED, data);
         t.steps.entry(step.run_id.clone()).or_default().push(step);
         Ok(StepWrite::Written)
     }
@@ -187,7 +227,9 @@ impl Journal for MemoryJournal {
             return Err(JournalError(format!("cannot suspend a run as {}", s.status.as_str())));
         }
         let mut t = self.t.lock();
-        Ok(match t.runs.iter_mut().find(|r| r.id == run_id && holds(r, worker)) {
+        let (kind, data) = suspend_event(&s);
+        let ok = match t.runs.iter_mut().find(|r| r.id == run_id && holds(r, worker) && r.cancel_requested_at.is_none())
+        {
             Some(r) => {
                 r.status = s.status;
                 r.awaiting = s.awaiting;
@@ -200,7 +242,11 @@ impl Journal for MemoryJournal {
                 true
             }
             None => false,
-        })
+        };
+        if ok {
+            t.push_event(run_id, kind, data);
+        }
+        Ok(ok)
     }
 
     async fn finish(&self, run_id: &str, worker: &str, f: Finish) -> JResult<bool> {
@@ -208,7 +254,8 @@ impl Journal for MemoryJournal {
             return Err(JournalError(format!("cannot finish a run as {}", f.status.as_str())));
         }
         let mut t = self.t.lock();
-        Ok(match t.runs.iter_mut().find(|r| r.id == run_id && holds(r, worker)) {
+        let data = finish_event(f.status, f.error.as_deref(), f.stop_reason.as_deref(), f.budget.usd);
+        let ok = match t.runs.iter_mut().find(|r| r.id == run_id && holds(r, worker)) {
             Some(r) => {
                 let now = Utc::now();
                 r.status = f.status;
@@ -224,7 +271,11 @@ impl Journal for MemoryJournal {
                 true
             }
             None => false,
-        })
+        };
+        if ok {
+            t.push_event(run_id, event::RUN_FINISHED, data);
+        }
+        Ok(ok)
     }
 
     async fn purge_finished(&self, older_than: Duration, batch: usize) -> JResult<u64> {
@@ -240,6 +291,7 @@ impl Journal for MemoryJournal {
         t.runs.retain(|r| !gone.contains(&r.id));
         for id in &gone {
             t.steps.remove(id);
+            t.run_events.remove(id);
         }
         t.events.retain(|(run, _), _| !gone.contains(run));
         Ok(gone.len() as u64)
@@ -286,7 +338,15 @@ impl Journal for MemoryJournal {
         Ok(true)
     }
 
-    async fn deliver_input(&self, tenant: &str, run_id: &str, step: &str, payload: String) -> JResult<Delivered> {
+    async fn deliver_input(
+        &self,
+        tenant: &str,
+        run_id: &str,
+        step: &str,
+        payload: String,
+        by: Option<&str>,
+        audit: Option<AuditEvent>,
+    ) -> JResult<Delivered> {
         let mut t = self.t.lock();
         let Some(r) = t.runs.iter_mut().find(|r| r.id == run_id && r.tenant_id == tenant) else {
             return Ok(Delivered::NotFound);
@@ -308,6 +368,99 @@ impl Journal for MemoryJournal {
             payload: Some(payload),
             created_at: now,
         });
+        t.push_event(run_id, event::RUN_INPUT_RECEIVED, serde_json::json!({"step": step, "by": by}));
+        t.push_audit(audit);
         Ok(Delivered::Accepted)
+    }
+
+    async fn start_step(&self, run_id: &str, worker: &str, data: serde_json::Value) -> JResult<StepStart> {
+        let mut t = self.t.lock();
+        let Some(r) = t.runs.iter().find(|r| r.id == run_id && holds(r, worker)) else {
+            return Ok(StepStart::LeaseLost);
+        };
+        if r.cancel_requested_at.is_some() {
+            return Ok(StepStart::Cancelled);
+        }
+        t.push_event(run_id, event::STEP_STARTED, data);
+        Ok(StepStart::Started)
+    }
+
+    async fn cancel_requested(&self, run_id: &str) -> JResult<bool> {
+        Ok(self.t.lock().runs.iter().any(|r| r.id == run_id && r.cancel_requested_at.is_some()))
+    }
+
+    async fn cancel(&self, tenant: &str, run_id: &str, by: &str, audit: Option<AuditEvent>) -> JResult<Cancelled> {
+        let mut t = self.t.lock();
+        let now = Utc::now();
+        let Some(r) = t.runs.iter_mut().find(|r| r.id == run_id && r.tenant_id == tenant) else {
+            return Ok(Cancelled::NotFound);
+        };
+        let out = match r.status {
+            s if s.is_terminal() => return Ok(Cancelled::AlreadyEnded(s)),
+            RunStatus::Running if r.cancel_requested_at.is_some() => return Ok(Cancelled::Requested),
+            RunStatus::Running => {
+                r.cancel_requested_at = Some(now);
+                r.cancelled_by = Some(by.to_owned());
+                r.updated_at = now;
+                (Cancelled::Requested, event::RUN_CANCEL_REQUESTED, serde_json::json!({"by": by}))
+            }
+            _ => {
+                let reason = format!("cancelled by {by}");
+                r.status = RunStatus::Cancelled;
+                r.cancel_requested_at = Some(now);
+                r.cancelled_by = Some(by.to_owned());
+                r.stop_reason = Some(reason.clone());
+                r.wake_at = None;
+                r.awaiting = None;
+                r.prompt = None;
+                r.updated_at = now;
+                r.finished_at = Some(now);
+                let data = finish_event(RunStatus::Cancelled, None, Some(&reason), r.budget.usd);
+                (Cancelled::Ended, event::RUN_FINISHED, data)
+            }
+        };
+        t.push_event(run_id, out.1, out.2);
+        t.push_audit(audit);
+        Ok(out.0)
+    }
+
+    async fn events(&self, tenant: &str, run_id: &str, after: u64, limit: usize) -> JResult<Vec<RunEvent>> {
+        let t = self.t.lock();
+        if !t.runs.iter().any(|r| r.id == run_id && r.tenant_id == tenant) {
+            return Ok(Vec::new());
+        }
+        Ok(t.run_events
+            .get(run_id)
+            .map(|v| v.iter().filter(|e| e.seq > after).take(limit).cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn list_runs(&self, q: &RunQuery) -> JResult<Vec<RunRecord>> {
+        let t = self.t.lock();
+        let mut v: Vec<RunRecord> = t.runs.iter().filter(|r| q.matches(r)).cloned().collect();
+        v.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
+        v.truncate(q.limit);
+        Ok(v)
+    }
+
+    async fn claim_audit(&self, worker: &str, ttl: Duration, limit: usize) -> JResult<Vec<AuditEvent>> {
+        let now = Utc::now();
+        let mut t = self.t.lock();
+        let mut out = Vec::new();
+        for (a, held) in &mut t.audit {
+            if out.len() >= limit {
+                break;
+            }
+            if held.as_ref().is_none_or(|(_, until)| *until < now) {
+                *held = Some((worker.to_owned(), now + lease(ttl)));
+                out.push(a.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    async fn ack_audit(&self, ids: &[String]) -> JResult<()> {
+        self.t.lock().audit.retain(|(a, _)| !ids.contains(&a.id));
+        Ok(())
     }
 }

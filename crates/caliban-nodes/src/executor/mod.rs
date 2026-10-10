@@ -29,8 +29,8 @@ pub use tools::{DataGuard, FnTool, NoGuard, NoTools, StaticTools, Tool, ToolCtx,
 
 use crate::budget::{BudgetError, BudgetState, Ledger};
 use crate::journal::{
-    Created, Delivered, EventKind, Finish, Journal, NewRun, RunRecord, RunStatus, StepRecord, StepStatus, StepWrite,
-    Suspend,
+    AuditEvent, Cancelled, Created, Delivered, EventKind, Finish, Journal, NewRun, RunEvent, RunQuery, RunRecord,
+    RunStatus, StepRecord, StepStart, StepStatus, StepWrite, Suspend,
 };
 use crate::seal::Sealer;
 use crate::{NodeKind, NodeSpec};
@@ -44,6 +44,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+
+tokio::task_local! {
+    /// Taint labels of what the step being built consumes (set around each vertex, tool call and
+    /// agent turn), so a checkpoint records its output's labels.
+    static CONSUMED: taint::Taint;
+}
+
+/// The labels in scope (see [`CONSUMED`]).
+fn consumed() -> taint::Taint {
+    CONSUMED.try_with(Clone::clone).unwrap_or_default()
+}
+
+/// Runs `f` with `t` as the labels of what it consumes.
+pub(crate) async fn consuming<F: std::future::Future>(t: taint::Taint, f: F) -> F::Output {
+    CONSUMED.scope(t, f).await
+}
 
 // ───────────────────────────── what the executor needs ─────────────────────────────
 
@@ -68,6 +84,8 @@ pub struct ModelReply {
     pub message: Value,
     /// Prompt and completion tokens.
     pub tokens: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
     pub usd: f64,
     /// The response was a stored one (an `Idempotency-Key` replay): nothing was paid again.
     pub replayed: bool,
@@ -181,12 +199,20 @@ pub struct StartRun {
     /// `None`: the promoted version.
     pub version: Option<u32>,
     pub input: Value,
+    /// Chat messages instead of `input`: mapped to the node's input by [`crate::chat`].
+    pub chat: Option<Vec<Value>>,
     pub invoker: String,
     pub invoker_key_hash: Option<String>,
     /// Client `Idempotency-Key` and the request fingerprint.
     pub idempotency: Option<(String, String)>,
     /// Run-level limits: each one lowers the version's budget for this run (never raises it).
     pub budget: Option<RunBudget>,
+    /// What started the run, when not a run request (`auto:<intent>`).
+    pub origin: Option<String>,
+    /// Refuse the run ([`ExecError::OverBudget`]) instead of creating one that would stop at its
+    /// first model call: the tenant's node spend caps are reached, or what is left of them is less
+    /// than the version's `budgets.usd` (`caliban/auto` falls back to a model call then).
+    pub check_spend: bool,
 }
 
 /// Run-level budget (`"budget"` on `POST /v1/nodes/{name}/runs`).
@@ -209,6 +235,9 @@ pub enum ExecError {
     KeyReused,
     #[error("{0}")]
     Conflict(String),
+    /// The tenant's node spend caps leave no room for the run (only with [`StartRun::check_spend`]).
+    #[error("{0}")]
+    OverBudget(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -237,11 +266,70 @@ pub struct RunView {
     pub budget: BudgetState,
     /// What the run spent on model calls so far (USD, priced like the metering).
     pub cost_usd: f64,
+    /// The run's model calls so far (prompt and completion tokens).
+    pub usage: RunUsage,
     pub steps: Vec<StepView>,
     pub claims: u32,
+    /// What started the run when it was not a run request (`auto:<intent>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// A cancellation was asked for and the run has not stopped yet.
+    pub cancel_requested: bool,
+    /// The number of the run's last event (`GET /v1/runs/{id}/events?after=` resumes there).
+    pub last_event: u64,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// Token usage of a run's model calls.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct RunUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl RunUsage {
+    pub fn of(steps: &[StepRecord]) -> Self {
+        let (p, c) = steps.iter().fold((0, 0), |(p, c), s| (p + s.prompt_tokens, c + s.completion_tokens));
+        Self { prompt_tokens: p, completion_tokens: c, total_tokens: p + c }
+    }
+}
+
+/// A run in a listing (`GET /v1/runs`): no steps and no content.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RunSummary {
+    pub id: String,
+    pub object: &'static str,
+    pub node: String,
+    pub version: u32,
+    pub status: RunStatus,
+    pub awaiting_step: Option<String>,
+    pub cost_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub invoker: String,
+    pub created_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl RunSummary {
+    pub fn of(r: &RunRecord) -> Self {
+        Self {
+            id: r.id.clone(),
+            object: "node.run",
+            node: r.node.clone(),
+            version: r.version,
+            status: r.status,
+            awaiting_step: r.awaiting.clone(),
+            cost_usd: r.budget.usd,
+            origin: r.origin.clone(),
+            invoker: r.invoker.clone(),
+            created_at: r.created_at,
+            finished_at: r.finished_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -257,8 +345,31 @@ pub struct StepView {
     pub kind: String,
     pub status: StepStatus,
     pub tokens: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
     pub usd: f64,
+    /// Taint labels of the step's output.
+    pub labels: Vec<String>,
+    pub started_at: DateTime<Utc>,
     pub duration_ms: i64,
+}
+
+impl StepView {
+    pub fn of(s: &StepRecord) -> Self {
+        Self {
+            id: s.step_id.clone(),
+            vertex: s.vertex.clone(),
+            kind: s.kind.clone(),
+            status: s.status,
+            tokens: s.tokens,
+            prompt_tokens: s.prompt_tokens,
+            completion_tokens: s.completion_tokens,
+            usd: s.usd,
+            labels: s.labels.clone(),
+            started_at: s.started_at,
+            duration_ms: (s.finished_at - s.started_at).num_milliseconds(),
+        }
+    }
 }
 
 // ───────────────────────────── the executor ─────────────────────────────
@@ -281,6 +392,9 @@ pub struct Executor {
     active: Mutex<std::collections::HashSet<String>>,
     /// Circuit breakers per (tenant, tool), in this process.
     breakers: Mutex<HashMap<(String, String), breaker::Breaker>>,
+    /// Notified whenever this process writes a run event (event streams wake up at once; events
+    /// written by other workers are seen at the next poll).
+    events: Notify,
 }
 
 impl Executor {
@@ -307,7 +421,28 @@ impl Executor {
             watchers: Mutex::default(),
             active: Mutex::default(),
             breakers: Mutex::default(),
+            events: Notify::new(),
         }
+    }
+
+    /// The sealer of run data (event streams open questions with it).
+    pub fn sealer(&self) -> &Arc<dyn Sealer> {
+        &self.sealer
+    }
+
+    /// How often an idle worker polls (event streams poll as often for other workers' events).
+    pub fn poll_interval(&self) -> Duration {
+        self.opts.poll
+    }
+
+    /// Resolves when this process writes a run event (or at once if one was written since the
+    /// returned future was created and polled).
+    pub fn event_written(&self) -> tokio::sync::futures::Notified<'_> {
+        self.events.notified()
+    }
+
+    fn changed(&self) {
+        self.events.notify_waiters();
     }
 
     /// The state of a tool's circuit breaker for a tenant (`Closed` when it never failed).
@@ -347,6 +482,10 @@ impl Executor {
     /// (`false`: an earlier request with the same `Idempotency-Key` created it).
     pub async fn create(&self, req: StartRun) -> Result<(RunRecord, bool), ExecError> {
         let node = self.nodes.resolve(&req.tenant, &req.node, req.version).map_err(ExecError::NotFound)?;
+        let mut req = req;
+        if let Some(messages) = req.chat.take() {
+            req.input = crate::chat::input_from_messages(&node.spec, &messages).map_err(ExecError::Invalid)?;
+        }
         if let Some(s) = node.spec.input_schema() {
             crate::schema::validate(s, &req.input).map_err(|e| ExecError::Invalid(format!("input: {e}")))?;
         }
@@ -357,6 +496,9 @@ impl Executor {
         let specs = pin_specs(&self.nodes, &req.tenant, &node);
         let specs = self.sealer.seal(&req.tenant, &id, &specs.to_string()).map_err(ExecError::Internal)?;
         let budget = run_budget(&node.spec, req.budget.as_ref()).map_err(ExecError::Invalid)?;
+        if req.check_spend {
+            self.check_spend(&req.tenant, &node, budget.usd_limit).await?;
+        }
         let run = NewRun {
             id,
             tenant_id: req.tenant,
@@ -369,6 +511,7 @@ impl Executor {
             budget,
             idempotency: req.idempotency,
             specs: Some(specs),
+            origin: req.origin,
         };
         let out = match self.journal.create_run(run).await? {
             Created::New(r) => (r, true),
@@ -376,7 +519,33 @@ impl Executor {
             Created::KeyReused => return Err(ExecError::KeyReused),
         };
         self.wake.notify_one();
+        self.changed();
         Ok(out)
+    }
+
+    /// Whether the tenant's node spend caps leave room for a run of `node` (see
+    /// [`StartRun::check_spend`]).
+    async fn check_spend(&self, tenant: &str, node: &ResolvedNode, usd_limit: Option<f64>) -> Result<(), ExecError> {
+        let caps = self.nodes.tenant_policy(tenant).spend;
+        if caps.daily_usd.is_none() && caps.monthly_usd.is_none() {
+            return Ok(());
+        }
+        let spent = self.journal.tenant_spend(tenant).await?;
+        let need = usd_limit.unwrap_or(0.0);
+        for (what, cap, used) in
+            [("daily", caps.daily_usd, spent.today_usd), ("monthly", caps.monthly_usd, spent.month_usd)]
+        {
+            if let Some(cap) = cap
+                && (used >= cap || cap - used < need)
+            {
+                return Err(ExecError::OverBudget(format!(
+                    "node {}: the tenant's {what} node spend cap leaves ${:.6} (of ${cap:.6}); a run may spend ${need:.6}",
+                    node.name,
+                    (cap - used).max(0.0)
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Claims this run if it is runnable and executes it until it ends or suspends. Returns
@@ -438,6 +607,7 @@ impl Executor {
         };
         let output = open(&r.output)?.map(|o| serde_json::from_str(&o).unwrap_or(Value::String(o)));
         let question = open(&r.prompt)?;
+        let usage = RunUsage::of(&steps);
         Ok(Some(RunView {
             id: r.id.clone(),
             object: "node.run",
@@ -452,19 +622,12 @@ impl Executor {
             awaiting: r.awaiting.clone().map(|step| Awaiting { step, question }),
             budget: r.budget,
             cost_usd: r.budget.usd,
-            steps: steps
-                .iter()
-                .map(|s| StepView {
-                    id: s.step_id.clone(),
-                    vertex: s.vertex.clone(),
-                    kind: s.kind.clone(),
-                    status: s.status,
-                    tokens: s.tokens,
-                    usd: s.usd,
-                    duration_ms: (s.finished_at - s.started_at).num_milliseconds(),
-                })
-                .collect(),
+            usage,
+            steps: steps.iter().map(StepView::of).collect(),
             claims: r.claims,
+            origin: r.origin.clone(),
+            cancel_requested: r.cancel_requested_at.is_some() && !r.status.is_terminal(),
+            last_event: r.last_event,
             created_at: r.created_at,
             started_at: r.started_at,
             finished_at: r.finished_at,
@@ -482,15 +645,38 @@ impl Executor {
         answer: &Value,
         by: Option<&str>,
     ) -> Result<Delivered, ExecError> {
-        let Some(r) = self.journal.get_run(tenant, run_id).await? else { return Ok(Delivered::NotFound) };
-        let Some(step) = step.map(str::to_owned).or(r.awaiting) else { return Ok(Delivered::NotAwaiting) };
-        let body = json!({"$answer": answer, "$by": by});
-        let sealed = self.sealer.seal(tenant, run_id, &body.to_string()).map_err(ExecError::Internal)?;
-        let d = self.journal.deliver_input(tenant, run_id, &step, sealed).await?;
+        let d = deliver(&self.journal, self.sealer.as_ref(), tenant, run_id, step, answer, by).await?;
         if d == Delivered::Accepted {
             self.wake.notify_one();
+            self.changed();
         }
         Ok(d)
+    }
+
+    /// Cancels a run (see [`Journal::cancel`]), audited as `node.run.cancel` with `by`.
+    pub async fn cancel(&self, tenant: &str, run_id: &str, by: &str) -> Result<Cancelled, ExecError> {
+        let out = cancel(&self.journal, tenant, run_id, by).await?;
+        if matches!(out, Cancelled::Ended | Cancelled::Requested) {
+            self.changed();
+            self.notify_watchers(run_id);
+        }
+        Ok(out)
+    }
+
+    /// The run's events after `after` (at most `limit`).
+    pub async fn events(
+        &self,
+        tenant: &str,
+        run_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<RunEvent>, ExecError> {
+        Ok(self.journal.events(tenant, run_id, after, limit).await?)
+    }
+
+    /// Runs of a tenant, newest first.
+    pub async fn list(&self, q: &RunQuery) -> Result<Vec<RunRecord>, ExecError> {
+        Ok(self.journal.list_runs(q).await?)
     }
 
     /// Waits until the run ends or waits for a human, at most until `deadline`, and returns it.
@@ -636,6 +822,16 @@ impl Executor {
                 };
                 self.journal.finish(run_id, &self.worker, f).await
             }
+            Stop::Cancelled(by) => {
+                let f = Finish {
+                    status: RunStatus::Cancelled,
+                    output: partial.as_ref().and_then(seal),
+                    error: None,
+                    stop_reason: Some(format!("cancelled by {by}")),
+                    budget,
+                };
+                self.journal.finish(run_id, &self.worker, f).await
+            }
             Stop::Suspend(s) => {
                 let s = Suspend {
                     status: s.status,
@@ -644,9 +840,30 @@ impl Executor {
                     wake_at: s.wake_at,
                     budget,
                 };
-                self.journal.suspend(run_id, &self.worker, s).await
+                match self.journal.suspend(run_id, &self.worker, s).await {
+                    // Not suspended: the lease was lost, or a cancellation came in meanwhile.
+                    Ok(false) => match self.journal.get_run(tenant, run_id).await {
+                        Ok(Some(r))
+                            if r.cancel_requested_at.is_some()
+                                && r.lease_owner.as_deref() == Some(self.worker.as_str()) =>
+                        {
+                            let by = r.cancelled_by.unwrap_or_else(|| "unknown".into());
+                            let f = Finish {
+                                status: RunStatus::Cancelled,
+                                output: partial.as_ref().and_then(seal),
+                                error: None,
+                                stop_reason: Some(format!("cancelled by {by}")),
+                                budget,
+                            };
+                            self.journal.finish(run_id, &self.worker, f).await
+                        }
+                        other => other.map(|_| false),
+                    },
+                    other => other,
+                }
             }
         };
+        self.changed();
         match res {
             Ok(true) => {}
             Ok(false) => tracing::warn!(run = %run_id, "the run's lease was lost before its state was recorded"),
@@ -670,6 +887,8 @@ pub(crate) enum Stop {
     Fail(String),
     /// Another worker owns the run now; record nothing.
     LeaseLost,
+    /// A cancellation was asked for (by whom): the run ends as `cancelled`, with partial results.
+    Cancelled(String),
 }
 
 #[derive(Debug, Clone)]
@@ -687,6 +906,8 @@ pub(crate) struct StepOut {
     /// Branch label (`router`: the route; `verify`: pass or fail).
     pub label: Option<String>,
     pub tokens: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
     pub usd: f64,
     /// Taint labels of the output, journaled with tool steps so a replay sees the same labels
     /// (model steps leave it empty: their labels come from their inputs).
@@ -695,7 +916,26 @@ pub(crate) struct StepOut {
 
 impl StepOut {
     pub fn value(output: Value) -> Self {
-        Self { output, label: None, tokens: 0, usd: 0.0, taint: taint::Taint::new() }
+        Self {
+            output,
+            label: None,
+            tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            usd: 0.0,
+            taint: taint::Taint::new(),
+        }
+    }
+
+    /// The output of a model call.
+    pub fn model(output: Value, r: &ModelReply) -> Self {
+        Self {
+            tokens: r.tokens,
+            prompt_tokens: r.prompt_tokens,
+            completion_tokens: r.completion_tokens,
+            usd: r.usd,
+            ..Self::value(output)
+        }
     }
 }
 
@@ -725,6 +965,9 @@ pub(crate) struct RunCx {
 
 impl RunCx {
     async fn load(ex: Arc<Executor>, run: RunRecord) -> Result<Self, Stop> {
+        if run.cancel_requested_at.is_some() {
+            return Err(Stop::Cancelled(run.cancelled_by.clone().unwrap_or_else(|| "unknown".into())));
+        }
         let pinned = match &run.specs {
             Some(sealed) => {
                 let text = ex
@@ -909,6 +1152,14 @@ impl RunCx {
             return Ok(out);
         }
         self.admit_step(ledger)?;
+        let labels: Vec<String> = consumed().into_iter().collect();
+        let data = json!({"step": step_id, "vertex": vertex, "kind": kind, "labels": labels});
+        match self.ex.journal.start_step(&self.run.id, &self.ex.worker, data).await {
+            Ok(StepStart::Started) => self.ex.changed(),
+            Ok(StepStart::Cancelled) => return Err(self.cancelled().await),
+            Ok(StepStart::LeaseLost) => return Err(Stop::LeaseLost),
+            Err(e) => return Err(Stop::Fail(format!("recording the start of step {step_id}: {e}"))),
+        }
         let started = Utc::now();
         let result = f.await;
         let (status, out) = match result {
@@ -945,6 +1196,8 @@ impl RunCx {
         started: DateTime<Utc>,
     ) -> Result<StepOut, Stop> {
         let _ = ledger;
+        let mut labels = consumed();
+        labels.extend(out.taint.iter().cloned());
         let mut body = json!({"output": out.output, "label": out.label});
         if !out.taint.is_empty() {
             body["taint"] = json!(out.taint);
@@ -966,11 +1219,16 @@ impl RunCx {
             status,
             result: Some(result),
             tokens: out.tokens,
+            prompt_tokens: out.prompt_tokens,
+            completion_tokens: out.completion_tokens,
             usd: out.usd,
+            labels: labels.into_iter().collect(),
             started_at: started,
             finished_at: Utc::now(),
         };
-        match self.ex.journal.put_step(&self.ex.worker, rec, &self.budget_state()).await {
+        let written = self.ex.journal.put_step(&self.ex.worker, rec, &self.budget_state()).await;
+        self.ex.changed();
+        match written {
             Ok(StepWrite::Written) => Ok(out.clone()),
             // Recorded concurrently by this run's earlier attempt: that result stands.
             Ok(StepWrite::Existing(rec)) => self.open_step(&rec),
@@ -992,6 +1250,8 @@ impl RunCx {
             output: v.get("output").cloned().unwrap_or(Value::Null),
             label: v.get("label").and_then(Value::as_str).map(str::to_owned),
             tokens: rec.tokens,
+            prompt_tokens: rec.prompt_tokens,
+            completion_tokens: rec.completion_tokens,
             usd: rec.usd,
             taint: v.get("taint").and_then(|t| serde_json::from_value(t.clone()).ok()).unwrap_or_default(),
         })
@@ -1011,6 +1271,10 @@ impl RunCx {
                     return Err(Stop::Fail(format!("step {step_id}: model call refused: {e}")));
                 }
                 Err(ModelError::Unavailable(e)) => {
+                    // A cancelled run does not retry its model call.
+                    if self.ex.journal.cancel_requested(&self.run.id).await.unwrap_or(false) {
+                        return Err(self.cancelled().await);
+                    }
                     if Instant::now() + wait > deadline {
                         return Err(Stop::Fail(format!("step {step_id}: model call failed: {e}")));
                     }
@@ -1023,6 +1287,15 @@ impl RunCx {
                 }
             }
         }
+    }
+
+    /// The stop of a run whose cancellation was asked for.
+    async fn cancelled(&self) -> Stop {
+        let by = match self.ex.journal.get_run(self.tenant(), &self.run.id).await {
+            Ok(Some(r)) => r.cancelled_by,
+            _ => None,
+        };
+        Stop::Cancelled(by.unwrap_or_else(|| "unknown".into()))
     }
 
     /// The tenant's daily and monthly node spend caps, against the journal (shared by every worker).
@@ -1199,6 +1472,75 @@ fn open_pinned(text: &str) -> Result<HashMap<(String, u32), ResolvedNode>, Strin
         );
     }
     Ok(out)
+}
+
+/// Records the answer to the human step a run waits for (`step`, or the one it waits for), sealed
+/// with `by`, and the audit event of the decision: `node.write.approve` or `node.write.deny` for a
+/// tainted write's approval step (`...@approve`), else `node.run.answer`. The event id is stable per
+/// (run, step), so the audit log records the decision once. Used by the data plane and the control
+/// plane (an answer from the console).
+pub async fn deliver(
+    journal: &Arc<dyn Journal>,
+    sealer: &dyn Sealer,
+    tenant: &str,
+    run_id: &str,
+    step: Option<&str>,
+    answer: &Value,
+    by: Option<&str>,
+) -> Result<Delivered, ExecError> {
+    let Some(r) = journal.get_run(tenant, run_id).await? else { return Ok(Delivered::NotFound) };
+    let Some(step) = step.map(str::to_owned).or(r.awaiting.clone()) else { return Ok(Delivered::NotAwaiting) };
+    let body = json!({"$answer": answer, "$by": by});
+    let sealed = sealer.seal(tenant, run_id, &body.to_string()).map_err(ExecError::Internal)?;
+    let approval = step.ends_with("@approve");
+    let action = match (approval, taint::approved(answer)) {
+        (true, true) => "node.write.approve",
+        (true, false) => "node.write.deny",
+        (false, _) => "node.run.answer",
+    };
+    let audit = AuditEvent {
+        id: format!("{run_id}/{step}/answer"),
+        tenant_id: tenant.to_owned(),
+        actor: by.unwrap_or("unknown").to_owned(),
+        action: action.into(),
+        target: Some(run_id.to_owned()),
+        detail: json!({"node": r.node, "version": r.version, "step": step}),
+        at: Utc::now(),
+    };
+    Ok(journal.deliver_input(tenant, run_id, &step, sealed, by, Some(audit)).await?)
+}
+
+/// Cancels a run, audited as `node.run.cancel` (event id `<run>/cancel`: recorded once however
+/// often it is asked).
+pub async fn cancel(journal: &Arc<dyn Journal>, tenant: &str, run_id: &str, by: &str) -> Result<Cancelled, ExecError> {
+    let Some(r) = journal.get_run(tenant, run_id).await? else { return Ok(Cancelled::NotFound) };
+    let audit = AuditEvent {
+        id: format!("{run_id}/cancel"),
+        tenant_id: tenant.to_owned(),
+        actor: by.to_owned(),
+        action: "node.run.cancel".into(),
+        target: Some(run_id.to_owned()),
+        detail: json!({"node": r.node, "version": r.version, "status": r.status}),
+        at: Utc::now(),
+    };
+    Ok(journal.cancel(tenant, run_id, by, Some(audit)).await?)
+}
+
+/// An event as clients see it: `run.input_required` carries its question opened when the caller
+/// may see run content (`content`), else none; nothing else is sealed.
+pub fn render_event(sealer: &dyn Sealer, tenant: &str, ev: &RunEvent, content: bool) -> Value {
+    let mut data = ev.data.clone();
+    if let Some(o) = data.as_object_mut()
+        && let Some(sealed) = o.remove("sealed_question")
+    {
+        let q = sealed
+            .as_str()
+            .filter(|_| content)
+            .and_then(|s| sealer.open(tenant, &ev.run_id, s).ok())
+            .map_or(Value::Null, Value::String);
+        o.insert("question".into(), q);
+    }
+    json!({"id": ev.seq, "type": ev.kind, "run_id": ev.run_id, "at": ev.created_at, "data": data})
 }
 
 /// Aborts the task when dropped.

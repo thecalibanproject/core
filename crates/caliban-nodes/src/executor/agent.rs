@@ -113,12 +113,14 @@ pub(super) async fn run_agent_at(
             body["tools"] = Value::Array(functions.clone());
         }
         let request = body.clone();
-        let reply = cx
-            .step(ledger, &step_id, "agent", "llm", &request, async {
+        let reply = super::consuming(
+            seen.clone(),
+            cx.step(ledger, &step_id, "agent", "llm", &request, async {
                 let r = cx.model(&step_id, body).await?;
-                Ok(StepOut { output: r.message, label: None, tokens: r.tokens, usd: r.usd, taint: Taint::new() })
-            })
-            .await?;
+                Ok(StepOut::model(r.message.clone(), &r))
+            }),
+        )
+        .await?;
         let message = reply.output;
         let calls: Vec<Value> = message.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
         let content = message.get("content").and_then(Value::as_str).unwrap_or_default().to_owned();

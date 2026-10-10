@@ -61,7 +61,7 @@ impl ModelClient for FakeModel {
             self.release.notified().await;
         }
         let message = (self.script)(&body);
-        Ok(ModelReply { message, tokens: 10, usd: 0.001, replayed: false })
+        Ok(ModelReply { message, tokens: 10, prompt_tokens: 7, completion_tokens: 3, usd: 0.001, replayed: false })
     }
 }
 
@@ -170,10 +170,13 @@ fn start(node: &str, input: Value) -> StartRun {
         node: node.into(),
         version: None,
         input,
+        chat: None,
         invoker: "api_key:test".into(),
         invoker_key_hash: None,
         idempotency: None,
         budget: None,
+        origin: None,
+        check_spend: false,
     }
 }
 
@@ -1201,4 +1204,154 @@ async fn pii_never_reaches_an_untrusted_tool() {
     assert_eq!(v.status, RunStatus::Succeeded, "{v:?}");
     assert_eq!(open.seen.lock().as_slice(), [json!({"email": "[EMAIL]"})], "the untrusted tool gets the surrogate");
     assert_eq!(safe.seen.lock().as_slice(), [json!({"email": "jane@example.com"})], "the trusted one gets the value");
+}
+
+#[tokio::test]
+async fn a_cancelled_run_stops_at_its_next_step_and_its_model_call_is_not_repeated() {
+    for j in journals().await {
+        let h = Harness::new(Arc::clone(&j));
+        h.nodes.add(
+            "chain",
+            1,
+            json!({
+                "kind": "workflow", "model_policy": {}, "budgets": budgets(10, 10_000),
+                "graph": {"vertices": [{"id": "a", "type": "llm"}, {"id": "b", "type": "llm"}, {"id": "c", "type": "llm"}],
+                          "edges": [{"from": "a", "to": "b"}, {"from": "b", "to": "c"}]}
+            }),
+        );
+        let model = FakeModel::new(|body| text(&format!("<{}>", last_user(body))));
+        *model.hold.lock() = Some("b#0".into());
+        let w1 = h.executor(&model, "w1");
+        let (r, _) = w1.create(start("chain", json!("x"))).await.unwrap();
+        let task = {
+            let (w1, id) = (Arc::clone(&w1), r.id.clone());
+            tokio::spawn(async move { w1.run_now(&id).await })
+        };
+        model.held.notified().await;
+        // Cancelled from another worker while step b's model call is in flight.
+        let w2 = h.executor(&model, "w2");
+        assert_eq!(w2.cancel("acme", &r.id, "api_key:abc").await.unwrap(), Cancelled::Requested);
+        model.release.notify_one();
+        task.await.unwrap().unwrap();
+        let v = w2.view("acme", &r.id).await.unwrap().unwrap();
+        assert_eq!(v.status, RunStatus::Cancelled, "{v:?}");
+        assert_eq!(v.stop_reason.as_deref(), Some("cancelled by api_key:abc"));
+        assert_eq!(v.output, Some(json!("<<x>>")), "the partial result: step b completed and was paid for");
+        assert_eq!(v.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["a#0", "b#0"]);
+        assert_eq!((model.calls_for("b#0"), model.calls_for("c#0")), (1, 0), "nothing ran after the cancel");
+        assert!(!v.cancel_requested, "it has stopped");
+        assert_eq!(
+            w2.cancel("acme", &r.id, "api_key:abc").await.unwrap(),
+            Cancelled::AlreadyEnded(RunStatus::Cancelled)
+        );
+        // Audited once, by the stable id.
+        let audit = j.claim_audit("w9", Duration::from_secs(30), 10).await.unwrap();
+        assert_eq!(
+            audit.iter().map(|a| (a.id.as_str(), a.action.as_str())).collect::<Vec<_>>(),
+            [(format!("{}/cancel", r.id).as_str(), "node.run.cancel")]
+        );
+        // Events: every step started and finished, then the end (after the cancel request).
+        let kinds: Vec<String> = w2.events("acme", &r.id, 0, 100).await.unwrap().into_iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                "run.created",
+                "step.started",
+                "step.finished",
+                "step.started",
+                "run.cancel_requested",
+                "step.finished",
+                "run.finished"
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failing_model_call_is_not_retried_once_the_run_is_cancelled() {
+    struct Down(AtomicUsize);
+    #[async_trait::async_trait]
+    impl ModelClient for Down {
+        async fn chat(&self, _: &CallCtx, _: Value) -> Result<ModelReply, ModelError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(ModelError::Unavailable("upstream down".into()))
+        }
+    }
+    for j in journals().await {
+        let h = Harness::new(Arc::clone(&j));
+        h.nodes.add(
+            "one",
+            1,
+            json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(5, 1000),
+                                      "graph": {"vertices": [{"id": "a", "type": "llm"}], "edges": []}}),
+        );
+        let down = Arc::new(Down(AtomicUsize::new(0)));
+        let ex = Arc::new(Executor::new(
+            Arc::clone(&j),
+            Arc::clone(&down) as Arc<dyn ModelClient>,
+            Arc::new(NoTools),
+            Arc::clone(&h.nodes) as Arc<dyn NodeSource>,
+            Arc::clone(&h.sealer) as Arc<dyn Sealer>,
+            "w1",
+            ExecutorOptions { model_retry_for: Duration::from_secs(30), ..ExecutorOptions::default() },
+        ));
+        let (r, _) = ex.create(start("one", json!("x"))).await.unwrap();
+        let task = {
+            let (ex, id) = (Arc::clone(&ex), r.id.clone());
+            tokio::spawn(async move { ex.run_now(&id).await })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while down.0.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ex.cancel("acme", &r.id, "api_key:abc").await.unwrap();
+        task.await.unwrap().unwrap();
+        let v = ex.view("acme", &r.id).await.unwrap().unwrap();
+        assert_eq!(v.status, RunStatus::Cancelled, "{v:?}");
+        let calls = down.0.load(Ordering::SeqCst);
+        assert!(calls <= 2, "at most the call in flight when the cancel came, then none: {calls}");
+    }
+}
+
+#[tokio::test]
+async fn step_events_carry_taint_labels_costs_and_usage() {
+    for j in journals().await {
+        let (_, _, tools) = crm_and_erp();
+        let h = Harness::new(j).with_tools(tools);
+        h.nodes.add("sync", 1, read_then_write(None, false).0);
+        let model = FakeModel::new(|_| text("unused"));
+        let ex = h.executor(&model, "w1");
+        let v = run(&ex, "sync", json!({})).await;
+        assert_eq!(v.status, RunStatus::InputRequired, "{v:?}");
+        let evs = ex.events("acme", &v.id, 0, 100).await.unwrap();
+        let read = evs.iter().find(|e| e.kind == "step.finished").unwrap();
+        assert_eq!(read.data["step"], "read#0");
+        assert_eq!(read.data["labels"], json!(["tool:crm/lookup"]), "a tool's output carries its label");
+        let ask = evs.last().unwrap();
+        assert_eq!((ask.kind.as_str(), &ask.data["step"]), ("run.input_required", &json!("write#0@approve")));
+        // Clients that may see content get the question; others get none.
+        let shown = render_event(h.sealer.as_ref(), "acme", ask, true);
+        assert!(shown["data"]["question"].as_str().unwrap().contains("Approve this write?"), "{shown}");
+        assert!(shown["data"].get("sealed_question").is_none());
+        assert_eq!(render_event(h.sealer.as_ref(), "acme", ask, false)["data"]["question"], Value::Null);
+        // The decision is audited by who made it, once.
+        ex.deliver_input("acme", &v.id, None, &json!({"approve": false}), Some("user:jo")).await.unwrap();
+        let audit = h.journal.claim_audit("w9", Duration::from_secs(30), 10).await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            (audit[0].id.as_str(), audit[0].action.as_str(), audit[0].actor.as_str()),
+            (format!("{}/write#0@approve/answer", v.id).as_str(), "node.write.deny", "user:jo")
+        );
+        assert_eq!(audit[0].detail["node"], "sync");
+    }
+    // Model steps: prompt and completion tokens add up to the run's usage.
+    for j in journals().await {
+        let h = Harness::new(j);
+        h.nodes.add("triage", 1, triage_spec());
+        let ex = h.executor(&triage_model(), "w1");
+        let v = run(&ex, "triage", json!({"case": "chest pain"})).await;
+        assert_eq!(v.usage, RunUsage { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 });
+        assert_eq!((v.steps[0].prompt_tokens, v.steps[0].completion_tokens), (7, 3));
+        assert_eq!(v.last_event, 4, "created, started, finished, input required: {v:?}");
+    }
 }
