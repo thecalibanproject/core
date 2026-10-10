@@ -56,11 +56,13 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
-      # The store parity suite, and SSO sessions shared by two control-plane replicas.
+      # The store parity suite (tool registry, usage per node, usage retention keeping totals,
+      # the worker role's grants included), and SSO sessions shared by two control-plane replicas.
       - run: cargo test -p caliban-cp -- store::tests::postgres auth::tests::postgres
       # The node journal parity suite and the executor on the Postgres journal (claims with
-      # SKIP LOCKED, lease takeover, human input, durable sleeps), then the end-to-end node tests
-      # (workers, crash and replay, exactly-once runs, split mode, usage shipping).
+      # SKIP LOCKED, lease takeover, human input, durable sleeps, spend caps across workers,
+      # retention, taint and approvals), then the end-to-end node tests (workers, crash and replay,
+      # exactly-once runs, split mode, usage shipping, schema checks, MCP tools, PII across tools).
       - run: cargo test -p caliban-nodes
       - run: cargo test -p caliban --bin caliban -- nodes_tests
 
