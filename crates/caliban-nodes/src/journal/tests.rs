@@ -2,21 +2,14 @@
 //! `CALIBAN_TEST_DATABASE_URL` is set) the Postgres journal, each test in its own schema.
 
 use super::memory::MemoryJournal;
-use super::postgres::{MIGRATION, PgJournal};
+use super::postgres::PgJournal;
 use super::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) async fn pg_journal() -> Option<PgJournal> {
     let url = std::env::var("CALIBAN_TEST_DATABASE_URL").ok()?;
-    let schema = format!("j_{}", uuid::Uuid::now_v7().simple());
-    let admin = sqlx::PgPool::connect(&url).await.expect("CALIBAN_TEST_DATABASE_URL must be reachable");
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&admin).await.unwrap();
-    let opts: sqlx::postgres::PgConnectOptions =
-        url.parse::<sqlx::postgres::PgConnectOptions>().unwrap().options([("search_path", schema.as_str())]);
-    let j = PgJournal::connect_with(opts).await.unwrap();
-    sqlx::raw_sql(MIGRATION).execute(j.pool()).await.unwrap();
-    Some(j)
+    Some(PgJournal::isolated(&url).await.expect("CALIBAN_TEST_DATABASE_URL must be reachable"))
 }
 
 /// Both journals (Postgres only when configured).

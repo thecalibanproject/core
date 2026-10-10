@@ -4,6 +4,8 @@
 mod kek_checkin_tests;
 mod nodes;
 #[cfg(test)]
+mod nodes_tests;
+#[cfg(test)]
 mod purge_tests;
 #[cfg(test)]
 mod revocation_tests;

@@ -1,0 +1,89 @@
+{
+  "kind": "workflow",
+  "description": "Reference node (P3 decision 6): classify a case, ask one clarifying question, recommend services from the catalogue. PII is masked by the gateway on every model call.",
+  "prompt": {
+    "system": "You are a careful triage assistant for a health services provider. You never give a diagnosis and you only recommend services that the catalogue returned.",
+    "input_schema": {
+      "type": "object",
+      "required": ["case"],
+      "additionalProperties": false,
+      "properties": {
+        "case": { "type": "string", "minLength": 3, "description": "The case as the person described it" }
+      }
+    },
+    "output_schema": {
+      "type": "object",
+      "required": ["category", "urgency", "services", "rationale"],
+      "additionalProperties": false,
+      "properties": {
+        "category": { "enum": ["clinical", "administrative", "billing"] },
+        "urgency": { "enum": ["routine", "soon", "urgent"] },
+        "services": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "rationale": { "type": "string" }
+      }
+    }
+  },
+  "model_policy": { "intent_classes": ["classification", "reasoning"], "candidates": ["tier:small"] },
+  "tools": [
+    { "ref": "mcp://catalogue/search_services#sha256:6a90b57baa162704df39ca8b3e7ee62c51e75fa9d434b387258952585697b3be", "effect": "read" }
+  ],
+  "guardrails": { "pii": "mask" },
+  "budgets": { "steps": 12, "tokens": 20000, "wall_clock_s": 120, "depth": 1, "fanout": 1 },
+  "exposure": { "http": true },
+  "graph": {
+    "entry": "classify",
+    "vertices": [
+      {
+        "id": "classify",
+        "type": "router",
+        "config": {
+          "prompt": "Case: {{input.case}}",
+          "routes": {
+            "clinical": "symptoms, care or a health problem",
+            "administrative": "appointments, records, forms",
+            "billing": "invoices, payments, insurance"
+          },
+          "default": "administrative"
+        }
+      },
+      {
+        "id": "clarify",
+        "type": "human",
+        "config": {
+          "question": "To route this {{input.route}} case well: since when has this been going on, and is anyone in immediate danger?"
+        }
+      },
+      {
+        "id": "catalogue",
+        "type": "tool",
+        "config": {
+          "tool": "mcp://catalogue/search_services#sha256:6a90b57baa162704df39ca8b3e7ee62c51e75fa9d434b387258952585697b3be",
+          "args": { "category": "{{outputs.classify.route}}", "case": "{{input.case}}" }
+        }
+      },
+      {
+        "id": "recommend",
+        "type": "llm",
+        "config": {
+          "prompt": "Case: {{outputs.clarify.case}}\nCategory: {{outputs.classify.route}}\nClarification: {{outputs.clarify.answer}}\nCatalogue matches: {{input}}\n\nRecommend services from the catalogue matches only, with an urgency and a short rationale.",
+          "output_schema": {
+            "type": "object",
+            "required": ["category", "urgency", "services", "rationale"],
+            "additionalProperties": false,
+            "properties": {
+              "category": { "enum": ["clinical", "administrative", "billing"] },
+              "urgency": { "enum": ["routine", "soon", "urgent"] },
+              "services": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+              "rationale": { "type": "string" }
+            }
+          }
+        }
+      }
+    ],
+    "edges": [
+      { "from": "classify", "to": "clarify" },
+      { "from": "clarify", "to": "catalogue" },
+      { "from": "catalogue", "to": "recommend" }
+    ]
+  }
+}

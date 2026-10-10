@@ -50,11 +50,41 @@ pub struct MockConfig {
     pub record: bool,
     /// Cut or pad every reply to exactly this many characters (`None`: the plain echo).
     pub reply_chars: Option<usize>,
+    /// Scripted Chat Completions replies (node tests): the assistant message for a request body,
+    /// or `None` for the echo.
+    pub responder: Option<Responder>,
+}
+
+/// A scripted reply: the request body in, the assistant message (`{"role", "content",
+/// "tool_calls"}`) out, or `None` for the default echo.
+#[derive(Clone)]
+pub struct Responder(pub Arc<ReplyFn>);
+
+/// The function behind a [`Responder`].
+pub type ReplyFn = dyn Fn(&Value) -> Option<Value> + Send + Sync;
+
+impl Responder {
+    pub fn new(f: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for Responder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Responder")
+    }
 }
 
 impl Default for MockConfig {
     fn default() -> Self {
-        Self { latency: Duration::ZERO, chunk_delay: Duration::ZERO, chunk_chars: 4, record: true, reply_chars: None }
+        Self {
+            latency: Duration::ZERO,
+            chunk_delay: Duration::ZERO,
+            chunk_chars: 4,
+            record: true,
+            reply_chars: None,
+            responder: None,
+        }
     }
 }
 
@@ -293,7 +323,11 @@ async fn chat(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
         }
         return (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":{"message":"mock failure"}}"#).into_response();
     }
-    let text = reply_text(&body, s.cfg.reply_chars);
+    let scripted = s.cfg.responder.as_ref().and_then(|r| (r.0)(&body));
+    let text = match &scripted {
+        Some(m) => m.get("content").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        None => reply_text(&body, s.cfg.reply_chars),
+    };
     let prompt = prompt_tokens(&body);
     let completion = completion_tokens(&text);
     let mut cached = 0;
@@ -348,9 +382,15 @@ async fn chat(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
         frames.push("data: [DONE]\n\n".into());
         return sse(frames, s.cfg.chunk_delay);
     }
+    let message = scripted.unwrap_or_else(|| json!({"role": "assistant", "content": text}));
+    let finish = if message.get("tool_calls").is_some_and(|t| t.as_array().is_some_and(|a| !a.is_empty())) {
+        "tool_calls"
+    } else {
+        "stop"
+    };
     json_resp(&json!({
         "id": "chatcmpl-mock", "object": "chat.completion", "created": 0, "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "usage": usage
     }))
 }

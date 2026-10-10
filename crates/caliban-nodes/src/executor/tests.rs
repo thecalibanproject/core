@@ -122,7 +122,9 @@ impl Harness {
             Arc::clone(&self.sealer) as Arc<dyn Sealer>,
             worker,
             ExecutorOptions {
-                lease_ttl: Duration::from_millis(400),
+                // Long enough that a slow machine never loses a lease by accident; the takeover
+                // test waits for it once.
+                lease_ttl: Duration::from_secs(1),
                 heartbeat: Duration::from_millis(100),
                 poll: Duration::from_millis(20),
                 model_retry_for: Duration::from_secs(5),

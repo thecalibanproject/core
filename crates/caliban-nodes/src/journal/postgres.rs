@@ -140,6 +140,23 @@ impl PgJournal {
         Self { pool }
     }
 
+    /// A journal in a new schema of its own, with the journal tables created (tests: many
+    /// journals in one database). Production journals use the tables the migration runner made.
+    #[doc(hidden)]
+    pub async fn isolated(url: &str) -> JResult<Self> {
+        let schema = format!("j_{}", uuid::Uuid::now_v7().simple());
+        let admin = PgPool::connect(url).await.map_err(db)?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&admin).await.map_err(db)?;
+        admin.close().await;
+        let opts: PgConnectOptions = url
+            .parse::<PgConnectOptions>()
+            .map_err(|e| JournalError(format!("database url: {e}")))?
+            .options([("search_path", schema.as_str())]);
+        let j = Self::connect_with(opts).await?;
+        sqlx::raw_sql(MIGRATION).execute(&j.pool).await.map_err(db)?;
+        Ok(j)
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
