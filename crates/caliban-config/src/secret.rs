@@ -336,6 +336,18 @@ impl Dek {
             .map_err(|_| "decryption failed (wrong tenant key?)".to_string())?;
         String::from_utf8(pt.to_vec()).map_err(|e| e.to_string())
     }
+
+    /// Seals a value of `tenant` bound to `context` as well (associated data: tenant id and
+    /// context), e.g. a node run journal entry bound to its run. Opens only with the same context.
+    pub fn seal_with(&self, tenant: &str, context: &str, plaintext: &str) -> String {
+        encrypt(&self.0, &context_aad(tenant, context), plaintext.as_bytes())
+    }
+
+    pub fn open_with(&self, tenant: &str, context: &str, sealed: &str) -> Result<String, String> {
+        let pt = decrypt(&self.0, &context_aad(tenant, context), sealed)
+            .map_err(|_| "decryption failed (wrong tenant key or context?)".to_string())?;
+        String::from_utf8(pt.to_vec()).map_err(|e| e.to_string())
+    }
 }
 
 /// A DEK wrapped by the KEK `kek_id`: base64(nonce ‖ ciphertext), associated data = tenant id and
@@ -352,6 +364,10 @@ fn dek_aad(tenant: &str, kek_id: &str) -> Vec<u8> {
 
 fn secret_aad(tenant: &str) -> Vec<u8> {
     [b"caliban/secret/v1\0".as_slice(), tenant.as_bytes()].concat()
+}
+
+fn context_aad(tenant: &str, context: &str) -> Vec<u8> {
+    [b"caliban/sealed-ctx/v1\0".as_slice(), tenant.as_bytes(), b"\0", context.as_bytes()].concat()
 }
 
 fn encrypt(key: &[u8; 32], aad: &[u8], msg: &[u8]) -> String {

@@ -47,6 +47,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (10, "cache_hit_billing", include_str!("../../../../migrations/0010_cache_hit_billing.sql")),
     (11, "router_status", include_str!("../../../../migrations/0011_router_status.sql")),
     (12, "node_versions", include_str!("../../../../migrations/0012_node_versions.sql")),
+    (13, "node_journal", include_str!("../../../../migrations/0013_node_journal.sql")),
 ];
 
 /// Advisory lock keys ("calibn" + n).

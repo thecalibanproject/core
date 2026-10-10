@@ -3,7 +3,9 @@
 //! A node is config, not code. This crate owns:
 //! - the spec (mirrors `schemas/node.schema.json`) and its static checks ([`NodeSpec::validate`]);
 //! - content hashes and publish-time validation against the tenant ([`hash`], [`publish`]);
-//! - the hierarchical budget ledger ([`budget`]).
+//! - the hierarchical budget ledger ([`budget`]);
+//! - the durable run journal, in memory and on Postgres, following the Absurd model ([`journal`]),
+//!   and the sealing of run data with the tenant's data key ([`seal`]).
 //!
 //! TODO(P3 M3): USD, depth and fan-out caps in the ledger, tenant spend caps. TODO(P3 M4): MCP
 //! client tools and the approved tool registry. TODO(P3 M8): WASM `code` vertices.
@@ -11,8 +13,10 @@
 pub mod budget;
 pub mod diff;
 pub mod hash;
+pub mod journal;
 pub mod publish;
 pub mod schema;
+pub mod seal;
 
 pub use budget::{Budget, BudgetError, Ledger};
 
