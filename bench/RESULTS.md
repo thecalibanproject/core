@@ -1,6 +1,7 @@
 # P0 measurement results
 
 Linux on AWS (two hosts, `TCP_NODELAY`, the GPU tier with a real model): [`RESULTS-aws-2026-10.md`](RESULTS-aws-2026-10.md).
+Second AWS run (the cost of `caliban/auto` intent classification end to end, semantic-cache guards, cache-hit billing, single sign-on, split mode, NER on x86, zero-egress install): [`RESULTS-aws-2026-10b.md`](RESULTS-aws-2026-10b.md).
 
 The P0 exit criteria (reference architecture, section 8) are: **under 3 ms p50 overhead**, **isolation audit passes**, **usage matches provider bills within 1%**. This file records the first full measurement and what it found. Regenerate the raw report with `scripts/bench.sh` (it writes `bench/results/REPORT.md`, which is not committed).
 
