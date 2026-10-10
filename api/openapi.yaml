@@ -1320,13 +1320,23 @@ paths:
     get:
       tags: [nodes]
       summary: List nodes (AI sub-apps)
-      parameters: [ { $ref: '#/components/parameters/TenantQuery' } ]
+      description: |
+        Every version of every node by default (with its spec). `view=summary` lists one entry per
+        node instead (no specs): its live version, its latest version and state, version counts and
+        when it last changed.
+      parameters:
+        - { $ref: '#/components/parameters/TenantQuery' }
+        - { name: view, in: query, schema: { type: string, enum: [versions, summary], default: versions } }
       responses:
         '200':
-          description: OK
+          description: 'Versions (`Node`), or summaries (`NodeSummary`) with `view=summary`'
           content:
             application/json:
-              schema: { type: array, items: { $ref: '#/components/schemas/Node' } }
+              schema:
+                oneOf:
+                  - { type: array, items: { $ref: '#/components/schemas/Node' } }
+                  - { type: array, items: { $ref: '#/components/schemas/NodeSummary' } }
+        '400': { $ref: '#/components/responses/Error' }
     post:
       tags: [nodes]
       summary: Create a draft node version (same as POST /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions)
@@ -2546,6 +2556,27 @@ components:
         created_at: { type: string, format: date-time }
         started_at: { type: [string, 'null'], format: date-time }
         finished_at: { type: [string, 'null'], format: date-time }
+    NodeSummary:
+      type: object
+      required: [tenant_id, name, versions, published, drafts, retired]
+      properties:
+        tenant_id: { type: string }
+        name: { type: string }
+        description: { type: [string, 'null'], description: 'The latest version''s `description`' }
+        kind: { type: [string, 'null'], enum: [workflow, agent, null] }
+        live_version: { type: [integer, 'null'], description: 'The promoted version' }
+        latest:
+          type: object
+          required: [version, state, hash]
+          properties:
+            version: { type: integer }
+            state: { type: string, enum: [draft, published, retired] }
+            hash: { type: string }
+        versions: { type: integer, description: 'Versions not deleted' }
+        published: { type: integer }
+        drafts: { type: integer }
+        retired: { type: integer }
+        updated_at: { type: [string, 'null'], format: date-time, description: 'The last creation, publication, retirement or promotion' }
     RunStatus:
       type: string
       enum: [pending, running, sleeping, input_required, succeeded, failed, budget_exhausted, cancelled]

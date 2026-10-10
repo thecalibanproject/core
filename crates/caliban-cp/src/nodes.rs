@@ -267,25 +267,65 @@ pub(crate) async fn diff(
 #[derive(Deserialize)]
 pub(crate) struct TenantFilter {
     tenant_id: Option<String>,
+    /// `summary`: one entry per node instead of every version.
+    view: Option<String>,
 }
 
 /// Every version of every node (drafts, published and retired; not deleted), across the tenants
-/// the caller may read.
+/// the caller may read; with `?view=summary`, one entry per node (no specs).
 pub(crate) async fn list_nodes(
     AxState(cp): AxState<Cp>,
     Extension(p): Extension<Principal>,
     Query(f): Query<TenantFilter>,
-) -> Json<Vec<Value>> {
+) -> ApiResult<Json<Vec<Value>>> {
     let st = cp.store.state();
     let visible = p.visible(crate::auth::rbac::Perm::NodesRead);
-    Json(
-        st.nodes
-            .iter()
-            .filter(|n| n.is_live() && f.tenant_id.as_ref().is_none_or(|t| &n.tenant_id == t))
-            .filter(|n| visible.contains(&n.tenant_id))
-            .map(|n| view(&st, n))
-            .collect(),
-    )
+    let versions = st
+        .nodes
+        .iter()
+        .filter(|n| n.is_live() && f.tenant_id.as_ref().is_none_or(|t| &n.tenant_id == t))
+        .filter(|n| visible.contains(&n.tenant_id));
+    match f.view.as_deref() {
+        None | Some("versions") => Ok(Json(versions.map(|n| view(&st, n)).collect())),
+        Some("summary") => Ok(Json(summaries(&st, versions))),
+        Some(other) => Err(bad(format!("unknown view '{other}' (versions or summary)"))),
+    }
+}
+
+/// One entry per (tenant, node): its live version, its latest version and state, how many versions
+/// it has, its description, and when it last changed.
+fn summaries<'a>(st: &State, versions: impl Iterator<Item = &'a NodeRecord>) -> Vec<Value> {
+    let mut by_node: std::collections::BTreeMap<(&str, &str), Vec<&NodeRecord>> = std::collections::BTreeMap::new();
+    for n in versions {
+        by_node.entry((n.tenant_id.as_str(), n.name.as_str())).or_default().push(n);
+    }
+    by_node
+        .into_iter()
+        .map(|((tenant, name), vs)| {
+            let latest = vs.iter().max_by_key(|n| n.version).copied();
+            let live = st.promotion(tenant, name);
+            let updated = vs
+                .iter()
+                .flat_map(|n| [Some(n.created_at), n.published_at, n.retired_at])
+                .chain([live.map(|p| p.promoted_at)])
+                .flatten()
+                .max();
+            let count = |s: NodeState| vs.iter().filter(|n| n.state == s).count();
+            json!({
+                "tenant_id": tenant,
+                "name": name,
+                "description": latest.and_then(|n| n.spec.get("description")).cloned(),
+                "kind": latest.and_then(|n| n.spec.get("kind")).cloned(),
+                "live_version": live.map(|p| p.version),
+                "latest": latest.map(|n| json!({"version": n.version, "state": n.state, "hash": n.hash})),
+                "versions": vs.len(),
+                "published": count(NodeState::Published),
+                "drafts": count(NodeState::Draft),
+                "retired": count(NodeState::Retired),
+                "updated_at": updated,
+            })
+        })
+        .collect()
 }
 
 /// Soft-deletes one node version (a draft or a retired one), scoped to the tenant. Its version
@@ -440,6 +480,33 @@ mod tests {
         let retire = a["entries"].as_array().unwrap().iter().find(|e| e["action"] == "node.retire").unwrap();
         assert_eq!(retire["detail"]["was_live"], true);
         assert_eq!(retire["detail"]["hash"], v1["hash"]);
+    }
+
+    #[tokio::test]
+    async fn nodes_are_listed_as_summaries() {
+        let c = cp(Some(ring()));
+        let app = app(Arc::clone(&c), None);
+        for _ in 0..3 {
+            call(&app, "POST", &format!("{V}/versions"), Some(json!({"spec": spec(3)}))).await;
+        }
+        assert_eq!(call(&app, "POST", &format!("{V}/versions/2/publish"), None).await.0, StatusCode::OK);
+        let (s, all) = call(&app, "GET", "/api/v1/nodes?tenant_id=acme", None).await;
+        assert_eq!((s, all.as_array().unwrap().len()), (StatusCode::OK, 3), "every version by default");
+        let (s, v) = call(&app, "GET", "/api/v1/nodes?tenant_id=acme&view=summary", None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        let n = &v[0];
+        assert_eq!(
+            (n["name"].as_str(), n["tenant_id"].as_str(), n["live_version"].as_u64()),
+            (Some("triage"), Some("acme"), Some(2))
+        );
+        assert_eq!((n["latest"]["version"].as_u64(), n["latest"]["state"].as_str()), (Some(3), Some("draft")));
+        assert_eq!(
+            (n["versions"].as_u64(), n["published"].as_u64(), n["drafts"].as_u64()),
+            (Some(3), Some(1), Some(2))
+        );
+        assert!(n["updated_at"].is_string() && n.get("spec").is_none());
+        assert_eq!(call(&app, "GET", "/api/v1/nodes?view=nope", None).await.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
