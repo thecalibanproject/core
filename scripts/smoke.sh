@@ -195,7 +195,7 @@ SQ='{"model":"ext/mock","temperature":0.2,"messages":[{"role":"user","content":"
 chat "$SQ" "$SKEY" >/dev/null
 grep -qi 'x-caliban-cache: miss' "$WORK/h" && pass "semantic cache: first question is a miss" || fail "semantic miss: $(grep -i x-caliban-cache "$WORK/h")"
 sleep 0.5; N1=$(wc -l <"$MOCK_LOG")
-OUT=$(chat '{"model":"ext/mock","temperature":0.2,"messages":[{"role":"user","content":"what is the capital of france"}]}' "$SKEY")
+OUT=$(chat '{"model":"ext/mock","temperature":0.2,"messages":[{"role":"user","content":"what is the capital of France"}]}' "$SKEY")
 grep -qi 'x-caliban-cache: hit' "$WORK/h" && grep -qi 'x-caliban-cache-tier: semantic' "$WORK/h" && [[ $(wc -l <"$MOCK_LOG") == "$N1" ]] \
   && pass "semantic cache: rephrased question served from T2 (x-caliban-cache: hit, tier semantic)" || fail "semantic hit: $(grep -i x-caliban-cache "$WORK/h")"
 python3 -c 'import sys,json;m=json.loads(sys.argv[1]);assert m["choices"][0]["message"]["content"]=="You said: What is the capital of France?",m' "$OUT" \

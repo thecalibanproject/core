@@ -5,7 +5,9 @@
 # the CP within the poll interval; the audit chain verifies; killing the CP leaves the router
 # serving (fail-static); a router restarted while the CP is down serves from its snapshot cache;
 # a restarted CP keeps its state (Postgres is the source of truth) and the router resyncs; a key
-# revoked and a tenant deleted on the CP are rejected (401) by the router after its next poll.
+# revoked and a tenant deleted on the CP are rejected (401) by the router after its next poll;
+# the router's usage events reach the CP's /usage (also those served while the CP was down, across
+# a router restart, exactly once); the router reports the KEK of the snapshot it serves.
 #
 # Needs docker (Postgres 17), python3, curl. Set SPLIT_DATABASE_URL to use an existing database
 # instead of a throwaway container.
@@ -97,6 +99,15 @@ chat_code() {
   curl -s -o "$WORK/out" -w '%{http_code}' "http://127.0.0.1:$DP/v1/chat/completions" -H "authorization: Bearer $1" \
     -H 'content-type: application/json' -d "{\"model\":\"${2:-local/mock}\",\"messages\":[{\"role\":\"user\",\"content\":\"${3:-ping}\"}]}"
 }
+# One chat request; prints its x-caliban-request-id.
+chat_id() {
+  curl -s -D "$WORK/h" -o "$WORK/out" "http://127.0.0.1:$DP/v1/chat/completions" -H "authorization: Bearer $1" \
+    -H 'content-type: application/json' -d "{\"model\":\"local/mock\",\"messages\":[{\"role\":\"user\",\"content\":\"$2\"}]}" >/dev/null
+  awk 'tolower($1)=="x-caliban-request-id:"{print $2}' "$WORK/h" | tr -d '\r'
+}
+# How many times the CP's /usage lists a request id.
+usage_count() { adm '/usage?limit=1000' | python3 -c "import sys,json;print(sum(e['request_id']=='$1' for e in json.load(sys.stdin)['events']))"; }
+wait_usage() { for _ in $(seq $(( $2 * 10 ))); do [[ $(usage_count "$1") == 1 ]] && return 0; sleep 0.1; done; return 1; }
 # Waits up to N seconds for a key to work on the router.
 wait_key() { for _ in $(seq $(( $2 * 10 ))); do [[ $(chat_code "$1" "${3:-local/mock}") == 200 ]] && return 0; sleep 0.1; done; return 1; }
 
@@ -121,14 +132,27 @@ adm /tenants/globex/provider-keys -d "{\"kind\":\"openai_compatible\",\"label\":
 START=$(python3 -c 'import time;print(time.time())')
 wait_key "$NEWKEY" $(( POLL * 3 + 2 )) ext/mock && pass "router picked up the new tenant + key within $(python3 -c "import time;print(round(time.time()-$START,1))")s (poll ${POLL}s)" || fail "new key never reached the router: $(cat "$WORK/out")"
 tail -1 "$MOCK_LOG" | grep -q '"auth": "Bearer sk-byok-split-9876"' && pass "sealed BYOK credential opened on the router (shared KEK)" || fail "byok upstream auth: $(tail -1 "$MOCK_LOG")"
-python3 -c 'import sys,json;d=json.load(sys.stdin);a=[e["action"] for e in d["entries"]];assert d["chain_verified"] and a[:3]==["provider_key.create","api_key.create","tenant.create"] and a[-1]=="store.seed",d' <<<"$(adm '/audit?limit=50')" \
-  && pass "audit log hash chain verifies (seed → tenant → key → BYOK)" || fail "audit: $(adm '/audit?limit=5')"
+python3 -c 'import sys,json;d=json.load(sys.stdin);a=[e["action"] for e in d["entries"]];assert d["chain_verified"] and a[:4]==["provider_key.create","tenant_key.create","api_key.create","tenant.create"] and a[-1]=="store.seed",d' <<<"$(adm '/audit?limit=50')" \
+  && pass "audit log hash chain verifies (seed → tenant → key → tenant data key → BYOK)" || fail "audit: $(adm '/audit?limit=5')"
+
+echo "usage shipping and KEK check-in"
+R1=$(chat_id "$KEY" "usage shipping check")
+[[ -n "$R1" ]] || fail "no request id"
+wait_usage "$R1" 5 && pass "router usage event reached the CP's /usage" || fail "usage not shipped: $(curl -s "http://127.0.0.1:$DP/healthz")"
+KEK_ID=$(adm /keys/status | python3 -c 'import sys,json;print(json.load(sys.stdin)["keyring"]["current"])')
+adm /keys/status | python3 -c "import sys,json;r=json.load(sys.stdin)['routers'];assert r and r[0]['active'] and '$KEK_ID' in r[0]['snapshot_kek_ids'],r" \
+  && pass "router reported the KEK of the snapshot it serves (keys status)" || fail "check-in: $(adm /keys/status)"
+curl -s "http://127.0.0.1:$DP/metrics" | grep -q "kek_ids=\"$KEK_ID\"" && pass "router /metrics exposes the snapshot KEK" || fail "metrics: $(curl -s "http://127.0.0.1:$DP/metrics" | head -5)"
 
 echo "fail-static"
 kill $CP_PID; wait $CP_PID 2>/dev/null || true
 sleep $(( POLL * 3 ))
 [[ $(chat_code "$NEWKEY" ext/mock) == 200 ]] && pass "CP down: router keeps serving the last good snapshot" || fail "router after CP death: $(cat "$WORK/out")"
 grep -q 'keeping last good snapshot' "$WORK/router.log" && pass "poll failures logged, snapshot kept" || fail "no fail-static log"
+R2=$(chat_id "$KEY" "served while the control plane is down")
+spooled() { curl -s "http://127.0.0.1:$DP/healthz" | python3 -c 'import sys,json;print(json.load(sys.stdin)["usage_shipping"]["backlog"] >= 1)'; }
+for _ in $(seq 50); do [[ $(spooled) == True ]] && break; sleep 0.1; done
+[[ $(spooled) == True ]] && pass "usage served while the CP is down waits in the spool" || fail "spool: $(curl -s "http://127.0.0.1:$DP/healthz")"
 
 kill $DP_PID; wait $DP_PID 2>/dev/null || true
 start_router
@@ -138,6 +162,8 @@ grep -q 'loaded cached snapshot' "$WORK/router.log" && pass "cache verified and 
 echo "control plane restart (postgres is the source of truth)"
 start_cp
 adm /tenants | grep -q '"id":"globex"' && pass "tenant created at runtime survived the CP restart" || fail "persistence"
+wait_usage "$R2" 10 && pass "usage spooled during the outage (across a router restart) delivered once" || fail "backlog not delivered: $(curl -s "http://127.0.0.1:$DP/healthz")"
+[[ $(usage_count "$R1") == 1 ]] && pass "earlier usage not counted twice" || fail "duplicate usage for $R1"
 adm /tenants -d '{"name":"Initech"}' >/dev/null
 K3=$(adm /tenants/initech/api-keys -d '{}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
 adm /tenants/initech/routes -X PUT -d '{"routes":[{"intent":"default","models":["local/mock"]}]}' | grep -q 'local/mock' && pass "routes set via CP" || fail "routes"
