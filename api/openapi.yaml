@@ -50,7 +50,16 @@ paths:
     post:
       tags: [inference]
       summary: OpenAI-compatible chat completion (streaming via SSE when stream=true)
-      description: Authenticate with a tenant API key (`cal_…`).
+      description: |
+        Authenticate with a tenant API key (`cal_…`).
+
+        **Nodes.** `model: "node/<name>"` (or `"node/<name>@v<N>"`) runs a published node: the
+        messages become its input, its output is the assistant message, and a human step is the
+        assistant message with `finish_reason: "input_required"` (continue with the header
+        `Caliban-Run-Id` and the answer as the last user message). The body then carries a `caliban`
+        object (`run_id`, `status`, `node`, `version`, `cost_usd`, `awaiting`). With
+        `model: "caliban/auto"`, a tenant that maps intents to nodes gets the node when the request
+        classifies into such an intent (see core/docs/nodes.md).
       requestBody:
         required: true
         content:
@@ -67,6 +76,10 @@ paths:
             x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
             x-caliban-cost-usd: { schema: { type: string }, description: 'Cost of this request in USD (non-streaming only; absent when the model has no price).' }
+            x-caliban-route: { schema: { type: string }, description: 'The path taken: `node/<name>@v<N>` (a node answered), or `model:<id>` (a `caliban/auto` answer by a model, for a tenant that maps intents to nodes).' }
+            x-caliban-route-fallback: { schema: { type: string, enum: [low_confidence, no_node_for_intent, node_not_allowed, node_unavailable, nodes_not_enabled, node_over_budget, node_input_invalid] }, description: 'Why `caliban/auto` answered with a model rather than a node.' }
+            Caliban-Run-Id: { schema: { type: string }, description: 'The node run that answered.' }
+            x-caliban-run-status: { schema: { type: string } }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ChatCompletionResponse' }
@@ -299,9 +312,15 @@ paths:
         a repeat returns the run the first request created (`Idempotent-Replayed: true`) and starts
         nothing; the same key with another body is a `422` (`idempotency_key_reused`).
 
+        **Stream** (`"stream": true`): `200` with the run's events (`text/event-stream`, see
+        `GET /v1/runs/{runId}/events`) until it ends or waits for a human.
+
+        Instead of `input`, `chat.messages` gives chat messages, mapped to the node's input as the
+        `node/<name>` chat shortcut does.
+
         Every model call the run makes goes through the gateway pipeline as the invoking key (PII,
-        caches, routing, quotas, metering), with an Idempotency-Key per step. Streaming, MCP and
-        `model: "node/<name>"` come later. Split-mode routers forward this request to a worker.
+        caches, routing, quotas, metering), with an Idempotency-Key per step. Split-mode routers
+        forward this request to a worker.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -316,8 +335,16 @@ paths:
               additionalProperties: false
               properties:
                 input: { description: 'Any JSON value: the run input' }
+                chat:
+                  type: object
+                  required: [messages]
+                  additionalProperties: false
+                  description: 'Chat messages instead of `input` (mapped to the node''s input).'
+                  properties:
+                    messages: { type: array, items: { $ref: '#/components/schemas/ChatMessage' } }
                 version: { type: integer, minimum: 1, description: 'A published version; default: the live one' }
                 async: { type: boolean, default: false }
+                stream: { type: boolean, default: false, description: 'Answer with the run''s events (SSE)' }
                 wait_s: { type: number, minimum: 0, description: 'Sync runs: wait at most this long (capped by the server)' }
                 budget:
                   type: object
@@ -330,10 +357,14 @@ paths:
                     wall_clock_s: { type: integer, minimum: 1 }
       responses:
         '200':
-          description: The run ended (succeeded, failed or budget_exhausted)
+          description: The run ended (succeeded, failed, budget_exhausted or cancelled), or its event stream
+          headers:
+            Caliban-Run-Id: { schema: { type: string } }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/NodeRun' }
+            text/event-stream:
+              schema: { type: string, description: 'Run events (`stream: true`), see `RunEvent`' }
         '202':
           description: The run is pending, running, sleeping or waiting for input
           headers:
@@ -348,6 +379,107 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
+
+  /v1/runs:
+    get:
+      tags: [nodes]
+      summary: List node runs
+      description: |
+        Runs of the key's tenant, of the nodes the key may run (its allowlist), newest first.
+        Summaries only (no content, no steps). Page with `cursor` (`next_cursor` of the previous page;
+        `null` on the last).
+      parameters:
+        - { name: node, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string }, description: 'Comma-separated run statuses' }
+        - { name: created_after, in: query, schema: { type: string, format: date-time } }
+        - { name: created_before, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeRunList' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/runs/{runId}/events:
+    parameters:
+      - { name: runId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [nodes]
+      summary: Follow a run's events (SSE)
+      description: |
+        The run's events from the journal, numbered from 1, so a client resumes on any worker or
+        router with `Last-Event-ID` (or `?after=`). Each SSE event has `id`, `event` (the type) and
+        `data` (a `RunEvent`). The stream ends after `run.finished`, or after `run.input_required`
+        while the run waits for that answer; that last event carries the run in `run`. Events never
+        carry step content; `run.input_required` carries the question.
+      parameters:
+        - { name: Last-Event-ID, in: header, required: false, schema: { type: string } }
+        - { name: after, in: query, schema: { type: integer, minimum: 0 } }
+      responses:
+        '200':
+          description: The event stream
+          content:
+            text/event-stream:
+              schema: { type: string, description: 'Server-Sent Events; each `data` is a `RunEvent`' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/runs/{runId}/cancel:
+    parameters:
+      - { name: runId, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [nodes]
+      summary: Cancel a node run
+      description: |
+        Durable: a run that waits (pending, sleeping, input required) is `cancelled` at once (`200`);
+        a running run is asked to stop (`202`, `cancel_requested: true`) and stops at its next step
+        boundary on whichever worker runs it (the model call in flight completes and is recorded; a
+        failing one is not retried). Cancelling a cancelled run is `200`; a run that ended otherwise
+        is `409` (`run_already_ended`). Audited as `node.run.cancel`.
+      responses:
+        '200':
+          description: The run is cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeRun' }
+        '202':
+          description: The running run will stop at its next step
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeRun' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /mcp:
+    post:
+      tags: [nodes]
+      summary: The MCP server (Streamable HTTP, stateless)
+      description: |
+        JSON-RPC over Streamable HTTP. Authenticate with the tenant API key as bearer token (`401`
+        otherwise). `tools/list`: the published nodes the key may run (input schema: the node's).
+        `tools/call`: runs the node, waits at most `CALIBAN_NODE_SYNC_WAIT_SECS`. With
+        `CALIBAN_MCP_TASKS=true`, clients declaring the tasks extension get a task (its id is the run
+        id) and use `tasks/get`, `tasks/update`, `tasks/cancel`. See core/docs/nodes.md.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true, description: 'A JSON-RPC message' }
+      responses:
+        '200':
+          description: The JSON-RPC answer
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Error' }
 
   /v1/runs/{runId}:
     parameters:
@@ -379,7 +511,9 @@ paths:
 
         A step named `<step>@approve` is the approval of a write whose arguments carry untrusted taint
         labels: answer `{"approve": true}` or `{"approve": false}` (a refusal fails the call). The
-        decision is journaled as an `approval` step (see docs/tools.md).
+        decision is journaled as an `approval` step (see docs/tools.md). Answers and approval decisions
+        are audited (`node.run.answer`, `node.write.approve`, `node.write.deny`) in the control
+        plane's hash-chained log, with who answered.
       requestBody:
         required: true
         content:
@@ -570,6 +704,152 @@ paths:
       responses:
         '204': { description: Revoked }
         '404': { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [tenants]
+      summary: Change an API key's node allowlist and datasource scopes
+      description: |
+        Absent fields are kept; `null` lifts a restriction (every published node; every scope of the
+        nodes it runs). Changing node access needs `nodes.run` on the tenant (`403` otherwise).
+        Audited as `api_key.update` with the old and new values; routers apply it with their next
+        snapshot.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                nodes: { type: [array, 'null'], items: { type: string } }
+                datasource_scopes: { type: [array, 'null'], items: { type: string } }
+      responses:
+        '200':
+          description: The key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyInfo' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/runs:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [nodes]
+      summary: The tenant's node runs (console)
+      description: |
+        Newest first, from the node journal (the database's, or a standalone process's in-memory
+        one; `503` when the control plane has none). Permission `runs.read`.
+      parameters:
+        - { name: node, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string }, description: 'Comma-separated run statuses' }
+        - { name: created_after, in: query, schema: { type: string, format: date-time } }
+        - { name: created_before, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeRunList' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/runs/{runId}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: runId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [nodes]
+      summary: A node run (console)
+      description: |
+        Metadata with `runs.read`: status, budget, cost, usage, steps (vertex, kind, status, timings,
+        tokens, cost, taint labels). With `runs.data` also the content (`input`, `output`, each
+        step's `output`, the awaited `question`); `content_visible` says which.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConsoleRun' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/runs/{runId}/input:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: runId, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [nodes]
+      summary: Answer a question or approve or deny a tainted write (console)
+      description: |
+        As the signed-in user (permission `runs.answer`): journaled with the user's identity and
+        recorded in the audit chain (`node.run.answer`, `node.write.approve`, `node.write.deny`). An
+        approval takes `{"approve": true}` or `{"approve": false}`. `409` when the run is not waiting
+        (or not for `step`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [answer]
+              additionalProperties: false
+              properties:
+                answer: { description: 'Any JSON value' }
+                step: { type: string }
+      responses:
+        '202':
+          description: Accepted; a worker resumes the run
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConsoleRun' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/inbox:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [nodes]
+      summary: Runs waiting for a human (console)
+      description: |
+        Questions and approvals of tainted writes, oldest wait first (permission `runs.read`; the
+        question with `runs.data`).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, data, content_visible]
+                properties:
+                  object: { type: string, enum: [list] }
+                  content_visible: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [run_id, node, version, step, kind, waiting_since]
+                      properties:
+                        run_id: { type: string }
+                        node: { type: string }
+                        version: { type: integer }
+                        step: { type: string }
+                        kind: { type: string, enum: [question, approval] }
+                        question: { type: [string, 'null'] }
+                        invoker: { type: string }
+                        waiting_since: { type: string, format: date-time }
+                        expires_at: { type: [string, 'null'], format: date-time, description: 'When the human step times out (its `timeout_s`)' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/datasources/{datasourceId}:
     parameters:
@@ -1559,6 +1839,54 @@ paths:
         '413': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
 
+  /api/v1/audit/ingest:
+    post:
+      tags: [system]
+      summary: Run decisions from the data plane
+      description: |
+        Authenticated with the router token. Workers deliver the decisions made on the data plane
+        (`node.run.answer`, `node.write.approve`, `node.write.deny`, `node.run.cancel`) at least once;
+        each event id is recorded once in the hash-chained audit log, so a retry appends nothing.
+        Other actions are `rejected`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                router_id: { type: string }
+                events:
+                  type: array
+                  maxItems: 1000
+                  items:
+                    type: object
+                    required: [id, tenant_id, actor, action, detail, at]
+                    properties:
+                      id: { type: string, description: 'Stable: `<run>/<step>/answer`, `<run>/cancel`' }
+                      tenant_id: { type: string }
+                      actor: { type: string }
+                      action: { type: string }
+                      target: { type: [string, 'null'] }
+                      detail: { type: object, additionalProperties: true }
+                      at: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accepted, duplicates, rejected]
+                properties:
+                  accepted: { type: integer }
+                  duplicates: { type: integer }
+                  rejected: { type: integer }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
   /api/v1/snapshot:
     get:
       tags: [system]
@@ -1874,6 +2202,7 @@ components:
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Share of the flat `caliban/auto` price billed when a cache tier (exact or semantic) answers this tenant''s request: no model is called. `null`: the deployment''s `[routing] auto_cache_hit_fraction` (default 0.2) applies.' }
         node_caps: { oneOf: [ { $ref: '#/components/schemas/NodeCaps' }, { type: 'null' } ], description: '`null`: the defaults (steps 200, tokens 2000000, wall_clock_s 3600, depth 5, fanout 32).' }
         node_spend_caps: { oneOf: [ { $ref: '#/components/schemas/NodeSpendCaps' }, { type: 'null' } ], description: 'Caps on what the tenant''s node runs spend on model calls; `null`: none.' }
+        node_routes: { $ref: '#/components/schemas/NodeRoutes' }
         created_at: { type: string, format: date-time }
         status: { type: string, enum: [active, deleted], description: '`deleted` only appears with `include_deleted=true`.' }
         deleted_at: { type: [string, 'null'], format: date-time }
@@ -1889,6 +2218,7 @@ components:
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Overrides `[routing] auto_cache_hit_fraction` for this tenant. Omitted or `null`: the deployment value.' }
         node_caps: { $ref: '#/components/schemas/NodeCaps' }
         node_spend_caps: { $ref: '#/components/schemas/NodeSpendCaps' }
+        node_routes: { $ref: '#/components/schemas/NodeRoutes' }
     TenantUpdate:
       type: object
       additionalProperties: false
@@ -1899,6 +2229,15 @@ components:
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'A number sets the override; `null` clears it (the deployment value applies); absent keeps it.' }
         node_caps: { oneOf: [ { $ref: '#/components/schemas/NodeCaps' }, { type: 'null' } ], description: 'Caps on the budgets of published node versions; `null` restores the defaults; absent keeps them.' }
         node_spend_caps: { oneOf: [ { $ref: '#/components/schemas/NodeSpendCaps' }, { type: 'null' } ], description: 'Daily and monthly caps on node spend; `null` removes them; absent keeps them.' }
+        node_routes: { $ref: '#/components/schemas/NodeRoutes' }
+    NodeRoutes:
+      type: [object, 'null']
+      additionalProperties: { type: string, pattern: '^node/[a-z0-9_-]+(@(v[1-9][0-9]*|published))?$' }
+      description: |
+        Intents `caliban/auto` hands to the tenant's nodes: intent id to `node/<name>` (the live
+        version), `node/<name>@published` (the same) or `node/<name>@v<N>`. Overrides
+        `[routing.tenants.<id>.routes]` of the config file, intent by intent. On update: `null`
+        clears it, absent keeps it.
     NodeSpendCaps:
       type: object
       additionalProperties: false
@@ -2123,8 +2462,8 @@ components:
         node: { type: string }
         version: { type: integer }
         hash: { type: string, description: 'Content hash of the version that runs' }
-        status: { type: string, enum: [pending, running, sleeping, input_required, succeeded, failed, budget_exhausted] }
-        output: { description: 'The run output; on budget_exhausted (and failed, when there is one) the partial result' }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        output: { description: 'The run output; on budget_exhausted and cancelled (and failed, when there is one) the partial result' }
         partial: { type: boolean, description: 'The run ended on a budget overrun: output is partial' }
         error: { type: [string, 'null'] }
         stop_reason: { type: [string, 'null'], description: 'Why a run stopped early (a budget), or a note on a run that succeeded (a loop that hit max_iterations)' }
@@ -2149,22 +2488,117 @@ components:
             fanout_limit: { type: integer }
             fanout_used: { type: integer, description: 'Widest map reached' }
         cost_usd: { type: number, description: 'What the run spent on model calls so far (USD): the sum of `charged_usd` over its usage events' }
+        usage: { $ref: '#/components/schemas/RunUsage' }
         steps:
           type: array
-          items:
-            type: object
-            properties:
-              id: { type: string, description: 'Deterministic step id, e.g. classify#0, fanout#0/3, agent#2.1' }
-              vertex: { type: string }
-              kind: { type: string }
-              status: { type: string, enum: [completed, failed] }
-              tokens: { type: integer }
-              usd: { type: number }
-              duration_ms: { type: integer }
+          items: { $ref: '#/components/schemas/RunStep' }
         claims: { type: integer, description: 'How many times a worker claimed the run (more than 1 after a takeover or a resume)' }
+        origin: { type: string, description: 'What started the run when not a run request: `auto:<intent>` (caliban/auto)' }
+        cancel_requested: { type: boolean, description: 'A cancellation was asked for and the run has not stopped yet' }
+        last_event: { type: integer, description: 'Number of the run''s last event (resume its event stream after it)' }
         created_at: { type: string, format: date-time }
         started_at: { type: [string, 'null'], format: date-time }
         finished_at: { type: [string, 'null'], format: date-time }
+    RunStatus:
+      type: string
+      enum: [pending, running, sleeping, input_required, succeeded, failed, budget_exhausted, cancelled]
+    RunUsage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      description: Tokens of the run's model calls so far
+      properties:
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        total_tokens: { type: integer }
+    RunStep:
+      type: object
+      required: [id, vertex, kind, status, tokens, usd, labels, started_at, duration_ms]
+      properties:
+        id: { type: string, description: 'Deterministic step id, e.g. classify#0, fanout#0/3, agent#2.1' }
+        vertex: { type: string }
+        kind: { type: string }
+        status: { type: string, enum: [completed, failed] }
+        tokens: { type: integer }
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        usd: { type: number }
+        labels: { type: array, items: { type: string }, description: 'Taint labels of the step''s output' }
+        started_at: { type: string, format: date-time }
+        duration_ms: { type: integer }
+        output: { description: 'Console only, with `runs.data`: the step''s output' }
+    NodeRunSummary:
+      type: object
+      required: [id, object, node, version, status, cost_usd, invoker, created_at]
+      properties:
+        id: { type: string }
+        object: { type: string, enum: [node.run] }
+        node: { type: string }
+        version: { type: integer }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        awaiting_step: { type: [string, 'null'] }
+        cost_usd: { type: number }
+        origin: { type: string }
+        invoker: { type: string, description: '`api_key:<hash prefix>`' }
+        created_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+    NodeRunList:
+      type: object
+      required: [object, data, next_cursor]
+      properties:
+        object: { type: string, enum: [list] }
+        data: { type: array, items: { $ref: '#/components/schemas/NodeRunSummary' } }
+        next_cursor: { type: [string, 'null'], description: 'Pass as `cursor` for the next page' }
+    RunEvent:
+      type: object
+      required: [id, type, run_id, at, data]
+      description: One event of a run's stream (the `data` of an SSE event).
+      properties:
+        id: { type: integer, description: 'Numbered from 1 per run; the SSE `id`' }
+        type:
+          type: string
+          enum: [run.created, step.started, step.finished, run.input_required, run.sleeping, run.input_received, run.cancel_requested, run.finished]
+        run_id: { type: string }
+        at: { type: string, format: date-time }
+        data:
+          type: object
+          additionalProperties: true
+          description: 'By type: step events `step`, `vertex`, `kind`, `labels`, and on finish `status`, `tokens`, `prompt_tokens`, `completion_tokens`, `usd`, `cost_usd`, `duration_ms`; `run.input_required` `step`, `question`; `run.input_received` `step`, `by`; `run.finished` `status`, `error`, `stop_reason`, `cost_usd`.'
+        run: { $ref: '#/components/schemas/NodeRun', description: 'On the last event of a stream' }
+    ConsoleRun:
+      type: object
+      required: [id, object, node, version, status, steps, budget, content_visible, created_at]
+      properties:
+        id: { type: string }
+        object: { type: string, enum: [node.run] }
+        node: { type: string }
+        version: { type: integer }
+        hash: { type: string }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        invoker: { type: string }
+        origin: { type: [string, 'null'] }
+        error: { type: [string, 'null'] }
+        stop_reason: { type: [string, 'null'] }
+        partial: { type: boolean }
+        awaiting:
+          type: [object, 'null']
+          properties:
+            step: { type: string }
+            kind: { type: string, enum: [question, approval] }
+            question: { type: [string, 'null'], description: 'With `runs.data`' }
+        cancel_requested: { type: boolean }
+        cancelled_by: { type: [string, 'null'] }
+        budget: { type: object, additionalProperties: true }
+        cost_usd: { type: number }
+        usage: { $ref: '#/components/schemas/RunUsage' }
+        claims: { type: integer }
+        last_event: { type: integer }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        content_visible: { type: boolean, description: 'The caller holds `runs.data`: `input`, `output` and step outputs are included' }
+        input: { description: 'With `runs.data`' }
+        output: { description: 'With `runs.data`' }
+        steps: { type: array, items: { $ref: '#/components/schemas/RunStep' } }
     NodeCreate:
       type: object
       required: [tenant_id, name, spec]

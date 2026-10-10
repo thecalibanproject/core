@@ -39,11 +39,13 @@ Data-plane endpoints (`:8080`, tenant `cal_…` key as bearer token):
 | `POST /v1/embeddings` | Embeddings |
 | `POST /v1/rerank` | Reranking |
 | `GET /v1/models` | Models this tenant can use |
-| `POST /v1/nodes/{name}/runs`, `GET /v1/runs/{id}`, `POST /v1/runs/{id}/input` | Run a published node (sync or async), read a run, answer its human step; see [Nodes](docs/nodes.md) |
+| `POST /v1/nodes/{name}/runs`, `GET /v1/runs`, `GET /v1/runs/{id}`, `GET /v1/runs/{id}/events`, `POST /v1/runs/{id}/input`, `POST /v1/runs/{id}/cancel` | Run a published node (sync, async or streamed), list runs, read a run, follow its events (SSE, resumable with `Last-Event-ID`), answer its human step, cancel it; see [Nodes](docs/nodes.md#running-a-node) |
+| `model: "node/<name>"` on chat completions and messages | Runs the node behind the OpenAI and Anthropic APIs, streams included; a human step is answered with `Caliban-Run-Id`; see [the chat shortcut](docs/nodes.md#the-chat-shortcut-model-nodename) |
+| `POST /mcp` | The MCP server (Streamable HTTP): every published node the API key may run is a tool; see [the MCP server](docs/nodes.md#the-mcp-server) |
 | `GET /healthz` | Liveness, config version, the snapshot served (`snapshot.version`, and `snapshot.kek_ids` in split mode), and quota store state (`quota.state` is `degraded` while a shared store is unreachable; the probe still returns `200`) |
 | `GET /metrics` | Prometheus text format: `caliban_snapshot_info{version,kek_ids}`, and the usage WAL and usage shipping counters. No tenant data, no authentication (like `/healthz`) |
 
-The model id `caliban/auto` lets Caliban choose: the request is classified into an intent (embedding kNN, with keyword rules as the fallback) and served by the cheapest model the tenant may use that meets the intent's quality floor, or by the tenant's ordered candidates when no floor is set. Naming a catalogue model id pins the model, subject to the tenant's policy. See [Routing (`caliban/auto`)](#routing-calibanauto).
+The model id `caliban/auto` lets Caliban choose: the request is classified into an intent (embedding kNN, with keyword rules as the fallback) and served by the cheapest model the tenant may use that meets the intent's quality floor, or by the tenant's ordered candidates when no floor is set. Naming a catalogue model id pins the model, subject to the tenant's policy. A tenant can also map intents to its nodes: a request classified into such an intent runs the node instead (see [`caliban/auto` picks a node](docs/nodes.md#calibanauto-picks-a-node)). See [Routing (`caliban/auto`)](#routing-calibanauto).
 
 Every chat response carries these headers (all exposed to browsers through CORS):
 
@@ -56,6 +58,8 @@ Every chat response carries these headers (all exposed to browsers through CORS)
 | `x-caliban-cache-tier` | Only on hits: `exact` or `semantic` |
 | `x-caliban-pii-entities` | Number of PII entities protected |
 | `x-caliban-cost-usd` | Cost in USD, on non-streaming responses when the model has prices (`0.00000000` on a cache hit); the same number as the usage event's `cost_usd`, prompt-cache prices included |
+| `x-caliban-route`, `x-caliban-route-fallback` | `caliban/auto` for a tenant that maps intents to nodes: the path taken (`node/<name>@v<N>` or `model:<id>`) and, on a model answer, why no node ran; see [`caliban/auto` picks a node](docs/nodes.md#calibanauto-picks-a-node) |
+| `caliban-run-id` | Node answers (the chat shortcut, `caliban/auto` handing to a node): the run, to continue it or follow it with the run API |
 
 `x-caliban-cache` stays `hit` for both cache tiers, so SDKs and dashboards that count `hit | miss | bypass` keep working (the Python SDK's usage model and the console's filters only accept those three values); usage events add `cache_tier` the same way.
 
@@ -135,10 +139,10 @@ The binary is in `apps/caliban`; everything else is in `crates/`, except the P0 
 | `caliban-ontology` | Compiler done; store and retrieval planned | Caliban Semantic Model (CSM) types and the **CQIR compiler**: typed queries lowered to a MongoDB aggregation pipeline (with lint) or to SQL for the CDC replica; a pure-function lane planner |
 | `caliban-connect` | MongoDB done; SQL and REST sources planned | Connector trait. MongoDB: read-only privilege check, stratified sampling into path statistics, reference discovery, ontology bootstrap (`proposed` elements), native-lane executor with an `explain` gate, epochs |
 | `caliban-replica` | v1 done | CDC replica: snapshot plus change streams to Arrow and Parquet, queried with DataFusion; the watermark is the last applied `clusterTime` |
-| `caliban-nodes` | Versions, journal and executor done (P3 M1, M2); MCP tools, spend caps planned | Node spec validation, content hashes, publish-time validation, JSON Schema subset; the hierarchical budget ledger; the durable run journal (Postgres and memory, Absurd model); the executor (graph vertices, bounded agent loop, replay). See [`docs/nodes.md`](docs/nodes.md) |
+| `caliban-nodes` | P3 M1 to M6 done; templates, plan cache, evals planned | Node spec validation, content hashes, publish-time validation, JSON Schema subset; the hierarchical budget ledger; the durable run journal (Postgres and memory, Absurd model) with run events, cancellation and the audit outbox; the executor (graph vertices, bounded agent loop, replay, taint); chat input mapping. See [`docs/nodes.md`](docs/nodes.md) |
 | `caliban-rag` | Fusion and budgeting done; index planned | Reciprocal rank fusion, token-budgeted context selection |
-| `caliban-mcp` | Pinning done; MCP client planned | Tool-manifest pinning against description poisoning |
-| `caliban-gateway` | Done | Data-plane HTTP app: the pipeline above, embeddings, rerank, rate limits, OTel tracing; the provider-backed embedder shared by routing and the semantic cache; tenant purges from the semantic cache; the node run API (in-process model calls for the executor, forwarding to workers) |
+| `caliban-mcp` | MCP client done | The MCP client to tenants' tool servers: pinning against description poisoning, injection scan, egress guard, minted per-call tokens. The MCP server exposing nodes is in `caliban-gateway` |
+| `caliban-gateway` | Done | Data-plane HTTP app: the pipeline above, embeddings, rerank, rate limits, OTel tracing; the provider-backed embedder shared by routing and the semantic cache; tenant purges from the semantic cache; the node run API with event streams (in-process model calls for the executor, forwarding to workers), the `node/<name>` chat shortcut, `caliban/auto` handing requests to nodes, and the MCP server at `/mcp` |
 | `caliban-cp` | Done | Control plane: admin API per `api/openapi.yaml`, in-memory and Postgres stores, hash-chained audit log, signed snapshots for split-mode routers, web console hosting |
 
 ### Contracts owned here
@@ -315,6 +319,7 @@ exemplars = { "legal.review" = ["review this NDA clause for risky terms", "check
 
 | `CALIBAN_TOOL_TOKEN_KEY`, `CALIBAN_TOOL_TOKEN_ISSUER`, `CALIBAN_TOOL_TOKEN_PREVIOUS_KEYS` | workers, standalone, control plane | The Ed25519 key that signs the tokens minted per node tool call, their issuer, and retired public keys kept in the JWKS during a rotation (`caliban gen-tool-token-key`); see [`docs/tools.md`](docs/tools.md#tokens-no-passthrough) |
 | `CALIBAN_MCP_ALLOW_LOOPBACK` | workers, standalone, control plane | `true` lets registered MCP tool servers live on loopback (development only) |
+| `CALIBAN_MCP_TASKS`, `CALIBAN_MCP_ALLOWED_HOSTS` | routers, standalone | The MCP server at `/mcp`: Tasks (off by default), and the `Host` values it accepts (unset: any); see [`docs/nodes.md`](docs/nodes.md#the-mcp-server) |
 
 Split-mode variables are listed under [Split mode](#split-mode); node-run variables (`CALIBAN_WORKER_URLS`, `CALIBAN_WORKER_TOKEN`, `CALIBAN_NODE_*`, retention) in [`docs/nodes.md`](docs/nodes.md#where-runs-execute); node tools (the MCP client, the tool registry, egress, taint) in [`docs/tools.md`](docs/tools.md).
 
@@ -517,6 +522,9 @@ CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres cargo t
 # and replay, exactly-once runs, split mode, usage shipping, the reference triage node):
 CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres cargo test -p caliban-nodes
 CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres cargo test -p caliban --bin caliban -- nodes_tests
+# ... and the exposure tests (event streams across workers, listing and cancellation, the chat
+# shortcut, the MCP server, the console inbox, the audit chain) and caliban/auto handing to nodes:
+CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres cargo test -p caliban --bin caliban -- exposure_tests auto_tests
 
 # Semantic cache against a real Qdrant (tenant isolation, TTL, learning, latency):
 docker run -d --rm -p 56333:6333 --name caliban-qdrant-test qdrant/qdrant:v1.19.1-unprivileged
@@ -559,7 +567,7 @@ Known gaps:
 - SSO: roles come from token claims only (no userinfo or Microsoft Graph calls, so Entra group overage is not followed); no refresh tokens, back-channel logout or multiple issuers. Another control-plane replica sees a role binding change within its 5 s refresh.
 - Semantic cache: the default thresholds (0.91 with the default prefix) are calibrated for Qwen3-Embedding-0.6B on one hand-written set of 74 pairs, not per embedding model; some models place unrelated text close together (bge-small scored random-word prompts above 0.95), so calibrate on your traffic before switching tenants on. The verifier is an answer-embedding comparison, not an LLM judge (Krites-style judging of grey-zone pairs is next); thresholds are not yet per intent category (the note's category-aware caching), and there is no near-hit-as-hint tier (T2b). Datasource epochs and ACL fingerprints are not wired into T2 keys yet (no grounded answers reach it today). Entries are not encrypted per tenant. A deleted tenant's entries are purged only by routers running at the time (see [Tenant offboarding](#tenant-offboarding-semantic-cache)). No per-tenant entry quota. Internal embedding calls are not metered. The tenant error budget is per router, and concurrent stat updates to one entry are last-writer-wins. Hits replay instantly, which is a timing signal within a tenant (research note, open question 6).
 - Routing: Stage 2 (ONNX classifier) and Stage 3 (LLM fallback) are not built; kNN abstentions go straight to the keyword rules. The built-in kNN defaults (k 5, temperature 0.05, abstain below 0.5, no OOS gate) are not calibrated for any particular embedder until ml ships an `intent_head` calibration for it. Model health is not tracked on the data plane yet (the policy has a hook; every model counts as healthy). Router-profile centroids are ignored (clusters are matched by intent id). Tenant exemplars come from config only, not yet from the control plane. Artifact signatures (`manifest.json.minisig`) are not checked, only file hashes.
-- Nodes: see [what this release leaves out](docs/nodes.md#not-in-this-release) (MCP tools, spend caps, streaming and MCP exposure, `code` vertices). Cross-worker deduplication of a step that was in flight when its worker died needs the shared Idempotency-Key store (`[limits] store = "valkey"`).
+- Nodes: see [what this release leaves out](docs/nodes.md#not-in-this-release) (`code` vertices, the console views, evals, A2A). Cross-worker deduplication of a step that was in flight when its worker died needs the shared Idempotency-Key store (`[limits] store = "valkey"`).
 - `usage_event` (Postgres) grows without bound: no retention, roll-up or partitioning yet. Migration `0007` adds `cache_tier`, `usage_source`, `cache_write_tokens` and `cache_write_1h_tokens` to it (next to the routing columns from `0005`) and the cache prices to `model`; `0010` adds `billed_usd` and `saved_usd` (and the tenant's `auto_cache_hit_fraction`).
 - Metering estimates are byte-based (about 4 bytes per token, no tokenizer). They apply only to events marked `usage_source: "estimated"`: client disconnects (the provider may bill more than the estimate), upstream streams that fail or end without usage, and models marked `rejects_stream_options`.
 - Cost needs per-model prices in the catalogue, cache prices included, and no list prices ship with Caliban. Providers that price cache reads differently per model (OpenAI, Anthropic) need the right value per model; unset cache prices meter cache tokens at the input price (with a warning).

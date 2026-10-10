@@ -225,6 +225,8 @@ fn cors() -> CorsLayer {
             HeaderName::from_static("anthropic-version"),
             HeaderName::from_static("anthropic-beta"),
             HeaderName::from_static("traceparent"),
+            HeaderName::from_static(runs::RUN_ID_HEADER),
+            HeaderName::from_static("last-event-id"),
         ])
         .expose_headers([
             header::RETRY_AFTER,
@@ -239,6 +241,10 @@ fn cors() -> CorsLayer {
             HeaderName::from_static("x-caliban-cost-usd"),
             HeaderName::from_static("x-caliban-billed-usd"),
             HeaderName::from_static(idempotency::REPLAYED),
+            HeaderName::from_static(node_chat::ROUTE_HEADER),
+            HeaderName::from_static(node_chat::ROUTE_FALLBACK_HEADER),
+            HeaderName::from_static(runs::RUN_ID_HEADER),
+            HeaderName::from_static("x-caliban-run-status"),
         ])
 }
 

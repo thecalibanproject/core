@@ -78,6 +78,22 @@ drafts, delete drafts and retired versions), `nodes.publish` (publish, promote, 
 | `developer` | yes | yes | no | yes |
 | `viewer`, `auditor` | yes | no | no | no |
 | `billing` | no | no | no | no |
+
+Run permissions (the console's [run endpoints](nodes.md#console-endpoints)): `runs.read` (run
+lists, the inbox, run metadata: steps, timings, tokens, cost, taint labels), `runs.data` (run
+content: inputs, outputs, questions; it is the tenant's data and may hold personal data) and
+`runs.answer` (answer a question, approve or deny a tainted write, as oneself):
+
+| Role | `runs.read` | `runs.data` | `runs.answer` |
+|---|---|---|---|
+| `owner`, `admin` | yes | yes | yes |
+| `tenant_admin` | yes | yes | yes |
+| `developer` | yes | yes | no |
+| `viewer`, `auditor` | yes | no | no |
+| `billing` | no | no | no |
+
+Tool permissions ([tools](tools.md)): `tools.read`, `tools.write`, `tools.approve`; owner, admin and
+`tenant_admin` hold all three, `developer` read and write, `viewer` and `auditor` read.
 Roles come from three places and add up:
 
 - **Group mappings in the config file** (`[[security.oidc.role_mappings]]`, or
@@ -114,6 +130,7 @@ tenants the caller may see. A refusal is `403` with `error.type = "permission_er
 | `GET /api/v1/tenants/{tenantId}/api-keys` | `api_keys.read` | owner, admin, auditor, tenant_admin, developer, viewer |
 | `POST /api/v1/tenants/{tenantId}/api-keys` | `api_keys.write` | owner, admin, tenant_admin, developer |
 | `DELETE /api/v1/tenants/{tenantId}/api-keys/{keyId}` | `api_keys.write` | owner, admin, tenant_admin, developer |
+| `PATCH /api/v1/tenants/{tenantId}/api-keys/{keyId}` | `api_keys.write` (`nodes.run` too to change node access) | owner, admin, tenant_admin, developer |
 | `GET /api/v1/tenants/{tenantId}/provider-keys` | `provider_keys.read` | owner, admin, auditor, tenant_admin, developer, viewer |
 | `POST /api/v1/tenants/{tenantId}/provider-keys` | `provider_keys.write` | owner, admin, tenant_admin |
 | `DELETE /api/v1/tenants/{tenantId}/provider-keys/{keyId}` | `provider_keys.write` | owner, admin, tenant_admin |
@@ -128,6 +145,18 @@ tenants the caller may see. A refusal is `403` with `error.type = "permission_er
 | `POST /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/retire` | `nodes.publish` | owner, admin, tenant_admin |
 | `POST /api/v1/tenants/{tenantId}/nodes/{nodeName}/promote` | `nodes.publish` | owner, admin, tenant_admin |
 | `GET /api/v1/tenants/{tenantId}/nodes/{nodeName}/diff` | `nodes.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `GET /api/v1/tenants/{tenantId}/tool-servers` | `tools.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `POST /api/v1/tenants/{tenantId}/tool-servers` | `tools.write` | owner, admin, tenant_admin, developer |
+| `DELETE /api/v1/tenants/{tenantId}/tool-servers/{server}` | `tools.write` | owner, admin, tenant_admin, developer |
+| `POST /api/v1/tenants/{tenantId}/tool-servers/{server}/discover` | `tools.write` | owner, admin, tenant_admin, developer |
+| `GET /api/v1/tenants/{tenantId}/tool-servers/{server}/tools` | `tools.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `POST /api/v1/tenants/{tenantId}/tool-servers/{server}/tools` | `tools.write` | owner, admin, tenant_admin, developer |
+| `POST /api/v1/tenants/{tenantId}/tool-servers/{server}/tools/{tool}/approve` | `tools.approve` | owner, admin, tenant_admin |
+| `POST /api/v1/tenants/{tenantId}/tool-servers/{server}/tools/{tool}/revoke` | `tools.approve` | owner, admin, tenant_admin |
+| `GET /api/v1/tenants/{tenantId}/runs` | `runs.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `GET /api/v1/tenants/{tenantId}/runs/{runId}` | `runs.read` (content with `runs.data`) | owner, admin, auditor, tenant_admin, developer, viewer |
+| `POST /api/v1/tenants/{tenantId}/runs/{runId}/input` | `runs.answer` | owner, admin, tenant_admin |
+| `GET /api/v1/tenants/{tenantId}/inbox` | `runs.read` (questions with `runs.data`) | owner, admin, auditor, tenant_admin, developer, viewer |
 | `GET /api/v1/models` | `catalog.read` | every role |
 | `POST /api/v1/models` | `catalog.write` | owner, admin |
 | `DELETE /api/v1/models/{modelId}` | `catalog.write` | owner, admin |
@@ -154,6 +183,7 @@ tenants the caller may see. A refusal is `403` with `error.type = "permission_er
 | `DELETE /api/v1/role-bindings/{bindingId}` | `rbac.write` (`owner` bindings: owner only) | owner, admin |
 | `GET /api/v1/health` | none (public) | anyone |
 | `GET /api/v1/snapshot` | router token, not a user | split-mode routers |
+| `POST /api/v1/usage/ingest`, `POST /api/v1/audit/ingest` | router token, not a user | split-mode routers and workers |
 
 "Every role" means any of the seven roles (tenant roles for their own tenant on tenant-scoped
 routes). The test `auth::tests::every_role_against_every_admin_route` checks this table against

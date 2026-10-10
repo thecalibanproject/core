@@ -181,8 +181,11 @@ needs either:
   question naming the tool, the labels and the arguments. `POST /v1/runs/{id}/input
   {"step": "<step>@approve", "answer": {"approve": true}}` approves (`false` refuses: the call
   fails; an agent gets the refusal as a tool result). The decision is a journaled `approval` step
-  with the labels and who answered (`api_key:<hash prefix>`, recorded with every answer), and is
-  logged on the `caliban::audit` tracing target.
+  with the labels and who answered (`api_key:<hash prefix>`, or the console user), and is recorded
+  in the control plane's hash-chained audit log as `node.write.approve` or `node.write.deny`
+  (once; see [Audit of run decisions](nodes.md#audit-of-run-decisions)). The console's inbox lists
+  writes waiting for approval (`GET /api/v1/tenants/{t}/inbox`), and an administrator with
+  `runs.answer` decides there as themselves.
 
 `pii` is handled by the personal-data rules above rather than by approvals: an untrusted tool never
 receives personal data, write or read.
