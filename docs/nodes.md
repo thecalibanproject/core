@@ -4,8 +4,10 @@ A node is an AI sub-app a tenant declares as config: a prompt, a model policy, p
 datasource scopes, budgets and, for workflows, a graph. The control plane versions and publishes
 nodes; the data plane runs them on a durable journal, and every model call a node makes goes
 through the same request pipeline as client traffic. This page describes what P3 milestones M1
-(deployable versions) and M2 (journal and executor) ship. The plan and its decisions are in
-`docs/architecture/p3-nodes-plan.md` (docs repository).
+(deployable versions), M2 (journal and executor), M3 (budgets and guards) and M4 (tools) ship;
+the tools themselves (the MCP client, the tool registry, minted tokens, egress, taint) are in
+[`tools.md`](tools.md). The plan and its decisions are in `docs/architecture/p3-nodes-plan.md`
+(docs repository).
 
 ## The spec
 
@@ -18,7 +20,7 @@ checked by `NodeSpec::validate` (`crates/caliban-nodes`). The parts the core enf
 | `prompt.system` | System prompt of the node's model calls |
 | `prompt.input_schema`, `prompt.output_schema` | Checked against the run input and the run output |
 | `model_policy.model` | The model the calls ask for; default: the first `candidates` entry that is a model id (not `tier:...`), else `caliban/auto` |
-| `tools` | `mcp://server/tool#sha256:<hash>` (pinned, see below) or `node://name@vN` (another node of the tenant, pinned to a version) |
+| `tools` | `{"ref", "effect": "read"\|"write", "allow_tainted"?: [label patterns]}`. `ref`: `mcp://server/tool#sha256:<hash>` (an approved, pinned manifest of a registered server; see [tools.md](tools.md)), `node://name@vN` (another node of the tenant, pinned to a version) or `builtin://datasource_query` (read only) |
 | `datasources.scopes` | `<datasource>.<object>:<read\|write>` |
 | `budgets` | `steps`, `tokens`, `wall_clock_s`, optional `usd`; `depth` (subnode nesting, default 3) and `fanout` (map concurrency, default 8). See [Budgets](#budgets) |
 | `guards` | `max_repeats` (loop guard, default 3), `tool_retries` (default 2). See [Guards](#guards) |
@@ -68,10 +70,12 @@ without tool calls is the final answer (parsed against `prompt.output_schema` wh
 A failing tool returns an error object to the model; an unknown tool name is reported to the model;
 a tool that cannot be resolved refuses the run before the first call.
 
-**Tools.** `node://name@vN` is handled by the executor. Other references go through a tool
-registry (`ToolRegistry`): this release has no MCP client, so `mcp://` tools are refused at run
-time with a clear error (they arrive in P3 M4 with the approved tool registry, minted per-call
-tokens and the egress allowlist). Any other scheme is an unknown tool kind.
+**Tools.** `node://name@vN` is handled by the executor. Other references go through the data
+plane's tool registry: `mcp://` resolves only to an approved manifest of a server the tenant
+registered, `builtin://datasource_query` to the built-in query tool; any other scheme is an
+unknown tool kind. A tool not trusted with personal data gets PII surrogates in its arguments; tool
+results are anonymized as they enter the run; values carry taint labels, and a write with tainted
+arguments needs an allowlist entry or a human approval. All of this is in [tools.md](tools.md).
 
 ## Versions and their lifecycle
 
@@ -106,8 +110,9 @@ is a `422` listing every problem):
 - the budgets fit inside the tenant's **node caps**: `node_caps` on the tenant (`PATCH
   /api/v1/tenants/{t}`, `null` restores the defaults: steps 200, tokens 2,000,000, wall_clock_s
   3,600, depth 5, fanout 32). Promoting a version checks the current caps again;
-- `mcp://` tools are pinned. TODO(M4): resolving them against the tenant's approved tool registry
-  happens in the `PublishContext::check_tool` hook, which accepts every pinned reference today.
+- every `mcp://server/tool#sha256:...` names an approved manifest, with exactly that pin, of a
+  server the tenant registered (the tool registry, [tools.md](tools.md)); `builtin://` tools are
+  read only, and `builtin://datasource_query` needs `datasources.scopes`.
 
 Retiring a version that another published version calls is a `409`, as is deleting a published
 version (retire it first).
@@ -354,15 +359,18 @@ vertex classifies the case (clinical, administrative, billing), a `human` vertex
 clarifying question, the pinned catalogue tool finds matching services, and an `llm` vertex returns
 a recommendation that must match the output schema. With the tenant in `mask` PII mode, no model
 call sees the person's identifiers. The end-to-end test (`apps/caliban/src/nodes_tests.rs`) runs it
-against the mock model server with the catalogue tool stubbed in-process.
+against the mock model server, with the catalogue as a real MCP server (`rmcp`, Streamable HTTP):
+registered, discovered, scanned and approved through the control plane, then called with tokens
+minted per call that the server verifies against Caliban's JWKS. Neither the client's API key nor
+the person's email reaches the tool server.
 
 ## Not in this release
 
-- **P3 M4:** the MCP client and the per-tenant approved tool registry (`mcp://` tools refuse to run;
-  `PublishContext::check_tool` is the publish-time hook), minted per-call tokens, the egress
-  allowlist, taint labels.
 - **P3 M5:** streaming run events (SSE), `model: "node/<name>"` on chat completions, the MCP server,
   run listing and cancellation.
 - **P3 M8:** `code` vertices (WASM), the console views, evals as promotion gates.
-- The journal is not purged yet (rows of a deleted tenant stay, unreadable). Node specs are stored in
-  clear in the control-plane database, as before; they are sealed only in snapshots and journals.
+- RAG search as a built-in tool: `caliban-rag` has no retriever yet (TODO; the `retrieved` taint
+  label is reserved for it).
+- Journal rows of a deleted tenant stay until retention purges them (unreadable meanwhile: its data
+  key is destroyed). Node specs are stored in clear in the control-plane database, as before; they
+  are sealed only in snapshots and journals.

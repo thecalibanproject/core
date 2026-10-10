@@ -240,3 +240,39 @@ impl DataGuard for PiiGuard {
         self.rewrite(tenant, v.clone()).await.is_ok_and(|(_, n)| n > 0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use caliban_config::{Config, Snapshot};
+    use caliban_mcp::egress::EgressPolicy;
+    use serde_json::json;
+
+    /// Only an approved manifest of a registered server resolves: an unregistered server, an
+    /// unapproved pin or another tenant's tool is unreachable.
+    #[test]
+    fn only_approved_tools_of_registered_servers_resolve() {
+        let pin = "sha256:".to_owned() + &"1".repeat(64);
+        let t = json!({"id": "acme", "name": "Acme",
+            "tool_servers": [{"name": "crm", "url": "https://crm.internal/mcp", "auth": {"method": "none"}}],
+            "tools": [{"server": "crm", "name": "lookup", "description": "d", "input_schema": {}, "pin": pin}]});
+        let g = json!({"id": "globex", "name": "Globex"});
+        let mut cfg = Config::from_toml_str("").unwrap();
+        cfg.tenants = vec![serde_json::from_value(t).unwrap(), serde_json::from_value(g).unwrap()];
+        let tools = SnapshotTools::new(
+            ConfigHandle::new(Snapshot::new(cfg, "t")),
+            Arc::new(Keyring::new([7; 32], [])),
+            Arc::new(McpClient::system(EgressPolicy::default())),
+            None,
+        );
+        let ok = format!("mcp://crm/lookup#{pin}");
+        let tool = tools.resolve("acme", &ok).unwrap();
+        assert_eq!(tool.info().name, "lookup");
+        assert!(!tool.trusted());
+        let err = |r: &str, tenant: &str| tools.resolve(tenant, r).err().unwrap().to_string();
+        assert!(err(&format!("mcp://evil/lookup#{pin}"), "acme").contains("no tool server"));
+        assert!(err(&format!("mcp://crm/lookup#sha256:{}", "2".repeat(64)), "acme").contains("no approved manifest"));
+        assert!(err(&ok, "globex").contains("no tool server"), "tool registries are per tenant");
+        assert!(err("http://evil.example/tool", "acme").contains("unknown kind"));
+    }
+}

@@ -313,7 +313,10 @@ exemplars = { "legal.review" = ["review this NDA clause for risky terms", "check
 | `CALIBAN_TCP_NODELAY` | all | `TCP_NODELAY` on accepted connections, on by default; `0`, `false` or `off` turns it off. On Linux, with Nagle on, a stream's first frame waits for the client's delayed ACK (24 ms per stream at real model pacing, up to 50 ms; `bench/RESULTS-aws-2026-10.md`). Streams also hold their headers back until the first frame is ready (at most 250 ms), so headers and first token leave in one write either way. On macOS loopback it cost about 5 ms p50 at concurrency 64 in the stress bench (Nagle coalesced the frames there); production is Linux |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | Turns on OTLP/HTTP trace export (off when unset). `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME` and `OTEL_SDK_DISABLED` are honoured |
 
-Split-mode variables are listed under [Split mode](#split-mode); node-run variables (`CALIBAN_WORKER_URLS`, `CALIBAN_WORKER_TOKEN`, `CALIBAN_NODE_*`) in [`docs/nodes.md`](docs/nodes.md#where-runs-execute).
+| `CALIBAN_TOOL_TOKEN_KEY`, `CALIBAN_TOOL_TOKEN_ISSUER`, `CALIBAN_TOOL_TOKEN_PREVIOUS_KEYS` | workers, standalone, control plane | The Ed25519 key that signs the tokens minted per node tool call, their issuer, and retired public keys kept in the JWKS during a rotation (`caliban gen-tool-token-key`); see [`docs/tools.md`](docs/tools.md#tokens-no-passthrough) |
+| `CALIBAN_MCP_ALLOW_LOOPBACK` | workers, standalone, control plane | `true` lets registered MCP tool servers live on loopback (development only) |
+
+Split-mode variables are listed under [Split mode](#split-mode); node-run variables (`CALIBAN_WORKER_URLS`, `CALIBAN_WORKER_TOKEN`, `CALIBAN_NODE_*`, retention) in [`docs/nodes.md`](docs/nodes.md#where-runs-execute); node tools (the MCP client, the tool registry, egress, taint) in [`docs/tools.md`](docs/tools.md).
 
 ### PII NER model (`ner` feature)
 

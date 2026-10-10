@@ -36,6 +36,7 @@ tags:
   - name: datasources
   - name: ontology
   - name: nodes
+  - name: tools
   - name: usage
   - name: system
   - name: auth
@@ -318,6 +319,15 @@ paths:
                 version: { type: integer, minimum: 1, description: 'A published version; default: the live one' }
                 async: { type: boolean, default: false }
                 wait_s: { type: number, minimum: 0, description: 'Sync runs: wait at most this long (capped by the server)' }
+                budget:
+                  type: object
+                  additionalProperties: false
+                  description: Lowers the version's budget for this run (a larger value is ignored).
+                  properties:
+                    steps: { type: integer, minimum: 1 }
+                    tokens: { type: integer, minimum: 1 }
+                    usd: { type: number, exclusiveMinimum: 0 }
+                    wall_clock_s: { type: integer, minimum: 1 }
       responses:
         '200':
           description: The run ended (succeeded, failed or budget_exhausted)
@@ -363,9 +373,13 @@ paths:
       tags: [nodes]
       summary: Answer the human step a run waits for
       description: |
-        Records the answer (sealed in the journal) and resumes the run. `step` defaults to the step
-        the run waits for (`awaiting.step`). `409` (`run_not_awaiting_input`) when the run is not
-        waiting for input, or not for that step.
+        Records the answer (sealed in the journal, with who answered: `api_key:<hash prefix>`) and
+        resumes the run. `step` defaults to the step the run waits for (`awaiting.step`). `409`
+        (`run_not_awaiting_input`) when the run is not waiting for input, or not for that step.
+
+        A step named `<step>@approve` is the approval of a write whose arguments carry untrusted taint
+        labels: answer `{"approve": true}` or `{"approve": false}` (a refusal fails the call). The
+        decision is journaled as an `approval` step (see docs/tools.md).
       requestBody:
         required: true
         content:
@@ -523,6 +537,13 @@ paths:
                     every published node of the tenant. `[]`: none. Granting node access needs the
                     `nodes.run` permission on the tenant (`403` otherwise); a creator without it gets
                     a key that runs no nodes.
+                datasource_scopes:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    Datasource scopes (`<datasource>.<object>:read`) the built-in datasource query tool
+                    may read for this key's runs, intersected with each node's `datasources.scopes`.
+                    Absent: every scope of the nodes it runs.
       responses:
         '201':
           description: Created
@@ -1041,16 +1062,219 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Node' }
 
+  /api/v1/tenants/{tenantId}/tool-servers:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [tools]
+      summary: Registered MCP tool servers (tools.read)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ToolServer' } }
+    post:
+      tags: [tools]
+      summary: Register an MCP tool server (tools.write)
+      description: |
+        Registering a server is what allows node tools to reach it (the egress allowlist). The URL must be
+        Streamable HTTP (`http` or `https`; stdio servers are not supported) and pass the egress rules (no
+        link-local or metadata addresses; loopback only with `CALIBAN_MCP_ALLOW_LOOPBACK`). `credential` is
+        sealed under the tenant's data key at once and never returned. Audited (`tool_server.create`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ToolServerCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ToolServer' }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/tool-servers/{server}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: server, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [tools]
+      summary: Delete a tool server (tools.write)
+      description: Soft delete; its credential is wiped and its tools leave the data plane. `409` while a published node version uses it.
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/tool-servers/{server}/discover:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: server, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [tools]
+      summary: Discover a server's tools (tools.write)
+      description: |
+        The control plane connects through the egress guard (with a discovery token for `caliban_token` servers),
+        lists the tools, pins each manifest and runs the injection scan. A manifest seen with a new pin is a new,
+        `discovered` record: a server cannot change an approved tool. Audited (`tool.discover`).
+      responses:
+        '200':
+          description: The manifests the server lists now
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  server: { type: string }
+                  tools: { type: array, items: { $ref: '#/components/schemas/ToolManifest' } }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/tool-servers/{server}/tools:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: server, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [tools]
+      summary: Every manifest recorded for the server, with pins, scan findings and status (tools.read)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ToolManifest' } }
+    post:
+      tags: [tools]
+      summary: Import manifests (a server the control plane cannot reach) (tools.write)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [manifests]
+              additionalProperties: false
+              properties:
+                manifests:
+                  type: array
+                  items:
+                    type: object
+                    required: [name, description, input_schema]
+                    properties:
+                      name: { type: string }
+                      description: { type: string }
+                      input_schema: { type: object }
+      responses:
+        '200':
+          description: The recorded manifests
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  server: { type: string }
+                  tools: { type: array, items: { $ref: '#/components/schemas/ToolManifest' } }
+
+  /api/v1/tenants/{tenantId}/tool-servers/{server}/tools/{tool}/approve:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: server, in: path, required: true, schema: { type: string } }
+      - { name: tool, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [tools]
+      summary: Approve a manifest by pin (tools.approve)
+      description: |
+        Only approved manifests reach the data plane and can be pinned by a published node version. A manifest
+        with scan findings needs `acknowledge_findings: true` (`422` otherwise). Audited (`tool.approve`, with the
+        findings and the acknowledgement).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pin]
+              additionalProperties: false
+              properties:
+                pin: { type: string, description: 'sha256:<hex>' }
+                acknowledge_findings: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Approved; `ref` is what node specs pin
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tool: { $ref: '#/components/schemas/ToolManifest' }
+                  ref: { type: string, description: 'mcp://server/tool#sha256:<hex>' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/tool-servers/{server}/tools/{tool}/revoke:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: server, in: path, required: true, schema: { type: string } }
+      - { name: tool, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [tools]
+      summary: Withdraw the approval of a manifest (tools.approve)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [pin], properties: { pin: { type: string } } }
+      responses:
+        '204': { description: Revoked }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /.well-known/caliban-tool-jwks.json:
+    get:
+      tags: [tools]
+      security: []
+      summary: The public keys tool servers verify minted tool tokens with
+      description: |
+        The current and previous `CALIBAN_TOOL_TOKEN_*` public keys (RFC 8037 OKP, Ed25519, `alg: EdDSA`). Tokens are
+        minted per call, audience-bound (the server's audience), scoped to one tool (`scope: tool:<name>`) and live
+        60 seconds. Empty without a key.
+      responses:
+        '200':
+          description: JWKS
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        kty: { type: string, enum: [OKP] }
+                        crv: { type: string, enum: [Ed25519] }
+                        alg: { type: string, enum: [EdDSA] }
+                        use: { type: string, enum: [sig] }
+                        kid: { type: string }
+                        x: { type: string }
+
   /api/v1/usage:
     get:
       tags: [usage]
       summary: Recent usage events and aggregate savings
       description: |
         With the Postgres store, from `usage_event`: every data plane's events (split-mode routers ship theirs
-        through `POST /api/v1/usage/ingest`), totals over all of them. With the in-memory store, the last 10,000
-        events of the process.
+        through `POST /api/v1/usage/ingest`), totals over all of them, including the days rolled up into
+        `usage_daily` once raw events pass `CALIBAN_USAGE_RETENTION_DAYS` (the totals do not change). With the
+        in-memory store, the last 10,000 events of the process. `node` and `run_id` filter node calls; `by_node`
+        totals each node version (cost per node); a `run_id` covers raw events only.
       parameters:
         - { $ref: '#/components/parameters/TenantQuery' }
+        - { name: node, in: query, schema: { type: string } }
+        - { name: run_id, in: query, schema: { type: string } }
         - name: limit
           in: query
           schema: { type: integer, default: 100, maximum: 1000 }
@@ -1649,6 +1873,7 @@ components:
         pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant, description: 'Surrogate consistency for reversible PII. `tenant`: the same value always gets the same surrogate in this tenant (keyed HMAC per tenant, derived from CALIBAN_KEK), so pseudonymised requests can hit the exact cache; sessions of the tenant become linkable through their surrogates. `session`: fresh surrogates per request. Surrogates never cross tenants.' }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Share of the flat `caliban/auto` price billed when a cache tier (exact or semantic) answers this tenant''s request: no model is called. `null`: the deployment''s `[routing] auto_cache_hit_fraction` (default 0.2) applies.' }
         node_caps: { oneOf: [ { $ref: '#/components/schemas/NodeCaps' }, { type: 'null' } ], description: '`null`: the defaults (steps 200, tokens 2000000, wall_clock_s 3600, depth 5, fanout 32).' }
+        node_spend_caps: { oneOf: [ { $ref: '#/components/schemas/NodeSpendCaps' }, { type: 'null' } ], description: 'Caps on what the tenant''s node runs spend on model calls; `null`: none.' }
         created_at: { type: string, format: date-time }
         status: { type: string, enum: [active, deleted], description: '`deleted` only appears with `include_deleted=true`.' }
         deleted_at: { type: [string, 'null'], format: date-time }
@@ -1663,6 +1888,7 @@ components:
         semantic_cache: { type: string, enum: ['off', 'on'], default: 'off' }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Overrides `[routing] auto_cache_hit_fraction` for this tenant. Omitted or `null`: the deployment value.' }
         node_caps: { $ref: '#/components/schemas/NodeCaps' }
+        node_spend_caps: { $ref: '#/components/schemas/NodeSpendCaps' }
     TenantUpdate:
       type: object
       additionalProperties: false
@@ -1672,6 +1898,17 @@ components:
         semantic_cache: { type: string, enum: ['off', 'on'] }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'A number sets the override; `null` clears it (the deployment value applies); absent keeps it.' }
         node_caps: { oneOf: [ { $ref: '#/components/schemas/NodeCaps' }, { type: 'null' } ], description: 'Caps on the budgets of published node versions; `null` restores the defaults; absent keeps them.' }
+        node_spend_caps: { oneOf: [ { $ref: '#/components/schemas/NodeSpendCaps' }, { type: 'null' } ], description: 'Daily and monthly caps on node spend; `null` removes them; absent keeps them.' }
+    NodeSpendCaps:
+      type: object
+      additionalProperties: false
+      description: |
+        Caps on what the tenant's node runs spend on model calls (USD, priced like the metering), per
+        UTC day and month, across all workers: checked before every model call against the journal's
+        per-day totals. A cap reached ends runs gracefully (`budget_exhausted`).
+      properties:
+        daily_usd: { type: number, minimum: 0 }
+        monthly_usd: { type: number, minimum: 0 }
     NodeCaps:
       type: object
       additionalProperties: false
@@ -1682,6 +1919,7 @@ components:
         wall_clock_s: { type: integer, minimum: 1 }
         depth: { type: integer, minimum: 1 }
         fanout: { type: integer, minimum: 1 }
+        usd: { type: number, exclusiveMinimum: 0, description: 'When set, every version must declare `budgets.usd` within it (the most one run may spend).' }
 
     ApiKeyInfo:
       type: object
@@ -1693,6 +1931,7 @@ components:
         created_at: { type: string, format: date-time }
         revoked_at: { type: [string, 'null'], format: date-time, description: 'Set once the key is revoked.' }
         nodes: { type: [array, 'null'], items: { type: string }, description: 'Node allowlist. `null`: every published node of the tenant; `[]`: none.' }
+        datasource_scopes: { type: array, items: { type: string }, description: 'Datasource scopes the built-in query tool may read for this key (absent: every scope of the nodes it runs).' }
     ApiKeyCreated:
       allOf:
         - $ref: '#/components/schemas/ApiKeyInfo'
@@ -1903,7 +2142,13 @@ components:
             tokens_used: { type: integer }
             wall_clock_ms_limit: { type: integer }
             wall_clock_ms_used: { type: integer, description: 'Execution time only (not waiting for a human or a timer)' }
-            usd: { type: number }
+            usd: { type: number, description: 'Model spend so far, priced like the metering' }
+            usd_limit: { type: number, description: 'The run''s USD cap (absent: none; tenant caps still apply)' }
+            depth_limit: { type: integer }
+            depth_used: { type: integer, description: 'Deepest subnode nesting reached' }
+            fanout_limit: { type: integer }
+            fanout_used: { type: integer, description: 'Widest map reached' }
+        cost_usd: { type: number, description: 'What the run spent on model calls so far (USD): the sum of `charged_usd` over its usage events' }
         steps:
           type: array
           items:
@@ -1927,6 +2172,62 @@ components:
         tenant_id: { type: string }
         name: { type: string }
         spec: { type: object, additionalProperties: true }
+
+    ToolAuth:
+      type: object
+      required: [method]
+      description: How Caliban authenticates to the server. Client tokens are never passed through.
+      properties:
+        method: { type: string, enum: [caliban_token, api_key, oauth_client_credentials, none] }
+        audience: { type: string, description: 'caliban_token: `aud` of minted tokens (default: the URL''s origin)' }
+        header: { type: string, description: 'api_key: the header carrying the key (default `Authorization: Bearer`)' }
+        token_url: { type: string, description: 'oauth_client_credentials' }
+        client_id: { type: string, description: 'oauth_client_credentials' }
+        scope: { type: string, description: 'oauth_client_credentials: requested scope (down-scoping)' }
+    ToolServer:
+      type: object
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        name: { type: string, description: 'The `server` of `mcp://server/tool#sha256:...`' }
+        url: { type: string }
+        auth: { $ref: '#/components/schemas/ToolAuth' }
+        trusted: { type: boolean, description: 'Trusted with personal data: PII surrogates in arguments are rehydrated for it' }
+        has_credential: { type: boolean }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+    ToolServerCreate:
+      type: object
+      required: [name, url]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        url: { type: string }
+        auth: { $ref: '#/components/schemas/ToolAuth' }
+        credential: { type: string, description: 'API key or OAuth client secret; sealed at once, never returned' }
+        trusted: { type: boolean, default: false }
+    ToolManifest:
+      type: object
+      properties:
+        id: { type: string }
+        server: { type: string }
+        name: { type: string }
+        description: { type: string }
+        input_schema: { type: object }
+        pin: { type: string, description: 'sha256 over the canonical [name, description, input_schema]' }
+        findings:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [instruction, hidden_unicode, url, exfiltration] }
+              location: { type: string }
+              excerpt: { type: string }
+        status: { type: string, enum: [discovered, approved, revoked] }
+        discovered_at: { type: string, format: date-time }
+        approved_at: { type: [string, 'null'], format: date-time }
+        approved_by: { type: [string, 'null'] }
+        findings_acknowledged: { type: boolean }
 
     UsageEvent:
       type: object
@@ -1956,32 +2257,46 @@ components:
         flat_price_usd: { type: number, description: '`caliban/auto` only: flat auto price for the same tokens (`[routing] auto_price_*`), through the same cost function as `cost_usd`; the flat price has no cache prices, so cache reads and writes count at its input price. On a cache hit of either tier: the full flat price of the cached answer''s tokens (what a miss would have billed), recorded next to `billed_usd`. Events written before cache-hit billing record 0 on hits.' }
         billed_usd: { type: number, description: '`caliban/auto` only: what the customer is billed. `flat_price_usd` on a miss; on a cache hit of either tier, `flat_price_usd` x the tenant''s cache-hit fraction (`auto_cache_hit_fraction`, default 0.2). Margin = billed_usd - routed_model_cost_usd. Absent on events written before cache-hit billing (they billed `flat_price_usd`).' }
         saved_usd: { type: number, description: 'Cache hits only: what the hit saved the customer. `caliban/auto`: `flat_price_usd - billed_usd`. Other models: the model cost the hit avoided (the cached answer''s tokens at the input and output price; nothing reached the provider). Absent on misses and for unpriced models.' }
+        node: { type: string, description: 'Node model calls only: the node of the run (its root node: a subnode''s calls are the run''s).' }
+        node_version: { type: integer }
+        run_id: { type: string }
     UsageReport:
       type: object
       required: [events, totals]
       properties:
         events: { type: array, items: { $ref: '#/components/schemas/UsageEvent' } }
-        totals:
-          type: object
-          properties:
-            requests: { type: integer }
-            prompt_tokens: { type: integer }
-            completion_tokens: { type: integer }
-            cached_prompt_tokens: { type: integer, description: 'Prompt tokens read from provider prompt caches' }
-            cache_write_tokens: { type: integer, description: 'Prompt tokens written to provider prompt caches' }
-            estimated_requests: { type: integer, description: 'Events with `usage_source: estimated`' }
-            cache_hits: { type: integer, description: 'Hits of both tiers.' }
-            saved_usd: { type: number, description: 'Sum of `saved_usd`: what cache hits saved customers, all models' }
-            semantic_cache_hits: { type: integer }
-            tokens_saved: { type: integer }
-            cost_usd: { type: number }
-            auto_requests: { type: integer, description: 'Requests that asked for `caliban/auto`' }
-            auto_cache_hits: { type: integer, description: '`caliban/auto` requests answered by a cache tier (billed at the discounted price)' }
-            flat_price_usd: { type: number, description: 'Full flat price, summed over `caliban/auto` events that carry both prices (cache hits at their full price)' }
-            billed_usd: { type: number, description: 'What those events were billed: the flat price on misses, the discounted price on cache hits' }
-            auto_saved_usd: { type: number, description: 'What `caliban/auto` cache hits saved customers: flat_price_usd - billed_usd over hits' }
-            routed_model_cost_usd: { type: number, description: 'Sum over the same events (0 on cache hits)' }
-            margin_usd: { type: number, description: 'billed_usd - routed_model_cost_usd' }
+        by_node:
+          type: array
+          description: The same totals per node version (node calls only), raw and rolled-up days.
+          items:
+            type: object
+            properties:
+              node: { type: string }
+              node_version: { type: integer }
+              totals: { $ref: '#/components/schemas/UsageTotals' }
+        totals: { $ref: '#/components/schemas/UsageTotals' }
+    UsageTotals:
+      type: object
+      properties:
+        charged_usd: { type: number, description: 'What the customer is charged: the billed `caliban/auto` price (discounted on cache hits), the model''s cost otherwise. Over a run''s events it equals the run''s `cost_usd`.' }
+        requests: { type: integer }
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        cached_prompt_tokens: { type: integer, description: 'Prompt tokens read from provider prompt caches' }
+        cache_write_tokens: { type: integer, description: 'Prompt tokens written to provider prompt caches' }
+        estimated_requests: { type: integer, description: 'Events with `usage_source: estimated`' }
+        cache_hits: { type: integer, description: 'Hits of both tiers.' }
+        saved_usd: { type: number, description: 'Sum of `saved_usd`: what cache hits saved customers, all models' }
+        semantic_cache_hits: { type: integer }
+        tokens_saved: { type: integer }
+        cost_usd: { type: number }
+        auto_requests: { type: integer, description: 'Requests that asked for `caliban/auto`' }
+        auto_cache_hits: { type: integer, description: '`caliban/auto` requests answered by a cache tier (billed at the discounted price)' }
+        flat_price_usd: { type: number, description: 'Full flat price, summed over `caliban/auto` events that carry both prices (cache hits at their full price)' }
+        billed_usd: { type: number, description: 'What those events were billed: the flat price on misses, the discounted price on cache hits' }
+        auto_saved_usd: { type: number, description: 'What `caliban/auto` cache hits saved customers: flat_price_usd - billed_usd over hits' }
+        routed_model_cost_usd: { type: number, description: 'Sum over the same events (0 on cache hits)' }
+        margin_usd: { type: number, description: 'billed_usd - routed_model_cost_usd' }
 
     Route:
       type: object
@@ -2028,7 +2343,8 @@ components:
       enum: [tenants.create, catalog.read, catalog.write, providers.probe, audit.read, rbac.read, rbac.write,
              tenant.read, tenant.write, tenant.delete, api_keys.read, api_keys.write, provider_keys.read,
              provider_keys.write, routes.read, routes.write, datasources.read, datasources.write, ontology.read,
-             ontology.review, nodes.read, nodes.write, usage.read]
+             ontology.review, nodes.read, nodes.write, nodes.publish, nodes.run, tools.read, tools.write,
+             tools.approve, usage.read]
     RoleInfo:
       type: object
       required: [role, scope, description, permissions]
