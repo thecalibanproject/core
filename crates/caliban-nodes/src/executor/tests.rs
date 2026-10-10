@@ -18,6 +18,8 @@ struct FakeModel {
     hold: Mutex<Option<String>>,
     held: Notify,
     release: Notify,
+    /// Calls for this step are rate limited this many times first.
+    throttle: Mutex<Option<(String, u32)>>,
 }
 
 impl FakeModel {
@@ -28,6 +30,7 @@ impl FakeModel {
             hold: Mutex::new(None),
             held: Notify::new(),
             release: Notify::new(),
+            throttle: Mutex::new(None),
         })
     }
 
@@ -44,6 +47,13 @@ impl FakeModel {
 impl ModelClient for FakeModel {
     async fn chat(&self, ctx: &CallCtx, body: Value) -> Result<ModelReply, ModelError> {
         self.calls.lock().push((ctx.step_id.clone(), ctx.idempotency_key.clone()));
+        if let Some((step, left)) = self.throttle.lock().as_mut()
+            && *step == ctx.step_id
+            && *left > 0
+        {
+            *left -= 1;
+            return Err(ModelError::Throttled { retry_after: Duration::from_millis(30), message: "429".into() });
+        }
         let hold = self.hold.lock().as_deref() == Some(ctx.step_id.as_str());
         if hold {
             *self.hold.lock() = None;
@@ -603,4 +613,41 @@ async fn run_creation_is_idempotent_and_inputs_are_validated() {
     let e = ex.create(start("strict", json!({"other": 1}))).await.unwrap_err();
     assert!(matches!(e, ExecError::Invalid(ref m) if m.contains("case")), "{e}");
     assert!(matches!(ex.create(start("ghost", json!({}))).await.unwrap_err(), ExecError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn rate_limited_steps_sleep_durably_then_resume() {
+    for j in journals().await {
+        let h = Harness::new(j);
+        h.nodes.add(
+            "chain",
+            1,
+            json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(10, 10_000),
+                   "graph": {"vertices": [{"id": "a", "type": "llm"}, {"id": "b", "type": "llm"}], "edges": [{"from": "a", "to": "b"}]}}),
+        );
+        let model = FakeModel::new(|body| text(&format!("<{}>", last_user(body))));
+        *model.throttle.lock() = Some(("b#0".into(), 2));
+        let ex = h.executor(&model, "w1");
+        let v = run(&ex, "chain", json!("x")).await;
+        // The worker is not held: the run sleeps in the journal until the limit resets.
+        assert_eq!(v.status, RunStatus::Sleeping, "{v:?}");
+        assert_eq!(v.steps.len(), 1);
+        let stop = Arc::new(Notify::new());
+        tokio::spawn(Arc::clone(&ex).run_loop(Arc::clone(&stop)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut done = None;
+        while Instant::now() < deadline {
+            done = ex.wait("acme", &v.id, Instant::now() + Duration::from_millis(100)).await.unwrap();
+            if done.as_ref().is_some_and(|d| d.status.is_terminal()) {
+                break;
+            }
+        }
+        stop.notify_waiters();
+        let done = done.unwrap();
+        assert_eq!(done.status, RunStatus::Succeeded, "{done:?}");
+        assert_eq!(model.calls_for("a#0"), 1, "a is not re-run after the sleeps");
+        assert_eq!(model.calls_for("b#0"), 3, "two rate-limited calls, then the answer");
+        assert!(h.journal.event(&v.id, "b#0:throttled:1").await.unwrap().is_some());
+        assert!(h.journal.event(&v.id, "b#0:throttled:2").await.unwrap().is_none());
+    }
 }

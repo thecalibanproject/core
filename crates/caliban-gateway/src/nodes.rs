@@ -119,11 +119,19 @@ impl ModelClient for GatewayModels {
             let msg = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("no detail").to_owned();
             let code = v.pointer("/error/code").and_then(Value::as_str).unwrap_or_default();
             let msg = format!("{status}: {msg}");
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                // A tenant quota: the run sleeps in the journal until it resets.
+                let secs = headers
+                    .get(header::RETRY_AFTER)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(1);
+                return Err(ModelError::Throttled { retry_after: Duration::from_secs(secs), message: msg });
+            }
             // Busy: the same step is still in flight (a worker died during the call); its stored
             // response is ready when it ends.
-            let transient = status.is_server_error()
-                || status == StatusCode::TOO_MANY_REQUESTS
-                || (status == StatusCode::CONFLICT && code == "idempotency_key_in_use");
+            let transient =
+                status.is_server_error() || (status == StatusCode::CONFLICT && code == "idempotency_key_in_use");
             return Err(if transient { ModelError::Unavailable(msg) } else { ModelError::Rejected(msg) });
         }
         let message = v

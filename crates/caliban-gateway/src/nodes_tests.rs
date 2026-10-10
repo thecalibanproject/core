@@ -182,3 +182,20 @@ async fn the_run_api_is_guarded() {
     let (s, _) = send(&a, "POST", "/v1/nodes/triage/runs", KEY, Some(json!({"inputs": 1}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "unknown fields are refused");
 }
+
+#[tokio::test]
+async fn rate_limited_node_calls_ask_for_a_durable_sleep() {
+    let (url, _) = upstream().await;
+    let mut cfg = config(&url);
+    cfg.limits.requests_per_minute = Some(1);
+    let gw = Arc::new(Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "t")), Arc::new(RecentUsage::default())));
+    let models = GatewayModels::new(&gw);
+    models.chat(&ctx("a#0", KEY), body("one")).await.unwrap();
+    match models.chat(&ctx("b#0", KEY), body("two")).await.unwrap_err() {
+        ModelError::Throttled { retry_after, message } => {
+            assert!(retry_after >= std::time::Duration::from_secs(1), "{retry_after:?}");
+            assert!(message.starts_with("429"), "{message}");
+        }
+        other => panic!("expected a rate limit, got {other:?}"),
+    }
+}

@@ -76,7 +76,14 @@ pub enum ModelError {
     /// A transient failure (upstream down, the same step still in flight elsewhere): retried.
     #[error("model call failed: {0}")]
     Unavailable(String),
+    /// Rate limited (a tenant quota): the run sleeps durably until `retry_after` instead of
+    /// holding a worker, then calls again.
+    #[error("model call rate limited: {message}")]
+    Throttled { retry_after: Duration, message: String },
 }
+
+/// Durable sleeps of one step while it is rate limited, after which the run fails.
+pub const MAX_THROTTLED_SLEEPS: u32 = 5;
 
 /// Makes the model calls of node runs. The data plane implements it with its own request pipeline
 /// (PII, cache, routing, quotas, metering, tracing), so a node never reaches a provider directly.
@@ -859,7 +866,36 @@ impl RunCx {
                     tokio::time::sleep(wait).await;
                     wait = (wait * 2).min(Duration::from_secs(2));
                 }
+                Err(ModelError::Throttled { retry_after, message }) => {
+                    return Err(self.throttled(step_id, retry_after, &message).await);
+                }
             }
+        }
+    }
+
+    /// A rate-limited step: a durable sleep (timer `<step>:throttled:<n>`) until the limit resets,
+    /// at most [`MAX_THROTTLED_SLEEPS`] times.
+    async fn throttled(&self, step_id: &str, retry_after: Duration, message: &str) -> Stop {
+        let mut n = 0;
+        loop {
+            match self.ex.journal.event(&self.run.id, &format!("{step_id}:throttled:{n}")).await {
+                Ok(Some(_)) => n += 1,
+                Ok(None) => break,
+                Err(e) => return Stop::Fail(e.to_string()),
+            }
+        }
+        if n >= MAX_THROTTLED_SLEEPS {
+            return Stop::Fail(format!("step {step_id}: still rate limited after {n} waits: {message}"));
+        }
+        let pause = retry_after.clamp(Duration::from_millis(10), Duration::from_secs(300));
+        match self.deadline(&format!("{step_id}:throttled:{n}"), pause).await {
+            Ok(wake_at) => Stop::Suspend(Suspension {
+                status: RunStatus::Sleeping,
+                awaiting: None,
+                question: None,
+                wake_at: Some(wake_at),
+            }),
+            Err(stop) => stop,
         }
     }
 
