@@ -50,6 +50,10 @@ pub struct ToolRef {
     pub effect: Effect,
     #[serde(default)]
     pub requires: Vec<String>,
+    /// `effect: write` only: taint labels its arguments may carry without a human approval
+    /// (`tool:<server>/*`, `datasource`, `*`, ...). See `executor::taint`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_tainted: Vec<String>,
 }
 
 /// A parsed tool reference.

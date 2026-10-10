@@ -6,8 +6,13 @@
 //! token budgets and by `agent.max_turns` (default: `budgets.steps`). A tool that fails returns an
 //! error object to the model instead of ending the run; an unknown or unavailable tool refuses the
 //! run before the first call.
+//!
+//! **Taint.** The conversation carries the labels of the run input and of every tool result the
+//! model saw; every tool call made after a result is labelled with them (a write may then need an
+//! approval, see `taint`), and so is the final answer.
 
 use super::graph::call_tool;
+use super::taint::Taint;
 use super::template::{as_text, extract_json};
 use super::tools::Tool;
 use super::{ResolvedNode, RunCx, StepOut, Stop};
@@ -67,10 +72,12 @@ pub(super) async fn run_agent_at(
     cx: &RunCx,
     node: &ResolvedNode,
     input: Value,
+    input_taint: Taint,
     prefix: &str,
     ledger: &Ledger,
     depth: u32,
-) -> Result<Value, Stop> {
+) -> Result<(Value, Taint), Stop> {
+    let mut seen = input_taint;
     let tools = bind_tools(cx, node)?;
     let spec = &node.spec;
     let max_turns = spec
@@ -109,7 +116,7 @@ pub(super) async fn run_agent_at(
         let reply = cx
             .step(ledger, &step_id, "agent", "llm", &request, async {
                 let r = cx.model(&step_id, body).await?;
-                Ok(StepOut { output: r.message, label: None, tokens: r.tokens, usd: r.usd })
+                Ok(StepOut { output: r.message, label: None, tokens: r.tokens, usd: r.usd, taint: Taint::new() })
             })
             .await?;
         let message = reply.output;
@@ -119,10 +126,11 @@ pub(super) async fn run_agent_at(
             cx.set_last(&Value::String(content.clone()));
         }
         if calls.is_empty() {
-            return Ok(match spec.output_schema() {
+            let out = match spec.output_schema() {
                 Some(_) => extract_json(&content).unwrap_or(Value::String(content)),
                 None => Value::String(content),
-            });
+            };
+            return Ok((out, seen));
         }
         messages.push(json!({"role": "assistant", "content": message.get("content").cloned().unwrap_or(Value::Null), "tool_calls": calls}));
         for (n, call) in calls.iter().enumerate() {
@@ -136,8 +144,11 @@ pub(super) async fn run_agent_at(
             let tool_step = format!("{step_id}.{n}");
             let result = match tools.iter().find(|t| t.function == name) {
                 None => json!({"error": format!("there is no tool named '{name}'")}),
-                Some(t) => match tool_result(cx, node, t, args, &tool_step, ledger, depth).await {
-                    Ok(v) => v,
+                Some(t) => match tool_result(cx, node, t, args, seen.clone(), &tool_step, ledger, depth).await {
+                    Ok((v, labels)) => {
+                        seen.extend(labels);
+                        v
+                    }
                     Err(Stop::Fail(e)) => json!({"error": e}),
                     Err(other) => return Err(other),
                 },
@@ -148,14 +159,18 @@ pub(super) async fn run_agent_at(
     Err(Stop::Budget(format!("the agent reached its turn limit ({max_turns}) without a final answer")))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tool_result(
     cx: &RunCx,
     node: &ResolvedNode,
     t: &Bound,
     args: Value,
+    args_taint: Taint,
     step_id: &str,
     ledger: &Ledger,
     depth: u32,
-) -> Result<Value, Stop> {
-    call_tool(cx, node, "agent", &t.reference, args, step_id, ledger, depth).await.map(|s| s.output)
+) -> Result<(Value, Taint), Stop> {
+    call_tool(cx, node, "agent", &t.reference, args, args_taint, step_id, ledger, depth)
+        .await
+        .map(|s| (s.output, s.taint))
 }

@@ -424,6 +424,10 @@ async fn run_input(State(gw): State<Arc<Gateway>>, Path(id): Path<String>, req: 
         Ok(x) => x,
         Err(r) => return r,
     };
+    // Who answered: journaled with the answer (approvals of tainted writes record it).
+    let by = auth::caller(&gw.config.load(), req.headers())
+        .ok()
+        .map(|c| format!("api_key:{}", &c.key_hash[..c.key_hash.len().min(12)]));
     let Ok(body) = axum::body::to_bytes(req.into_body(), crate::MAX_BODY).await else {
         return error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", None, "request body too large");
     };
@@ -431,7 +435,7 @@ async fn run_input(State(gw): State<Arc<Gateway>>, Path(id): Path<String>, req: 
         Ok(i) => i,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", None, format!("invalid body: {e}")),
     };
-    match runs.executor.deliver_input(&tenant, &id, input.step.as_deref(), &input.answer).await {
+    match runs.executor.deliver_input(&tenant, &id, input.step.as_deref(), &input.answer, by.as_deref()).await {
         Ok(Delivered::Accepted) => {
             // Resumed here at once (another worker would pick it up at its next poll).
             runs.executor.spawn_run(id.clone());

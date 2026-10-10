@@ -21,6 +21,7 @@
 mod agent;
 pub mod breaker;
 mod graph;
+pub mod taint;
 pub mod template;
 pub mod tools;
 
@@ -471,17 +472,20 @@ impl Executor {
     }
 
     /// Records the answer to the human step the run waits for (`step`, or the one it waits for
-    /// when `None`) and wakes the run.
+    /// when `None`) and wakes the run. `by` is who answered (journaled with the answer; approvals
+    /// of tainted writes record it).
     pub async fn deliver_input(
         &self,
         tenant: &str,
         run_id: &str,
         step: Option<&str>,
         answer: &Value,
+        by: Option<&str>,
     ) -> Result<Delivered, ExecError> {
         let Some(r) = self.journal.get_run(tenant, run_id).await? else { return Ok(Delivered::NotFound) };
         let Some(step) = step.map(str::to_owned).or(r.awaiting) else { return Ok(Delivered::NotAwaiting) };
-        let sealed = self.sealer.seal(tenant, run_id, &answer.to_string()).map_err(ExecError::Internal)?;
+        let body = json!({"$answer": answer, "$by": by});
+        let sealed = self.sealer.seal(tenant, run_id, &body.to_string()).map_err(ExecError::Internal)?;
         let d = self.journal.deliver_input(tenant, run_id, &step, sealed).await?;
         if d == Delivered::Accepted {
             self.wake.notify_one();
@@ -568,10 +572,20 @@ impl Executor {
                 return;
             }
         };
+        // The run input is labelled `pii` when it holds personal data.
+        let mut input_taint = taint::Taint::new();
+        if self.data.has_pii(&cx.run.tenant_id, &cx.input).await {
+            input_taint.insert(taint::PII.to_owned());
+        }
         let result = match cx.root.spec.kind {
-            NodeKind::Workflow => graph::run_graph(&cx, &cx.root, cx.input.clone(), "", &cx.ledger, 0).await,
-            NodeKind::Agent => agent::run_agent_at(&cx, &cx.root, cx.input.clone(), "", &cx.ledger, 0).await,
-        };
+            NodeKind::Workflow => {
+                graph::run_graph(&cx, &cx.root, cx.input.clone(), input_taint, "", &cx.ledger, 0).await
+            }
+            NodeKind::Agent => {
+                agent::run_agent_at(&cx, &cx.root, cx.input.clone(), input_taint, "", &cx.ledger, 0).await
+            }
+        }
+        .map(|(v, _)| v);
         let result = result.and_then(|out| match cx.root.spec.output_schema() {
             Some(s) => {
                 let v = match &out {
@@ -674,11 +688,14 @@ pub(crate) struct StepOut {
     pub label: Option<String>,
     pub tokens: u64,
     pub usd: f64,
+    /// Taint labels of the output, journaled with tool steps so a replay sees the same labels
+    /// (model steps leave it empty: their labels come from their inputs).
+    pub taint: taint::Taint,
 }
 
 impl StepOut {
     pub fn value(output: Value) -> Self {
-        Self { output, label: None, tokens: 0, usd: 0.0 }
+        Self { output, label: None, tokens: 0, usd: 0.0, taint: taint::Taint::new() }
     }
 }
 
@@ -928,7 +945,11 @@ impl RunCx {
         started: DateTime<Utc>,
     ) -> Result<StepOut, Stop> {
         let _ = ledger;
-        let body = json!({"output": out.output, "label": out.label}).to_string();
+        let mut body = json!({"output": out.output, "label": out.label});
+        if !out.taint.is_empty() {
+            body["taint"] = json!(out.taint);
+        }
+        let body = body.to_string();
         let result = self
             .ex
             .sealer
@@ -972,6 +993,7 @@ impl RunCx {
             label: v.get("label").and_then(Value::as_str).map(str::to_owned),
             tokens: rec.tokens,
             usd: rec.usd,
+            taint: v.get("taint").and_then(|t| serde_json::from_value(t.clone()).ok()).unwrap_or_default(),
         })
     }
 
@@ -1071,6 +1093,11 @@ impl RunCx {
 
     /// The answer delivered for a human step, if any.
     pub async fn answer(&self, step_id: &str) -> Result<Option<Value>, Stop> {
+        Ok(self.answer_by(step_id).await?.map(|(a, _)| a))
+    }
+
+    /// The answer delivered for a human step and who delivered it (`api_key:<prefix>`).
+    pub async fn answer_by(&self, step_id: &str) -> Result<Option<(Value, Option<String>)>, Stop> {
         let ev = self.ex.journal.event(&self.run.id, step_id).await.map_err(|e| Stop::Fail(e.to_string()))?;
         let Some(sealed) = ev.and_then(|e| e.payload) else { return Ok(None) };
         let text = self
@@ -1078,7 +1105,15 @@ impl RunCx {
             .sealer
             .open(self.tenant(), &self.run.id, &sealed)
             .map_err(|e| Stop::Fail(format!("the answer to {step_id} cannot be opened: {e}")))?;
-        Ok(Some(serde_json::from_str(&text).unwrap_or(Value::String(text))))
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        // Answers are stored as {"$answer": ..., "$by": ...}; older ones as the bare answer.
+        Ok(Some(match v {
+            Value::Object(mut m) if m.contains_key("$answer") => {
+                let by = m.get("$by").and_then(Value::as_str).map(str::to_owned);
+                (m.remove("$answer").unwrap_or(Value::Null), by)
+            }
+            other => (other, None),
+        }))
     }
 }
 

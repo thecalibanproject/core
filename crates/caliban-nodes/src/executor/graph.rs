@@ -10,30 +10,34 @@
 //! another matching edge, or ends with the last value and a note in `stop_reason`.
 
 use super::agent;
+use super::taint::{self, Taint};
 use super::template::{Scope, as_text, extract_json, render_str, render_value};
 use super::tools::{ToolCtx, ToolError};
 use super::{ResolvedNode, RunCx, StepOut, Stop, Suspension, idempotency_key};
 use crate::budget::{Budget, Ledger};
 use crate::journal::RunStatus;
-use crate::{NodeKind, ToolTarget, Vertex, VertexKind};
+use crate::{Effect, NodeKind, ToolTarget, Vertex, VertexKind};
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// Runs a node (workflow or agent) inside the current run, under `ledger`.
+/// Runs a node (workflow or agent) inside the current run, under `ledger`. `taint`: the input's
+/// labels; returns the output and its labels.
 pub(super) fn run_node<'a>(
     cx: &'a RunCx,
     node: &'a ResolvedNode,
     input: Value,
+    taint: Taint,
     prefix: &'a str,
     ledger: &'a Ledger,
     depth: u32,
-) -> BoxFuture<'a, Result<Value, Stop>> {
+) -> BoxFuture<'a, Result<(Value, Taint), Stop>> {
     Box::pin(async move {
         match node.spec.kind {
-            NodeKind::Workflow => run_graph(cx, node, input, prefix, ledger, depth).await,
-            NodeKind::Agent => agent::run_agent_at(cx, node, input, prefix, ledger, depth).await,
+            NodeKind::Workflow => run_graph(cx, node, input, taint, prefix, ledger, depth).await,
+            NodeKind::Agent => agent::run_agent_at(cx, node, input, taint, prefix, ledger, depth).await,
         }
     })
 }
@@ -42,23 +46,31 @@ pub(super) async fn run_graph(
     cx: &RunCx,
     node: &ResolvedNode,
     input: Value,
+    input_taint: Taint,
     prefix: &str,
     ledger: &Ledger,
     depth: u32,
-) -> Result<Value, Stop> {
+) -> Result<(Value, Taint), Stop> {
     let g = node.spec.graph.as_ref().ok_or_else(|| Stop::Fail("workflow node without a graph".into()))?;
     let mut current = g.entry_vertex().ok_or_else(|| Stop::Fail("the graph has no vertices".into()))?;
     let mut value = input;
+    let mut taint = input_taint;
     let mut visits: HashMap<&str, u32> = HashMap::new();
     let mut visited: HashSet<&str> = HashSet::new();
     let mut outputs: BTreeMap<String, Value> = BTreeMap::new();
+    let mut taints: BTreeMap<String, Taint> = BTreeMap::new();
     loop {
         let n = visits.get(current.id.as_str()).copied().unwrap_or(0);
         if let Some(max) = current.max_iterations
             && n >= max
         {
             note(cx, format!("vertex '{}' reached max_iterations ({max}); the run ended there", current.id));
-            return Ok(value);
+            return Ok((value, taint));
+        }
+        // What the vertex consumes: the value it receives and every output its config names.
+        let mut in_taint = taint.clone();
+        for id in taint::referenced_outputs(&current.config) {
+            in_taint.extend(taints.get(&id).cloned().unwrap_or_default());
         }
         if let Some(s) = current.config.get("input_schema") {
             crate::schema::validate(s, &value).map_err(|e| {
@@ -66,7 +78,8 @@ pub(super) async fn run_graph(
             })?;
         }
         let base = format!("{prefix}{}#{n}", current.id);
-        let out = exec_vertex(cx, node, current, &value, &base, &outputs, ledger, depth).await?;
+        let (out, out_taint) =
+            exec_vertex(cx, node, current, &value, &in_taint, &base, &outputs, ledger, depth).await?;
         if let Some(s) = current.config.get("output_schema")
             && current.kind() != Some(VertexKind::Llm)
         {
@@ -78,7 +91,9 @@ pub(super) async fn run_graph(
         visited.insert(current.id.as_str());
         cx.set_last(&out.output);
         outputs.insert(current.id.clone(), out.output.clone());
+        taints.insert(current.id.clone(), out_taint.clone());
         value = out.output;
+        taint = out_taint;
 
         let capped = current.max_iterations.is_some_and(|max| n + 1 >= max);
         let mut skipped_loop = false;
@@ -96,7 +111,7 @@ pub(super) async fn run_graph(
         }
         match next.and_then(|e| g.vertex(&e.to)) {
             Some(v) => current = v,
-            None => return Ok(value),
+            None => return Ok((value, taint)),
         }
     }
 }
@@ -121,36 +136,45 @@ fn with_field(input: &Value, key: &str, v: Value) -> Value {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Runs one vertex. Returns its output and the output's taint labels (`in_taint`: what it
+/// consumes).
 fn exec_vertex<'a>(
     cx: &'a RunCx,
     node: &'a ResolvedNode,
     v: &'a Vertex,
     input: &'a Value,
+    in_taint: &'a Taint,
     base: &'a str,
     outputs: &'a BTreeMap<String, Value>,
     ledger: &'a Ledger,
     depth: u32,
-) -> BoxFuture<'a, Result<StepOut, Stop>> {
+) -> BoxFuture<'a, Result<(StepOut, Taint), Stop>> {
     Box::pin(async move {
         let scope = Scope { input, outputs };
         let c = &v.config;
+        // A model call passes on the labels of what it consumed.
+        let same = |out: StepOut| (out, in_taint.clone());
         match v.kind() {
-            Some(VertexKind::Llm) => llm(cx, node, v, input, base, outputs, ledger, "llm").await,
-            Some(VertexKind::Router) => router(cx, node, v, input, base, outputs, ledger).await,
+            Some(VertexKind::Llm) => llm(cx, node, v, input, base, outputs, ledger, "llm").await.map(same),
+            Some(VertexKind::Router) => router(cx, node, v, input, base, outputs, ledger).await.map(same),
             Some(VertexKind::Tool) => {
                 let reference = c.get("tool").and_then(Value::as_str).unwrap_or_default();
                 let args = c.get("args").map_or_else(|| input.clone(), |a| render_value(a, &scope));
-                call_tool(cx, node, &v.id, reference, args, base, ledger, depth).await
+                let out = call_tool(cx, node, &v.id, reference, args, in_taint.clone(), base, ledger, depth).await?;
+                let t = out.taint.clone();
+                Ok((out, t))
             }
-            Some(VertexKind::Map) => map(cx, node, v, input, base, outputs, ledger, depth).await,
-            Some(VertexKind::Reduce) => reduce(cx, node, v, input, base, outputs, ledger).await,
-            Some(VertexKind::Verify) => verify(cx, node, v, input, base, outputs, ledger).await,
-            Some(VertexKind::Human) => human(cx, v, input, base, &scope, ledger).await,
+            Some(VertexKind::Map) => map(cx, node, v, input, in_taint, base, outputs, ledger, depth).await,
+            Some(VertexKind::Reduce) => reduce(cx, node, v, input, base, outputs, ledger).await.map(same),
+            Some(VertexKind::Verify) => verify(cx, node, v, input, base, outputs, ledger).await.map(same),
+            Some(VertexKind::Human) => human(cx, v, input, base, &scope, ledger).await.map(same),
             Some(VertexKind::Subnode) => {
                 let reference = c.get("node").and_then(Value::as_str).unwrap_or_default();
                 let child_input = c.get("input").map_or_else(|| input.clone(), |t| render_value(t, &scope));
-                let out = subnode(cx, node, reference, child_input, &format!("{base}>"), ledger, depth).await?;
-                Ok(StepOut::value(out))
+                let (out, t) =
+                    subnode(cx, node, reference, child_input, in_taint.clone(), &format!("{base}>"), ledger, depth)
+                        .await?;
+                Ok((StepOut::value(out), t))
             }
             Some(VertexKind::Code) => {
                 Err(Stop::Fail(format!("vertex '{}': code vertices are not yet supported", v.id)))
@@ -205,7 +229,13 @@ async fn model_step(
     let input = body.clone();
     cx.step(ledger, step_id, vertex, kind, &input, async {
         let r = cx.model(step_id, body).await?;
-        Ok(StepOut { output: Value::String(content_of(&r.message)), label: None, tokens: r.tokens, usd: r.usd })
+        Ok(StepOut {
+            output: Value::String(content_of(&r.message)),
+            label: None,
+            tokens: r.tokens,
+            usd: r.usd,
+            taint: Taint::new(),
+        })
     })
     .await
 }
@@ -314,7 +344,9 @@ async fn router(
 }
 
 /// A tool call as a journaled step: `node://` runs the node inside this run, anything else goes
-/// through the tool registry.
+/// through the tool registry. `args_taint`: the labels of the arguments. A write with tainted
+/// arguments waits for a human approval unless the node allowlists those labels. The returned
+/// step's `taint` is the output's labels (journaled, so a replay sees the same).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn call_tool(
     cx: &RunCx,
@@ -322,15 +354,29 @@ pub(super) async fn call_tool(
     vertex: &str,
     reference: &str,
     args: Value,
+    args_taint: Taint,
     step_id: &str,
     ledger: &Ledger,
     depth: u32,
 ) -> Result<StepOut, Stop> {
+    let declared = node.spec.tools.iter().find(|t| t.reference == reference);
+    if let Some(t) = declared
+        && t.effect == Effect::Write
+        && !taint::untrusted(&args_taint).is_empty()
+        && !taint::allowed(&args_taint, &t.allow_tainted)
+    {
+        approve_write(cx, vertex, reference, &args, &args_taint, step_id, ledger).await?;
+    }
     let input = json!({"tool": reference, "args": args});
     cx.step(ledger, step_id, vertex, "tool", &input, async {
+        let mut out_taint = args_taint.clone();
         let out = match ToolTarget::parse(reference) {
             Ok(ToolTarget::Node { .. }) => {
-                subnode(cx, node, reference, args, &format!("{step_id}>"), ledger, depth).await?
+                let (out, t) =
+                    subnode(cx, node, reference, args, args_taint.clone(), &format!("{step_id}>"), ledger, depth)
+                        .await?;
+                out_taint = t;
+                out
             }
             _ => {
                 let tool = cx.ex.tools.resolve(cx.tenant(), reference).map_err(|e| Stop::Fail(e.to_string()))?;
@@ -342,12 +388,67 @@ pub(super) async fn call_tool(
                     step_id: step_id.to_owned(),
                     idempotency_key: idempotency_key(&cx.run.id, step_id),
                 };
-                guarded_call(cx, reference, tool.as_ref(), &ctx, args).await?
+                let out = guarded_call(cx, reference, tool.as_ref(), &ctx, args).await?;
+                out_taint.extend(taint::label_for(reference));
+                out
             }
         };
-        Ok(StepOut::value(out))
+        Ok(StepOut { taint: out_taint, ..StepOut::value(out) })
     })
     .await
+}
+
+/// A write whose arguments carry untrusted labels: waits for a human (`<step>@approve`, the run
+/// in `input_required`), then journals the decision with who made it. A refusal fails the call.
+#[allow(clippy::too_many_arguments)]
+async fn approve_write(
+    cx: &RunCx,
+    vertex: &str,
+    reference: &str,
+    args: &Value,
+    args_taint: &Taint,
+    step_id: &str,
+    ledger: &Ledger,
+) -> Result<(), Stop> {
+    let id = format!("{step_id}@approve");
+    let labels: Vec<&String> = taint::untrusted(args_taint);
+    if !cx.is_recorded(&id) && cx.answer(&id).await?.is_none() {
+        cx.admit_step(ledger)?;
+        let mut shown = args.to_string();
+        if shown.len() > 2000 {
+            shown.truncate(shown.floor_char_boundary(2000));
+            shown.push_str("...");
+        }
+        let question = format!(
+            "Approve this write? Tool {reference} (effect: write) would be called with arguments derived from untrusted \
+             data ({}): {shown}. Answer {{\"approve\": true}} or {{\"approve\": false}}.",
+            labels.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
+        );
+        return Err(Stop::Suspend(Suspension {
+            status: RunStatus::InputRequired,
+            awaiting: Some(id),
+            question: Some(question),
+            wake_at: None,
+        }));
+    }
+    let step_input = json!({"tool": reference, "args": args, "labels": labels});
+    let out = cx
+        .step(ledger, &id, vertex, "approval", &step_input, async {
+            let (answer, by) = cx.answer_by(&id).await?.unwrap_or((Value::Null, None));
+            let ok = taint::approved(&answer);
+            tracing::info!(target: "caliban::audit", tenant = cx.tenant(), run = %cx.run.id, step = %id, tool = reference,
+                approved = ok, by = by.as_deref().unwrap_or("unknown"), labels = ?labels, "tainted write decision");
+            Ok(StepOut::value(json!({"approved": ok, "by": by, "labels": labels})))
+        })
+        .await?;
+    if out.output["approved"] == true {
+        Ok(())
+    } else {
+        Err(Stop::Fail(format!(
+            "the write to '{reference}' was refused by a human (its arguments carry {})",
+            labels.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
+        )))
+    }
 }
 
 /// A tool call behind its circuit breaker, retried while it fails transiently (at most
@@ -412,15 +513,17 @@ async fn guarded_call(
 
 /// Runs `node://name@vN` inside this run: its steps are journaled under `prefix`, its budget is a
 /// child of `ledger` (capped by both), and nesting is limited by `budgets.depth`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn subnode(
     cx: &RunCx,
     _parent: &ResolvedNode,
     reference: &str,
     input: Value,
+    taint: Taint,
     prefix: &str,
     ledger: &Ledger,
     depth: u32,
-) -> Result<Value, Stop> {
+) -> Result<(Value, Taint), Stop> {
     let Ok(ToolTarget::Node { name, version }) = ToolTarget::parse(reference) else {
         return Err(Stop::Fail(format!("'{reference}' is not a node reference")));
     };
@@ -438,7 +541,7 @@ pub(super) async fn subnode(
         .child(cap, cx.elapsed_ms())
         .map_err(|e| Stop::Budget(format!("subnode {name}@v{version} cannot start: {e}")))?;
     cx.note_depth(child_ledger.level());
-    run_node(cx, &child, input, prefix, &child_ledger, depth + 1).await
+    run_node(cx, &child, input, taint, prefix, &child_ledger, depth + 1).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -447,11 +550,12 @@ async fn map(
     node: &ResolvedNode,
     v: &Vertex,
     input: &Value,
+    in_taint: &Taint,
     base: &str,
     outputs: &BTreeMap<String, Value>,
     ledger: &Ledger,
     depth: u32,
-) -> Result<StepOut, Stop> {
+) -> Result<(StepOut, Taint), Stop> {
     let c = &v.config;
     let items = match c.get("over").and_then(Value::as_str) {
         Some(p) => input.pointer(p),
@@ -477,7 +581,7 @@ async fn map(
         let (slots, body) = (&slots, &body);
         async move {
             let _slot = slots.acquire().await.map_err(|_| Stop::Fail("map closed".into()))?;
-            exec_vertex(cx, node, body, item, &format!("{base}/{i}"), outputs, ledger, depth).await
+            exec_vertex(cx, node, body, item, in_taint, &format!("{base}/{i}"), outputs, ledger, depth).await
         }
     });
     let results = futures::future::join_all(branches).await;
@@ -491,9 +595,11 @@ async fn map(
         _ => 3,
     };
     let mut stop: Option<Stop> = None;
+    let mut taint = in_taint.clone();
     for r in results {
         match r {
-            Ok(s) => {
+            Ok((s, t)) => {
+                taint.extend(t);
                 tokens += s.tokens;
                 usd += s.usd;
                 out.push(s.output);
@@ -509,7 +615,7 @@ async fn map(
         cx.set_last(&Value::Array(out));
         return Err(s);
     }
-    Ok(StepOut { output: Value::Array(out), label: None, tokens, usd })
+    Ok((StepOut { output: Value::Array(out), label: None, tokens, usd, taint: Taint::new() }, taint))
 }
 
 async fn reduce(
