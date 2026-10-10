@@ -10,6 +10,7 @@ pub mod auth;
 pub mod keys;
 mod models;
 mod nodes;
+mod runs;
 pub mod store;
 pub mod tools;
 
@@ -275,6 +276,10 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/tenants/{tenant_id}/tool-servers/{server}/tools", get(tools::list_tools).post(tools::import))
         .route("/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/approve", post(tools::approve))
         .route("/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/revoke", post(tools::revoke))
+        .route("/tenants/{tenant_id}/runs", get(runs::list))
+        .route("/tenants/{tenant_id}/runs/{id}", get(runs::get))
+        .route("/tenants/{tenant_id}/runs/{id}/input", post(runs::answer))
+        .route("/tenants/{tenant_id}/inbox", get(runs::inbox))
         .route("/models", get(models::list_models).post(models::create_model))
         .route("/models/{*id}", delete(models::delete_model))
         .route("/providers", get(models::list_providers).post(models::create_provider))

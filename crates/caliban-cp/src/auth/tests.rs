@@ -713,6 +713,8 @@ struct Case {
     allowed: &'static str,
 }
 
+/// Run metadata: every role but billing.
+const RUN_READERS: &str = "owner admin auditor tenant_admin developer viewer";
 const READERS: &str = "owner admin auditor tenant_admin developer viewer";
 const EVERYONE: &str = "owner admin auditor tenant_admin developer viewer billing";
 
@@ -914,6 +916,17 @@ fn cases() -> Vec<Case> {
             true,
             "owner admin tenant_admin",
         ),
+        c("GET", "/tenants/{tenant_id}/runs", "/api/v1/tenants/{t}/runs", None, true, RUN_READERS),
+        c("GET", "/tenants/{tenant_id}/runs/{id}", "/api/v1/tenants/{t}/runs/run_nope", None, true, RUN_READERS),
+        c(
+            "POST",
+            "/tenants/{tenant_id}/runs/{id}/input",
+            "/api/v1/tenants/{t}/runs/run_nope/input",
+            Some(json!({"answer": "yes"})),
+            true,
+            "owner admin tenant_admin",
+        ),
+        c("GET", "/tenants/{tenant_id}/inbox", "/api/v1/tenants/{t}/inbox", None, true, RUN_READERS),
         c("GET", "/models", "/api/v1/models", None, false, EVERYONE),
         c("POST", "/models", "/api/v1/models", Some(json!({})), false, "owner admin"),
         c("DELETE", "/models/{*id}", "/api/v1/models/nope/none", None, false, "owner admin"),
@@ -1313,4 +1326,98 @@ async fn postgres_sessions_work_across_replicas() {
     let mut copy = Browser::default();
     copy.cookies.insert("caliban_session".into(), token);
     assert_eq!(copy.send(&a.app, "GET", "/auth/me", &[], None).await.status, StatusCode::UNAUTHORIZED);
+}
+
+/// Run content in the console follows `runs.data`, and answering follows `runs.answer`: a viewer
+/// sees a run's steps and costs but not what was said; a developer sees the content but cannot
+/// answer; a tenant admin answers as themselves.
+#[tokio::test]
+async fn run_content_and_answers_follow_the_roles() {
+    use caliban_nodes::budget::BudgetState;
+    use caliban_nodes::journal::memory::MemoryJournal;
+    use caliban_nodes::journal::{Journal, NewRun, RunStatus, Suspend};
+    use caliban_nodes::seal::{DekSealer, Sealer};
+    let journal: Arc<dyn Journal> = Arc::new(MemoryJournal::new());
+    let ring = Keyring::new([7; 32], []);
+    let cfg = base_config();
+    let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "boot"));
+    let cp: Cp = Arc::new(
+        ControlPlane::new(Store::new(cfg, handle, RecentUsage::default()), BREAK_GLASS.into(), "standalone")
+            .with_keyring(Some(Arc::new(ring.clone())))
+            .with_oidc(Some(Oidc::new(settings("http://127.0.0.1:9/never-contacted")).unwrap()))
+            .with_journal(Some(Arc::clone(&journal))),
+    );
+    let (dek, rec) = crate::keys::new_dek(&ring, "acme");
+    cp.store.apply("setup", Mutation::CreateDek { tenant_id: "acme".into(), dek: rec }).await.unwrap();
+    let dek = Arc::new(dek);
+    let sealer = DekSealer::new(move |_: &str| Ok::<_, String>(Arc::clone(&dek)));
+    let seal = |s: &str| sealer.seal("acme", "run_1", s).unwrap();
+    journal
+        .create_run(NewRun {
+            id: "run_1".into(),
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: 1,
+            spec_hash: "sha256:00".into(),
+            invoker: "api_key:abc".into(),
+            invoker_key_hash: None,
+            input: seal(r#"{"case": "chest pain, jane@example.com"}"#),
+            budget: BudgetState::new(5, 100, 60),
+            idempotency: None,
+            specs: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+    journal.claim("run_1", "w", Duration::from_secs(30)).await.unwrap().unwrap();
+    let ask = Suspend {
+        status: RunStatus::InputRequired,
+        awaiting: Some("ask#0".into()),
+        prompt: Some(seal("Since when?")),
+        wake_at: None,
+        budget: BudgetState::new(5, 100, 60),
+    };
+    assert!(journal.suspend("run_1", "w", ask).await.unwrap());
+    let app = app(Arc::clone(&cp), None);
+    let as_role = async |groups: &[&str], method: &str, uri: &str, body: Option<Value>| {
+        let token = session_for(&cp, groups[0], groups).await;
+        let (cookie, csrf) = (format!("caliban_session={token}"), csrf_token(&token));
+        send(&app, method, uri, &[("cookie", &cookie), ("x-csrf-token", &csrf)], body).await
+    };
+    // A viewer: metadata, no content.
+    let r = as_role(&["acme-viewers"], "GET", "/api/v1/tenants/acme/runs/run_1", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!((r.body["status"].as_str(), r.body["content_visible"].as_bool()), (Some("input_required"), Some(false)));
+    assert!(r.body.get("input").is_none() && r.body["awaiting"].get("question").is_none(), "{}", r.body);
+    assert!(!r.body.to_string().contains("jane@example.com"));
+    let inbox = as_role(&["acme-viewers"], "GET", "/api/v1/tenants/acme/inbox", None).await;
+    assert_eq!(
+        (inbox.body["data"][0]["kind"].as_str(), &inbox.body["data"][0]["question"]),
+        (Some("question"), &Value::Null)
+    );
+    // A developer: the content, but no answering.
+    let r = as_role(&["acme-devs"], "GET", "/api/v1/tenants/acme/runs/run_1", None).await;
+    assert_eq!(r.body["input"]["case"], "chest pain, jane@example.com");
+    assert_eq!(r.body["awaiting"]["question"], "Since when?");
+    let answer = Some(json!({"answer": "two days"}));
+    let r = as_role(&["acme-devs"], "POST", "/api/v1/tenants/acme/runs/run_1/input", answer.clone()).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // Another tenant's admin sees nothing of acme's runs.
+    assert_eq!(
+        as_role(&["globex-admins"], "GET", "/api/v1/tenants/acme/runs", None).await.status,
+        StatusCode::FORBIDDEN
+    );
+    // A tenant admin answers, as themselves; the audit chain says who.
+    let r = as_role(&["acme-admins"], "POST", "/api/v1/tenants/acme/runs/run_1/input", answer).await;
+    assert_eq!((r.status, r.body["status"].as_str()), (StatusCode::ACCEPTED, Some("pending")), "{}", r.body);
+    let evs = journal.events("acme", "run_1", 0, 10).await.unwrap();
+    let by = evs.last().unwrap().data["by"].as_str().unwrap().to_owned();
+    assert!(by.starts_with("acme-admins@example.test <"), "{by}");
+    let log = cp.store.audit(5).await.unwrap();
+    let last = log.last().unwrap();
+    assert_eq!(
+        (last.action.as_str(), last.actor.as_str(), last.target.as_deref()),
+        ("node.run.answer", by.as_str(), Some("run_1"))
+    );
+    assert!(verify_chain(&log).is_ok());
 }

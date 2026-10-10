@@ -142,6 +142,11 @@ pub(crate) struct Env {
 }
 
 pub(crate) async fn env(latency: Duration) -> Env {
+    env_with(latency, None).await
+}
+
+/// An environment whose control plane reads `journal` (the console's run endpoints).
+pub(crate) async fn env_with(latency: Duration, journal: Option<Arc<dyn Journal>>) -> Env {
     let cfg = MockConfig { latency, responder: Some(responder()), ..MockConfig::default() };
     let mock = Mock::start("127.0.0.1:0", cfg).await.unwrap();
     let cfg = config(&mock.base_url());
@@ -150,7 +155,8 @@ pub(crate) async fn env(latency: Duration) -> Env {
         ControlPlane::new(Store::new(cfg, handle.clone(), RecentUsage::default()), ADMIN.into(), "standalone")
             .with_keyring(Some(Arc::new(ring())))
             .with_snapshots(None, Some(ROUTER_TOKEN.into()))
-            .with_tools(ToolsSetup { client: mcp_client(), signer: Some(tool_signer()) }),
+            .with_tools(ToolsSetup { client: mcp_client(), signer: Some(tool_signer()) })
+            .with_journal(journal),
     );
     let cp_app = caliban_cp::app(Arc::clone(&cp), None);
     Env { mock, cp, cp_app, handle }

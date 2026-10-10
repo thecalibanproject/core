@@ -16,6 +16,12 @@
 //! registering). Owner and admin hold all three; `tenant_admin` all three on its tenant;
 //! `developer` read and write; `viewer` and `auditor` read; `billing` none.
 //!
+//! Runs (P3 M5, the console): `runs.read` (run lists, the inbox, run metadata: steps, timings,
+//! tokens, cost, taint labels), `runs.data` (run content: inputs, outputs, questions) and
+//! `runs.answer` (answer a question or approve or deny a tainted write as oneself). Owner and admin
+//! hold all three; `tenant_admin` all three on its tenant; `developer` read and data; `viewer` and
+//! `auditor` read; `billing` none.
+//!
 //! Every admin API route has exactly one entry in [`ROUTES`]; a route without one is denied to
 //! everybody (deny by default). Tenant-scoped permissions are checked against the tenant the
 //! request is about, found as [`TenantFrom`] says. List endpoints without a tenant filter return
@@ -94,6 +100,7 @@ impl Role {
                 OntologyRead,
                 NodesRead,
                 ToolsRead,
+                RunsRead,
                 UsageRead,
             ],
             Role::TenantAdmin => &[
@@ -117,6 +124,9 @@ impl Role {
                 ToolsRead,
                 ToolsWrite,
                 ToolsApprove,
+                RunsRead,
+                RunsData,
+                RunsAnswer,
                 UsageRead,
             ],
             Role::Developer => &[
@@ -135,6 +145,8 @@ impl Role {
                 NodesRun,
                 ToolsRead,
                 ToolsWrite,
+                RunsRead,
+                RunsData,
                 UsageRead,
             ],
             Role::Viewer => &[
@@ -147,6 +159,7 @@ impl Role {
                 OntologyRead,
                 NodesRead,
                 ToolsRead,
+                RunsRead,
                 UsageRead,
             ],
             Role::Billing => &[CatalogRead, TenantRead, UsageRead],
@@ -192,11 +205,15 @@ pub enum Perm {
     ToolsRead,
     ToolsWrite,
     ToolsApprove,
+    /// Node runs in the console: lists and metadata, run content, answering as oneself.
+    RunsRead,
+    RunsData,
+    RunsAnswer,
     UsageRead,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 28] = [
+    pub const ALL: [Perm; 31] = [
         Perm::TenantsCreate,
         Perm::CatalogRead,
         Perm::CatalogWrite,
@@ -224,6 +241,9 @@ impl Perm {
         Perm::ToolsRead,
         Perm::ToolsWrite,
         Perm::ToolsApprove,
+        Perm::RunsRead,
+        Perm::RunsData,
+        Perm::RunsAnswer,
         Perm::UsageRead,
     ];
 
@@ -256,6 +276,9 @@ impl Perm {
             Perm::ToolsRead => "tools.read",
             Perm::ToolsWrite => "tools.write",
             Perm::ToolsApprove => "tools.approve",
+            Perm::RunsRead => "runs.read",
+            Perm::RunsData => "runs.data",
+            Perm::RunsAnswer => "runs.answer",
             Perm::UsageRead => "usage.read",
         }
     }
@@ -454,6 +477,10 @@ pub const ROUTES: &[RouteRule] = &[
     r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools", Perm::ToolsWrite, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/approve", Perm::ToolsApprove, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/revoke", Perm::ToolsApprove, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/runs", Perm::RunsRead, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/runs/{id}", Perm::RunsRead, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/runs/{id}/input", Perm::RunsAnswer, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/inbox", Perm::RunsRead, TenantFrom::Path),
     r("GET", "/models", Perm::CatalogRead, TenantFrom::None),
     r("POST", "/models", Perm::CatalogWrite, TenantFrom::None),
     r("DELETE", "/models/{*id}", Perm::CatalogWrite, TenantFrom::None),
@@ -562,6 +589,25 @@ mod tests {
         ];
         for (role, perms) in want {
             for p in [ToolsRead, ToolsWrite, ToolsApprove] {
+                assert_eq!(role.grants(p), perms.contains(&p), "{} {}", role.as_str(), p.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn run_permissions_follow_the_roles() {
+        use Perm::{RunsAnswer, RunsData, RunsRead};
+        let want: &[(Role, &[Perm])] = &[
+            (Role::Owner, &[RunsRead, RunsData, RunsAnswer]),
+            (Role::Admin, &[RunsRead, RunsData, RunsAnswer]),
+            (Role::TenantAdmin, &[RunsRead, RunsData, RunsAnswer]),
+            (Role::Developer, &[RunsRead, RunsData]),
+            (Role::Viewer, &[RunsRead]),
+            (Role::Auditor, &[RunsRead]),
+            (Role::Billing, &[]),
+        ];
+        for (role, perms) in want {
+            for p in [RunsRead, RunsData, RunsAnswer] {
                 assert_eq!(role.grants(p), perms.contains(&p), "{} {}", role.as_str(), p.as_str());
             }
         }

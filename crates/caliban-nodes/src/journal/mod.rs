@@ -379,6 +379,53 @@ pub struct AuditEvent {
     pub at: DateTime<Utc>,
 }
 
+/// The cursor after a run in a listing (`<created_at in ns>_<run id>`; opaque to clients).
+pub fn encode_cursor(at: DateTime<Utc>, id: &str) -> String {
+    format!("{}_{id}", at.timestamp_nanos_opt().unwrap_or_default())
+}
+
+/// The `(created_at, id)` a cursor names.
+pub fn decode_cursor(c: &str) -> Option<(DateTime<Utc>, String)> {
+    let (ns, id) = c.split_once('_')?;
+    Some((DateTime::from_timestamp_nanos(ns.parse().ok()?), id.to_owned()))
+}
+
+/// A run listing query from `?node=&status=&created_after=&created_before=&limit=&cursor=`
+/// (the data plane's `GET /v1/runs` and the console's run list).
+pub fn run_query(
+    tenant: &str,
+    nodes: Option<Vec<String>>,
+    node: Option<String>,
+    status: Option<&str>,
+    created: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+    limit: Option<usize>,
+    cursor: Option<&str>,
+) -> Result<RunQuery, String> {
+    let statuses = match status {
+        None => vec![],
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| RunStatus::parse(s).ok_or_else(|| format!("unknown status '{s}'")))
+            .collect::<Result<_, _>>()?,
+    };
+    let before = match cursor {
+        None => None,
+        Some(c) => Some(decode_cursor(c).ok_or("invalid cursor")?),
+    };
+    Ok(RunQuery {
+        tenant: tenant.to_owned(),
+        nodes,
+        node,
+        statuses,
+        created_after: created.0,
+        created_before: created.1,
+        before,
+        limit: limit.unwrap_or(50).clamp(1, 200),
+    })
+}
+
 /// What [`Journal::list_runs`] returns, newest first.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunQuery {
