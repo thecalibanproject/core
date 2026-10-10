@@ -219,6 +219,77 @@ pub struct NodeRecord {
     pub deleted_at: Option<DateTime<Utc>>,
 }
 
+/// A tenant's registered MCP tool server. Registering it is what allows egress to it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ToolServerRecord {
+    pub id: String,
+    pub tenant_id: String,
+    /// The `server` of `mcp://server/tool#sha256:...` (node-name rules).
+    pub name: String,
+    pub url: String,
+    pub auth: caliban_config::ToolAuth,
+    /// Trusted with personal data: PII surrogates in arguments are rehydrated for it.
+    pub trusted: bool,
+    /// The API key or OAuth client secret, sealed under the tenant DEK (base64 nonce ‖ ciphertext).
+    #[serde(skip)]
+    pub secret: Option<String>,
+    /// Whether a credential is stored (the API shows this, never the credential).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_credential: bool,
+    pub created_at: DateTime<Utc>,
+    pub created_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+impl ToolServerRecord {
+    pub fn is_live(&self) -> bool {
+        self.deleted_at.is_none()
+    }
+}
+
+/// Where a tool manifest is in its review.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    /// Seen on the server (or imported); not callable.
+    #[default]
+    Discovered,
+    /// Approved by a human: shipped to the data plane, callable by nodes that pin it.
+    Approved,
+    /// Approval withdrawn.
+    Revoked,
+}
+
+impl ToolStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolStatus::Discovered => "discovered",
+            ToolStatus::Approved => "approved",
+            ToolStatus::Revoked => "revoked",
+        }
+    }
+}
+
+/// One manifest of a server's tool, as discovered: its pin and the injection scan's findings.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ToolManifestRecord {
+    pub id: String,
+    pub tenant_id: String,
+    pub server: String,
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub pin: String,
+    pub findings: Vec<caliban_mcp::scan::Finding>,
+    pub status: ToolStatus,
+    pub discovered_at: DateTime<Utc>,
+    pub approved_at: Option<DateTime<Utc>>,
+    pub approved_by: Option<String>,
+    /// Approved although the scan found something (an explicit decision, audited).
+    pub findings_acknowledged: bool,
+}
+
 /// The promotion pointer of a node: its live version.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Promotion {
@@ -327,6 +398,9 @@ pub struct State {
     pub nodes: Vec<NodeRecord>,
     /// Tenant → node name → its live version.
     pub promotions: BTreeMap<String, BTreeMap<String, Promotion>>,
+    /// Includes soft-deleted servers (`deleted_at` set).
+    pub tool_servers: Vec<ToolServerRecord>,
+    pub tool_manifests: Vec<ToolManifestRecord>,
     pub ontologies: BTreeMap<String, Ontology>,
     /// Tenant → wrapped DEK. Created on the tenant's first secret, destroyed with the tenant.
     pub deks: BTreeMap<String, DekRecord>,
@@ -434,6 +508,23 @@ impl State {
         self.promotions.get(tenant_id).and_then(|p| p.get(name))
     }
 
+    /// A live tool server of the tenant, by name.
+    pub fn tool_server(&self, tenant_id: &str, name: &str) -> Option<&ToolServerRecord> {
+        self.tool_servers.iter().find(|s| s.tenant_id == tenant_id && s.name == name && s.is_live())
+    }
+
+    /// An approved manifest (`tool` of `server`, with this pin) of a live server of the tenant.
+    pub fn approved_tool(&self, tenant_id: &str, server: &str, tool: &str, pin: &str) -> Option<&ToolManifestRecord> {
+        self.tool_server(tenant_id, server)?;
+        self.tool_manifests.iter().find(|m| {
+            m.tenant_id == tenant_id
+                && m.server == server
+                && m.name == tool
+                && m.pin == pin
+                && m.status == ToolStatus::Approved
+        })
+    }
+
     /// The tenant's node caps (its own, else the defaults).
     pub fn node_caps(&self, tenant_id: &str) -> NodeCaps {
         self.tenant(tenant_id).and_then(|t| t.node_caps).unwrap_or_default()
@@ -487,6 +578,8 @@ const TENANT_FIELDS: &[&str] = &[
     "api_key_nodes",
     "data_key",
     "node_spend_caps",
+    "tool_servers",
+    "tools",
 ];
 
 fn tenant_settings(t: &TenantConfig) -> Map<String, Value> {
@@ -573,6 +666,7 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
                 serde_json::to_value(st.routes.get(&t.id).cloned().unwrap_or_default()).map_err(|e| e.to_string())?,
             );
             render_nodes(st, &t.id, &mut obj)?;
+            render_tools(st, &t.id, &mut obj)?;
             serde_json::from_value::<TenantConfig>(Value::Object(obj)).map_err(|e| format!("tenant {}: {e}", t.id))
         })
         .collect::<Result<_, _>>()?;
@@ -621,6 +715,61 @@ fn render_nodes(st: &State, tenant: &str, obj: &mut Map<String, Value>) -> Resul
     }
     if !allowlists.is_empty() {
         obj.insert("api_key_nodes".into(), serde_json::to_value(allowlists).map_err(|e| e.to_string())?);
+    }
+    Ok(())
+}
+
+/// The tenant's live tool servers (credentials sealed for the data plane) and approved manifests
+/// of those servers.
+fn render_tools(st: &State, tenant: &str, obj: &mut Map<String, Value>) -> Result<(), String> {
+    let mut servers = Vec::new();
+    for s in st.tool_servers.iter().filter(|s| s.tenant_id == tenant && s.is_live()) {
+        let credential = match &s.secret {
+            None => None,
+            Some(sealed) => {
+                let d = st.deks.get(tenant).ok_or_else(|| {
+                    format!(
+                        "tenant {tenant}: tool server '{}' is sealed under a tenant key that does not exist",
+                        s.name
+                    )
+                })?;
+                Some(SecretRef::TenantSealed {
+                    tenant_sealed: TenantSealed {
+                        tenant: tenant.to_owned(),
+                        kek_id: d.wrapped.kek_id.clone(),
+                        wrapped_dek: d.wrapped.wrapped.clone(),
+                        sealed: sealed.clone(),
+                    },
+                })
+            }
+        };
+        servers.push(caliban_config::ToolServerConfig {
+            name: s.name.clone(),
+            url: s.url.clone(),
+            auth: s.auth.clone(),
+            trusted: s.trusted,
+            credential,
+        });
+    }
+    let tools: Vec<caliban_config::ApprovedTool> = st
+        .tool_manifests
+        .iter()
+        .filter(|m| {
+            m.tenant_id == tenant && m.status == ToolStatus::Approved && st.tool_server(tenant, &m.server).is_some()
+        })
+        .map(|m| caliban_config::ApprovedTool {
+            server: m.server.clone(),
+            name: m.name.clone(),
+            description: m.description.clone(),
+            input_schema: m.input_schema.clone(),
+            pin: m.pin.clone(),
+        })
+        .collect();
+    if !servers.is_empty() {
+        obj.insert("tool_servers".into(), serde_json::to_value(servers).map_err(|e| e.to_string())?);
+    }
+    if !tools.is_empty() {
+        obj.insert("tools".into(), serde_json::to_value(tools).map_err(|e| e.to_string())?);
     }
     Ok(())
 }
@@ -732,6 +881,38 @@ pub enum Mutation {
         name: String,
         version: u32,
         at: DateTime<Utc>,
+    },
+    /// Registers an MCP tool server (its credential already sealed under the tenant DEK).
+    CreateToolServer(ToolServerRecord),
+    /// Soft-deletes a server: its credential is wiped and its tools leave the data plane.
+    DeleteToolServer {
+        tenant_id: String,
+        name: String,
+        at: DateTime<Utc>,
+    },
+    /// Manifests seen on a server (discovery or import): new pins are added as `discovered`,
+    /// known ones are kept as they are.
+    RecordToolManifests {
+        tenant_id: String,
+        server: String,
+        manifests: Vec<ToolManifestRecord>,
+    },
+    /// A human approves one manifest (by pin). With scan findings, only when acknowledged.
+    ApproveTool {
+        tenant_id: String,
+        server: String,
+        tool: String,
+        pin: String,
+        acknowledge_findings: bool,
+        at: DateTime<Utc>,
+        by: String,
+    },
+    /// Withdraws the approval of one manifest (by pin).
+    RevokeTool {
+        tenant_id: String,
+        server: String,
+        tool: String,
+        pin: String,
     },
     /// Upserts elements (e.g. proposals from the bootstrap job) as one new ontology version.
     ProposeOntology {
@@ -1007,6 +1188,43 @@ impl Mutation {
                     id,
                     json!({"name": n.map(|x| &x.name), "version": n.map(|x| x.version)}),
                 )
+            }
+            Mutation::CreateToolServer(s) => d(
+                Some(&s.tenant_id),
+                "tool_server.create",
+                &s.id,
+                json!({"name": s.name, "url": s.url, "auth": s.auth, "trusted": s.trusted, "has_credential": s.secret.is_some()}),
+            ),
+            Mutation::DeleteToolServer { tenant_id, name, .. } => {
+                let s = before.tool_server(tenant_id, name);
+                d(
+                    Some(tenant_id),
+                    "tool_server.delete",
+                    s.map_or(name.as_str(), |s| s.id.as_str()),
+                    json!({"name": name}),
+                )
+            }
+            Mutation::RecordToolManifests { tenant_id, server, manifests } => d(
+                Some(tenant_id),
+                "tool.discover",
+                server,
+                json!({"server": server, "manifests": manifests.iter().map(|m| json!({"tool": m.name, "pin": m.pin, "findings": m.findings.len()})).collect::<Vec<_>>()}),
+            ),
+            Mutation::ApproveTool { tenant_id, server, tool, pin, acknowledge_findings, .. } => {
+                let m = before
+                    .tool_manifests
+                    .iter()
+                    .find(|m| &m.tenant_id == tenant_id && &m.server == server && &m.name == tool && &m.pin == pin);
+                d(
+                    Some(tenant_id),
+                    "tool.approve",
+                    m.map_or(tool.as_str(), |m| m.id.as_str()),
+                    json!({"server": server, "tool": tool, "pin": pin, "findings": m.map(|m| &m.findings),
+                           "findings_acknowledged": acknowledge_findings}),
+                )
+            }
+            Mutation::RevokeTool { tenant_id, server, tool, pin } => {
+                d(Some(tenant_id), "tool.revoke", tool, json!({"server": server, "tool": tool, "pin": pin}))
             }
             Mutation::ProposeOntology { tenant_id, elements } => d(
                 Some(tenant_id),

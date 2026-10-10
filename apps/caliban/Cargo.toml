@@ -17,6 +17,7 @@ caliban-config.workspace = true
 caliban-cp.workspace = true
 caliban-gateway.workspace = true
 caliban-meter.workspace = true
+caliban-mcp.workspace = true
 caliban-nodes.workspace = true
 caliban-types.workspace = true
 anyhow.workspace = true
@@ -38,7 +39,7 @@ hex.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 caliban-cache.workspace = true
-caliban-mcp.workspace = true
+caliban-mcp = { workspace = true, features = ["test-server"] }
 tower.workspace = true
 # Black-box tests (tests/isolation.rs, tests/usage_accuracy.rs): mock upstream + process harness.
 caliban-bench = { path = "../../bench" }

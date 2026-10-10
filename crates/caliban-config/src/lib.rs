@@ -925,6 +925,69 @@ pub struct TenantConfig {
     /// workers (the journal is the source of truth). Rendered by the control plane when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_spend_caps: Option<NodeSpendCaps>,
+    /// MCP tool servers the tenant registered (the egress allowlist of its nodes' tools), with
+    /// their credential sealed under the tenant's data key. Rendered by the control plane.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_servers: Vec<ToolServerConfig>,
+    /// Approved tool manifests (pinned): the only MCP tools the tenant's nodes can call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ApprovedTool>,
+}
+
+/// A registered MCP tool server (Streamable HTTP).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolServerConfig {
+    /// The `server` of `mcp://server/tool#sha256:...`.
+    pub name: String,
+    pub url: String,
+    pub auth: ToolAuth,
+    /// The tenant trusts this server with personal data: PII surrogates in tool arguments are
+    /// rehydrated for it. Untrusted (the default) servers only ever see surrogates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trusted: bool,
+    /// The API key or OAuth client secret, sealed under the tenant's data key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<SecretRef>,
+}
+
+/// How Caliban authenticates to a tool server. Client tokens are never passed through.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolAuth {
+    /// A token minted per call by Caliban (EdDSA JWT for this tenant, node, run and tool), which
+    /// the server verifies with Caliban's JWKS. `audience`: default the server URL's origin.
+    CalibanToken {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<String>,
+    },
+    /// A static API key the server issued, sent in `header` (default `Authorization: Bearer`).
+    ApiKey {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        header: Option<String>,
+    },
+    /// OAuth 2.0 client credentials: Caliban fetches an access token from `token_url` (down-scoped
+    /// with `scope` when the server supports it) and sends it as a bearer token.
+    OauthClientCredentials {
+        token_url: String,
+        client_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+    },
+    /// No authentication (a server on a private network that needs none).
+    None,
+}
+
+/// An approved, pinned tool manifest.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedTool {
+    pub server: String,
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    /// `sha256:<hex>` over the manifest (see `caliban_mcp::ToolManifest::pin`).
+    pub pin: String,
 }
 
 /// Tenant-wide caps on node spend (USD, priced like the metering), checked before every model

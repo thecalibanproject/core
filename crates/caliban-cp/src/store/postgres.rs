@@ -53,6 +53,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (16, "node_spend_caps", include_str!("../../../../migrations/0016_node_spend_caps.sql")),
     (17, "node_run_retention", include_str!("../../../../migrations/0017_node_run_retention.sql")),
     (18, "usage_nodes", include_str!("../../../../migrations/0018_usage_nodes.sql")),
+    (19, "tool_registry", include_str!("../../../../migrations/0019_tool_registry.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -949,6 +950,20 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
             )
             .await
         }
+        Mutation::CreateToolServer(s) => insert_tool_server(c, s).await,
+        Mutation::DeleteToolServer { tenant_id, name, at } => {
+            let q = "UPDATE tool_server SET deleted_at = $3, sealed_secret = NULL
+                     WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL";
+            exec(c, sqlx::query(q).bind(tenant_id).bind(name).bind(at)).await
+        }
+        Mutation::RecordToolManifests { tenant_id, server, .. }
+        | Mutation::ApproveTool { tenant_id, server, .. }
+        | Mutation::RevokeTool { tenant_id, server, .. } => {
+            for m in next.tool_manifests.iter().filter(|m| &m.tenant_id == tenant_id && &m.server == server) {
+                upsert_tool_manifest(c, m).await?;
+            }
+            Ok(())
+        }
         Mutation::ProposeOntology { tenant_id, elements } => {
             ontology_commit(c, tenant_id, "ontology.propose", elements).await
         }
@@ -1152,6 +1167,13 @@ async fn delete_tenant(c: &mut PgConnection, id: &str, at: DateTime<Utc>) -> Res
     )
     .await?;
     exec(c, tenant_at("UPDATE node SET deleted_at = $2 WHERE tenant_id = $1 AND deleted_at IS NULL")).await?;
+    exec(
+        c,
+        tenant_at(
+            "UPDATE tool_server SET deleted_at = $2, sealed_secret = NULL WHERE tenant_id = $1 AND deleted_at IS NULL",
+        ),
+    )
+    .await?;
     let tenant = |sql: &'static str| sqlx::query(sql).bind(id);
     exec(c, tenant("DELETE FROM node_promotion WHERE tenant_id = $1")).await?;
     exec(c, tenant("DELETE FROM route WHERE tenant_id = $1")).await?;
@@ -1343,6 +1365,59 @@ async fn set_routes(c: &mut PgConnection, tenant: &str, routes: &[RouteConfig]) 
         .await?;
     }
     Ok(())
+}
+
+async fn insert_tool_server(c: &mut PgConnection, s: &super::ToolServerRecord) -> Result<(), StoreError> {
+    let sealed = s
+        .secret
+        .as_deref()
+        .map(|b| B64.decode(b).map_err(|e| StoreError::Invalid(format!("sealed credential is not base64: {e}"))))
+        .transpose()?;
+    exec(
+        c,
+        sqlx::query(
+            "INSERT INTO tool_server (id, tenant_id, name, url, auth, sealed_secret, trusted, created_at, created_by, deleted_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(&s.id)
+        .bind(&s.tenant_id)
+        .bind(&s.name)
+        .bind(&s.url)
+        .bind(Json(serde_json::to_value(&s.auth).map_err(|e| StoreError::Backend(e.to_string()))?))
+        .bind(sealed)
+        .bind(s.trusted)
+        .bind(s.created_at)
+        .bind(&s.created_by)
+        .bind(s.deleted_at),
+    )
+    .await
+}
+
+async fn upsert_tool_manifest(c: &mut PgConnection, m: &super::ToolManifestRecord) -> Result<(), StoreError> {
+    exec(
+        c,
+        sqlx::query(
+            "INSERT INTO tool_manifest (id, tenant_id, server, name, description, input_schema, pin, findings, status,
+                                        discovered_at, approved_at, approved_by, findings_acknowledged)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, approved_at = EXCLUDED.approved_at,
+                 approved_by = EXCLUDED.approved_by, findings_acknowledged = EXCLUDED.findings_acknowledged",
+        )
+        .bind(&m.id)
+        .bind(&m.tenant_id)
+        .bind(&m.server)
+        .bind(&m.name)
+        .bind(&m.description)
+        .bind(Json(m.input_schema.clone()))
+        .bind(&m.pin)
+        .bind(Json(serde_json::to_value(&m.findings).map_err(|e| StoreError::Backend(e.to_string()))?))
+        .bind(m.status.as_str())
+        .bind(m.discovered_at)
+        .bind(m.approved_at)
+        .bind(&m.approved_by)
+        .bind(m.findings_acknowledged),
+    )
+    .await
 }
 
 async fn insert_datasource(c: &mut PgConnection, d: &DatasourceRecord) -> Result<(), StoreError> {
@@ -1633,6 +1708,53 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             epoch: u64::try_from(get::<i64>(&r, "epoch")?).unwrap_or_default(),
             connection: get::<Json<Value>>(&r, "connection")?.0,
             deleted_at: get(&r, "deleted_at")?,
+        });
+    }
+
+    for r in rows(
+        c,
+        "SELECT id, tenant_id, name, url, auth, sealed_secret, trusted, created_at, created_by, deleted_at
+         FROM tool_server ORDER BY ord",
+    )
+    .await?
+    {
+        let secret = get::<Option<Vec<u8>>>(&r, "sealed_secret")?.map(|b| B64.encode(b));
+        st.tool_servers.push(super::ToolServerRecord {
+            id: get(&r, "id")?,
+            tenant_id: get(&r, "tenant_id")?,
+            name: get(&r, "name")?,
+            url: get(&r, "url")?,
+            auth: parse(get::<Json<Value>>(&r, "auth")?.0)?,
+            trusted: get(&r, "trusted")?,
+            has_credential: secret.is_some(),
+            secret,
+            created_at: get(&r, "created_at")?,
+            created_by: get(&r, "created_by")?,
+            deleted_at: get(&r, "deleted_at")?,
+        });
+    }
+    for r in rows(
+        c,
+        "SELECT id, tenant_id, server, name, description, input_schema, pin, findings, status, discovered_at,
+                approved_at, approved_by, findings_acknowledged
+         FROM tool_manifest ORDER BY ord",
+    )
+    .await?
+    {
+        st.tool_manifests.push(super::ToolManifestRecord {
+            id: get(&r, "id")?,
+            tenant_id: get(&r, "tenant_id")?,
+            server: get(&r, "server")?,
+            name: get(&r, "name")?,
+            description: get(&r, "description")?,
+            input_schema: get::<Json<Value>>(&r, "input_schema")?.0,
+            pin: get(&r, "pin")?,
+            findings: parse(get::<Json<Value>>(&r, "findings")?.0)?,
+            status: parse_enum(get(&r, "status")?)?,
+            discovered_at: get(&r, "discovered_at")?,
+            approved_at: get(&r, "approved_at")?,
+            approved_by: get(&r, "approved_by")?,
+            findings_acknowledged: get(&r, "findings_acknowledged")?,
         });
     }
 

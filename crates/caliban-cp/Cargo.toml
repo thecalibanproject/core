@@ -12,6 +12,7 @@ caliban-config.workspace = true
 caliban-meter.workspace = true
 caliban-nodes.workspace = true
 caliban-ontology.workspace = true
+caliban-mcp.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -35,6 +36,7 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+caliban-mcp = { workspace = true, features = ["test-server"] }
 futures.workspace = true
 # Test-only signing keys for the in-process mock OIDC provider.
 p256 = { version = "0.13", features = ["pkcs8", "arithmetic"] }

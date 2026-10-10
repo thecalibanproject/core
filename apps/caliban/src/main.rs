@@ -169,6 +169,9 @@ enum Cmd {
     },
     /// Generate an Ed25519 snapshot signing key (control plane) and its public key (routers).
     GenSigningKey,
+    /// Generate the Ed25519 key that signs the tokens minted per tool call (workers, standalone,
+    /// and the control plane for discovery and its JWKS) and print its public key.
+    GenToolTokenKey,
     /// Probe a local health endpoint and exit 0/1 (for container healthchecks; the image has no shell).
     Healthcheck {
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -239,6 +242,17 @@ async fn main() -> Result<()> {
         Cmd::Keys { cmd } => {
             let cfg = Config::from_file(&cli.config).with_context(|| format!("loading {}", cli.config))?;
             return keys_command(cmd, &cfg).await;
+        }
+        Cmd::GenToolTokenKey => {
+            let mut seed = [0u8; 32];
+            rand::rng().fill_bytes(&mut seed);
+            let signer = caliban_mcp::token::ToolTokenSigner::new(&seed, "caliban", vec![]);
+            println!(
+                "CALIBAN_TOOL_TOKEN_KEY={}   # workers, standalone, control plane; keep secret",
+                base64::engine::general_purpose::STANDARD.encode(seed)
+            );
+            println!("# public key (kid {}): {}", signer.key_id(), signer.public_key_b64());
+            return Ok(());
         }
         Cmd::GenSigningKey => {
             let (seed, public) = generate_signing_key();
@@ -427,6 +441,7 @@ async fn main() -> Result<()> {
         | Cmd::GenKek
         | Cmd::Keys { .. }
         | Cmd::GenSigningKey
+        | Cmd::GenToolTokenKey
         | Cmd::Worker(_)
         | Cmd::Healthcheck { .. } => unreachable!(),
     };
@@ -536,7 +551,8 @@ async fn control_plane(
         caliban_cp::ControlPlane::new(store, admin_token, mode)
             .with_snapshots(signer, router_token)
             .with_keyring(keyring)
-            .with_oidc(oidc),
+            .with_oidc(oidc)
+            .with_tools(caliban_cp::tools::ToolsSetup::from_env().map_err(anyhow::Error::msg).context("MCP tools")?),
     );
     if postgres {
         // Picks up writes made through other control-plane replicas.

@@ -11,6 +11,7 @@ pub mod keys;
 mod models;
 mod nodes;
 pub mod store;
+pub mod tools;
 
 use auth::Principal;
 use auth::rbac::Perm;
@@ -51,6 +52,8 @@ pub struct ControlPlane {
     exported: Mutex<Option<Arc<Exported>>>,
     /// KEK keyring (`CALIBAN_KEK`, `CALIBAN_KEK_PREVIOUS`); without it secrets cannot be stored.
     keyring: Option<Arc<Keyring>>,
+    /// The MCP client for tool discovery and the tool token key (JWKS).
+    tools: Option<Arc<tools::ToolsSetup>>,
 }
 
 /// The last signed snapshot, re-served while the rendered config is unchanged.
@@ -73,7 +76,30 @@ impl ControlPlane {
             router_token: None,
             exported: Mutex::new(None),
             keyring: None,
+            tools: None,
         }
+    }
+
+    /// The MCP client used for tool discovery (default: the system resolver, no loopback) and
+    /// the tool token key whose JWKS the control plane publishes.
+    #[must_use]
+    pub fn with_tools(mut self, tools: tools::ToolsSetup) -> Self {
+        self.tools = Some(Arc::new(tools));
+        self
+    }
+
+    pub(crate) fn tools(&self) -> Arc<tools::ToolsSetup> {
+        static DEFAULT: std::sync::OnceLock<Arc<tools::ToolsSetup>> = std::sync::OnceLock::new();
+        self.tools.clone().unwrap_or_else(|| {
+            Arc::clone(DEFAULT.get_or_init(|| {
+                Arc::new(tools::ToolsSetup {
+                    client: Arc::new(caliban_mcp::client::McpClient::system(
+                        caliban_mcp::egress::EgressPolicy::default(),
+                    )),
+                    signer: None,
+                })
+            }))
+        })
     }
 
     /// Enables OIDC single sign-on.
@@ -228,6 +254,12 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/tenants/{tenant_id}/nodes/{id}/versions/{version}/retire", post(nodes::retire))
         .route("/tenants/{tenant_id}/nodes/{id}/promote", post(nodes::promote))
         .route("/tenants/{tenant_id}/nodes/{id}/diff", get(nodes::diff))
+        .route("/tenants/{tenant_id}/tool-servers", get(tools::list_servers).post(tools::create_server))
+        .route("/tenants/{tenant_id}/tool-servers/{server}", delete(tools::delete_server))
+        .route("/tenants/{tenant_id}/tool-servers/{server}/discover", post(tools::discover))
+        .route("/tenants/{tenant_id}/tool-servers/{server}/tools", get(tools::list_tools).post(tools::import))
+        .route("/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/approve", post(tools::approve))
+        .route("/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/revoke", post(tools::revoke))
         .route("/models", get(models::list_models).post(models::create_model))
         .route("/models/{*id}", delete(models::delete_model))
         .route("/providers", get(models::list_providers).post(models::create_provider))
@@ -254,7 +286,10 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/usage/ingest", post(ingest_usage).layer(axum::extract::DefaultBodyLimit::max(INGEST_MAX_BYTES)))
         .route("/health", get(health));
 
-    let mut app = Router::new().nest("/api/v1", api).merge(auth::handlers::routes());
+    let mut app = Router::new()
+        .nest("/api/v1", api)
+        .route("/.well-known/caliban-tool-jwks.json", get(tools::jwks))
+        .merge(auth::handlers::routes());
     if let Some(dir) = web_dir {
         // SPA: unknown paths fall back to index.html for client-side routing.
         let index = format!("{dir}/index.html");

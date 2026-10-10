@@ -12,6 +12,7 @@ test-server = ["rmcp/server", "rmcp/macros", "rmcp/transport-streamable-http-ser
 
 [dependencies]
 async-trait.workspace = true
+caliban-config.workspace = true
 axum = { workspace = true, optional = true }
 base64.workspace = true
 chrono.workspace = true

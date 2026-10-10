@@ -10,6 +10,12 @@
 //! `tenant_admin` all four on its tenant; `developer` read, write and run (not publish); `viewer`
 //! and `auditor` read; `billing` none.
 //!
+//! Tools (P3 M4): `tools.read` (registered MCP servers, their manifests and scan findings),
+//! `tools.write` (register, delete and discover servers, import manifests) and `tools.approve`
+//! (approve or revoke a manifest: what lets nodes call a tool, so a human decision kept apart from
+//! registering). Owner and admin hold all three; `tenant_admin` all three on its tenant;
+//! `developer` read and write; `viewer` and `auditor` read; `billing` none.
+//!
 //! Every admin API route has exactly one entry in [`ROUTES`]; a route without one is denied to
 //! everybody (deny by default). Tenant-scoped permissions are checked against the tenant the
 //! request is about, found as [`TenantFrom`] says. List endpoints without a tenant filter return
@@ -87,6 +93,7 @@ impl Role {
                 DatasourcesRead,
                 OntologyRead,
                 NodesRead,
+                ToolsRead,
                 UsageRead,
             ],
             Role::TenantAdmin => &[
@@ -107,6 +114,9 @@ impl Role {
                 NodesWrite,
                 NodesPublish,
                 NodesRun,
+                ToolsRead,
+                ToolsWrite,
+                ToolsApprove,
                 UsageRead,
             ],
             Role::Developer => &[
@@ -123,6 +133,8 @@ impl Role {
                 NodesRead,
                 NodesWrite,
                 NodesRun,
+                ToolsRead,
+                ToolsWrite,
                 UsageRead,
             ],
             Role::Viewer => &[
@@ -134,6 +146,7 @@ impl Role {
                 DatasourcesRead,
                 OntologyRead,
                 NodesRead,
+                ToolsRead,
                 UsageRead,
             ],
             Role::Billing => &[CatalogRead, TenantRead, UsageRead],
@@ -175,11 +188,15 @@ pub enum Perm {
     NodesPublish,
     /// Run nodes (data plane, with API keys); grant node access to API keys (admin API).
     NodesRun,
+    /// MCP tool servers and manifests: read, register and discover, approve.
+    ToolsRead,
+    ToolsWrite,
+    ToolsApprove,
     UsageRead,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 25] = [
+    pub const ALL: [Perm; 28] = [
         Perm::TenantsCreate,
         Perm::CatalogRead,
         Perm::CatalogWrite,
@@ -204,6 +221,9 @@ impl Perm {
         Perm::NodesWrite,
         Perm::NodesPublish,
         Perm::NodesRun,
+        Perm::ToolsRead,
+        Perm::ToolsWrite,
+        Perm::ToolsApprove,
         Perm::UsageRead,
     ];
 
@@ -233,6 +253,9 @@ impl Perm {
             Perm::NodesWrite => "nodes.write",
             Perm::NodesPublish => "nodes.publish",
             Perm::NodesRun => "nodes.run",
+            Perm::ToolsRead => "tools.read",
+            Perm::ToolsWrite => "tools.write",
+            Perm::ToolsApprove => "tools.approve",
             Perm::UsageRead => "usage.read",
         }
     }
@@ -422,6 +445,14 @@ pub const ROUTES: &[RouteRule] = &[
     r("POST", "/tenants/{tenant_id}/nodes/{id}/versions/{version}/retire", Perm::NodesPublish, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/nodes/{id}/promote", Perm::NodesPublish, TenantFrom::Path),
     r("GET", "/tenants/{tenant_id}/nodes/{id}/diff", Perm::NodesRead, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/tool-servers", Perm::ToolsRead, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/tool-servers", Perm::ToolsWrite, TenantFrom::Path),
+    r("DELETE", "/tenants/{tenant_id}/tool-servers/{server}", Perm::ToolsWrite, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/tool-servers/{server}/discover", Perm::ToolsWrite, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/tool-servers/{server}/tools", Perm::ToolsRead, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools", Perm::ToolsWrite, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/approve", Perm::ToolsApprove, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/revoke", Perm::ToolsApprove, TenantFrom::Path),
     r("GET", "/models", Perm::CatalogRead, TenantFrom::None),
     r("POST", "/models", Perm::CatalogWrite, TenantFrom::None),
     r("DELETE", "/models/{*id}", Perm::CatalogWrite, TenantFrom::None),
@@ -512,6 +543,24 @@ mod tests {
         ];
         for (role, perms) in want {
             for p in [NodesRead, NodesWrite, NodesPublish, NodesRun] {
+                assert_eq!(role.grants(p), perms.contains(&p), "{} {}", role.as_str(), p.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn tool_permissions_follow_the_roles() {
+        use Perm::{ToolsApprove, ToolsRead, ToolsWrite};
+        let want: &[(Role, &[Perm])] = &[
+            (Role::Owner, &[ToolsRead, ToolsWrite, ToolsApprove]),
+            (Role::TenantAdmin, &[ToolsRead, ToolsWrite, ToolsApprove]),
+            (Role::Developer, &[ToolsRead, ToolsWrite]),
+            (Role::Viewer, &[ToolsRead]),
+            (Role::Auditor, &[ToolsRead]),
+            (Role::Billing, &[]),
+        ];
+        for (role, perms) in want {
+            for p in [ToolsRead, ToolsWrite, ToolsApprove] {
                 assert_eq!(role.grants(p), perms.contains(&p), "{} {}", role.as_str(), p.as_str());
             }
         }

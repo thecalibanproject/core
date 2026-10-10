@@ -231,6 +231,11 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             }
             st.promotions.remove(id);
             st.role_bindings.retain(|b| b.tenant_id.as_ref() != Some(id));
+            for s in st.tool_servers.iter_mut().filter(|s| &s.tenant_id == id && s.is_live()) {
+                s.deleted_at = Some(*at);
+                s.secret = None;
+                s.has_credential = false;
+            }
         }
         Mutation::UpdateTenant {
             id,
@@ -508,6 +513,105 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 }
             }
         }
+        Mutation::CreateToolServer(s) => {
+            need_tenant(st, &s.tenant_id)?;
+            if !caliban_nodes::valid_node_name(&s.name) {
+                return Err(StoreError::Invalid(format!(
+                    "'{}' is not a tool server name (1 to 64 characters of a-z, 0-9, '-' and '_')",
+                    s.name
+                )));
+            }
+            if st.tool_server(&s.tenant_id, &s.name).is_some() {
+                return Err(StoreError::Conflict(format!("tool server '{}' already exists", s.name)));
+            }
+            if s.secret.is_some() && !st.deks.contains_key(&s.tenant_id) {
+                return Err(StoreError::Invalid(
+                    "the credential is sealed under a tenant key that does not exist".into(),
+                ));
+            }
+            st.tool_servers.push(super::ToolServerRecord { has_credential: s.secret.is_some(), ..s.clone() });
+        }
+        Mutation::DeleteToolServer { tenant_id, name, at } => {
+            need_tenant(st, tenant_id)?;
+            st.tool_server(tenant_id, name).ok_or_else(|| StoreError::NotFound("tool server".into()))?;
+            // A published version that calls one of its tools would break: retire it first.
+            let users: Vec<String> = st
+                .nodes
+                .iter()
+                .filter(|n| &n.tenant_id == tenant_id && n.is_live() && n.state == NodeState::Published)
+                .filter(|n| {
+                    parse_spec(n).is_ok_and(|s| {
+                        s.tools.iter().any(|t| {
+                            matches!(caliban_nodes::ToolTarget::parse(&t.reference), Ok(caliban_nodes::ToolTarget::Mcp { server, .. }) if &server == name)
+                        })
+                    })
+                })
+                .map(|n| format!("{}@v{}", n.name, n.version))
+                .collect();
+            if !users.is_empty() {
+                return Err(StoreError::Conflict(format!(
+                    "tool server '{name}' is used by {}; retire those first",
+                    users.join(", ")
+                )));
+            }
+            let s = st
+                .tool_servers
+                .iter_mut()
+                .find(|s| &s.tenant_id == tenant_id && &s.name == name && s.is_live())
+                .ok_or_else(|| StoreError::NotFound("tool server".into()))?;
+            s.deleted_at = Some(*at);
+            s.secret = None;
+            s.has_credential = false;
+        }
+        Mutation::RecordToolManifests { tenant_id, server, manifests } => {
+            need_tenant(st, tenant_id)?;
+            st.tool_server(tenant_id, server).ok_or_else(|| StoreError::NotFound("tool server".into()))?;
+            for m in manifests {
+                let known = st
+                    .tool_manifests
+                    .iter()
+                    .any(|x| &x.tenant_id == tenant_id && &x.server == server && x.name == m.name && x.pin == m.pin);
+                if !known {
+                    st.tool_manifests.push(super::ToolManifestRecord {
+                        tenant_id: tenant_id.clone(),
+                        server: server.clone(),
+                        status: super::ToolStatus::Discovered,
+                        approved_at: None,
+                        approved_by: None,
+                        findings_acknowledged: false,
+                        ..m.clone()
+                    });
+                }
+            }
+        }
+        Mutation::ApproveTool { tenant_id, server, tool, pin, acknowledge_findings, at, by } => {
+            need_tenant(st, tenant_id)?;
+            st.tool_server(tenant_id, server).ok_or_else(|| StoreError::NotFound("tool server".into()))?;
+            let m = st
+                .tool_manifests
+                .iter_mut()
+                .find(|m| &m.tenant_id == tenant_id && &m.server == server && &m.name == tool && &m.pin == pin)
+                .ok_or_else(|| StoreError::NotFound("tool manifest".into()))?;
+            if !m.findings.is_empty() && !acknowledge_findings {
+                return Err(StoreError::Invalid(format!(
+                    "the injection scan flagged this manifest ({}); approve it with acknowledge_findings: true if a human reviewed them",
+                    m.findings.iter().map(|f| format!("{} in {}", f.kind, f.location)).collect::<Vec<_>>().join(", ")
+                )));
+            }
+            m.status = super::ToolStatus::Approved;
+            m.approved_at = Some(*at);
+            m.approved_by = Some(by.clone());
+            m.findings_acknowledged = !m.findings.is_empty() && *acknowledge_findings;
+        }
+        Mutation::RevokeTool { tenant_id, server, tool, pin } => {
+            need_tenant(st, tenant_id)?;
+            let m = st
+                .tool_manifests
+                .iter_mut()
+                .find(|m| &m.tenant_id == tenant_id && &m.server == server && &m.name == tool && &m.pin == pin)
+                .ok_or_else(|| StoreError::NotFound("tool manifest".into()))?;
+            m.status = super::ToolStatus::Revoked;
+        }
         Mutation::ProposeOntology { tenant_id, elements } => {
             need_tenant(st, tenant_id)?;
             let onto = st.ontologies.entry(tenant_id.clone()).or_insert_with(|| Ontology {
@@ -687,8 +791,27 @@ impl caliban_nodes::publish::PublishContext for TenantNodes<'_> {
         self.st.node_caps(self.tenant)
     }
 
-    // TODO(P3 M4): `check_tool` resolves `mcp://` references against the tenant's approved tool
-    // registry (pinned manifests). Until then every pinned reference passes here.
+    /// `mcp://server/tool#pin` must name an approved manifest, with exactly that pin, of a live
+    /// server the tenant registered.
+    fn check_tool(&self, target: &caliban_nodes::ToolTarget) -> Result<(), String> {
+        let caliban_nodes::ToolTarget::Mcp { server, tool, pin } = target else { return Ok(()) };
+        if self.st.tool_server(self.tenant, server).is_none() {
+            return Err(format!("the tenant has no tool server named '{server}'"));
+        }
+        if self.st.approved_tool(self.tenant, server, tool, pin).is_some() {
+            return Ok(());
+        }
+        let other = self.st.tool_manifests.iter().find(|m| {
+            m.tenant_id == self.tenant
+                && &m.server == server
+                && &m.name == tool
+                && m.status == super::ToolStatus::Approved
+        });
+        Err(match other {
+            Some(m) => format!("the approved manifest of '{tool}' has pin {}, not {pin}", m.pin),
+            None => format!("'{tool}' has no approved manifest on server '{server}'"),
+        })
+    }
 }
 
 /// Applies a [`super::Rekey`] batch: every change must still find the value it was planned from.
