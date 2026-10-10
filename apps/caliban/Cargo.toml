@@ -19,6 +19,7 @@ caliban-gateway.workspace = true
 caliban-meter.workspace = true
 caliban-types.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true

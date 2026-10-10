@@ -223,6 +223,7 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route_layer(middleware::from_fn_with_state(Arc::clone(&cp), auth::authorize))
         // Router token, not the admin token: a compromised router cannot administer.
         .route("/snapshot", get(snapshot))
+        .route("/usage/ingest", post(ingest_usage).layer(axum::extract::DefaultBodyLimit::max(INGEST_MAX_BYTES)))
         .route("/health", get(health));
 
     let mut app = Router::new().nest("/api/v1", api).merge(auth::handlers::routes());
@@ -876,44 +877,69 @@ struct UsageQuery {
 }
 
 /// Usage events (newest first) and totals; without `tenant_id`, over the tenants the caller sees.
-async fn usage(State(cp): State<Cp>, Extension(p): Extension<Principal>, Query(q): Query<UsageQuery>) -> Json<Value> {
-    let visible = p.visible(Perm::UsageRead);
-    let mut all = cp.store.usage.snapshot(q.tenant_id.as_deref(), usize::MAX);
-    all.retain(|e| visible.contains(&e.tenant_id));
-    let events: Vec<_> = all.iter().take(q.limit.unwrap_or(100).min(1000)).cloned().collect();
-    let auto = all.iter().filter(|e| e.requested_model.as_deref() == Some("caliban/auto"));
-    let priced = all.iter().filter(|e| e.margin_usd().is_some());
-    let totals = json!({
-        "requests": all.len(),
-        "prompt_tokens": all.iter().map(|e| e.prompt_tokens).sum::<u64>(),
-        "completion_tokens": all.iter().map(|e| e.completion_tokens).sum::<u64>(),
-        "cached_prompt_tokens": all.iter().map(|e| e.cached_prompt_tokens).sum::<u64>(),
-        "cache_write_tokens": all.iter().map(|e| e.cache_write_tokens).sum::<u64>(),
-        // Requests whose tokens are a gateway estimate (disconnects, streams without usage).
-        "estimated_requests": all.iter().filter(|e| e.usage_source == Some(caliban_meter::UsageSource::Estimated)).count(),
-        "cache_hits": all.iter().filter(|e| e.cache == caliban_types::CacheStatus::Hit).count(),
-        // What cache hits of both tiers saved customers (see `UsageEvent::saved_usd`).
-        "saved_usd": usd_total(all.iter().filter_map(|e| e.saved_usd)),
-        "semantic_cache_hits": all.iter().filter(|e| e.cache_tier == Some(caliban_types::CacheTier::Semantic)).count(),
-        "tokens_saved": all.iter().map(|e| e.tokens_saved + e.cached_prompt_tokens).sum::<u64>(),
-        "cost_usd": usd_total(all.iter().filter_map(|e| e.cost_usd)),
-        // caliban/auto: the full flat price and what was billed (discounted on cache hits) vs the
-        // routed models' real cost, over events with both prices.
-        "auto_requests": auto.clone().count(),
-        "auto_cache_hits": auto.clone().filter(|e| e.cache == caliban_types::CacheStatus::Hit).count(),
-        "flat_price_usd": usd_total(priced.clone().filter_map(|e| e.flat_price_usd)),
-        "billed_usd": usd_total(priced.clone().filter_map(caliban_meter::UsageEvent::auto_billed_usd)),
-        "auto_saved_usd": usd_total(priced.clone().filter_map(|e| e.saved_usd)),
-        "routed_model_cost_usd": usd_total(priced.clone().filter_map(|e| e.routed_model_cost_usd)),
-        "margin_usd": usd_total(priced.filter_map(caliban_meter::UsageEvent::margin_usd)),
-    });
-    Json(json!({ "events": events, "totals": totals }))
+/// With the Postgres store they come from `usage_event` (every router's events, every replica);
+/// with the memory store from this process's ring.
+async fn usage(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Query(q): Query<UsageQuery>,
+) -> ApiResult<Json<Value>> {
+    let tenants: Option<Vec<String>> = match (p.visible(Perm::UsageRead), q.tenant_id) {
+        (auth::rbac::Visible::All, None) => None,
+        (auth::rbac::Visible::All, Some(t)) => Some(vec![t]),
+        (auth::rbac::Visible::Only(set), None) => Some(set.into_iter().collect()),
+        (auth::rbac::Visible::Only(set), Some(t)) => Some(set.into_iter().filter(|v| *v == t).collect()),
+    };
+    let report = cp.store.usage_report(tenants.as_deref(), q.limit.unwrap_or(100).min(1000)).await?;
+    Ok(Json(json!(report)))
 }
 
-/// Sum of USD amounts, starting from +0.0: `Iterator::sum::<f64>()` returns -0.0 for an empty
-/// iterator, which the API would serialize as `-0.0` (and the console show as "-$0.00").
-fn usd_total(amounts: impl Iterator<Item = f64>) -> f64 {
-    amounts.fold(0.0, |acc, x| acc + x)
+#[derive(Deserialize)]
+struct UsageIngest {
+    /// The sending router (for logs).
+    #[serde(default)]
+    router_id: Option<String>,
+    events: Vec<caliban_meter::UsageEvent>,
+}
+
+/// Most events accepted in one ingest call, and the body size that fits them.
+const INGEST_MAX_EVENTS: usize = 5_000;
+const INGEST_MAX_BYTES: usize = 16 << 20;
+
+/// `POST /api/v1/usage/ingest`: a split-mode router delivers usage events (router token, like the
+/// snapshot). Stored at most once per `request_id`, so retries never double-bill; invalid events
+/// are counted as `rejected` and dropped (retrying them cannot help).
+async fn ingest_usage(State(cp): State<Cp>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let Some(token) = cp.router_token.as_deref() else {
+        return ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "split mode is not enabled: set CALIBAN_ROUTER_TOKEN on the control plane".into(),
+        )
+        .into_response();
+    };
+    if !bearer_is(&headers, token) {
+        return ApiError(StatusCode::UNAUTHORIZED, "invalid router token".into()).into_response();
+    }
+    let batch: UsageIngest = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return bad(format!("invalid usage batch: {e}")).into_response(),
+    };
+    if batch.events.len() > INGEST_MAX_EVENTS {
+        return ApiError(StatusCode::PAYLOAD_TOO_LARGE, format!("at most {INGEST_MAX_EVENTS} events per batch"))
+            .into_response();
+    }
+    let n = batch.events.len();
+    match cp.store.ingest_usage(batch.events).await {
+        Ok(r) => {
+            tracing::debug!(router = ?batch.router_id, events = n, accepted = r.accepted, duplicates = r.duplicates, "usage ingested");
+            if r.rejected > 0 {
+                tracing::warn!(router = ?batch.router_id, rejected = r.rejected, "refused invalid usage events");
+            }
+            Json(json!(r)).into_response()
+        }
+        // The router keeps the batch and retries.
+        Err(e) => ApiError::from(e).into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -1145,7 +1171,7 @@ mod tests {
     #[tokio::test]
     async fn empty_usd_totals_are_positive_zero() {
         assert!(std::iter::empty::<f64>().sum::<f64>().is_sign_negative(), "the pitfall usd_total avoids");
-        assert!(usd_total(std::iter::empty()).is_sign_positive());
+        assert!(store::usage::usd_total(std::iter::empty()).is_sign_positive());
         let app = app(cp(), None);
         let (s, u) = call(&app, "GET", "/api/v1/usage", None, true).await;
         assert_eq!(s, StatusCode::OK);

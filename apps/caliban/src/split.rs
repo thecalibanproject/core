@@ -8,6 +8,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use caliban_config::signing::{SignedSnapshot, SnapshotPayload, SnapshotVerifier, config_digest};
 use caliban_config::{ConfigHandle, Snapshot};
+use caliban_meter::ShipError;
 use rand::Rng;
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, ETAG, IF_NONE_MATCH};
@@ -203,6 +204,75 @@ impl SnapshotSource {
                     tracing::warn!(error = %format!("{e:#}"), serving = %self.version, "snapshot poll failed; keeping last good snapshot")
                 }
             }
+        }
+    }
+}
+
+/// Delivers usage events to the control plane (`POST /api/v1/usage/ingest`, router token), for
+/// [`caliban_meter::UsageShipper`]. The control plane stores each `request_id` once, so a batch
+/// sent again after a lost acknowledgement or a restart is not counted twice.
+pub struct HttpUsageTransport {
+    client: reqwest::Client,
+    url: String,
+    token: String,
+    router_id: String,
+}
+
+impl HttpUsageTransport {
+    pub fn new(control_plane_url: &str, token: String, router_id: String) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .context("building HTTP client")?;
+        Ok(Self {
+            client,
+            url: format!("{}/api/v1/usage/ingest", control_plane_url.trim_end_matches('/')),
+            token,
+            router_id,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl caliban_meter::UsageTransport for HttpUsageTransport {
+    async fn send(&self, events: &[caliban_meter::UsageEvent]) -> Result<caliban_meter::Delivered, ShipError> {
+        let body = serde_json::json!({ "router_id": self.router_id, "events": events });
+        let resp = self
+            .client
+            .post(&self.url)
+            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ShipError::Retry(format!("POST {}: {e}", self.url)))?;
+        let status = resp.status();
+        if status.is_success() {
+            let v: serde_json::Value =
+                resp.json().await.map_err(|e| ShipError::Retry(format!("reading the ingest answer: {e}")))?;
+            let n = |k: &str| v[k].as_u64().unwrap_or(0);
+            return Ok(caliban_meter::Delivered {
+                accepted: n("accepted"),
+                duplicates: n("duplicates"),
+                rejected: n("rejected"),
+            });
+        }
+        let text: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
+        let msg = match status {
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => {
+                format!("the control plane does not accept usage events ({status}); upgrade it")
+            }
+            StatusCode::UNAUTHORIZED => format!("the control plane refused the router token ({status})"),
+            _ => format!("control plane returned {status}: {text}"),
+        };
+        // A malformed or oversized batch fails the same way every time: drop it (counted) rather
+        // than block the backlog. Everything else (down, overloaded, misconfigured token, older
+        // control plane) is retried.
+        if matches!(status, StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY)
+        {
+            Err(ShipError::Fatal(msg))
+        } else {
+            Err(ShipError::Retry(msg))
         }
     }
 }

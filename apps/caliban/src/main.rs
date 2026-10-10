@@ -6,6 +6,8 @@ mod kek_checkin_tests;
 mod purge_tests;
 #[cfg(test)]
 mod revocation_tests;
+#[cfg(test)]
+mod ship_tests;
 mod split;
 
 use anyhow::{Context, Result};
@@ -36,8 +38,104 @@ struct Cli {
     /// and counted in /healthz.
     #[arg(long, env = "CALIBAN_USAGE_WAL_QUEUE", default_value_t = 16_384, global = true)]
     usage_wal_queue: usize,
+    #[command(flatten)]
+    ship: ShipArgs,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// Usage shipping: split-mode routers deliver their usage events to the control plane (and a
+/// standalone process with a Postgres store to its own store), at least once, deduplicated there.
+#[derive(clap::Args)]
+struct ShipArgs {
+    /// Ship usage events to the control plane (split mode; standalone with Postgres). `false`
+    /// keeps them on the router only (WAL and ring), as before.
+    #[arg(long, env = "CALIBAN_USAGE_SHIP", default_value_t = true, action = clap::ArgAction::Set, global = true)]
+    usage_ship: bool,
+    /// Events per delivery at most (1 to 5000).
+    #[arg(long, env = "CALIBAN_USAGE_SHIP_BATCH", default_value_t = 500, global = true)]
+    usage_ship_batch: usize,
+    /// How long an event waits for its batch to fill before it is sent anyway.
+    #[arg(long, env = "CALIBAN_USAGE_SHIP_INTERVAL_MS", default_value_t = 1000, global = true)]
+    usage_ship_interval_ms: u64,
+    /// Events queued in memory for the sender; beyond it events are dropped and counted.
+    #[arg(long, env = "CALIBAN_USAGE_SHIP_QUEUE", default_value_t = 10_000, global = true)]
+    usage_ship_queue: usize,
+    /// Directory for undelivered events (control plane unreachable). Default: `usage-spool` next
+    /// to `CALIBAN_SNAPSHOT_CACHE` when that is set, otherwise memory (lost on restart).
+    #[arg(long, env = "CALIBAN_USAGE_SPOOL_DIR", global = true)]
+    usage_spool_dir: Option<PathBuf>,
+    /// Undelivered events kept at most; beyond it events are dropped, counted and logged.
+    #[arg(long, env = "CALIBAN_USAGE_SPOOL_MAX", default_value_t = 100_000, global = true)]
+    usage_spool_max: usize,
+}
+
+impl ShipArgs {
+    fn options(&self, snapshot_cache: Option<&std::path::Path>) -> Result<caliban_meter::ShipOptions> {
+        anyhow::ensure!(
+            (1..=5000).contains(&self.usage_ship_batch),
+            "CALIBAN_USAGE_SHIP_BATCH must be between 1 and 5000"
+        );
+        let spool_dir = self.usage_spool_dir.clone().or_else(|| {
+            snapshot_cache.map(|p| p.parent().unwrap_or_else(|| std::path::Path::new(".")).join("usage-spool"))
+        });
+        Ok(caliban_meter::ShipOptions {
+            batch_max: self.usage_ship_batch,
+            interval: Duration::from_millis(self.usage_ship_interval_ms.max(1)),
+            queue: self.usage_ship_queue.max(1),
+            spool_dir,
+            spool_max_events: self.usage_spool_max,
+            ..caliban_meter::ShipOptions::default()
+        })
+    }
+
+    fn start(
+        &self,
+        transport: Arc<dyn caliban_meter::UsageTransport>,
+        snapshot_cache: Option<&std::path::Path>,
+    ) -> Result<Arc<caliban_meter::UsageShipper>> {
+        let opts = self.options(snapshot_cache)?;
+        let spool = opts.spool_dir.as_ref().map_or_else(|| "memory".to_owned(), |d| d.display().to_string());
+        if opts.spool_dir.is_none() {
+            tracing::warn!(
+                "usage shipping without a spool directory: events not yet delivered when the process stops are lost (set CALIBAN_USAGE_SPOOL_DIR)"
+            );
+        }
+        let shipper = caliban_meter::UsageShipper::start(transport, opts.clone())
+            .with_context(|| format!("opening the usage spool {spool}"))?;
+        tracing::info!(
+            batch = opts.batch_max,
+            interval_ms = opts.interval.as_millis() as u64,
+            spool,
+            spool_max = opts.spool_max_events,
+            "usage shipping enabled"
+        );
+        Ok(Arc::new(shipper))
+    }
+}
+
+/// Standalone with a Postgres store: the data plane's events go to the store through the same
+/// shipper as a router's (batched, deduplicated), once the control plane is built.
+#[derive(Default)]
+struct LocalUsageTransport {
+    cp: std::sync::OnceLock<Arc<caliban_cp::ControlPlane>>,
+}
+
+#[async_trait::async_trait]
+impl caliban_meter::UsageTransport for LocalUsageTransport {
+    async fn send(
+        &self,
+        events: &[caliban_meter::UsageEvent],
+    ) -> Result<caliban_meter::Delivered, caliban_meter::ShipError> {
+        let cp = self.cp.get().ok_or_else(|| caliban_meter::ShipError::Retry("control plane starting".into()))?;
+        let r =
+            cp.store.ingest_usage(events.to_vec()).await.map_err(|e| caliban_meter::ShipError::Retry(e.to_string()))?;
+        Ok(caliban_meter::Delivered { accepted: r.accepted, duplicates: r.duplicates, rejected: r.rejected })
+    }
+}
+
+fn database_url() -> Option<String> {
+    std::env::var("CALIBAN_DATABASE_URL").ok().filter(|u| !u.trim().is_empty())
 }
 
 #[derive(Subcommand)]
@@ -150,10 +248,13 @@ async fn main() -> Result<()> {
         tracing::info!(path = %path, fsync = opts.fsync.as_str(), queue = opts.queue, "usage WAL enabled");
         Arc::new(JsonlSink::with_options(path, opts))
     });
-    let usage_sinks = |recent: &RecentUsage| -> Arc<dyn UsageSink> {
+    let usage_sinks = |recent: &RecentUsage, ship: Option<&Arc<caliban_meter::UsageShipper>>| -> Arc<dyn UsageSink> {
         let mut sinks: Vec<Arc<dyn UsageSink>> = vec![Arc::new(recent.clone())];
         if let Some(w) = &wal {
             sinks.push(Arc::clone(w) as Arc<dyn UsageSink>);
+        }
+        if let Some(s) = ship {
+            sinks.push(Arc::clone(s) as Arc<dyn UsageSink>);
         }
         Arc::new(Tee(sinks))
     };
@@ -171,18 +272,36 @@ async fn main() -> Result<()> {
         let router_id = split::router_id();
         let keyring_ids =
             keyring.as_ref().map(|k| k.ids().into_iter().map(str::to_owned).collect()).unwrap_or_default();
-        let mut source =
-            split::SnapshotSource::new(url, token, verifier, snapshot_cache.clone(), router_id.clone(), keyring_ids)?;
+        let mut source = split::SnapshotSource::new(
+            url,
+            token.clone(),
+            verifier,
+            snapshot_cache.clone(),
+            router_id.clone(),
+            keyring_ids,
+        )?;
         tracing::info!(control_plane = %url, router_id, poll_secs = every.as_secs(), cache = ?snapshot_cache, "router in split mode");
         let first = source.initial(every).await;
         tracing::info!(version = %first.version, tenants = first.config.tenants.len(), kek_ids = ?first.kek_ids, "serving config snapshot");
         let handle = ConfigHandle::new(Snapshot::new(first.config, first.version).with_kek_ids(first.kek_ids));
         tokio::spawn(source.run(handle.clone(), every));
-        let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default()))?);
+        // Usage events go to the control plane (fail-static: the router keeps serving while it is
+        // down; undelivered events wait in the spool).
+        let shipper = if cli.ship.usage_ship {
+            let transport = Arc::new(split::HttpUsageTransport::new(url, token.clone(), router_id)?);
+            Some(cli.ship.start(transport, snapshot_cache.as_deref())?)
+        } else {
+            tracing::warn!(
+                "CALIBAN_USAGE_SHIP=false: usage events stay on this router (the control plane does not bill them)"
+            );
+            None
+        };
+        let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default(), shipper.as_ref()))?);
         spawn_router_warmup(&gw);
         gw.spawn_tenant_purge(PURGE_EVERY);
         let res = serve("router", listen.clone(), caliban_gateway::app(gw)).await;
         flush_wal(wal.as_deref()).await;
+        flush_shipper(shipper.as_deref()).await;
         return res;
     }
 
@@ -193,7 +312,15 @@ async fn main() -> Result<()> {
     }
     let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "file-0"));
     let recent = RecentUsage::default();
-    let usage = usage_sinks(&recent);
+    // Standalone with Postgres: usage is read from the store, so the data plane ships its events
+    // there (the memory store reads this process's ring directly).
+    let local_ship = (matches!(cli.cmd, Cmd::Standalone) && database_url().is_some() && cli.ship.usage_ship)
+        .then(|| Arc::new(LocalUsageTransport::default()));
+    let shipper = match &local_ship {
+        Some(t) => Some(cli.ship.start(Arc::clone(t) as Arc<dyn caliban_meter::UsageTransport>, None)?),
+        None => None,
+    };
+    let usage = usage_sinks(&recent, shipper.as_ref());
 
     let gw = Arc::new(new_gateway(handle.clone(), Arc::clone(&usage))?);
     spawn_router_warmup(&gw);
@@ -207,13 +334,13 @@ async fn main() -> Result<()> {
             router_task().await
         }
         Cmd::ControlPlane => {
-            let cp = control_plane(&cfg, &handle, &recent, "control-plane").await?;
+            let cp = control_plane(&cfg, &handle, &recent, "control-plane", None).await?;
             cp.await
         }
         Cmd::Standalone => {
             // The control plane publishes the store's state (Postgres wins over the file) into
             // `handle` before the data plane starts serving. Tenant purges start from that state.
-            let cp = control_plane(&cfg, &handle, &recent, "standalone").await?;
+            let cp = control_plane(&cfg, &handle, &recent, "standalone", local_ship.as_deref()).await?;
             purge_gw.spawn_tenant_purge(PURGE_EVERY);
             tokio::try_join!(router_task(), cp).map(|_| ())
         }
@@ -225,7 +352,16 @@ async fn main() -> Result<()> {
         | Cmd::Healthcheck { .. } => unreachable!(),
     };
     flush_wal(wal.as_deref()).await;
+    flush_shipper(shipper.as_deref()).await;
     res
+}
+
+/// Graceful shutdown of usage shipping: what is queued is delivered, or kept in the spool for the
+/// next start.
+async fn flush_shipper(shipper: Option<&caliban_meter::UsageShipper>) {
+    if let Some(s) = shipper {
+        s.shutdown(Duration::from_secs(5)).await;
+    }
 }
 
 /// Graceful shutdown of the usage WAL: everything recorded so far is written and synced, and
@@ -242,6 +378,7 @@ async fn control_plane(
     handle: &ConfigHandle,
     recent: &RecentUsage,
     mode: &'static str,
+    local_ship: Option<&LocalUsageTransport>,
 ) -> Result<impl std::future::Future<Output = Result<()>>> {
     let oidc = control_plane_sso(cfg)?;
     let break_glass = match std::env::var("CALIBAN_BREAK_GLASS").ok().filter(|v| !v.trim().is_empty()) {
@@ -271,7 +408,7 @@ async fn control_plane(
         }
         (true, Err(e), false) => return Err(e),
     };
-    let store = match std::env::var("CALIBAN_DATABASE_URL").ok().filter(|u| !u.trim().is_empty()) {
+    let store = match database_url() {
         Some(url) => {
             let s = caliban_cp::store::Store::postgres(&url, cfg.clone(), handle.clone(), recent.clone())
                 .await
@@ -325,6 +462,9 @@ async fn control_plane(
     if postgres {
         // Picks up writes made through other control-plane replicas.
         caliban_cp::spawn_refresh(Arc::clone(&cp), Duration::from_secs(5));
+    }
+    if let Some(t) = local_ship {
+        let _ = t.cp.set(Arc::clone(&cp));
     }
     if sso {
         caliban_cp::auth::spawn_purge(Arc::clone(&cp), Duration::from_secs(600));

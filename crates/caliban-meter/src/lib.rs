@@ -3,12 +3,15 @@
 //! computed from them.
 //!
 //! Quotas (rate limits, token reservation before the call and settlement after) live in
-//! [`quota`]; `Idempotency-Key` records (shared with the same Valkey) in [`idempotency`]. TODO: NATS/Kafka sink.
+//! [`quota`]; `Idempotency-Key` records (shared with the same Valkey) in [`idempotency`]. Split-mode
+//! routers deliver their events to the control plane through [`ship`].
 
 pub mod idempotency;
 pub mod quota;
+pub mod ship;
 mod wal;
 
+pub use ship::{Delivered, ShipError, ShipOptions, ShipStats, UsageShipper, UsageTransport};
 pub use wal::{FsyncPolicy, JsonlSink, WalOptions, WalStats, read_wal};
 
 use async_trait::async_trait;

@@ -39,6 +39,7 @@ pub mod memory;
 pub mod postgres;
 #[cfg(test)]
 mod tests;
+pub mod usage;
 
 use crate::auth::rbac::Role;
 use audit::{AuditDraft, AuditEntry};
@@ -906,6 +907,23 @@ pub trait Backend: Send + Sync {
     async fn put_router(&self, r: &RouterStatus) -> Result<(), StoreError>;
     /// Every router that ever checked in, most recently seen first.
     async fn routers(&self) -> Result<Vec<RouterStatus>, StoreError>;
+
+    // Usage events (see `usage`). A backend without a durable usage log returns `None` and the
+    // store keeps events in its in-memory ring.
+
+    /// Stores events not stored before (by `request_id`; ids are unique within `events`) and
+    /// returns how many were new.
+    async fn insert_usage(&self, _events: &[caliban_meter::UsageEvent]) -> Result<Option<u64>, StoreError> {
+        Ok(None)
+    }
+    /// The newest `limit` events and the totals over every event of `tenants` (`None`: all).
+    async fn usage_report(
+        &self,
+        _tenants: Option<&[String]>,
+        _limit: usize,
+    ) -> Result<Option<usage::UsageReport>, StoreError> {
+        Ok(None)
+    }
 }
 
 /// What a split-mode router reported on its last snapshot poll.
@@ -936,6 +954,8 @@ pub struct Store {
     pub usage: RecentUsage,
     /// Last check-in written per router (throttles writes while nothing changes).
     router_writes: parking_lot::Mutex<std::collections::HashMap<String, RouterStatus>>,
+    /// Deduplication of ingested usage events when the backend keeps no usage log (memory).
+    memory_usage: usage::MemoryUsage,
 }
 
 impl Store {
@@ -990,6 +1010,7 @@ impl Store {
             config,
             usage,
             router_writes: parking_lot::Mutex::default(),
+            memory_usage: usage::MemoryUsage::new(),
         };
         s.install(state);
         s
@@ -1066,6 +1087,56 @@ impl Store {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Stores usage events delivered by a data plane, at most once per `request_id` (see
+    /// [`usage`]). Invalid events are counted as rejected and dropped.
+    pub async fn ingest_usage(&self, events: Vec<caliban_meter::UsageEvent>) -> Result<usage::Ingested, StoreError> {
+        let mut out = usage::Ingested::default();
+        let mut ids = std::collections::HashSet::new();
+        let mut batch = Vec::with_capacity(events.len());
+        for e in events {
+            if !usage::valid_event(&e) {
+                out.rejected += 1;
+            } else if !ids.insert(e.request_id.clone()) {
+                out.duplicates += 1;
+            } else {
+                batch.push(e);
+            }
+        }
+        if batch.is_empty() {
+            return Ok(out);
+        }
+        match self.backend.insert_usage(&batch).await? {
+            Some(new) => {
+                out.accepted += new;
+                out.duplicates += batch.len() as u64 - new;
+            }
+            None => {
+                let m = self.memory_usage.ingest(&self.usage, batch).await;
+                out.accepted += m.accepted;
+                out.duplicates += m.duplicates;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Usage events (newest first, at most `limit`) and totals, over `tenants` (`None`: all).
+    pub async fn usage_report(
+        &self,
+        tenants: Option<&[String]>,
+        limit: usize,
+    ) -> Result<usage::UsageReport, StoreError> {
+        match self.backend.usage_report(tenants, limit).await? {
+            Some(r) => Ok(r),
+            None => Ok(usage::MemoryUsage::report(&self.usage, tenants, limit)),
+        }
+    }
+
+    /// Whether usage events are kept in the backend (Postgres) rather than the process ring. A
+    /// standalone data plane then ships its own events to the store too.
+    pub fn durable_usage(&self) -> bool {
+        self.backend.name() == "postgres"
     }
 
     /// Router check-ins, most recently seen first.

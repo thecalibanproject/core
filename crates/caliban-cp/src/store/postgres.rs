@@ -160,52 +160,57 @@ impl PgBackend {
         &self.pool
     }
 
-    /// Appends usage events to `usage_event` (idempotent on `request_id`, so a shipper can retry
-    /// a batch). Not called by the data plane yet: routers keep events in their WAL and ring
-    /// until usage shipping lands; this is the column mapping it will use.
+    /// Appends usage events to `usage_event`, one statement per call; idempotent on `request_id`
+    /// (`ON CONFLICT DO NOTHING`), so a shipper can retry a batch. Returns how many rows were new.
+    /// Ids must be unique within `events` (`Store::ingest_usage` makes them so).
     pub async fn insert_usage_events(&self, events: &[caliban_meter::UsageEvent]) -> Result<u64, StoreError> {
-        let mut inserted = 0;
-        let mut tx = self.pool.begin().await.map_err(db)?;
-        for e in events {
-            let r = sqlx::query(
-                "INSERT INTO usage_event (request_id, tenant_id, model, intent, prompt_tokens, completion_tokens,
-                                          cached_prompt_tokens, tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts,
-                                          requested_model, intent_confidence, route_stage, routed_model_cost_usd, flat_price_usd,
-                                          cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens, billed_usd, saved_usd)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
-                 ON CONFLICT (request_id) DO NOTHING",
-            )
-            .bind(&e.request_id)
-            .bind(&e.tenant_id)
-            .bind(&e.model)
-            .bind(&e.intent)
-            .bind(i64_of(e.prompt_tokens))
-            .bind(i64_of(e.completion_tokens))
-            .bind(i64_of(e.cached_prompt_tokens))
-            .bind(i64_of(e.tokens_saved))
-            .bind(e.cache.as_str())
-            .bind(i32::try_from(e.pii_entities).unwrap_or(i32::MAX))
-            .bind(e.cost_usd)
-            .bind(i64_of(e.latency_ms))
-            .bind(e.ts)
-            .bind(&e.requested_model)
-            .bind(e.intent_confidence)
-            .bind(&e.route_stage)
-            .bind(e.routed_model_cost_usd)
-            .bind(e.flat_price_usd)
-            .bind(e.cache_tier.map(|t| t.as_str()))
-            .bind(e.usage_source.map(caliban_meter::UsageSource::as_str))
-            .bind(i64_of(e.cache_write_tokens))
-            .bind(i64_of(e.cache_write_1h_tokens))
-            .bind(e.billed_usd)
-            .bind(e.saved_usd)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
-            inserted += r.rows_affected();
+        if events.is_empty() {
+            return Ok(0);
         }
-        tx.commit().await.map_err(db)?;
-        Ok(inserted)
+        let col = |f: &dyn Fn(&caliban_meter::UsageEvent) -> String| events.iter().map(f).collect::<Vec<_>>();
+        let opt = |f: &dyn Fn(&caliban_meter::UsageEvent) -> Option<String>| events.iter().map(f).collect::<Vec<_>>();
+        let int =
+            |f: &dyn Fn(&caliban_meter::UsageEvent) -> u64| events.iter().map(|e| i64_of(f(e))).collect::<Vec<_>>();
+        let usd = |f: &dyn Fn(&caliban_meter::UsageEvent) -> Option<f64>| events.iter().map(f).collect::<Vec<_>>();
+        let r = sqlx::query(
+            "INSERT INTO usage_event (request_id, tenant_id, model, intent, prompt_tokens, completion_tokens,
+                                      cached_prompt_tokens, tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts,
+                                      requested_model, intent_confidence, route_stage, routed_model_cost_usd, flat_price_usd,
+                                      cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens, billed_usd, saved_usd)
+             SELECT * FROM UNNEST($1::TEXT[], $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::BIGINT[], $6::BIGINT[],
+                                  $7::BIGINT[], $8::BIGINT[], $9::TEXT[], $10::INTEGER[], $11::FLOAT8[], $12::BIGINT[],
+                                  $13::TIMESTAMPTZ[], $14::TEXT[], $15::REAL[], $16::TEXT[], $17::FLOAT8[], $18::FLOAT8[],
+                                  $19::TEXT[], $20::TEXT[], $21::BIGINT[], $22::BIGINT[], $23::FLOAT8[], $24::FLOAT8[])
+             ON CONFLICT (request_id) DO NOTHING",
+        )
+        .bind(col(&|e| e.request_id.clone()))
+        .bind(col(&|e| e.tenant_id.clone()))
+        .bind(col(&|e| e.model.clone()))
+        .bind(col(&|e| e.intent.clone()))
+        .bind(int(&|e| e.prompt_tokens))
+        .bind(int(&|e| e.completion_tokens))
+        .bind(int(&|e| e.cached_prompt_tokens))
+        .bind(int(&|e| e.tokens_saved))
+        .bind(col(&|e| e.cache.as_str().to_owned()))
+        .bind(events.iter().map(|e| i32::try_from(e.pii_entities).unwrap_or(i32::MAX)).collect::<Vec<_>>())
+        .bind(usd(&|e| e.cost_usd))
+        .bind(int(&|e| e.latency_ms))
+        .bind(events.iter().map(|e| e.ts).collect::<Vec<_>>())
+        .bind(opt(&|e| e.requested_model.clone()))
+        .bind(events.iter().map(|e| e.intent_confidence).collect::<Vec<_>>())
+        .bind(opt(&|e| e.route_stage.clone()))
+        .bind(usd(&|e| e.routed_model_cost_usd))
+        .bind(usd(&|e| e.flat_price_usd))
+        .bind(opt(&|e| e.cache_tier.map(|t| t.as_str().to_owned())))
+        .bind(opt(&|e| e.usage_source.map(|u| u.as_str().to_owned())))
+        .bind(int(&|e| e.cache_write_tokens))
+        .bind(int(&|e| e.cache_write_1h_tokens))
+        .bind(usd(&|e| e.billed_usd))
+        .bind(usd(&|e| e.saved_usd))
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(r.rows_affected())
     }
 
     /// Applies pending migrations; refuses to start if an applied migration was edited.
@@ -441,6 +446,86 @@ impl Backend for PgBackend {
         Ok(a + b)
     }
 
+    async fn insert_usage(&self, events: &[caliban_meter::UsageEvent]) -> Result<Option<u64>, StoreError> {
+        self.insert_usage_events(events).await.map(Some)
+    }
+
+    async fn usage_report(
+        &self,
+        tenants: Option<&[String]>,
+        limit: usize,
+    ) -> Result<Option<super::usage::UsageReport>, StoreError> {
+        let tenants: Option<Vec<String>> = tenants.map(<[String]>::to_vec);
+        let rows = sqlx::query(
+            "SELECT request_id, tenant_id, model, intent, prompt_tokens, completion_tokens, cached_prompt_tokens,
+                    tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts, requested_model, intent_confidence,
+                    route_stage, routed_model_cost_usd, flat_price_usd, cache_tier, usage_source, cache_write_tokens,
+                    cache_write_1h_tokens, billed_usd, saved_usd
+             FROM usage_event WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1))
+             ORDER BY ts DESC, request_id DESC LIMIT $2",
+        )
+        .bind(&tenants)
+        .bind(i64_of(limit as u64))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let events = rows.iter().map(usage_row).collect::<Result<Vec<_>, _>>()?;
+        // The same totals as `UsageTotals::from_events`, aggregated in the database. "priced" is
+        // `UsageEvent::margin_usd().is_some()`: a billed (or legacy flat) price and a routed cost.
+        let t = sqlx::query(
+            "SELECT COUNT(*)::BIGINT AS requests,
+                    COALESCE(SUM(prompt_tokens), 0)::BIGINT AS prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0)::BIGINT AS completion_tokens,
+                    COALESCE(SUM(cached_prompt_tokens), 0)::BIGINT AS cached_prompt_tokens,
+                    COALESCE(SUM(cache_write_tokens), 0)::BIGINT AS cache_write_tokens,
+                    COUNT(*) FILTER (WHERE usage_source = 'estimated')::BIGINT AS estimated_requests,
+                    COUNT(*) FILTER (WHERE cache = 'hit')::BIGINT AS cache_hits,
+                    COALESCE(SUM(saved_usd), 0)::FLOAT8 AS saved_usd,
+                    COUNT(*) FILTER (WHERE cache_tier = 'semantic')::BIGINT AS semantic_cache_hits,
+                    COALESCE(SUM(tokens_saved + cached_prompt_tokens), 0)::BIGINT AS tokens_saved,
+                    COALESCE(SUM(cost_usd), 0)::FLOAT8 AS cost_usd,
+                    COUNT(*) FILTER (WHERE requested_model = 'caliban/auto')::BIGINT AS auto_requests,
+                    COUNT(*) FILTER (WHERE requested_model = 'caliban/auto' AND cache = 'hit')::BIGINT AS auto_cache_hits,
+                    COALESCE(SUM(flat_price_usd) FILTER (WHERE priced), 0)::FLOAT8 AS flat_price_usd,
+                    COALESCE(SUM(COALESCE(billed_usd, flat_price_usd)) FILTER (WHERE priced), 0)::FLOAT8 AS billed_usd,
+                    COALESCE(SUM(saved_usd) FILTER (WHERE priced), 0)::FLOAT8 AS auto_saved_usd,
+                    COALESCE(SUM(routed_model_cost_usd) FILTER (WHERE priced), 0)::FLOAT8 AS routed_model_cost_usd,
+                    COALESCE(SUM(COALESCE(billed_usd, flat_price_usd) - routed_model_cost_usd) FILTER (WHERE priced), 0)::FLOAT8
+                        AS margin_usd
+             FROM (SELECT *, (COALESCE(billed_usd, flat_price_usd) IS NOT NULL AND routed_model_cost_usd IS NOT NULL)
+                             AS priced
+                   FROM usage_event WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1))) u",
+        )
+        .bind(&tenants)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)?;
+        let n = |c: &str| -> Result<u64, StoreError> { get::<i64>(&t, c).map(|v| u64::try_from(v).unwrap_or(0)) };
+        // `+ 0.0` turns a -0.0 from the database into +0.0.
+        let f = |c: &str| -> Result<f64, StoreError> { get::<f64>(&t, c).map(|v| v + 0.0) };
+        let totals = super::usage::UsageTotals {
+            requests: n("requests")?,
+            prompt_tokens: n("prompt_tokens")?,
+            completion_tokens: n("completion_tokens")?,
+            cached_prompt_tokens: n("cached_prompt_tokens")?,
+            cache_write_tokens: n("cache_write_tokens")?,
+            estimated_requests: n("estimated_requests")?,
+            cache_hits: n("cache_hits")?,
+            saved_usd: f("saved_usd")?,
+            semantic_cache_hits: n("semantic_cache_hits")?,
+            tokens_saved: n("tokens_saved")?,
+            cost_usd: f("cost_usd")?,
+            auto_requests: n("auto_requests")?,
+            auto_cache_hits: n("auto_cache_hits")?,
+            flat_price_usd: f("flat_price_usd")?,
+            billed_usd: f("billed_usd")?,
+            auto_saved_usd: f("auto_saved_usd")?,
+            routed_model_cost_usd: f("routed_model_cost_usd")?,
+            margin_usd: f("margin_usd")?,
+        };
+        Ok(Some(super::usage::UsageReport { events, totals }))
+    }
+
     async fn put_router(&self, r: &RouterStatus) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO router_status (router_id, last_seen, snapshot_version, snapshot_kek_ids, keyring_ids)
@@ -481,6 +566,36 @@ impl Backend for PgBackend {
             })
             .collect()
     }
+}
+
+fn usage_row(r: &PgRow) -> Result<caliban_meter::UsageEvent, StoreError> {
+    let u = |c: &str| -> Result<u64, StoreError> { get::<i64>(r, c).map(|v| u64::try_from(v).unwrap_or(0)) };
+    Ok(caliban_meter::UsageEvent {
+        request_id: get(r, "request_id")?,
+        tenant_id: get(r, "tenant_id")?,
+        model: get(r, "model")?,
+        intent: get::<Option<String>>(r, "intent")?.unwrap_or_default(),
+        prompt_tokens: u("prompt_tokens")?,
+        completion_tokens: u("completion_tokens")?,
+        cached_prompt_tokens: u("cached_prompt_tokens")?,
+        cache_write_tokens: u("cache_write_tokens")?,
+        cache_write_1h_tokens: u("cache_write_1h_tokens")?,
+        tokens_saved: u("tokens_saved")?,
+        cache: parse_enum(get(r, "cache")?)?,
+        cache_tier: get::<Option<String>>(r, "cache_tier")?.map(parse_enum).transpose()?,
+        usage_source: get::<Option<String>>(r, "usage_source")?.map(parse_enum).transpose()?,
+        pii_entities: usize::try_from(get::<i32>(r, "pii_entities")?).unwrap_or(0),
+        cost_usd: get(r, "cost_usd")?,
+        latency_ms: u("latency_ms")?,
+        ts: get(r, "ts")?,
+        requested_model: get(r, "requested_model")?,
+        intent_confidence: get(r, "intent_confidence")?,
+        route_stage: get(r, "route_stage")?,
+        routed_model_cost_usd: get(r, "routed_model_cost_usd")?,
+        flat_price_usd: get(r, "flat_price_usd")?,
+        billed_usd: get(r, "billed_usd")?,
+        saved_usd: get(r, "saved_usd")?,
+    })
 }
 
 fn session_row(r: &PgRow) -> Result<SessionRecord, StoreError> {

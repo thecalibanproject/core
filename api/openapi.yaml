@@ -730,6 +730,10 @@ paths:
     get:
       tags: [usage]
       summary: Recent usage events and aggregate savings
+      description: |
+        With the Postgres store, from `usage_event`: every data plane's events (split-mode routers ship theirs
+        through `POST /api/v1/usage/ingest`), totals over all of them. With the in-memory store, the last 10,000
+        events of the process.
       parameters:
         - { $ref: '#/components/parameters/TenantQuery' }
         - name: limit
@@ -976,6 +980,45 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Me' }
         '401': { $ref: '#/components/responses/Error' }
+
+  /api/v1/usage/ingest:
+    post:
+      tags: [system]
+      summary: Usage events from a split-mode router
+      description: |
+        Authenticated with the router token (`CALIBAN_ROUTER_TOKEN`), not the admin token. Each `request_id` is
+        stored once: a batch sent again (lost acknowledgement, router restart) is answered with `duplicates` and
+        not counted again. Invalid events (empty or oversized ids) are counted as `rejected` and dropped. Billing
+        fields are stored as the router computed them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                router_id: { type: string }
+                events:
+                  type: array
+                  maxItems: 5000
+                  items: { $ref: '#/components/schemas/UsageEvent' }
+      responses:
+        '200':
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accepted, duplicates, rejected]
+                properties:
+                  accepted: { type: integer, description: Events stored for the first time }
+                  duplicates: { type: integer, description: Events already stored; ignored }
+                  rejected: { type: integer, description: Invalid events; ignored }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
 
   /api/v1/snapshot:
     get:

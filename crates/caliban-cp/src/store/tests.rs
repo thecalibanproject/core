@@ -1043,6 +1043,167 @@ async fn router_checkins(s: &Store) {
     assert_eq!(a.snapshot_version, "cp-2");
 }
 
+fn usage_event(id: &str, tenant: &str, at_secs: i64, extra: Value) -> caliban_meter::UsageEvent {
+    let mut v = json!({
+        "request_id": id, "tenant_id": tenant, "model": "ext/gpt", "intent": "chat", "prompt_tokens": 100,
+        "completion_tokens": 20, "cached_prompt_tokens": 10, "tokens_saved": 0, "cache": "miss",
+        "usage_source": "provider", "pii_entities": 1, "cost_usd": 0.0005, "latency_ms": 12,
+        "ts": (ts() + chrono::Duration::seconds(at_secs)).to_rfc3339(), "requested_model": "caliban/auto",
+        "intent_confidence": 0.75, "route_stage": "knn", "routed_model_cost_usd": 0.0005,
+        "flat_price_usd": 0.001, "billed_usd": 0.001
+    });
+    v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    serde_json::from_value(v).unwrap()
+}
+
+/// Usage ingestion and reports: at most once per `request_id`, invalid events refused, totals
+/// over the matching tenants, newest events first. Returns the full report for parity checks.
+async fn usage_ingest(s: &Store) -> usage::UsageReport {
+    let hit = json!({"cache": "hit", "cache_tier": "semantic", "usage_source": null, "prompt_tokens": 0,
+                     "completion_tokens": 0, "cached_prompt_tokens": 0, "tokens_saved": 120, "cost_usd": 0.0,
+                     "routed_model_cost_usd": 0.0, "billed_usd": 0.0002, "saved_usd": 0.0008});
+    let batch = vec![
+        usage_event("r1", "acme", 1, json!({})),
+        usage_event("r2", "acme", 2, hit),
+        usage_event(
+            "r3",
+            "acme",
+            3,
+            json!({"requested_model": "ext/gpt", "routed_model_cost_usd": null,
+                                              "flat_price_usd": null, "billed_usd": null, "usage_source": "estimated"}),
+        ),
+        usage_event("r4", "globex", 4, json!({})),
+    ];
+    let r = s.ingest_usage(batch.clone()).await.unwrap();
+    assert_eq!((r.accepted, r.duplicates, r.rejected), (4, 0, 0));
+    // A retried batch (lost acknowledgement, router restart) is never counted again.
+    let r = s.ingest_usage(batch).await.unwrap();
+    assert_eq!((r.accepted, r.duplicates, r.rejected), (0, 4, 0));
+    // Duplicates within a batch and invalid events.
+    let r = s
+        .ingest_usage(vec![
+            usage_event("r5", "globex", 5, json!({})),
+            usage_event("r5", "globex", 5, json!({})),
+            usage_event("", "globex", 6, json!({})),
+        ])
+        .await
+        .unwrap();
+    assert_eq!((r.accepted, r.duplicates, r.rejected), (1, 1, 1));
+
+    let all = s.usage_report(None, 100).await.unwrap();
+    let ids: Vec<&str> = all.events.iter().map(|e| e.request_id.as_str()).collect();
+    assert_eq!(ids, ["r5", "r4", "r3", "r2", "r1"], "newest first");
+    let t = &all.totals;
+    assert_eq!((t.requests, t.auto_requests, t.auto_cache_hits, t.cache_hits, t.semantic_cache_hits), (5, 4, 1, 1, 1));
+    assert_eq!((t.prompt_tokens, t.completion_tokens, t.tokens_saved, t.estimated_requests), (400, 80, 160, 1));
+    let close = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} vs {b}");
+    close(t.billed_usd, 0.001 * 3.0 + 0.0002);
+    close(t.flat_price_usd, 0.004);
+    close(t.saved_usd, 0.0008);
+    close(t.auto_saved_usd, 0.0008);
+    close(t.routed_model_cost_usd, 0.0005 * 3.0);
+    close(t.margin_usd, 0.0032 - 0.0015);
+    close(t.cost_usd, 0.0005 * 4.0);
+    assert_eq!(
+        all.events[3],
+        usage_event(
+            "r2",
+            "acme",
+            2,
+            json!({"cache": "hit", "cache_tier": "semantic",
+        "usage_source": null, "prompt_tokens": 0, "completion_tokens": 0, "cached_prompt_tokens": 0,
+        "tokens_saved": 120, "cost_usd": 0.0, "routed_model_cost_usd": 0.0, "billed_usd": 0.0002, "saved_usd": 0.0008})
+        ),
+        "events round-trip"
+    );
+
+    let acme = s.usage_report(Some(&["acme".to_owned()]), 2).await.unwrap();
+    assert_eq!((acme.events.len(), acme.totals.requests), (2, 3), "limit applies to events, not totals");
+    let none = s.usage_report(Some(&[]), 10).await.unwrap();
+    assert_eq!((none.events.len(), none.totals.requests), (0, 0));
+    assert!(none.totals.billed_usd.is_sign_positive() && none.totals.margin_usd.is_sign_positive());
+    all
+}
+
+#[tokio::test]
+async fn memory_usage_ingest() {
+    let cfg = base();
+    usage_ingest(&Store::new(cfg.clone(), handle(&cfg), RecentUsage::default())).await;
+}
+
+#[tokio::test]
+async fn postgres_usage_ingest_matches_memory() {
+    let Some(pg) = pg_backend().await else { return };
+    let cfg = base();
+    let s = Store::open_postgres(pg, cfg.clone(), handle(&cfg), RecentUsage::default()).await.unwrap();
+    assert!(s.durable_usage());
+    let pg_report = usage_ingest(&s).await;
+    let mem_report = usage_ingest(&Store::new(cfg.clone(), handle(&cfg), RecentUsage::default())).await;
+    assert_eq!(pg_report.events, mem_report.events);
+    let (a, b) = (serde_json::to_value(&pg_report.totals).unwrap(), serde_json::to_value(&mem_report.totals).unwrap());
+    for (k, v) in a.as_object().unwrap() {
+        let (x, y) = (v.as_f64().unwrap(), b[k].as_f64().unwrap());
+        assert!((x - y).abs() < 1e-12, "{k}: postgres {x} vs memory {y}");
+    }
+}
+
+/// The ingest endpoint over a store: router token only, a retried batch counted once, totals in
+/// `GET /api/v1/usage`.
+async fn ingest_endpoint(s: Store) {
+    use tower::ServiceExt;
+    let cp = std::sync::Arc::new(
+        crate::ControlPlane::new(s, "admin".into(), "control-plane").with_snapshots(None, Some("router".into())),
+    );
+    let app = crate::app(cp, None);
+    let call = |method: &str, uri: &str, bearer: &str, body: Option<Value>| {
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(body.map_or_else(axum::body::Body::empty, |b| axum::body::Body::from(b.to_string())))
+            .unwrap();
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 22).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        }
+    };
+    let batch = json!({"router_id": "router-a", "events": [
+        usage_event("i1", "acme", 1, json!({})),
+        usage_event("i2", "acme", 2, json!({"cache": "hit", "cache_tier": "exact", "routed_model_cost_usd": 0.0,
+                                             "billed_usd": 0.0002, "saved_usd": 0.0008})),
+    ]});
+    let (st, r) = call("POST", "/api/v1/usage/ingest", "admin", Some(batch.clone())).await;
+    assert_eq!(st, axum::http::StatusCode::UNAUTHORIZED, "the admin token is not a router token: {r}");
+    let (st, r) = call("POST", "/api/v1/usage/ingest", "router", Some(batch.clone())).await;
+    assert_eq!((st, r.clone()), (axum::http::StatusCode::OK, json!({"accepted": 2, "duplicates": 0, "rejected": 0})));
+    let (_, r) = call("POST", "/api/v1/usage/ingest", "router", Some(batch)).await;
+    assert_eq!(r, json!({"accepted": 0, "duplicates": 2, "rejected": 0}));
+    let (st, _) = call("POST", "/api/v1/usage/ingest", "router", Some(json!({"events": "nope"}))).await;
+    assert_eq!(st, axum::http::StatusCode::BAD_REQUEST);
+    let (_, u) = call("GET", "/api/v1/usage?tenant_id=acme", "admin", None).await;
+    let t = &u["totals"];
+    assert_eq!((t["requests"].as_u64(), t["auto_cache_hits"].as_u64()), (Some(2), Some(1)));
+    assert!((t["billed_usd"].as_f64().unwrap() - 0.0012).abs() < 1e-12, "{t}");
+    assert!((t["saved_usd"].as_f64().unwrap() - 0.0008).abs() < 1e-12, "{t}");
+}
+
+#[tokio::test]
+async fn memory_ingest_endpoint() {
+    let cfg = base();
+    ingest_endpoint(Store::new(cfg.clone(), handle(&cfg), RecentUsage::default())).await;
+}
+
+#[tokio::test]
+async fn postgres_ingest_endpoint() {
+    let Some(pg) = pg_backend().await else { return };
+    let cfg = base();
+    ingest_endpoint(Store::open_postgres(pg, cfg.clone(), handle(&cfg), RecentUsage::default()).await.unwrap()).await;
+}
+
 #[tokio::test]
 async fn memory_router_checkins() {
     let cfg = base();
