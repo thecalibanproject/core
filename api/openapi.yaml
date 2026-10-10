@@ -1635,11 +1635,15 @@ paths:
         through `POST /api/v1/usage/ingest`), totals over all of them, including the days rolled up into
         `usage_daily` once raw events pass `CALIBAN_USAGE_RETENTION_DAYS` (the totals do not change). With the
         in-memory store, the last 10,000 events of the process. `node` and `run_id` filter node calls; `by_node`
-        totals each node version (cost per node); a `run_id` covers raw events only.
+        totals each node version (cost per node); a `run_id` covers raw events only. `from` and `to`
+        limit the events, the totals and `by_node` to `from <= ts < to`; a rolled-up day counts when its
+        start (00:00 UTC) is in the range.
       parameters:
         - { $ref: '#/components/parameters/TenantQuery' }
         - { name: node, in: query, schema: { type: string } }
         - { name: run_id, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time }, description: 'Events at or after this time (RFC 3339)' }
+        - { name: to, in: query, schema: { type: string, format: date-time }, description: 'Events before this time; `400` unless after `from`' }
         - name: limit
           in: query
           schema: { type: integer, default: 100, maximum: 1000 }

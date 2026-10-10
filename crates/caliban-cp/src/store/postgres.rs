@@ -646,12 +646,15 @@ impl Backend for PgBackend {
              FROM usage_event
              WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2)
                    AND ($3::TEXT IS NULL OR run_id = $3)
+                   AND ($5::TIMESTAMPTZ IS NULL OR ts >= $5) AND ($6::TIMESTAMPTZ IS NULL OR ts < $6)
              ORDER BY ts DESC, request_id DESC LIMIT $4",
         )
         .bind(&tenants)
         .bind(&f.node)
         .bind(&f.run_id)
         .bind(i64_of(f.limit as u64))
+        .bind(f.from)
+        .bind(f.to)
         .fetch_all(&self.pool)
         .await
         .map_err(db)?;
@@ -662,10 +665,12 @@ impl Backend for PgBackend {
             "SELECT {outer} FROM (
                  SELECT {raw} FROM (SELECT *, {priced} AS priced FROM usage_event
                                     WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2)
-                                          AND ($3::TEXT IS NULL OR run_id = $3)) u
+                                          AND ($3::TEXT IS NULL OR run_id = $3) AND ($4::TIMESTAMPTZ IS NULL OR ts >= $4) AND ($5::TIMESTAMPTZ IS NULL OR ts < $5)) u
                  UNION ALL
                  SELECT {cols} FROM usage_daily
                  WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2) AND $3::TEXT IS NULL
+                       AND ($4::TIMESTAMPTZ IS NULL OR (day::TIMESTAMP AT TIME ZONE 'UTC') >= $4)
+                       AND ($5::TIMESTAMPTZ IS NULL OR (day::TIMESTAMP AT TIME ZONE 'UTC') < $5)
              ) t",
             outer = usage_sums(),
             raw = usage_aggregates(),
@@ -676,6 +681,8 @@ impl Backend for PgBackend {
             .bind(&tenants)
             .bind(&f.node)
             .bind(&f.run_id)
+            .bind(f.from)
+            .bind(f.to)
             .fetch_one(&self.pool)
             .await
             .map_err(db)?;
@@ -685,12 +692,14 @@ impl Backend for PgBackend {
                  SELECT node, COALESCE(node_version, 0) AS node_version, {raw}
                  FROM (SELECT *, {priced} AS priced FROM usage_event
                        WHERE node IS NOT NULL AND ($1::TEXT[] IS NULL OR tenant_id = ANY($1))
-                             AND ($2::TEXT IS NULL OR node = $2) AND ($3::TEXT IS NULL OR run_id = $3)) u
+                             AND ($2::TEXT IS NULL OR node = $2) AND ($3::TEXT IS NULL OR run_id = $3)
+                             AND ($4::TIMESTAMPTZ IS NULL OR ts >= $4) AND ($5::TIMESTAMPTZ IS NULL OR ts < $5)) u
                  GROUP BY 1, 2
                  UNION ALL
                  SELECT node, node_version, {cols} FROM usage_daily
                  WHERE node <> '' AND ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2)
-                       AND $3::TEXT IS NULL
+                       AND $3::TEXT IS NULL AND ($4::TIMESTAMPTZ IS NULL OR (day::TIMESTAMP AT TIME ZONE 'UTC') >= $4)
+                       AND ($5::TIMESTAMPTZ IS NULL OR (day::TIMESTAMP AT TIME ZONE 'UTC') < $5)
              ) t GROUP BY node, node_version ORDER BY node, node_version",
             outer = usage_sums(),
             raw = usage_aggregates(),
@@ -701,6 +710,8 @@ impl Backend for PgBackend {
             .bind(&tenants)
             .bind(&f.node)
             .bind(&f.run_id)
+            .bind(f.from)
+            .bind(f.to)
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;

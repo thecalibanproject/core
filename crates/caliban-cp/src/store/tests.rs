@@ -1434,7 +1434,17 @@ async fn usage_by_node(s: &Store) -> usage::UsageReport {
         node: node.map(str::to_owned),
         run_id: run.map(str::to_owned),
         limit: 100,
+        ..Default::default()
     };
+    // A time range applies to the events, the totals and the per-node totals.
+    let at = |secs: i64| usage_base() + chrono::Duration::seconds(secs);
+    let window = usage::UsageFilter { from: Some(at(2)), to: Some(at(4)), ..q(None, None) };
+    let w = s.usage_query(&window).await.unwrap();
+    assert_eq!(w.events.iter().map(|e| e.request_id.as_str()).collect::<Vec<_>>(), ["n3", "n2"]);
+    assert_eq!(w.totals.requests, 2);
+    assert_eq!(w.by_node.iter().map(|g| g.totals.requests).sum::<u64>(), 2);
+    let later = usage::UsageFilter { from: Some(at(100)), ..q(None, None) };
+    assert_eq!(s.usage_query(&later).await.unwrap().totals.requests, 0);
     let close = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} vs {b}");
     let all = s.usage_query(&q(None, None)).await.unwrap();
     assert_eq!(all.totals.requests, 5);
@@ -1537,6 +1547,16 @@ async fn postgres_usage_retention_keeps_totals_identical() {
         same(&x.totals, &y.totals);
     }
     assert_eq!(after.0.events.len(), 1, "raw events are gone; their totals are not");
+    // A time range counts a rolled-up day when the day starts inside it.
+    let old_days = usage::UsageFilter {
+        from: Some(Utc::now() - chrono::Duration::days(200)),
+        to: Some(Utc::now() - chrono::Duration::days(50)),
+        limit: 1000,
+        ..Default::default()
+    };
+    let w = s.usage_query(&old_days).await.unwrap();
+    assert_eq!((w.totals.requests, w.events.len()), (31, 0), "the rolled-up days only");
+    assert_eq!(w.by_node.iter().map(|g| g.totals.requests).sum::<u64>(), 15);
 
     // With retention on, an event older than it is refused; a retried recent one is a duplicate.
     s.set_usage_retention_days(90);

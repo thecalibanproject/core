@@ -986,6 +986,10 @@ struct UsageQuery {
     node: Option<String>,
     /// Only the model calls of this run.
     run_id: Option<String>,
+    /// Events at or after this time (RFC 3339).
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Events before this time.
+    to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Usage events (newest first) and totals; without `tenant_id`, over the tenants the caller sees.
@@ -1002,8 +1006,19 @@ async fn usage(
         (auth::rbac::Visible::Only(set), None) => Some(set.into_iter().collect()),
         (auth::rbac::Visible::Only(set), Some(t)) => Some(set.into_iter().filter(|v| *v == t).collect()),
     };
-    let f =
-        store::usage::UsageFilter { tenants, node: q.node, run_id: q.run_id, limit: q.limit.unwrap_or(100).min(1000) };
+    if let (Some(from), Some(to)) = (q.from, q.to)
+        && from >= to
+    {
+        return Err(bad("from must be before to"));
+    }
+    let f = store::usage::UsageFilter {
+        tenants,
+        node: q.node,
+        run_id: q.run_id,
+        limit: q.limit.unwrap_or(100).min(1000),
+        from: q.from,
+        to: q.to,
+    };
     let report = cp.store.usage_query(&f).await?;
     Ok(Json(json!(report)))
 }

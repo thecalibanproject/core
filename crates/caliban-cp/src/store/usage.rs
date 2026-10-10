@@ -124,6 +124,10 @@ pub struct UsageFilter {
     pub run_id: Option<String>,
     /// Newest events returned at most.
     pub limit: usize,
+    /// Events at or after this time (`ts`); rolled-up days whose start (00:00 UTC) is in the range.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Events before this time.
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl UsageFilter {
@@ -131,6 +135,8 @@ impl UsageFilter {
         self.tenants.as_ref().is_none_or(|t| t.contains(&e.tenant_id))
             && self.node.as_ref().is_none_or(|n| e.node.as_ref() == Some(n))
             && self.run_id.as_ref().is_none_or(|r| e.run_id.as_ref() == Some(r))
+            && self.from.is_none_or(|f| e.ts >= f)
+            && self.to.is_none_or(|t| e.ts < t)
     }
 }
 

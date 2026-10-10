@@ -571,7 +571,9 @@ most one call per run in flight).
 **Usage per run and per node.** Every model call of a run is metered like any other request, and
 its usage event carries `node`, `node_version` and `run_id` (a subnode's calls carry the run's
 root node: the run pays for them). `GET /api/v1/usage` takes `node` and `run_id` filters next to
-`tenant_id`, and returns `by_node` (the totals per node version) next to `totals`. `charged_usd`
+`tenant_id`, and `from` / `to` (a time range, `from <= ts < to`, for the events, the totals and
+`by_node`; a rolled-up day counts when its start is in the range), and returns `by_node` (the totals
+per node version) next to `totals`. `charged_usd`
 is what the customer is charged (the billed `caliban/auto` price, discounted on cache hits; the
 model's cost otherwise): over a run's events it equals the run's `cost_usd`.
 
