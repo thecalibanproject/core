@@ -675,6 +675,21 @@ async fn deletes(s: &Store) {
     let revoke =
         |tenant: &str, id: &str| Mutation::RevokeApiKey { tenant_id: tenant.into(), id: id.into(), at: del_ts() };
 
+    // ── API key update: the allowlist and scopes change in place, on both backends ──
+    let update = |id: &str, nodes: Option<Option<Vec<String>>>| Mutation::UpdateApiKey {
+        tenant_id: "globex".into(),
+        id: id.into(),
+        nodes,
+        datasource_scopes: Some(Some(vec!["crm.customers:read".into()])),
+    };
+    s.apply(A, update("key_g1", Some(Some(vec!["triage".into()])))).await.unwrap();
+    let k = s.state().api_keys.iter().find(|k| k.id == "key_g1").cloned().unwrap();
+    assert_eq!((k.nodes, k.datasource_scopes), (Some(vec!["triage".into()]), Some(vec!["crm.customers:read".into()])));
+    assert_eq!(s.config.load().tenant(&"globex".into()).unwrap().api_key_nodes[&"2".repeat(64)], ["triage"]);
+    s.apply(A, update("key_g1", Some(None))).await.unwrap();
+    assert_eq!(s.state().api_keys.iter().find(|k| k.id == "key_g1").unwrap().nodes, None);
+    assert_eq!(s.apply(A, update("key_nope", None)).await.unwrap_err(), not_found("api key"));
+
     // ── API key revoke: soft, the row stays, the hash leaves the snapshot ──
     let head = s.state().audit_head;
     assert_eq!(s.apply(A, revoke("acme", "key_g1")).await.unwrap_err(), not_found("api key"), "other tenant's key");

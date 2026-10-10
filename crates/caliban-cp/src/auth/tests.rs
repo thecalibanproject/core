@@ -751,6 +751,14 @@ fn cases() -> Vec<Case> {
             true,
             "owner admin tenant_admin developer",
         ),
+        c(
+            "PATCH",
+            "/tenants/{tenant_id}/api-keys/{key_id}",
+            "/api/v1/tenants/{t}/api-keys/key_nope",
+            Some(json!({"datasource_scopes": null})),
+            true,
+            "owner admin tenant_admin developer",
+        ),
         c("GET", "/tenants/{tenant_id}/provider-keys", "/api/v1/tenants/{t}/provider-keys", None, true, READERS),
         c(
             "POST",

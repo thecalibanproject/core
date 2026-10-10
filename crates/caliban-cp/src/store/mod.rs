@@ -842,6 +842,14 @@ pub enum StoreError {
 pub enum Mutation {
     CreateTenant(Tenant),
     CreateApiKey(ApiKeyRecord),
+    /// Changes an active key's node allowlist and datasource scopes; `None` keeps a value,
+    /// `Some(None)` removes the restriction.
+    UpdateApiKey {
+        tenant_id: String,
+        id: String,
+        nodes: Option<Option<Vec<String>>>,
+        datasource_scopes: Option<Option<Vec<String>>>,
+    },
     /// Soft revoke: `revoked_at = at`, the row is kept.
     RevokeApiKey {
         tenant_id: String,
@@ -1120,6 +1128,18 @@ impl Mutation {
                     detail["nodes"] = json!(n);
                 }
                 d(Some(&k.tenant_id), "api_key.create", &k.id, detail)
+            }
+            Mutation::UpdateApiKey { tenant_id, id, nodes, datasource_scopes } => {
+                let k = before.active_api_key(tenant_id, id);
+                let mut detail = json!({"name": k.map(|k| &k.name), "prefix": k.map(|k| &k.prefix)});
+                if let Some(to) = nodes {
+                    detail["nodes"] = json!({"from": k.and_then(|k| k.nodes.clone()), "to": to});
+                }
+                if let Some(to) = datasource_scopes {
+                    detail["datasource_scopes"] =
+                        json!({"from": k.and_then(|k| k.datasource_scopes.clone()), "to": to});
+                }
+                d(Some(tenant_id), "api_key.update", id, detail)
             }
             Mutation::RevokeApiKey { tenant_id, id, .. } => {
                 let k = before.active_api_key(tenant_id, id);

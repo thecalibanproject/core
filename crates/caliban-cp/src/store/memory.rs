@@ -287,6 +287,23 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             }
             st.api_keys.push(k.clone());
         }
+        Mutation::UpdateApiKey { tenant_id, id, nodes, datasource_scopes } => {
+            need_tenant(st, tenant_id)?;
+            if let Some(bad) = nodes.iter().flatten().flatten().find(|n| !caliban_nodes::valid_node_name(n)) {
+                return Err(StoreError::Invalid(format!("'{bad}' is not a node name")));
+            }
+            let k = st
+                .api_keys
+                .iter_mut()
+                .find(|k| &k.tenant_id == tenant_id && &k.id == id && k.is_active())
+                .ok_or_else(|| StoreError::NotFound("api key".into()))?;
+            if let Some(n) = nodes {
+                k.nodes.clone_from(n);
+            }
+            if let Some(s) = datasource_scopes {
+                k.datasource_scopes.clone_from(s);
+            }
+        }
         Mutation::RevokeApiKey { tenant_id, id, at } => {
             need_tenant(st, tenant_id)?;
             let k = st

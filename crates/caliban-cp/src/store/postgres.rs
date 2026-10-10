@@ -851,6 +851,12 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
     match m {
         Mutation::CreateTenant(t) => insert_tenant(c, t).await,
         Mutation::CreateApiKey(k) => insert_api_key(c, k).await,
+        Mutation::UpdateApiKey { tenant_id, id, .. } => {
+            let k = next.active_api_key(tenant_id, id).ok_or_else(|| StoreError::NotFound("api key".into()))?;
+            let q = "UPDATE api_key SET nodes = $3, datasource_scopes = $4
+                     WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL";
+            exec(c, sqlx::query(q).bind(tenant_id).bind(id).bind(&k.nodes).bind(&k.datasource_scopes)).await
+        }
         Mutation::RevokeApiKey { tenant_id, id, at } => {
             let q = "UPDATE api_key SET revoked_at = $3 WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL";
             exec(c, sqlx::query(q).bind(tenant_id).bind(id).bind(at)).await

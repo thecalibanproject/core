@@ -242,7 +242,7 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/tenants", get(list_tenants).post(create_tenant))
         .route("/tenants/{tenant_id}", get(get_tenant).patch(update_tenant).delete(delete_tenant))
         .route("/tenants/{tenant_id}/api-keys", get(list_api_keys).post(create_api_key))
-        .route("/tenants/{tenant_id}/api-keys/{key_id}", delete(revoke_api_key))
+        .route("/tenants/{tenant_id}/api-keys/{key_id}", delete(revoke_api_key).patch(update_api_key))
         .route("/tenants/{tenant_id}/provider-keys", get(list_provider_keys).post(create_provider_key))
         .route("/tenants/{tenant_id}/provider-keys/{key_id}", delete(delete_provider_key))
         .route("/tenants/{tenant_id}/routes", get(get_routes).put(put_routes))
@@ -621,6 +621,39 @@ async fn revoke_api_key(
 ) -> ApiResult<StatusCode> {
     cp.store.apply(&p.actor, Mutation::RevokeApiKey { tenant_id, id: key_id, at: now_micros() }).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiKeyUpdate {
+    /// Node allowlist. Absent: kept. `null`: every published node of the tenant. A list: only
+    /// those (`[]`: none). Needs `nodes.run` on the tenant.
+    #[serde(default, deserialize_with = "present")]
+    nodes: Option<Option<Vec<String>>>,
+    /// Datasource scopes. Absent: kept. `null`: every scope of the nodes the key runs.
+    #[serde(default, deserialize_with = "present")]
+    datasource_scopes: Option<Option<Vec<String>>>,
+}
+
+/// Changes a key's node allowlist and datasource scopes after creation (audited as
+/// `api_key.update` with the old and new values). Routers pick it up with the next snapshot.
+async fn update_api_key(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path((tenant_id, key_id)): Path<(String, String)>,
+    Json(body): Json<ApiKeyUpdate>,
+) -> ApiResult<Json<ApiKeyRecord>> {
+    if body.nodes.is_some() && !p.allows(Perm::NodesRun, Some(&tenant_id)) {
+        return Err(auth::forbidden("changing an API key's node access needs the nodes.run permission"));
+    }
+    let m = Mutation::UpdateApiKey {
+        tenant_id: tenant_id.clone(),
+        id: key_id.clone(),
+        nodes: body.nodes,
+        datasource_scopes: body.datasource_scopes,
+    };
+    let st = cp.store.apply(&p.actor, m).await?;
+    st.active_api_key(&tenant_id, &key_id).cloned().map(Json).ok_or_else(|| not_found("api key"))
 }
 
 #[derive(Deserialize, Default)]
@@ -1319,6 +1352,42 @@ mod tests {
         );
         assert_eq!(e["detail"], json!({"name": "ci", "prefix": &key[..8]}));
         assert!(!a.to_string().contains(&key[8..]));
+    }
+
+    #[tokio::test]
+    async fn an_api_key_allowlist_changes_after_creation_and_is_audited() {
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
+        let (_, k) = call(&app, "POST", "/api/v1/tenants/globex/api-keys", Some(json!({"name": "ci"})), true).await;
+        let (key, id) = (k["key"].as_str().unwrap().to_owned(), k["id"].as_str().unwrap().to_owned());
+        let hash = hash_api_key(&key);
+        let uri = format!("/api/v1/tenants/globex/api-keys/{id}");
+        let nodes = |c: &Cp| c.store.config.load().tenant(&"globex".into()).unwrap().api_key_nodes.get(&hash).cloned();
+        assert_eq!(nodes(&c), None, "no allowlist: every node");
+        let body = json!({"nodes": ["triage"], "datasource_scopes": ["crm.customers:read"]});
+        let (s, v) = call(&app, "PATCH", &uri, Some(body), true).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((&v["nodes"], &v["datasource_scopes"]), (&json!(["triage"]), &json!(["crm.customers:read"])));
+        assert_eq!(nodes(&c), Some(vec!["triage".to_owned()]), "the data plane sees it at once");
+        // Absent fields are kept; null lifts the restriction.
+        let (_, v) = call(&app, "PATCH", &uri, Some(json!({"nodes": null})), true).await;
+        assert_eq!((&v["nodes"], &v["datasource_scopes"]), (&Value::Null, &json!(["crm.customers:read"])));
+        assert_eq!(nodes(&c), None);
+        let (s, _) = call(&app, "PATCH", &uri, Some(json!({"nodes": ["Not A Name"]})), true).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            call(&app, "PATCH", &uri, Some(json!({"bogus": 1})), true).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let other = "/api/v1/tenants/globex/api-keys/key_nope";
+        assert_eq!(call(&app, "PATCH", other, Some(json!({"nodes": []})), true).await.0, StatusCode::NOT_FOUND);
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=5", None, true).await;
+        assert_eq!(a["chain_verified"], true);
+        let e = &a["entries"][0];
+        assert_eq!((&e["action"], &e["target"]), (&json!("api_key.update"), &json!(id)));
+        assert_eq!(e["detail"]["nodes"], json!({"from": ["triage"], "to": null}));
+        assert_eq!(a["entries"][1]["detail"]["datasource_scopes"], json!({"from": null, "to": ["crm.customers:read"]}));
     }
 
     #[tokio::test]
