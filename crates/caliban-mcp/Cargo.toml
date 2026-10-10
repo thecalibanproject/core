@@ -1,16 +1,47 @@
 [package]
 name = "caliban-mcp"
-description = "MCP server (expose nodes/ontology as tools) and client (customer tool servers, untrusted). A2A later."
+description = "MCP client to customer tool servers (untrusted): pinned manifests, injection scan, egress allowlist with pinned IPs, minted per-call tokens. Later: the MCP server exposing nodes, A2A."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# A small Streamable HTTP MCP server for tests (crate tests and the end-to-end node tests).
+test-server = ["rmcp/server", "rmcp/macros", "rmcp/transport-streamable-http-server", "dep:axum"]
+
 [dependencies]
-sha2.workspace = true
+async-trait.workspace = true
+axum = { workspace = true, optional = true }
+base64.workspace = true
+chrono.workspace = true
 hex.workspace = true
+ed25519-dalek = "3.0"
+parking_lot.workspace = true
+rand.workspace = true
+# The official MCP SDK: the Streamable HTTP client only (no stdio, so no child processes).
+rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+# rmcp's HTTP client is reqwest 0.13 (the workspace is on 0.12); rustls with the ring provider,
+# like the rest of the build.
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+regex.workspace = true
+futures.workspace = true
+http = "1"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+caliban-mcp = { path = ".", features = ["test-server"] }
+tokio.workspace = true
 
 [lints]
 workspace = true
