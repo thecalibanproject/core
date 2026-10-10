@@ -90,6 +90,7 @@ fn tenant(id: &str) -> Tenant {
         pii_surrogate_scope: PiiSurrogateScope::Tenant,
         semantic_cache: SemanticCacheMode::Off,
         auto_cache_hit_fraction: None,
+        node_caps: None,
         created_at: ts(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -117,7 +118,13 @@ fn node(id: &str, tenant: &str, name: &str) -> NodeRecord {
         name: name.into(),
         version: 0,
         spec: json!({"k": 1}),
+        hash: caliban_nodes::hash::content_hash(&json!({"k": 1})),
+        state: NodeState::Draft,
         created_at: ts(),
+        created_by: Some("tester".into()),
+        published_at: None,
+        retired_at: None,
+        sealed_spec: None,
         deleted_at: None,
     }
 }
@@ -186,6 +193,7 @@ async fn suite(s: &Store) {
         pii_surrogate_scope: Some(PiiSurrogateScope::Session),
         semantic_cache: None,
         auto_cache_hit_fraction: None,
+        node_caps: None,
     };
     s.apply(A, to_session).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
@@ -201,6 +209,7 @@ async fn suite(s: &Store) {
         pii_surrogate_scope: None,
         semantic_cache: Some(SemanticCacheMode::On),
         auto_cache_hit_fraction: None,
+        node_caps: None,
     };
     s.apply(A, on).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
@@ -220,6 +229,7 @@ async fn suite(s: &Store) {
         pii_surrogate_scope: None,
         semantic_cache: None,
         auto_cache_hit_fraction: f,
+        node_caps: None,
     };
     s.apply(A, fraction(Some(Some(0.1)))).await.unwrap();
     assert_eq!(s.state().tenant("globex").unwrap().auto_cache_hit_fraction, Some(0.1));
@@ -253,6 +263,7 @@ async fn suite(s: &Store) {
         pii_surrogate_scope: None,
         semantic_cache: None,
         auto_cache_hit_fraction: None,
+        node_caps: None,
     };
     assert_eq!(s.apply(A, ghost).await.unwrap_err(), StoreError::NotFound("tenant".into()));
     let key = ApiKeyRecord {
@@ -263,6 +274,7 @@ async fn suite(s: &Store) {
         hash: "2".repeat(64),
         created_at: ts(),
         revoked_at: None,
+        nodes: None,
     };
     s.apply(A, Mutation::CreateApiKey(key.clone())).await.unwrap();
     assert_eq!(s.config.load().tenant_by_key_hash(&"2".repeat(64)).unwrap().id.as_str(), "globex");
@@ -406,6 +418,7 @@ async fn suite(s: &Store) {
     );
 
     tenant_keys(s).await;
+    node_lifecycle(s).await;
     deletes(s).await;
     identity(s).await;
 
@@ -675,6 +688,7 @@ async fn deletes(s: &Store) {
         hash: "2".repeat(64),
         created_at: ts(),
         revoked_at: None,
+        nodes: None,
     };
     assert!(matches!(s.apply(A, Mutation::CreateApiKey(reuse)).await, Err(StoreError::Conflict(_))));
     // Config-seeded keys can be revoked too.
@@ -727,7 +741,8 @@ async fn deletes(s: &Store) {
     assert_eq!(s.apply(A, del_node("globex", "node_2")).await.unwrap_err(), not_found("node"));
     s.apply(A, Mutation::CreateNode(node("node_3", "globex", "triage"))).await.unwrap();
     let st = s.state();
-    let live: Vec<(&str, u32)> = st.nodes.iter().filter(|n| n.is_live()).map(|n| (n.id.as_str(), n.version)).collect();
+    let live: Vec<(&str, u32)> =
+        st.nodes.iter().filter(|n| n.is_live() && n.name == "triage").map(|n| (n.id.as_str(), n.version)).collect();
     assert_eq!(live, [("node_1", 1), ("node_3", 3)]);
 
     // ── tenant delete: tombstone + cascade ──
@@ -740,6 +755,7 @@ async fn deletes(s: &Store) {
         hash: "4".repeat(64),
         created_at: ts(),
         revoked_at: None,
+        nodes: None,
     };
     s.apply(A, Mutation::CreateApiKey(dkey)).await.unwrap();
     let (dek, rec) = crate::keys::new_dek(&ring(), "doomed");
@@ -979,6 +995,154 @@ async fn tenant_keys(s: &Store) {
 }
 
 /// Backend-independent view of the state (no timestamps of seeded rows).
+/// Node versions: draft, publish (validated against the tenant, sealed), promote, retire.
+async fn node_lifecycle(s: &Store) {
+    let r1 = ring();
+    if !s.state().deks.contains_key("globex") {
+        let (_, rec) = crate::keys::new_dek(&r1, "globex");
+        s.apply(A, Mutation::CreateDek { tenant_id: "globex".into(), dek: rec }).await.unwrap();
+    }
+    // The store does not open sealed specs; any key makes a well-formed envelope.
+    let dek = caliban_config::Dek::generate();
+    let spec = |steps: u32, tools: Value| {
+        json!({"kind": "agent", "prompt": {"system": "x"}, "model_policy": {}, "tools": tools,
+               "budgets": {"steps": steps, "tokens": 100, "wall_clock_s": 10}})
+    };
+    let version = |id: &str, name: &str, spec: Value| NodeRecord {
+        hash: caliban_nodes::hash::content_hash(&spec),
+        spec,
+        ..node(id, "globex", name)
+    };
+    let publish = |name: &str, v: u32, promote: bool| Mutation::PublishNode {
+        tenant_id: "globex".into(),
+        name: name.into(),
+        version: v,
+        sealed_spec: dek.seal("globex", "{}"),
+        promote,
+        at: ts(),
+        by: A.into(),
+    };
+    let promote = |name: &str, v: u32| Mutation::PromoteNode {
+        tenant_id: "globex".into(),
+        name: name.into(),
+        version: v,
+        at: ts(),
+        by: A.into(),
+    };
+    let retire = |name: &str, v: u32| Mutation::RetireNode {
+        tenant_id: "globex".into(),
+        name: name.into(),
+        version: v,
+        at: del_ts(),
+    };
+    let conflict = |r: Result<Arc<State>, StoreError>| assert!(matches!(r, Err(StoreError::Conflict(_))), "{r:?}");
+    let invalid = |r: Result<Arc<State>, StoreError>, want: &str| match r {
+        Err(StoreError::Invalid(m)) => assert!(m.contains(want), "{m}"),
+        other => panic!("expected Invalid({want}), got {other:?}"),
+    };
+
+    assert_eq!(s.apply(A, publish("risk", 1, true)).await.unwrap_err(), StoreError::NotFound("node version".into()));
+    s.apply(A, Mutation::CreateNode(version("node_r1", "risk", spec(3, json!([]))))).await.unwrap();
+    assert!(s.config.load().tenant(&"globex".into()).unwrap().nodes.is_empty(), "drafts never reach the data plane");
+    s.apply(A, publish("risk", 1, true)).await.unwrap();
+    conflict(s.apply(A, publish("risk", 1, true)).await);
+    let st = s.state();
+    let r = st.node_version("globex", "risk", 1).unwrap();
+    assert_eq!((r.state, r.published_at, r.sealed_spec.is_some()), (NodeState::Published, Some(ts()), true));
+    assert_eq!(st.promotion("globex", "risk").map(|p| p.version), Some(1));
+
+    // A caller of risk@v1; a caller of a draft or a missing version is refused.
+    s.apply(
+        A,
+        Mutation::CreateNode(version(
+            "node_c1",
+            "caller",
+            spec(3, json!([{"ref": "node://risk@v1", "effect": "read"}])),
+        )),
+    )
+    .await
+    .unwrap();
+    s.apply(
+        A,
+        Mutation::CreateNode(version(
+            "node_c2",
+            "caller",
+            spec(3, json!([{"ref": "node://risk@v9", "effect": "read"}])),
+        )),
+    )
+    .await
+    .unwrap();
+    invalid(s.apply(A, publish("caller", 2, true)).await, "node://risk@v9 does not exist");
+    s.apply(A, publish("caller", 1, true)).await.unwrap();
+
+    // v2 published without promotion, then promoted; a draft cannot be promoted.
+    s.apply(A, Mutation::CreateNode(version("node_r2", "risk", spec(4, json!([]))))).await.unwrap();
+    conflict(s.apply(A, promote("risk", 2)).await);
+    s.apply(A, publish("risk", 2, false)).await.unwrap();
+    assert_eq!(s.state().promotion("globex", "risk").map(|p| p.version), Some(1));
+    s.apply(A, promote("risk", 2)).await.unwrap();
+    assert_eq!(s.state().promotion("globex", "risk").map(|p| p.version), Some(2));
+    let snap = s.config.load();
+    let t = snap.tenant(&"globex".into()).unwrap();
+    let mut shipped: Vec<(&str, u32, bool)> = t.nodes.iter().map(|n| (n.name.as_str(), n.version, n.live)).collect();
+    shipped.sort_unstable();
+    assert_eq!(shipped, [("caller", 1, true), ("risk", 1, false), ("risk", 2, true)]);
+    assert!(t.data_key.is_some());
+
+    // Caps: lowering them blocks promoting a version that no longer fits; null restores defaults.
+    let caps = |c: Option<NodeCaps>| Mutation::UpdateTenant {
+        id: "globex".into(),
+        pii_default: None,
+        pii_surrogate_scope: None,
+        semantic_cache: None,
+        auto_cache_hit_fraction: None,
+        node_caps: Some(c),
+    };
+    invalid(s.apply(A, caps(Some(NodeCaps { steps: 0, ..NodeCaps::DEFAULT }))).await, "positive");
+    s.apply(A, caps(Some(NodeCaps { steps: 3, ..NodeCaps::DEFAULT }))).await.unwrap();
+    invalid(s.apply(A, promote("risk", 2)).await, "budgets.steps = 4 exceeds");
+    s.apply(A, promote("risk", 1)).await.unwrap();
+    s.apply(A, caps(None)).await.unwrap();
+    assert_eq!(s.state().node_caps("globex"), NodeCaps::DEFAULT);
+
+    // Retire: not while a published version calls it; a published version is not deleted.
+    conflict(s.apply(A, retire("risk", 1)).await);
+    conflict(s.apply(A, Mutation::DeleteNode { tenant_id: "globex".into(), id: "node_r1".into(), at: del_ts() }).await);
+    s.apply(A, retire("caller", 1)).await.unwrap();
+    s.apply(A, retire("risk", 1)).await.unwrap();
+    conflict(s.apply(A, retire("risk", 1)).await);
+    conflict(s.apply(A, publish("risk", 1, true)).await);
+    let st = s.state();
+    assert_eq!(st.promotion("globex", "risk"), None, "retiring the live version clears the pointer");
+    assert_eq!(st.node_version("globex", "risk", 1).unwrap().retired_at, Some(del_ts()));
+    s.apply(A, Mutation::DeleteNode { tenant_id: "globex".into(), id: "node_c2".into(), at: del_ts() }).await.unwrap();
+    let names: Vec<(String, u32)> =
+        s.config.load().tenant(&"globex".into()).unwrap().nodes.iter().map(|n| (n.name.clone(), n.version)).collect();
+    assert_eq!(names, [("risk".to_owned(), 2)], "only published versions are shipped");
+
+    // API key node allowlists.
+    let key = |id: &str, hash: char, nodes: Option<Vec<String>>| ApiKeyRecord {
+        id: id.into(),
+        tenant_id: "globex".into(),
+        name: id.into(),
+        prefix: "cal_node".into(),
+        hash: hash.to_string().repeat(64),
+        created_at: ts(),
+        revoked_at: None,
+        nodes,
+    };
+    invalid(
+        s.apply(A, Mutation::CreateApiKey(key("key_bad", '7', Some(vec!["Bad Name".into()])))).await,
+        "not a node name",
+    );
+    s.apply(A, Mutation::CreateApiKey(key("key_n1", '8', Some(vec!["risk".into()])))).await.unwrap();
+    s.apply(A, Mutation::CreateApiKey(key("key_n2", '9', None))).await.unwrap();
+    let snap = s.config.load();
+    let t = snap.tenant(&"globex".into()).unwrap();
+    assert!(t.key_may_run(&"8".repeat(64), "risk") && !t.key_may_run(&"8".repeat(64), "caller"));
+    assert!(t.key_may_run(&"9".repeat(64), "caller"), "no allowlist: every node");
+}
+
 fn normalize(st: &State) -> Value {
     fn strip(v: &mut Value) {
         match v {
@@ -1006,7 +1170,8 @@ fn normalize(st: &State) -> Value {
         "models": st.models,
         "routes": st.routes,
         "datasources": st.datasources.iter().map(|d| json!([d, crate::keys::count_sealed(&d.connection)])).collect::<Vec<_>>(),
-        "nodes": st.nodes,
+        "nodes": st.nodes.iter().map(|n| json!([n, n.sealed_spec.is_some()])).collect::<Vec<_>>(),
+        "promotions": st.promotions,
         "ontologies": st.ontologies,
         "users": st.users,
         "role_bindings": st.role_bindings,
@@ -1312,6 +1477,18 @@ async fn postgres_backend_matches_memory_and_persists() {
     // The audit table is append-only at the database level.
     assert!(sqlx::query("UPDATE audit_log SET actor = 'mallory' WHERE seq = 2").execute(&pool).await.is_err());
     assert!(sqlx::query("DELETE FROM audit_log WHERE seq = 2").execute(&pool).await.is_err());
+
+    // Node versions are immutable at the database level, and states never move backwards.
+    assert!(sqlx::query("UPDATE node SET spec = '{}' WHERE id = 'node_r1'").execute(&pool).await.is_err());
+    assert!(sqlx::query("UPDATE node SET hash = 'sha256:x' WHERE id = 'node_r1'").execute(&pool).await.is_err());
+    assert!(sqlx::query("UPDATE node SET state = 'draft' WHERE id = 'node_r2'").execute(&pool).await.is_err());
+    assert!(
+        sqlx::query("UPDATE node SET state = 'published', retired_at = NULL WHERE id = 'node_r1'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert_eq!(scalar_of(&pool, "SELECT count(*) FROM node WHERE state <> 'draft' AND sealed_spec IS NULL").await, 0);
 
     // Secrets at rest: sealed_key holds ciphertext only.
     let n: i64 = sqlx::query_scalar(

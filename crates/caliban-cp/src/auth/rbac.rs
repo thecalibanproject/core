@@ -4,6 +4,12 @@
 //! audit log included). Tenant roles apply to one tenant: `tenant_admin`, `developer`, `viewer` and
 //! `billing`. A principal holds any number of both; what it may do is the union.
 //!
+//! Nodes (P3): `nodes.read` (versions, diffs), `nodes.write` (create drafts, delete drafts and
+//! retired versions), `nodes.publish` (publish, promote, retire) and `nodes.run` (run nodes; on the
+//! admin API, granting node access to an API key needs it). Owner and admin hold all four;
+//! `tenant_admin` all four on its tenant; `developer` read, write and run (not publish); `viewer`
+//! and `auditor` read; `billing` none.
+//!
 //! Every admin API route has exactly one entry in [`ROUTES`]; a route without one is denied to
 //! everybody (deny by default). Tenant-scoped permissions are checked against the tenant the
 //! request is about, found as [`TenantFrom`] says. List endpoints without a tenant filter return
@@ -53,8 +59,12 @@ impl Role {
             Role::Owner => "Everything, including granting and revoking the owner role.",
             Role::Admin => "Everything except granting or revoking the owner role.",
             Role::Auditor => "Read-only access to everything, including the audit log.",
-            Role::TenantAdmin => "Manages one tenant: settings, API keys, BYOK keys, routes, datasources, nodes.",
-            Role::Developer => "API keys, routes, nodes and ontology review of one tenant; reads the rest.",
+            Role::TenantAdmin => {
+                "Manages one tenant: settings, API keys, BYOK keys, routes, datasources, nodes (publishing included)."
+            }
+            Role::Developer => {
+                "API keys, routes, node drafts and runs, and ontology review of one tenant; reads the rest."
+            }
             Role::Viewer => "Read-only access to one tenant.",
             Role::Billing => "Usage and spend of one tenant.",
         }
@@ -95,6 +105,8 @@ impl Role {
                 OntologyReview,
                 NodesRead,
                 NodesWrite,
+                NodesPublish,
+                NodesRun,
                 UsageRead,
             ],
             Role::Developer => &[
@@ -110,6 +122,7 @@ impl Role {
                 OntologyReview,
                 NodesRead,
                 NodesWrite,
+                NodesRun,
                 UsageRead,
             ],
             Role::Viewer => &[
@@ -158,11 +171,15 @@ pub enum Perm {
     OntologyReview,
     NodesRead,
     NodesWrite,
+    /// Publish, promote and retire node versions.
+    NodesPublish,
+    /// Run nodes (data plane, with API keys); grant node access to API keys (admin API).
+    NodesRun,
     UsageRead,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 23] = [
+    pub const ALL: [Perm; 25] = [
         Perm::TenantsCreate,
         Perm::CatalogRead,
         Perm::CatalogWrite,
@@ -185,6 +202,8 @@ impl Perm {
         Perm::OntologyReview,
         Perm::NodesRead,
         Perm::NodesWrite,
+        Perm::NodesPublish,
+        Perm::NodesRun,
         Perm::UsageRead,
     ];
 
@@ -212,6 +231,8 @@ impl Perm {
             Perm::OntologyReview => "ontology.review",
             Perm::NodesRead => "nodes.read",
             Perm::NodesWrite => "nodes.write",
+            Perm::NodesPublish => "nodes.publish",
+            Perm::NodesRun => "nodes.run",
             Perm::UsageRead => "usage.read",
         }
     }
@@ -394,6 +415,13 @@ pub const ROUTES: &[RouteRule] = &[
     r("PUT", "/tenants/{tenant_id}/routes", Perm::RoutesWrite, TenantFrom::Path),
     r("DELETE", "/tenants/{tenant_id}/datasources/{id}", Perm::DatasourcesWrite, TenantFrom::Path),
     r("DELETE", "/tenants/{tenant_id}/nodes/{id}", Perm::NodesWrite, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/nodes/{id}/versions", Perm::NodesRead, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/nodes/{id}/versions", Perm::NodesWrite, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/nodes/{id}/versions/{version}", Perm::NodesRead, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/nodes/{id}/versions/{version}/publish", Perm::NodesPublish, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/nodes/{id}/versions/{version}/retire", Perm::NodesPublish, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/nodes/{id}/promote", Perm::NodesPublish, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/nodes/{id}/diff", Perm::NodesRead, TenantFrom::Path),
     r("GET", "/models", Perm::CatalogRead, TenantFrom::None),
     r("POST", "/models", Perm::CatalogWrite, TenantFrom::None),
     r("DELETE", "/models/{*id}", Perm::CatalogWrite, TenantFrom::None),
@@ -468,6 +496,25 @@ mod tests {
         }
         assert_eq!(rule("GET", "/api/v1/tenants/{tenant_id}").unwrap().perm, Perm::TenantRead);
         assert!(rule("GET", "/api/v1/nope").is_none());
+    }
+
+    #[test]
+    fn node_permissions_follow_the_roles() {
+        use Perm::{NodesPublish, NodesRead, NodesRun, NodesWrite};
+        let want: &[(Role, &[Perm])] = &[
+            (Role::Owner, &[NodesRead, NodesWrite, NodesPublish, NodesRun]),
+            (Role::Admin, &[NodesRead, NodesWrite, NodesPublish, NodesRun]),
+            (Role::TenantAdmin, &[NodesRead, NodesWrite, NodesPublish, NodesRun]),
+            (Role::Developer, &[NodesRead, NodesWrite, NodesRun]),
+            (Role::Viewer, &[NodesRead]),
+            (Role::Auditor, &[NodesRead]),
+            (Role::Billing, &[]),
+        ];
+        for (role, perms) in want {
+            for p in [NodesRead, NodesWrite, NodesPublish, NodesRun] {
+                assert_eq!(role.grants(p), perms.contains(&p), "{} {}", role.as_str(), p.as_str());
+            }
+        }
     }
 
     #[test]

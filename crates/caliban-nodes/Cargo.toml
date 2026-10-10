@@ -1,16 +1,27 @@
 [package]
 name = "caliban-nodes"
-description = "Node (AI sub-app) spec, graph validation, budget ledger. Executor + durable journal are TODO."
+description = "Nodes (AI sub-apps): spec, validation, content hashes, budget ledger, durable run journal (memory and Postgres) and the executor."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+caliban-config.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
-parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

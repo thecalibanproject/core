@@ -870,10 +870,21 @@ dependencies = [
 name = "caliban-nodes"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "caliban-config",
+ "chrono",
+ "futures",
+ "hex",
  "parking_lot",
+ "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
  "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

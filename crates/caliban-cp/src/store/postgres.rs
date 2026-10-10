@@ -8,9 +8,9 @@
 
 use super::audit::{AuditDraft, AuditEntry, now_micros};
 use super::{
-    ApiKeyRecord, Backend, Check, DatasourceRecord, DekRecord, Mutation, NodeRecord, PendingLogin, ProviderKeyRecord,
-    Rekey, RoleBinding, RouterStatus, SessionRecord, State, StoreError, StoredSecret, SubjectKind, Tenant,
-    TenantStatus, UserRecord,
+    ApiKeyRecord, Backend, Check, DatasourceRecord, DekRecord, Mutation, NodeRecord, NodeState, PendingLogin,
+    Promotion, ProviderKeyRecord, Rekey, RoleBinding, RouterStatus, SessionRecord, State, StoreError, StoredSecret,
+    SubjectKind, Tenant, TenantStatus, UserRecord,
 };
 use crate::auth::rbac::Role;
 use base64::Engine;
@@ -46,6 +46,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (9, "sso_rbac", include_str!("../../../../migrations/0009_sso_rbac.sql")),
     (10, "cache_hit_billing", include_str!("../../../../migrations/0010_cache_hit_billing.sql")),
     (11, "router_status", include_str!("../../../../migrations/0011_router_status.sql")),
+    (12, "node_versions", include_str!("../../../../migrations/0012_node_versions.sql")),
 ];
 
 /// Advisory lock keys ("calibn" + n).
@@ -626,7 +627,8 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
         Mutation::DeleteTenant { id, at } => delete_tenant(c, id, *at).await,
         Mutation::UpdateTenant { id, .. } => {
             let t = next.tenant(id).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
-            let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3, semantic_cache = $4, auto_cache_hit_fraction = $5
+            let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3, semantic_cache = $4, auto_cache_hit_fraction = $5,
+                                       node_caps = $6
                      WHERE id = $1 AND status = 'active'";
             exec(
                 c,
@@ -635,7 +637,8 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
                     .bind(enum_str(&t.pii_default))
                     .bind(t.pii_surrogate_scope.as_str())
                     .bind(t.semantic_cache.as_str())
-                    .bind(t.auto_cache_hit_fraction),
+                    .bind(t.auto_cache_hit_fraction)
+                    .bind(caps_json(t.node_caps)?),
             )
             .await
         }
@@ -675,6 +678,47 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
                 .find(|x| x.id == n.id)
                 .ok_or_else(|| StoreError::Backend("node not applied".into()))?;
             insert_node(c, assigned).await
+        }
+        Mutation::PublishNode { tenant_id, name, version, .. }
+        | Mutation::PromoteNode { tenant_id, name, version, .. }
+        | Mutation::RetireNode { tenant_id, name, version, .. } => {
+            let promote = match m {
+                Mutation::PublishNode { promote, .. } => *promote,
+                Mutation::PromoteNode { .. } => true,
+                _ => false,
+            };
+            let n = next
+                .node_version(tenant_id, name, *version)
+                .ok_or_else(|| StoreError::Backend("node version not applied".into()))?;
+            let sealed = n
+                .sealed_spec
+                .as_deref()
+                .map(|s| B64.decode(s))
+                .transpose()
+                .map_err(|e| StoreError::Invalid(format!("sealed node spec is not base64: {e}")))?;
+            exec(
+                c,
+                sqlx::query(
+                    "UPDATE node SET state = $4, published_at = $5, retired_at = $6, sealed_spec = $7
+                     WHERE tenant_id = $1 AND name = $2 AND version = $3 AND deleted_at IS NULL",
+                )
+                .bind(tenant_id)
+                .bind(name)
+                .bind(i32::try_from(*version).unwrap_or(i32::MAX))
+                .bind(n.state.as_str())
+                .bind(n.published_at)
+                .bind(n.retired_at)
+                .bind(sealed),
+            )
+            .await?;
+            set_promotion(
+                c,
+                tenant_id,
+                name,
+                next.promotion(tenant_id, name),
+                promote || matches!(m, Mutation::RetireNode { .. }),
+            )
+            .await
         }
         Mutation::ProposeOntology { tenant_id, elements } => {
             ontology_commit(c, tenant_id, "ontology.propose", elements).await
@@ -880,6 +924,7 @@ async fn delete_tenant(c: &mut PgConnection, id: &str, at: DateTime<Utc>) -> Res
     .await?;
     exec(c, tenant_at("UPDATE node SET deleted_at = $2 WHERE tenant_id = $1 AND deleted_at IS NULL")).await?;
     let tenant = |sql: &'static str| sqlx::query(sql).bind(id);
+    exec(c, tenant("DELETE FROM node_promotion WHERE tenant_id = $1")).await?;
     exec(c, tenant("DELETE FROM route WHERE tenant_id = $1")).await?;
     exec(c, tenant("DELETE FROM role_binding WHERE tenant_id = $1")).await?;
     // BYOK: drop the sealed ciphertext with its rows, and the tenant's wrapped DEK
@@ -900,8 +945,8 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         c,
         sqlx::query(
             "INSERT INTO tenant (id, name, region, pii_default, pii_surrogate_scope, semantic_cache, settings, created_at, status, deleted_at,
-                                 auto_cache_hit_fraction)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                                 auto_cache_hit_fraction, node_caps)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(&t.id)
         .bind(&t.name)
@@ -913,22 +958,66 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         .bind(t.created_at)
         .bind(t.status.as_str())
         .bind(t.deleted_at)
-        .bind(t.auto_cache_hit_fraction),
+        .bind(t.auto_cache_hit_fraction)
+        .bind(caps_json(t.node_caps)?),
     )
     .await
+}
+
+fn caps_json(c: Option<caliban_nodes::publish::NodeCaps>) -> Result<Option<Json<Value>>, StoreError> {
+    c.map(|c| serde_json::to_value(c).map(Json).map_err(|e| StoreError::Backend(e.to_string()))).transpose()
+}
+
+/// Writes the pointer of (`tenant`, `name`) as `p` says (removed when `None`), when `touch`.
+async fn set_promotion(
+    c: &mut PgConnection,
+    tenant: &str,
+    name: &str,
+    p: Option<&Promotion>,
+    touch: bool,
+) -> Result<(), StoreError> {
+    if !touch {
+        return Ok(());
+    }
+    match p {
+        Some(p) => {
+            exec(
+                c,
+                sqlx::query(
+                    "INSERT INTO node_promotion (tenant_id, name, version, promoted_at, promoted_by) VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (tenant_id, name) DO UPDATE SET version = EXCLUDED.version,
+                         promoted_at = EXCLUDED.promoted_at, promoted_by = EXCLUDED.promoted_by",
+                )
+                .bind(tenant)
+                .bind(name)
+                .bind(i32::try_from(p.version).unwrap_or(i32::MAX))
+                .bind(p.promoted_at)
+                .bind(&p.promoted_by),
+            )
+            .await
+        }
+        None => {
+            exec(
+                c,
+                sqlx::query("DELETE FROM node_promotion WHERE tenant_id = $1 AND name = $2").bind(tenant).bind(name),
+            )
+            .await
+        }
+    }
 }
 
 async fn insert_api_key(c: &mut PgConnection, k: &ApiKeyRecord) -> Result<(), StoreError> {
     exec(
         c,
-        sqlx::query("INSERT INTO api_key (id, tenant_id, name, prefix, sha256, created_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+        sqlx::query("INSERT INTO api_key (id, tenant_id, name, prefix, sha256, created_at, revoked_at, nodes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
             .bind(&k.id)
             .bind(&k.tenant_id)
             .bind(&k.name)
             .bind(&k.prefix)
             .bind(&k.hash)
             .bind(k.created_at)
-            .bind(k.revoked_at),
+            .bind(k.revoked_at)
+            .bind(&k.nodes),
     )
     .await
 }
@@ -1042,16 +1131,32 @@ async fn insert_datasource(c: &mut PgConnection, d: &DatasourceRecord) -> Result
 }
 
 async fn insert_node(c: &mut PgConnection, n: &NodeRecord) -> Result<(), StoreError> {
+    let sealed = n
+        .sealed_spec
+        .as_deref()
+        .map(|s| B64.decode(s))
+        .transpose()
+        .map_err(|e| StoreError::Invalid(format!("sealed node spec is not base64: {e}")))?;
     exec(
         c,
-        sqlx::query("INSERT INTO node (id, tenant_id, name, version, spec, created_at, deleted_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-            .bind(&n.id)
-            .bind(&n.tenant_id)
-            .bind(&n.name)
-            .bind(i32::try_from(n.version).unwrap_or(i32::MAX))
-            .bind(Json(n.spec.clone()))
-            .bind(n.created_at)
-            .bind(n.deleted_at),
+        sqlx::query(
+            "INSERT INTO node (id, tenant_id, name, version, spec, created_at, deleted_at, state, hash, sealed_spec, created_by,
+                               published_at, retired_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&n.id)
+        .bind(&n.tenant_id)
+        .bind(&n.name)
+        .bind(i32::try_from(n.version).unwrap_or(i32::MAX))
+        .bind(Json(n.spec.clone()))
+        .bind(n.created_at)
+        .bind(n.deleted_at)
+        .bind(n.state.as_str())
+        .bind(&n.hash)
+        .bind(sealed)
+        .bind(&n.created_by)
+        .bind(n.published_at)
+        .bind(n.retired_at),
     )
     .await
 }
@@ -1168,7 +1273,7 @@ async fn rows(c: &mut PgConnection, sql: &'static str) -> Result<Vec<PgRow>, Sto
 async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     let mut st = State::default();
 
-    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
         st.tenants.push(Tenant {
             id: get(&r, "id")?,
             name: get(&r, "name")?,
@@ -1177,6 +1282,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             pii_surrogate_scope: parse_enum(get(&r, "pii_surrogate_scope")?)?,
             semantic_cache: parse_enum(get(&r, "semantic_cache")?)?,
             auto_cache_hit_fraction: get(&r, "auto_cache_hit_fraction")?,
+            node_caps: get::<Option<Json<Value>>>(&r, "node_caps")?.map(|j| parse(j.0)).transpose()?,
             created_at: get(&r, "created_at")?,
             status: match get::<String>(&r, "status")?.as_str() {
                 "deleted" => TenantStatus::Deleted,
@@ -1192,7 +1298,8 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
 
     // Revoked keys are loaded too (listed with `include_revoked`); `render` leaves them out.
     for r in
-        rows(c, "SELECT id, tenant_id, name, prefix, sha256, created_at, revoked_at FROM api_key ORDER BY ord").await?
+        rows(c, "SELECT id, tenant_id, name, prefix, sha256, created_at, revoked_at, nodes FROM api_key ORDER BY ord")
+            .await?
     {
         st.api_keys.push(ApiKeyRecord {
             id: get(&r, "id")?,
@@ -1202,6 +1309,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             hash: get(&r, "sha256")?,
             created_at: get(&r, "created_at")?,
             revoked_at: get(&r, "revoked_at")?,
+            nodes: get(&r, "nodes")?,
         });
     }
 
@@ -1293,17 +1401,48 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
         });
     }
 
-    for r in rows(c, "SELECT id, tenant_id, name, version, spec, created_at, deleted_at FROM node ORDER BY ord").await?
+    for r in rows(
+        c,
+        "SELECT id, tenant_id, name, version, spec, created_at, deleted_at, state, hash, sealed_spec, created_by,
+                published_at, retired_at
+         FROM node ORDER BY ord",
+    )
+    .await?
     {
+        let spec = get::<Json<Value>>(&r, "spec")?.0;
         st.nodes.push(NodeRecord {
             id: get(&r, "id")?,
             tenant_id: get(&r, "tenant_id")?,
             name: get(&r, "name")?,
             version: u32::try_from(get::<i32>(&r, "version")?).unwrap_or_default(),
-            spec: get::<Json<Value>>(&r, "spec")?.0,
+            // Versions created before migration 0012 have no stored hash: it is a pure function of
+            // the spec.
+            hash: get::<Option<String>>(&r, "hash")?.unwrap_or_else(|| caliban_nodes::hash::content_hash(&spec)),
+            spec,
+            state: parse_enum::<NodeState>(get(&r, "state")?)?,
             created_at: get(&r, "created_at")?,
+            created_by: get(&r, "created_by")?,
+            published_at: get(&r, "published_at")?,
+            retired_at: get(&r, "retired_at")?,
+            sealed_spec: get::<Option<Vec<u8>>>(&r, "sealed_spec")?.map(|b| B64.encode(b)),
             deleted_at: get(&r, "deleted_at")?,
         });
+    }
+
+    for r in rows(
+        c,
+        "SELECT tenant_id, name, version, promoted_at, promoted_by FROM node_promotion ORDER BY tenant_id, name",
+    )
+    .await?
+    {
+        st.promotions.entry(get(&r, "tenant_id")?).or_default().insert(
+            get(&r, "name")?,
+            Promotion {
+                version: u32::try_from(get::<i32>(&r, "version")?).unwrap_or_default(),
+                promoted_at: get(&r, "promoted_at")?,
+                promoted_by: get(&r, "promoted_by")?,
+            },
+        );
     }
 
     for r in rows(

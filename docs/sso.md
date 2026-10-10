@@ -60,12 +60,24 @@ logged, so anonymous requests cannot grow the audit log.
 | `owner` | deployment | Everything, including granting and revoking `owner` |
 | `admin` | deployment | Everything except granting or revoking `owner` |
 | `auditor` | deployment | Read everything, including the audit log, users and role bindings; probe provider health |
-| `tenant_admin` | one tenant | Tenant settings, API keys, BYOK keys, routes, datasources, ontology review, nodes, usage |
-| `developer` | one tenant | API keys, routes, nodes and ontology review; reads the rest of the tenant (not BYOK secrets, which are never readable) |
+| `tenant_admin` | one tenant | Tenant settings, API keys, BYOK keys, routes, datasources, ontology review, nodes (publishing included), usage |
+| `developer` | one tenant | API keys, routes, node drafts and runs, and ontology review; reads the rest of the tenant (not BYOK secrets, which are never readable) |
 | `viewer` | one tenant | Read-only access to the tenant |
 | `billing` | one tenant | The tenant and its usage and spend |
 
 Every role (tenant roles included) can read the model catalogue and the shared provider list.
+
+Node permissions ([nodes](nodes.md)): `nodes.read` (versions and diffs), `nodes.write` (create
+drafts, delete drafts and retired versions), `nodes.publish` (publish, promote, retire) and
+`nodes.run` (run nodes; on the admin API, granting node access to an API key needs it):
+
+| Role | `nodes.read` | `nodes.write` | `nodes.publish` | `nodes.run` |
+|---|---|---|---|---|
+| `owner`, `admin` | yes | yes | yes | yes |
+| `tenant_admin` | yes | yes | yes | yes |
+| `developer` | yes | yes | no | yes |
+| `viewer`, `auditor` | yes | no | no | no |
+| `billing` | no | no | no | no |
 Roles come from three places and add up:
 
 - **Group mappings in the config file** (`[[security.oidc.role_mappings]]`, or
@@ -109,6 +121,13 @@ tenants the caller may see. A refusal is `403` with `error.type = "permission_er
 | `PUT /api/v1/tenants/{tenantId}/routes` | `routes.write` | owner, admin, tenant_admin, developer |
 | `DELETE /api/v1/tenants/{tenantId}/datasources/{datasourceId}` | `datasources.write` | owner, admin, tenant_admin |
 | `DELETE /api/v1/tenants/{tenantId}/nodes/{nodeId}` | `nodes.write` | owner, admin, tenant_admin, developer |
+| `GET /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions` | `nodes.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `POST /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions` | `nodes.write` | owner, admin, tenant_admin, developer |
+| `GET /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}` | `nodes.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `POST /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/publish` | `nodes.publish` | owner, admin, tenant_admin |
+| `POST /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/retire` | `nodes.publish` | owner, admin, tenant_admin |
+| `POST /api/v1/tenants/{tenantId}/nodes/{nodeName}/promote` | `nodes.publish` | owner, admin, tenant_admin |
+| `GET /api/v1/tenants/{tenantId}/nodes/{nodeName}/diff` | `nodes.read` | owner, admin, auditor, tenant_admin, developer, viewer |
 | `GET /api/v1/models` | `catalog.read` | every role |
 | `POST /api/v1/models` | `catalog.write` | owner, admin |
 | `DELETE /api/v1/models/{modelId}` | `catalog.write` | owner, admin |

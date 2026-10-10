@@ -909,6 +909,56 @@ pub struct TenantConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// Published node versions (P3), rendered by the control plane; never written in a config
+    /// file. Omitted when empty, so snapshots of tenants without nodes stay as they were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<PublishedNode>,
+    /// API keys restricted to some nodes: key hash (as in `api_key_hashes`) to node names. A key
+    /// not listed may run every published node of the tenant.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub api_key_nodes: BTreeMap<String, Vec<String>>,
+    /// The tenant's data key, wrapped by a KEK: node workers seal run journals with it. Rendered
+    /// when the tenant has published nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_key: Option<WrappedDek>,
+}
+
+/// A published node version in the data-plane snapshot. The spec travels sealed under the tenant's
+/// data key (a self-contained [`TenantSealed`] envelope, like BYOK keys); routers and workers open
+/// it with their keyring.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedNode {
+    pub name: String,
+    pub version: u32,
+    /// `sha256:<hex>` over the canonical spec JSON.
+    pub hash: String,
+    /// The promoted version: what a run of `name` without a version runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live: bool,
+    /// The spec JSON, sealed under the tenant's data key.
+    pub spec: TenantSealed,
+}
+
+impl PublishedNode {
+    /// The spec JSON (opened with `keyring`).
+    pub fn open_spec(&self, keyring: &Keyring) -> Result<String, String> {
+        let wrapped = WrappedDek { kek_id: self.spec.kek_id.clone(), wrapped: self.spec.wrapped_dek.clone() };
+        let dek = keyring.unwrap_dek(&self.spec.tenant, &wrapped)?;
+        dek.open(&self.spec.tenant, &self.spec.sealed)
+    }
+}
+
+impl TenantConfig {
+    /// A published version of node `name`: `version`, or the promoted one when `None`.
+    pub fn node(&self, name: &str, version: Option<u32>) -> Option<&PublishedNode> {
+        self.nodes.iter().find(|n| n.name == name && version.map_or(n.live, |v| n.version == v))
+    }
+
+    /// Whether the API key with this hash may run node `name` (its allowlist, if it has one).
+    pub fn key_may_run(&self, key_hash: &str, name: &str) -> bool {
+        self.api_key_nodes.get(key_hash).is_none_or(|allowed| allowed.iter().any(|n| n == name))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
@@ -1116,6 +1166,28 @@ impl Config {
                 }
                 if !seen_hashes.insert(h.as_str()) {
                     return Err(ConfigError::Invalid(format!("api key hash reused across tenants ({})", t.id)));
+                }
+            }
+            if t.api_key_nodes.keys().any(|h| !t.api_key_hashes.iter().any(|k| k.eq_ignore_ascii_case(h))) {
+                return Err(ConfigError::Invalid(format!(
+                    "tenant {}: api_key_nodes names a key it does not have",
+                    t.id
+                )));
+            }
+            let mut versions = std::collections::HashSet::new();
+            let mut live = std::collections::HashSet::new();
+            for n in &t.nodes {
+                if !versions.insert((n.name.as_str(), n.version)) || (n.live && !live.insert(n.name.as_str())) {
+                    return Err(ConfigError::Invalid(format!(
+                        "tenant {}: node {}@v{} is listed twice or promoted twice",
+                        t.id, n.name, n.version
+                    )));
+                }
+                if n.spec.tenant != t.id.as_str() {
+                    return Err(ConfigError::Invalid(format!(
+                        "tenant {}: node {} is sealed for another tenant",
+                        t.id, n.name
+                    )));
                 }
             }
             for r in &t.routes {

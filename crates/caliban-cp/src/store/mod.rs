@@ -48,6 +48,7 @@ use caliban_config::{
     TenantConfig, TenantSealed, WrappedDek,
 };
 use caliban_meter::RecentUsage;
+use caliban_nodes::publish::NodeCaps;
 use caliban_ontology::{Element, Ontology, Status};
 use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, SemanticCacheMode, TrustTier};
 use chrono::{DateTime, Utc};
@@ -90,6 +91,9 @@ pub struct Tenant {
     /// Fraction of the flat `caliban/auto` price billed for a cache hit, in 0..=1. `None`: the
     /// deployment's `[routing] auto_cache_hit_fraction` (default 0.20).
     pub auto_cache_hit_fraction: Option<f64>,
+    /// Caps on the budgets of every node version the tenant publishes. `None`: the defaults
+    /// ([`NodeCaps::DEFAULT`]).
+    pub node_caps: Option<NodeCaps>,
     pub created_at: DateTime<Utc>,
     pub status: TenantStatus,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -110,6 +114,9 @@ pub struct ApiKeyRecord {
     pub created_at: DateTime<Utc>,
     /// Set when the key is revoked. The row is kept for audit; the hash leaves the snapshot.
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Node allowlist: the nodes this key may run. `None`: every published node of the tenant;
+    /// empty: none.
+    pub nodes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -163,6 +170,30 @@ pub struct DatasourceRecord {
     pub deleted_at: Option<DateTime<Utc>>,
 }
 
+/// Where a node version is in its lifecycle: `draft` -> `published` -> `retired`, never back.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeState {
+    /// Created, editable only by creating another version; not runnable.
+    #[default]
+    Draft,
+    /// Validated against the tenant and shipped to the data plane (sealed); runnable.
+    Published,
+    /// No longer shipped or runnable; kept for audit.
+    Retired,
+}
+
+impl NodeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeState::Draft => "draft",
+            NodeState::Published => "published",
+            NodeState::Retired => "retired",
+        }
+    }
+}
+
+/// One immutable version of a node.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct NodeRecord {
     pub id: String,
@@ -170,11 +201,28 @@ pub struct NodeRecord {
     pub name: String,
     pub version: u32,
     pub spec: Value,
+    /// `sha256:<hex>` over the canonical spec JSON (see `caliban_nodes::hash`).
+    pub hash: String,
+    pub state: NodeState,
     pub created_at: DateTime<Utc>,
+    pub created_by: Option<String>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub retired_at: Option<DateTime<Utc>>,
+    /// The spec sealed under the tenant's DEK (set when published): what the snapshot ships.
+    #[serde(skip)]
+    pub sealed_spec: Option<String>,
     /// Soft delete; deleted node versions are never returned by the API, and their version
     /// numbers are not reused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<DateTime<Utc>>,
+}
+
+/// The promotion pointer of a node: its live version.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Promotion {
+    pub version: u32,
+    pub promoted_at: DateTime<Utc>,
+    pub promoted_by: String,
 }
 
 /// A person or service known from the identity provider, keyed by `(issuer, subject)`. Created
@@ -275,6 +323,8 @@ pub struct State {
     pub datasources: Vec<DatasourceRecord>,
     /// Includes soft-deleted rows (`deleted_at` set).
     pub nodes: Vec<NodeRecord>,
+    /// Tenant → node name → its live version.
+    pub promotions: BTreeMap<String, BTreeMap<String, Promotion>>,
     pub ontologies: BTreeMap<String, Ontology>,
     /// Tenant → wrapped DEK. Created on the tenant's first secret, destroyed with the tenant.
     pub deks: BTreeMap<String, DekRecord>,
@@ -301,6 +351,7 @@ impl State {
                 pii_surrogate_scope: t.pii_surrogate_scope,
                 semantic_cache: t.semantic_cache,
                 auto_cache_hit_fraction: t.auto_cache_hit_fraction,
+                node_caps: None,
                 created_at: now,
                 status: TenantStatus::Active,
                 deleted_at: None,
@@ -315,6 +366,7 @@ impl State {
                     hash: h.to_ascii_lowercase(),
                     created_at: now,
                     revoked_at: None,
+                    nodes: None,
                 });
             }
             for p in &t.providers {
@@ -364,6 +416,26 @@ impl State {
         self.nodes.iter().find(|n| n.tenant_id == tenant_id && n.id == id && n.is_live())
     }
 
+    /// A version of node `name` of the tenant (not deleted).
+    pub fn node_version(&self, tenant_id: &str, name: &str, version: u32) -> Option<&NodeRecord> {
+        self.nodes.iter().find(|n| n.tenant_id == tenant_id && n.name == name && n.version == version && n.is_live())
+    }
+
+    /// Every version of node `name` of the tenant (not deleted), oldest first.
+    pub fn node_versions<'a>(&'a self, tenant_id: &'a str, name: &'a str) -> impl Iterator<Item = &'a NodeRecord> + 'a {
+        self.nodes.iter().filter(move |n| n.tenant_id == tenant_id && n.name == name && n.is_live())
+    }
+
+    /// The live version of node `name`, if it has one.
+    pub fn promotion(&self, tenant_id: &str, name: &str) -> Option<&Promotion> {
+        self.promotions.get(tenant_id).and_then(|p| p.get(name))
+    }
+
+    /// The tenant's node caps (its own, else the defaults).
+    pub fn node_caps(&self, tenant_id: &str) -> NodeCaps {
+        self.tenant(tenant_id).and_then(|t| t.node_caps).unwrap_or_default()
+    }
+
     pub fn user(&self, id: &str) -> Option<&UserRecord> {
         self.users.iter().find(|u| u.id == id)
     }
@@ -408,6 +480,9 @@ const TENANT_FIELDS: &[&str] = &[
     "api_key_hashes",
     "providers",
     "routes",
+    "nodes",
+    "api_key_nodes",
+    "data_key",
 ];
 
 fn tenant_settings(t: &TenantConfig) -> Map<String, Value> {
@@ -490,10 +565,57 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
                 "routes".into(),
                 serde_json::to_value(st.routes.get(&t.id).cloned().unwrap_or_default()).map_err(|e| e.to_string())?,
             );
+            render_nodes(st, &t.id, &mut obj)?;
             serde_json::from_value::<TenantConfig>(Value::Object(obj)).map_err(|e| format!("tenant {}: {e}", t.id))
         })
         .collect::<Result<_, _>>()?;
     Ok(cfg)
+}
+
+/// The tenant's published node versions (sealed specs, the live flag), the node allowlists of
+/// its API keys, and its wrapped DEK (for workers) once it has released a version. Drafts and
+/// retired versions never reach the data plane.
+fn render_nodes(st: &State, tenant: &str, obj: &mut Map<String, Value>) -> Result<(), String> {
+    let mut nodes = Vec::new();
+    for n in st.nodes.iter().filter(|n| n.tenant_id == tenant && n.is_live() && n.state == NodeState::Published) {
+        let d = st.deks.get(tenant).ok_or_else(|| {
+            format!("tenant {tenant}: node {}@v{} is sealed under a tenant key that does not exist", n.name, n.version)
+        })?;
+        let sealed = n
+            .sealed_spec
+            .clone()
+            .ok_or_else(|| format!("tenant {tenant}: published node {}@v{} has no sealed spec", n.name, n.version))?;
+        nodes.push(caliban_config::PublishedNode {
+            name: n.name.clone(),
+            version: n.version,
+            hash: n.hash.clone(),
+            live: st.promotion(tenant, &n.name).is_some_and(|p| p.version == n.version),
+            spec: TenantSealed {
+                tenant: tenant.to_owned(),
+                kek_id: d.wrapped.kek_id.clone(),
+                wrapped_dek: d.wrapped.wrapped.clone(),
+                sealed,
+            },
+        });
+    }
+    let allowlists: BTreeMap<&String, &Vec<String>> = st
+        .api_keys
+        .iter()
+        .filter(|k| k.tenant_id == tenant && k.is_active())
+        .filter_map(|k| k.nodes.as_ref().map(|n| (&k.hash, n)))
+        .collect();
+    // Workers keep opening the journals of runs of retired versions.
+    let released = st.nodes.iter().any(|n| n.tenant_id == tenant && n.is_live() && n.state != NodeState::Draft);
+    if released && let Some(d) = st.deks.get(tenant) {
+        obj.insert("data_key".into(), serde_json::to_value(&d.wrapped).map_err(|e| e.to_string())?);
+    }
+    if !nodes.is_empty() {
+        obj.insert("nodes".into(), serde_json::to_value(nodes).map_err(|e| e.to_string())?);
+    }
+    if !allowlists.is_empty() {
+        obj.insert("api_key_nodes".into(), serde_json::to_value(allowlists).map_err(|e| e.to_string())?);
+    }
+    Ok(())
 }
 
 /// Render + validate: the invariant every committed state must satisfy.
@@ -539,6 +661,8 @@ pub enum Mutation {
         semantic_cache: Option<SemanticCacheMode>,
         /// `Some(None)` clears the override (back to the deployment value).
         auto_cache_hit_fraction: Option<Option<f64>>,
+        /// `Some(None)` clears the caps (back to the defaults).
+        node_caps: Option<Option<NodeCaps>>,
     },
     CreateProviderKey(ProviderKeyRecord),
     DeleteProviderKey {
@@ -564,12 +688,40 @@ pub enum Mutation {
         id: String,
         at: DateTime<Utc>,
     },
-    /// `version` is assigned by the store (latest version for (tenant, name) + 1).
+    /// A draft. `version` is assigned by the store (latest version for (tenant, name) + 1).
     CreateNode(NodeRecord),
-    /// Soft-deletes one node version.
+    /// Soft-deletes one node version (a draft or a retired one; published versions are retired
+    /// first).
     DeleteNode {
         tenant_id: String,
         id: String,
+        at: DateTime<Utc>,
+    },
+    /// Publishes a draft after publish-time validation against the tenant, with its spec sealed
+    /// under the tenant DEK; `promote` also makes it the live version.
+    PublishNode {
+        tenant_id: String,
+        name: String,
+        version: u32,
+        sealed_spec: String,
+        promote: bool,
+        at: DateTime<Utc>,
+        by: String,
+    },
+    /// Moves the promotion pointer to a published version (rollback included); its budgets are
+    /// checked against the tenant's caps again.
+    PromoteNode {
+        tenant_id: String,
+        name: String,
+        version: u32,
+        at: DateTime<Utc>,
+        by: String,
+    },
+    /// Retires a published version: it leaves the data plane (and the pointer, if live).
+    RetireNode {
+        tenant_id: String,
+        name: String,
+        version: u32,
         at: DateTime<Utc>,
     },
     /// Upserts elements (e.g. proposals from the bootstrap job) as one new ontology version.
@@ -705,6 +857,7 @@ impl Mutation {
                 pii_surrogate_scope,
                 semantic_cache,
                 auto_cache_hit_fraction,
+                node_caps,
             } => {
                 let t = before.tenant(id);
                 let mut detail = json!({
@@ -717,10 +870,17 @@ impl Mutation {
                     detail["auto_cache_hit_fraction"] =
                         json!({"from": t.and_then(|t| t.auto_cache_hit_fraction), "to": to});
                 }
+                if let Some(to) = node_caps {
+                    detail["node_caps"] = json!({"from": t.and_then(|t| t.node_caps), "to": to});
+                }
                 d(Some(id), "tenant.update", id, detail)
             }
             Mutation::CreateApiKey(k) => {
-                d(Some(&k.tenant_id), "api_key.create", &k.id, json!({"name": k.name, "prefix": k.prefix}))
+                let mut detail = json!({"name": k.name, "prefix": k.prefix});
+                if let Some(n) = &k.nodes {
+                    detail["nodes"] = json!(n);
+                }
+                d(Some(&k.tenant_id), "api_key.create", &k.id, detail)
             }
             Mutation::RevokeApiKey { tenant_id, id, .. } => {
                 let k = before.active_api_key(tenant_id, id);
@@ -793,7 +953,39 @@ impl Mutation {
                     json!({"kind": ds.map(|x| &x.kind), "name": ds.map(|x| &x.name)}),
                 )
             }
-            Mutation::CreateNode(n) => d(Some(&n.tenant_id), "node.create", &n.id, json!({"name": n.name})),
+            Mutation::CreateNode(n) => {
+                d(Some(&n.tenant_id), "node.create", &n.id, json!({"name": n.name, "hash": n.hash}))
+            }
+            Mutation::PublishNode { tenant_id, name, version, promote, .. } => {
+                let n = before.node_version(tenant_id, name, *version);
+                d(
+                    Some(tenant_id),
+                    "node.publish",
+                    n.map_or(name.as_str(), |n| n.id.as_str()),
+                    json!({"name": name, "version": version, "hash": n.map(|n| &n.hash), "promoted": promote,
+                           "previous_live": before.promotion(tenant_id, name).map(|p| p.version)}),
+                )
+            }
+            Mutation::PromoteNode { tenant_id, name, version, .. } => {
+                let n = before.node_version(tenant_id, name, *version);
+                d(
+                    Some(tenant_id),
+                    "node.promote",
+                    n.map_or(name.as_str(), |n| n.id.as_str()),
+                    json!({"name": name, "version": version, "hash": n.map(|n| &n.hash),
+                           "previous_live": before.promotion(tenant_id, name).map(|p| p.version)}),
+                )
+            }
+            Mutation::RetireNode { tenant_id, name, version, .. } => {
+                let n = before.node_version(tenant_id, name, *version);
+                d(
+                    Some(tenant_id),
+                    "node.retire",
+                    n.map_or(name.as_str(), |n| n.id.as_str()),
+                    json!({"name": name, "version": version, "hash": n.map(|n| &n.hash),
+                           "was_live": before.promotion(tenant_id, name).is_some_and(|p| p.version == *version)}),
+                )
+            }
             Mutation::DeleteNode { tenant_id, id, .. } => {
                 let n = before.live_node(tenant_id, id);
                 d(

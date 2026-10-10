@@ -348,7 +348,9 @@ paths:
         (also needs `[cache.semantic] enabled`). `auto_cache_hit_fraction` sets the share of the
         flat `caliban/auto` price billed for this tenant's cache hits (0 to 1); `null` clears it, so
         the deployment's `[routing] auto_cache_hit_fraction` (default 0.2) applies. Out of range
-        is a 422.
+        is a 422. `node_caps` bounds the budgets of every node version the tenant publishes (and
+        promotes); `null` restores the defaults. Lowering the caps does not touch versions already
+        published, but promoting one that no longer fits is refused.
       requestBody:
         required: true
         content:
@@ -404,12 +406,21 @@ paths:
               type: object
               properties:
                 name: { type: string }
+                nodes:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    Node allowlist: the nodes this key may run (`POST /v1/nodes/{name}/runs`). Absent:
+                    every published node of the tenant. `[]`: none. Granting node access needs the
+                    `nodes.run` permission on the tenant (`403` otherwise); a creator without it gets
+                    a key that runs no nodes.
       responses:
         '201':
           description: Created
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiKeyCreated' }
+        '403': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/api-keys/{keyId}:
     parameters:
@@ -459,10 +470,205 @@ paths:
       tags: [nodes]
       summary: Delete a node version
       description: |
-        Soft-deletes one node version (`node.delete` audit row), scoped to the tenant in the path.
-        It is no longer listed; its version number is not reused by later versions.
+        Soft-deletes one node version by its record id (`node.delete` audit row), scoped to the
+        tenant in the path. Drafts and retired versions can be deleted; a published version is a
+        409 (retire it first). It is no longer listed; its version number is not reused.
       responses:
         '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { $ref: '#/components/parameters/NodeName' }
+    get:
+      tags: [nodes]
+      summary: List the versions of a node
+      description: Every version not deleted (drafts, published and retired), oldest first, and the live one. Needs `nodes.read`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  live: { type: [integer, 'null'], description: 'The promoted version; `null` when none is.' }
+                  promotion:
+                    type: [object, 'null']
+                    properties:
+                      version: { type: integer }
+                      promoted_at: { type: string, format: date-time }
+                      promoted_by: { type: string }
+                  versions: { type: array, items: { $ref: '#/components/schemas/Node' } }
+        '404': { $ref: '#/components/responses/Error' }
+    post:
+      tags: [nodes]
+      summary: Create a draft version
+      description: |
+        The version number is the node's latest plus one. The spec is checked statically
+        (schemas/node.schema.json; MCP tools pinned; cycles bounded by `max_iterations`; `code`
+        vertices are refused as not yet supported) and content-hashed. Versions are immutable:
+        changing a node means creating a new version. Needs `nodes.write`; audited as `node.create`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [spec]
+              properties:
+                spec: { type: object, additionalProperties: true }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { $ref: '#/components/parameters/NodeName' }
+      - { $ref: '#/components/parameters/NodeVersion' }
+    get:
+      tags: [nodes]
+      summary: Get a version (spec and content hash)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/publish:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { $ref: '#/components/parameters/NodeName' }
+      - { $ref: '#/components/parameters/NodeVersion' }
+    post:
+      tags: [nodes]
+      summary: Publish a draft (and promote it by default)
+      description: |
+        Validates the draft against the tenant: the static checks again; every `node://name@vN` it
+        calls is a published version of the same tenant and references form no cycle; every
+        datasource scope (`<datasource>.<object>:<access>`) names a datasource of the tenant and
+        `*` or an approved ontology entity bound to it; the budgets fit the tenant's
+        `node_caps`; `mcp://` tools are pinned (resolving them against an approved tool registry
+        comes with the MCP client). The spec is then sealed under the tenant's data key (created on
+        first use; needs `CALIBAN_KEK`, else 400) and ships to routers and workers in the signed
+        snapshot. With `promote` (default `true`) it also becomes the live version. Needs
+        `nodes.publish`; audited as `node.publish`. A version that is not a draft is a 409; a
+        validation failure is a 422 listing every problem.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                promote: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Published
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/retire:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { $ref: '#/components/parameters/NodeName' }
+      - { $ref: '#/components/parameters/NodeVersion' }
+    post:
+      tags: [nodes]
+      summary: Retire a published version
+      description: |
+        The version leaves the data-plane snapshot (new runs of it are refused; runs in flight fail
+        when they next need it). If it was live, the node has no live version until another is
+        promoted. A version still called (`node://`) by another published version is a 409.
+        Retirement is final. Needs `nodes.publish`; audited as `node.retire`.
+      responses:
+        '200':
+          description: Retired
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/nodes/{nodeName}/promote:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { $ref: '#/components/parameters/NodeName' }
+    post:
+      tags: [nodes]
+      summary: Move the promotion pointer (promote or roll back)
+      description: |
+        Makes a published version the live one (what `POST /v1/nodes/{name}/runs` without a version
+        runs). Its budgets are checked against the tenant's current `node_caps` (422). A draft or a
+        retired version is a 409. Needs `nodes.publish`; audited as `node.promote` with the
+        previous live version.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                version: { type: integer }
+      responses:
+        '200':
+          description: Promoted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/nodes/{nodeName}/diff:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { $ref: '#/components/parameters/NodeName' }
+    get:
+      tags: [nodes]
+      summary: Diff two versions
+      description: Their hashes and a structural JSON diff of their specs (JSON pointers; arrays compared index by index).
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: integer } }
+        - { name: to, in: query, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  from: { type: object, properties: { version: { type: integer }, hash: { type: string }, state: { type: string } } }
+                  to: { type: object, properties: { version: { type: integer }, hash: { type: string }, state: { type: string } } }
+                  identical: { type: boolean }
+                  changes:
+                    type: array
+                    items:
+                      type: object
+                      required: [path, op]
+                      properties:
+                        path: { type: string, description: 'JSON pointer' }
+                        op: { type: string, enum: [added, removed, changed] }
+                        from: {}
+                        to: {}
         '404': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/provider-keys:
@@ -713,7 +919,7 @@ paths:
               schema: { type: array, items: { $ref: '#/components/schemas/Node' } }
     post:
       tags: [nodes]
-      summary: Create a node version (spec validated against schemas/node.schema.json)
+      summary: Create a draft node version (same as POST /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions)
       requestBody:
         required: true
         content:
@@ -1102,6 +1308,16 @@ components:
       in: path
       required: true
       schema: { type: string }
+    NodeName:
+      name: nodeName
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[a-z0-9][a-z0-9_-]{0,63}$' }
+    NodeVersion:
+      name: version
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
     TenantQuery:
       name: tenant_id
       in: query
@@ -1323,6 +1539,7 @@ components:
         semantic_cache: { type: string, enum: ['off', 'on'], default: 'off', description: 'T2 semantic cache for this tenant. `on`: eligible requests may be answered with the response to an earlier, semantically similar request of the same tenant (per-entry learned thresholds, deployment error budget). Entries never cross tenants. Also needs `[cache.semantic] enabled`.' }
         pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant, description: 'Surrogate consistency for reversible PII. `tenant`: the same value always gets the same surrogate in this tenant (keyed HMAC per tenant, derived from CALIBAN_KEK), so pseudonymised requests can hit the exact cache; sessions of the tenant become linkable through their surrogates. `session`: fresh surrogates per request. Surrogates never cross tenants.' }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Share of the flat `caliban/auto` price billed when a cache tier (exact or semantic) answers this tenant''s request: no model is called. `null`: the deployment''s `[routing] auto_cache_hit_fraction` (default 0.2) applies.' }
+        node_caps: { oneOf: [ { $ref: '#/components/schemas/NodeCaps' }, { type: 'null' } ], description: '`null`: the defaults (steps 200, tokens 2000000, wall_clock_s 3600, depth 5, fanout 32).' }
         created_at: { type: string, format: date-time }
         status: { type: string, enum: [active, deleted], description: '`deleted` only appears with `include_deleted=true`.' }
         deleted_at: { type: [string, 'null'], format: date-time }
@@ -1336,6 +1553,7 @@ components:
         pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant }
         semantic_cache: { type: string, enum: ['off', 'on'], default: 'off' }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Overrides `[routing] auto_cache_hit_fraction` for this tenant. Omitted or `null`: the deployment value.' }
+        node_caps: { $ref: '#/components/schemas/NodeCaps' }
     TenantUpdate:
       type: object
       additionalProperties: false
@@ -1344,6 +1562,17 @@ components:
         pii_surrogate_scope: { type: string, enum: [tenant, session] }
         semantic_cache: { type: string, enum: ['off', 'on'] }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'A number sets the override; `null` clears it (the deployment value applies); absent keeps it.' }
+        node_caps: { oneOf: [ { $ref: '#/components/schemas/NodeCaps' }, { type: 'null' } ], description: 'Caps on the budgets of published node versions; `null` restores the defaults; absent keeps them.' }
+    NodeCaps:
+      type: object
+      additionalProperties: false
+      required: [steps, tokens, wall_clock_s, depth, fanout]
+      properties:
+        steps: { type: integer, minimum: 1 }
+        tokens: { type: integer, minimum: 1 }
+        wall_clock_s: { type: integer, minimum: 1 }
+        depth: { type: integer, minimum: 1 }
+        fanout: { type: integer, minimum: 1 }
 
     ApiKeyInfo:
       type: object
@@ -1354,6 +1583,7 @@ components:
         prefix: { type: string, description: 'First 8 chars, for display' }
         created_at: { type: string, format: date-time }
         revoked_at: { type: [string, 'null'], format: date-time, description: 'Set once the key is revoked.' }
+        nodes: { type: [array, 'null'], items: { type: string }, description: 'Node allowlist. `null`: every published node of the tenant; `[]`: none.' }
     ApiKeyCreated:
       allOf:
         - $ref: '#/components/schemas/ApiKeyInfo'
@@ -1520,15 +1750,22 @@ components:
         elements: { type: array, items: { $ref: '#/components/schemas/OntologyElement' } }
 
     Node:
+      description: One immutable node version.
       type: object
-      required: [id, tenant_id, name, version, spec, created_at]
+      required: [id, tenant_id, name, version, spec, hash, state, live, created_at]
       properties:
-        id: { type: string }
+        id: { type: string, description: 'Record id (DELETE /api/v1/tenants/{tenantId}/nodes/{id})' }
         tenant_id: { type: string }
         name: { type: string }
         version: { type: integer }
         spec: { type: object, additionalProperties: true, description: 'See schemas/node.schema.json' }
+        hash: { type: string, description: '`sha256:<hex>` over the canonical spec JSON (keys sorted, no whitespace). Stable across key order and formatting.' }
+        state: { type: string, enum: [draft, published, retired] }
+        live: { type: boolean, description: 'The promotion pointer names this version.' }
         created_at: { type: string, format: date-time }
+        created_by: { type: [string, 'null'] }
+        published_at: { type: [string, 'null'], format: date-time }
+        retired_at: { type: [string, 'null'], format: date-time }
     NodeCreate:
       type: object
       required: [tenant_id, name, spec]

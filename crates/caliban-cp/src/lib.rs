@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod keys;
 mod models;
+mod nodes;
 pub mod store;
 
 use auth::Principal;
@@ -21,7 +22,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use caliban_config::signing::{SnapshotPayload, SnapshotSigner, config_digest};
 use caliban_config::{Keyring, RouteConfig, SecretRef};
-use caliban_nodes::NodeSpec;
+use caliban_nodes::publish::NodeCaps;
 use caliban_ontology::Status;
 use caliban_types::{PiiMode, PiiSurrogateScope, ProviderKind, SemanticCacheMode, TrustTier, hash_api_key};
 use parking_lot::Mutex;
@@ -32,8 +33,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use store::audit::{now_micros, verify_chain};
 use store::{
-    ApiKeyRecord, DatasourceRecord, Mutation, NodeRecord, ProviderKeyRecord, Store, StoreError, StoredSecret, Tenant,
-    TenantStatus, new_id, slug,
+    ApiKeyRecord, DatasourceRecord, Mutation, ProviderKeyRecord, Store, StoreError, StoredSecret, Tenant, TenantStatus,
+    new_id, slug,
 };
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -199,7 +200,13 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/tenants/{tenant_id}/provider-keys/{key_id}", delete(delete_provider_key))
         .route("/tenants/{tenant_id}/routes", get(get_routes).put(put_routes))
         .route("/tenants/{tenant_id}/datasources/{id}", delete(delete_datasource))
-        .route("/tenants/{tenant_id}/nodes/{id}", delete(delete_node))
+        .route("/tenants/{tenant_id}/nodes/{id}", delete(nodes::delete_node))
+        .route("/tenants/{tenant_id}/nodes/{id}/versions", get(nodes::list_versions).post(nodes::create_version))
+        .route("/tenants/{tenant_id}/nodes/{id}/versions/{version}", get(nodes::get_version))
+        .route("/tenants/{tenant_id}/nodes/{id}/versions/{version}/publish", post(nodes::publish))
+        .route("/tenants/{tenant_id}/nodes/{id}/versions/{version}/retire", post(nodes::retire))
+        .route("/tenants/{tenant_id}/nodes/{id}/promote", post(nodes::promote))
+        .route("/tenants/{tenant_id}/nodes/{id}/diff", get(nodes::diff))
         .route("/models", get(models::list_models).post(models::create_model))
         .route("/models/{*id}", delete(models::delete_model))
         .route("/providers", get(models::list_providers).post(models::create_provider))
@@ -210,7 +217,7 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/datasources/{id}/introspect", post(introspect_datasource))
         .route("/ontology", get(get_ontology))
         .route("/ontology/elements/{id}/review", post(review_element))
-        .route("/nodes", get(list_nodes).post(create_node))
+        .route("/nodes", get(nodes::list_nodes).post(nodes::create_node))
         .route("/usage", get(usage))
         .route("/audit", get(audit))
         .route("/keys/status", get(keys_status))
@@ -420,6 +427,7 @@ struct TenantCreate {
     pii_surrogate_scope: Option<PiiSurrogateScope>,
     semantic_cache: Option<SemanticCacheMode>,
     auto_cache_hit_fraction: Option<f64>,
+    node_caps: Option<NodeCaps>,
 }
 
 async fn create_tenant(
@@ -431,6 +439,9 @@ async fn create_tenant(
     if id.is_empty() {
         return Err(bad("name must contain letters or digits"));
     }
+    if let Some(c) = &body.node_caps {
+        c.validate().map_err(bad)?;
+    }
     let t = Tenant {
         id,
         name: body.name,
@@ -439,6 +450,7 @@ async fn create_tenant(
         pii_surrogate_scope: body.pii_surrogate_scope.unwrap_or_default(),
         semantic_cache: body.semantic_cache.unwrap_or_default(),
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
+        node_caps: body.node_caps,
         created_at: now_micros(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -461,6 +473,10 @@ struct TenantUpdate {
     /// Absent: kept. `null`: cleared (the deployment value applies). A number in 0..=1: set.
     #[serde(default, deserialize_with = "present")]
     auto_cache_hit_fraction: Option<Option<f64>>,
+    /// Caps on the budgets of the node versions the tenant publishes. Absent: kept. `null`:
+    /// cleared (the defaults apply).
+    #[serde(default, deserialize_with = "present")]
+    node_caps: Option<Option<NodeCaps>>,
 }
 
 /// Tells an explicit `null` (`Some(None)`) from an absent field (`None`, with `#[serde(default)]`).
@@ -486,6 +502,7 @@ async fn update_tenant(
         pii_surrogate_scope: body.pii_surrogate_scope,
         semantic_cache: body.semantic_cache,
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
+        node_caps: body.node_caps,
     };
     let st = cp.store.apply(&p.actor, m).await?;
     st.tenant(&tenant_id).cloned().map(Json).ok_or_else(|| not_found("tenant"))
@@ -503,7 +520,7 @@ async fn delete_tenant(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn ensure_tenant(cp: &ControlPlane, id: &str) -> ApiResult<()> {
+pub(crate) fn ensure_tenant(cp: &ControlPlane, id: &str) -> ApiResult<()> {
     if cp.store.state().has_tenant(id) { Ok(()) } else { Err(not_found("tenant")) }
 }
 
@@ -544,6 +561,9 @@ async fn revoke_api_key(
 #[derive(Deserialize, Default)]
 struct ApiKeyCreate {
     name: Option<String>,
+    /// Node allowlist: the nodes the key may run. Absent: every published node of the tenant;
+    /// `[]`: none. Granting node access needs `nodes.run` on the tenant.
+    nodes: Option<Vec<String>>,
 }
 
 async fn create_api_key(
@@ -552,15 +572,26 @@ async fn create_api_key(
     Path(tenant_id): Path<String>,
     body: Option<Json<ApiKeyCreate>>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    let body = body.map(|b| b.0).unwrap_or_default();
+    // A key cannot be given rights its creator does not hold: without `nodes.run`, the key runs
+    // no nodes.
+    let nodes = if p.allows(Perm::NodesRun, Some(&tenant_id)) {
+        body.nodes
+    } else if body.nodes.as_ref().is_some_and(|n| !n.is_empty()) {
+        return Err(auth::forbidden("granting node access to an API key needs the nodes.run permission"));
+    } else {
+        Some(vec![])
+    };
     let key = generate_api_key();
     let rec = ApiKeyRecord {
         id: new_id("key"),
         tenant_id,
-        name: body.and_then(|b| b.0.name).unwrap_or_else(|| "default".into()),
+        name: body.name.unwrap_or_else(|| "default".into()),
         prefix: key.chars().take(8).collect(),
         hash: hash_api_key(&key),
         created_at: now_micros(),
         revoked_at: None,
+        nodes,
     };
     cp.store.apply(&p.actor, Mutation::CreateApiKey(rec.clone())).await?;
     let mut v = serde_json::to_value(&rec).unwrap_or_default();
@@ -810,65 +841,7 @@ async fn review_element(
         .ok_or_else(|| not_found("ontology element"))
 }
 
-// ───────────────────────────── nodes & usage ─────────────────────────────
-
-async fn list_nodes(
-    State(cp): State<Cp>,
-    Extension(p): Extension<Principal>,
-    Query(f): Query<TenantFilter>,
-) -> Json<Vec<NodeRecord>> {
-    let st = cp.store.state();
-    let visible = p.visible(Perm::NodesRead);
-    Json(
-        st.nodes
-            .iter()
-            .filter(|n| n.is_live() && f.tenant_id.as_ref().is_none_or(|t| &n.tenant_id == t))
-            .filter(|n| visible.contains(&n.tenant_id))
-            .cloned()
-            .collect(),
-    )
-}
-
-/// Soft-deletes one node version, scoped to the tenant. Its version number is not reused.
-async fn delete_node(
-    State(cp): State<Cp>,
-    Extension(p): Extension<Principal>,
-    Path((tenant_id, id)): Path<(String, String)>,
-) -> ApiResult<StatusCode> {
-    cp.store.apply(&p.actor, Mutation::DeleteNode { tenant_id, id, at: now_micros() }).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Deserialize)]
-struct NodeCreate {
-    tenant_id: String,
-    name: String,
-    spec: Value,
-}
-
-async fn create_node(
-    State(cp): State<Cp>,
-    Extension(p): Extension<Principal>,
-    Json(body): Json<NodeCreate>,
-) -> ApiResult<(StatusCode, Json<NodeRecord>)> {
-    ensure_tenant(&cp, &body.tenant_id)?;
-    let spec: NodeSpec = serde_json::from_value(body.spec.clone())
-        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid node spec: {e}")))?;
-    spec.validate().map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let id = new_id("node");
-    let rec = NodeRecord {
-        id: id.clone(),
-        tenant_id: body.tenant_id,
-        name: body.name,
-        version: 0,
-        spec: body.spec,
-        created_at: now_micros(),
-        deleted_at: None,
-    };
-    let st = cp.store.apply(&p.actor, Mutation::CreateNode(rec)).await?;
-    let created = st.nodes.iter().find(|n| n.id == id).cloned().ok_or_else(|| not_found("node"))?;
-    Ok((StatusCode::CREATED, Json(created)))
-}
+// ───────────────────────────── usage ─────────────────────────────
 
 #[derive(Deserialize)]
 struct UsageQuery {

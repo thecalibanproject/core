@@ -24,8 +24,7 @@ jsonwebtoken.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-# Postgres store: runtime queries only (no compile-time macros), tokio + rustls.
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "chrono", "json"] }
+sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true

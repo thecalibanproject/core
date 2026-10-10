@@ -1,8 +1,13 @@
 //! In-memory backend (dev/demo): state and audit chain live in the process.
 
 use super::audit::{AuditEntry, now_micros};
-use super::{Backend, Check, Mutation, PendingLogin, RouterStatus, SessionRecord, State, StoreError, SubjectKind};
+use super::{
+    Backend, Check, Mutation, NodeRecord, NodeState, PendingLogin, Promotion, RouterStatus, SessionRecord, State,
+    StoreError, SubjectKind,
+};
+use caliban_nodes::publish::NodeCaps;
 use caliban_ontology::Ontology;
+use caliban_ontology::Status;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde_json::json;
@@ -224,9 +229,17 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             for n in st.nodes.iter_mut().filter(|n| &n.tenant_id == id && n.is_live()) {
                 n.deleted_at = Some(*at);
             }
+            st.promotions.remove(id);
             st.role_bindings.retain(|b| b.tenant_id.as_ref() != Some(id));
         }
-        Mutation::UpdateTenant { id, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction } => {
+        Mutation::UpdateTenant {
+            id,
+            pii_default,
+            pii_surrogate_scope,
+            semantic_cache,
+            auto_cache_hit_fraction,
+            node_caps,
+        } => {
             let t = st
                 .tenants
                 .iter_mut()
@@ -245,9 +258,18 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 check_fraction(*f)?;
                 t.auto_cache_hit_fraction = *f;
             }
+            if let Some(c) = node_caps {
+                if let Some(c) = c {
+                    c.validate().map_err(StoreError::Invalid)?;
+                }
+                t.node_caps = *c;
+            }
         }
         Mutation::CreateApiKey(k) => {
             need_tenant(st, &k.tenant_id)?;
+            if let Some(bad) = k.nodes.iter().flatten().find(|n| !caliban_nodes::valid_node_name(n)) {
+                return Err(StoreError::Invalid(format!("'{bad}' is not a node name")));
+            }
             if st.api_keys.iter().any(|x| x.hash == k.hash || x.id == k.id) {
                 return Err(StoreError::Conflict("api key already exists".into()));
             }
@@ -346,6 +368,12 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
         }
         Mutation::CreateNode(n) => {
             need_tenant(st, &n.tenant_id)?;
+            if !caliban_nodes::valid_node_name(&n.name) {
+                return Err(StoreError::Invalid(format!(
+                    "'{}' is not a node name (1 to 64 characters of a-z, 0-9, '-' and '_')",
+                    n.name
+                )));
+            }
             let version = st
                 .nodes
                 .iter()
@@ -354,7 +382,14 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 .max()
                 .unwrap_or(0)
                 + 1;
-            st.nodes.push(super::NodeRecord { version, ..n.clone() });
+            st.nodes.push(super::NodeRecord {
+                version,
+                state: NodeState::Draft,
+                published_at: None,
+                retired_at: None,
+                sealed_spec: None,
+                ..n.clone()
+            });
         }
         Mutation::DeleteNode { tenant_id, id, at } => {
             need_tenant(st, tenant_id)?;
@@ -363,7 +398,108 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 .iter_mut()
                 .find(|n| &n.tenant_id == tenant_id && &n.id == id && n.is_live())
                 .ok_or_else(|| StoreError::NotFound("node".into()))?;
+            if n.state == NodeState::Published {
+                return Err(StoreError::Conflict(format!(
+                    "{}@v{} is published: retire it before deleting it",
+                    n.name, n.version
+                )));
+            }
             n.deleted_at = Some(*at);
+        }
+        Mutation::PublishNode { tenant_id, name, version, sealed_spec, promote, at, by } => {
+            need_tenant(st, tenant_id)?;
+            let n = st
+                .node_version(tenant_id, name, *version)
+                .ok_or_else(|| StoreError::NotFound("node version".into()))?;
+            match n.state {
+                NodeState::Draft => {}
+                NodeState::Published => {
+                    return Err(StoreError::Conflict(format!("{name}@v{version} is already published")));
+                }
+                NodeState::Retired => {
+                    return Err(StoreError::Conflict(format!("{name}@v{version} is retired; create a new version")));
+                }
+            }
+            let spec = parse_spec(n)?;
+            caliban_nodes::publish::validate_for_publish(name, *version, &spec, &TenantNodes { st, tenant: tenant_id })
+                .map_err(|e| StoreError::Invalid(e.to_string()))?;
+            if !st.deks.contains_key(tenant_id) {
+                return Err(StoreError::Invalid(format!(
+                    "{name}@v{version} is sealed under a tenant key that does not exist"
+                )));
+            }
+            let n = st
+                .nodes
+                .iter_mut()
+                .find(|n| &n.tenant_id == tenant_id && &n.name == name && n.version == *version && n.is_live())
+                .ok_or_else(|| StoreError::NotFound("node version".into()))?;
+            n.state = NodeState::Published;
+            n.published_at = Some(*at);
+            n.sealed_spec = Some(sealed_spec.clone());
+            if *promote {
+                promote_to(st, tenant_id, name, *version, *at, by);
+            }
+        }
+        Mutation::PromoteNode { tenant_id, name, version, at, by } => {
+            need_tenant(st, tenant_id)?;
+            let n = st
+                .node_version(tenant_id, name, *version)
+                .ok_or_else(|| StoreError::NotFound("node version".into()))?;
+            if n.state != NodeState::Published {
+                return Err(StoreError::Conflict(format!(
+                    "{name}@v{version} is {}: only published versions can be promoted",
+                    n.state.as_str()
+                )));
+            }
+            let over = st.node_caps(tenant_id).violations(&parse_spec(n)?);
+            if !over.is_empty() {
+                return Err(StoreError::Invalid(format!("cannot promote {name}@v{version}: {}", over.join("; "))));
+            }
+            promote_to(st, tenant_id, name, *version, *at, by);
+        }
+        Mutation::RetireNode { tenant_id, name, version, at } => {
+            need_tenant(st, tenant_id)?;
+            let n = st
+                .node_version(tenant_id, name, *version)
+                .ok_or_else(|| StoreError::NotFound("node version".into()))?;
+            if n.state != NodeState::Published {
+                return Err(StoreError::Conflict(format!(
+                    "{name}@v{version} is {}: only published versions can be retired",
+                    n.state.as_str()
+                )));
+            }
+            // A published version that calls this one would break.
+            let callers: Vec<String> = st
+                .nodes
+                .iter()
+                .filter(|x| &x.tenant_id == tenant_id && x.is_live() && x.state == NodeState::Published)
+                .filter(|x| !(&x.name == name && x.version == *version))
+                .filter(|x| {
+                    parse_spec(x).is_ok_and(|s| s.node_refs().iter().any(|(rn, rv)| rn == name && rv == version))
+                })
+                .map(|x| format!("{}@v{}", x.name, x.version))
+                .collect();
+            if !callers.is_empty() {
+                return Err(StoreError::Conflict(format!(
+                    "{name}@v{version} is called by {}; retire those first",
+                    callers.join(", ")
+                )));
+            }
+            let n = st
+                .nodes
+                .iter_mut()
+                .find(|n| &n.tenant_id == tenant_id && &n.name == name && n.version == *version && n.is_live())
+                .ok_or_else(|| StoreError::NotFound("node version".into()))?;
+            n.state = NodeState::Retired;
+            n.retired_at = Some(*at);
+            if st.promotion(tenant_id, name).is_some_and(|p| p.version == *version)
+                && let Some(p) = st.promotions.get_mut(tenant_id)
+            {
+                p.remove(name);
+                if p.is_empty() {
+                    st.promotions.remove(tenant_id);
+                }
+            }
         }
         Mutation::ProposeOntology { tenant_id, elements } => {
             need_tenant(st, tenant_id)?;
@@ -466,6 +602,86 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
         Mutation::Record(_) => {}
     }
     Ok(())
+}
+
+fn parse_spec(n: &NodeRecord) -> Result<caliban_nodes::NodeSpec, StoreError> {
+    serde_json::from_value(n.spec.clone())
+        .map_err(|e| StoreError::Invalid(format!("{}@v{}: invalid node spec: {e}", n.name, n.version)))
+}
+
+fn promote_to(st: &mut State, tenant: &str, name: &str, version: u32, at: DateTime<Utc>, by: &str) {
+    st.promotions
+        .entry(tenant.to_owned())
+        .or_default()
+        .insert(name.to_owned(), Promotion { version, promoted_at: at, promoted_by: by.to_owned() });
+}
+
+/// Publish-time validation against the committed state of one tenant.
+pub(crate) struct TenantNodes<'a> {
+    pub st: &'a State,
+    pub tenant: &'a str,
+}
+
+impl caliban_nodes::publish::PublishContext for TenantNodes<'_> {
+    /// `<datasource>.<object>:<access>`: `<datasource>` is a live datasource of the tenant (by
+    /// name); `<object>` is `*` or a collection (or entity name) of an approved ontology entity
+    /// bound to that datasource.
+    fn scope_exists(&self, scope: &str) -> Result<(), String> {
+        let (target, access) = scope.rsplit_once(':').ok_or("expected <datasource>.<object>:<access>")?;
+        if !matches!(access, "read" | "write") {
+            return Err(format!("access must be read or write, not '{access}'"));
+        }
+        let (ds, object) = target.split_once('.').ok_or("expected <datasource>.<object>:<access>")?;
+        let d = self
+            .st
+            .datasources
+            .iter()
+            .find(|d| d.tenant_id == self.tenant && d.is_live() && d.name.eq_ignore_ascii_case(ds))
+            .ok_or_else(|| format!("the tenant has no datasource named '{ds}'"))?;
+        if object == "*" {
+            return Ok(());
+        }
+        let bound = self.st.ontologies.get(self.tenant).into_iter().flat_map(|o| o.elements.iter()).any(|e| {
+            e.status == Status::Approved
+                && match &e.spec {
+                    caliban_ontology::ElementSpec::Entity(def) => match &def.binding {
+                        caliban_ontology::model::EntityBinding::Root { datasource, collection, .. } => {
+                            (datasource == &d.id || datasource.eq_ignore_ascii_case(&d.name))
+                                && (collection == object || e.name == object || e.id == object)
+                        }
+                        caliban_ontology::model::EntityBinding::Embedded { .. } => false,
+                    },
+                    _ => false,
+                }
+        });
+        if bound {
+            Ok(())
+        } else {
+            Err(format!("no approved ontology entity of datasource '{ds}' is named '{object}'"))
+        }
+    }
+
+    fn version(&self, name: &str, version: u32) -> caliban_nodes::publish::RefState {
+        use caliban_nodes::publish::RefState;
+        match self.st.node_version(self.tenant, name, version) {
+            None => RefState::Missing,
+            Some(n) => match n.state {
+                NodeState::Draft => RefState::Draft,
+                NodeState::Retired => RefState::Retired,
+                NodeState::Published => match serde_json::from_value(n.spec.clone()) {
+                    Ok(spec) => RefState::Published(Box::new(spec)),
+                    Err(_) => RefState::Missing,
+                },
+            },
+        }
+    }
+
+    fn caps(&self) -> NodeCaps {
+        self.st.node_caps(self.tenant)
+    }
+
+    // TODO(P3 M4): `check_tool` resolves `mcp://` references against the tenant's approved tool
+    // registry (pinned manifests). Until then every pinned reference passes here.
 }
 
 /// Applies a [`super::Rekey`] batch: every change must still find the value it was planned from.
