@@ -561,7 +561,14 @@ async fn run_data_is_sealed_at_rest() {
     stored.extend(steps.iter().filter_map(|s| s.result.clone()));
     assert_eq!(stored.len(), 6);
     for s in &stored {
-        assert!(!s.contains("Jane") && !s.contains("chest") && !s.contains("forty") && !s.contains("gp"), "{s}");
+        // Markers with characters base64 never contains, so a ciphertext cannot match by chance.
+        assert!(
+            !s.contains("Jane Roe")
+                && !s.contains("chest pain")
+                && !s.contains("forty-one")
+                && !s.contains("\"service\""),
+            "{s}"
+        );
         assert!(h.sealer.open("acme", &v.id, s).is_ok());
         assert!(h.sealer.open("acme", "run_other", s).is_err(), "bound to its run");
     }
@@ -649,5 +656,42 @@ async fn rate_limited_steps_sleep_durably_then_resume() {
         assert_eq!(model.calls_for("b#0"), 3, "two rate-limited calls, then the answer");
         assert!(h.journal.event(&v.id, "b#0:throttled:1").await.unwrap().is_some());
         assert!(h.journal.event(&v.id, "b#0:throttled:2").await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn run_data_is_sealed_at_rest_in_postgres() {
+    let Some(pg) = crate::journal::tests::pg_journal().await else {
+        eprintln!("CALIBAN_TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    let pool = pg.pool().clone();
+    let h = Harness::new(Arc::new(pg));
+    h.nodes.add("triage", 1, triage_spec());
+    let model = triage_model();
+    let ex = h.executor(&model, "w1");
+    let v = run(&ex, "triage", json!({"case": "patient Jane Roe, chest pain"})).await;
+    ex.deliver_input("acme", &v.id, None, &json!("forty-one")).await.unwrap();
+    ex.run_now(&v.id).await.unwrap();
+    assert_eq!(ex.view("acme", &v.id).await.unwrap().unwrap().status, RunStatus::Succeeded);
+    let stored: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT input FROM node_run UNION ALL SELECT output FROM node_run UNION ALL SELECT prompt FROM node_run
+         UNION ALL SELECT result FROM node_step UNION ALL SELECT payload FROM node_event WHERE kind = 'input'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let stored: Vec<String> = stored.into_iter().flatten().collect();
+    assert_eq!(stored.len(), 6, "input, output, three step results, the answer");
+    for s in &stored {
+        // Markers with characters base64 never contains, so a ciphertext cannot match by chance.
+        assert!(
+            !s.contains("Jane Roe")
+                && !s.contains("chest pain")
+                && !s.contains("forty-one")
+                && !s.contains("\"service\""),
+            "{s}"
+        );
+        assert!(h.sealer.open("acme", &v.id, s).is_ok());
     }
 }
