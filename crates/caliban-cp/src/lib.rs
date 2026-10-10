@@ -629,6 +629,9 @@ struct ApiKeyCreate {
     /// Node allowlist: the nodes the key may run. Absent: every published node of the tenant;
     /// `[]`: none. Granting node access needs `nodes.run` on the tenant.
     nodes: Option<Vec<String>>,
+    /// Datasource scopes (`<datasource>.<object>:read`) the built-in query tool may read for this
+    /// key's runs, intersected with each node's. Absent: every scope of the nodes it runs.
+    datasource_scopes: Option<Vec<String>>,
 }
 
 async fn create_api_key(
@@ -657,6 +660,7 @@ async fn create_api_key(
         created_at: now_micros(),
         revoked_at: None,
         nodes,
+        datasource_scopes: body.datasource_scopes,
     };
     cp.store.apply(&p.actor, Mutation::CreateApiKey(rec.clone())).await?;
     let mut v = serde_json::to_value(&rec).unwrap_or_default();

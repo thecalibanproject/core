@@ -54,6 +54,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (17, "node_run_retention", include_str!("../../../../migrations/0017_node_run_retention.sql")),
     (18, "usage_nodes", include_str!("../../../../migrations/0018_usage_nodes.sql")),
     (19, "tool_registry", include_str!("../../../../migrations/0019_tool_registry.sql")),
+    (20, "api_key_datasource_scopes", include_str!("../../../../migrations/0020_api_key_datasource_scopes.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -1265,7 +1266,7 @@ async fn set_promotion(
 async fn insert_api_key(c: &mut PgConnection, k: &ApiKeyRecord) -> Result<(), StoreError> {
     exec(
         c,
-        sqlx::query("INSERT INTO api_key (id, tenant_id, name, prefix, sha256, created_at, revoked_at, nodes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
+        sqlx::query("INSERT INTO api_key (id, tenant_id, name, prefix, sha256, created_at, revoked_at, nodes, datasource_scopes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
             .bind(&k.id)
             .bind(&k.tenant_id)
             .bind(&k.name)
@@ -1273,7 +1274,8 @@ async fn insert_api_key(c: &mut PgConnection, k: &ApiKeyRecord) -> Result<(), St
             .bind(&k.hash)
             .bind(k.created_at)
             .bind(k.revoked_at)
-            .bind(&k.nodes),
+            .bind(&k.nodes)
+            .bind(&k.datasource_scopes),
     )
     .await
 }
@@ -1608,7 +1610,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
 
     // Revoked keys are loaded too (listed with `include_revoked`); `render` leaves them out.
     for r in
-        rows(c, "SELECT id, tenant_id, name, prefix, sha256, created_at, revoked_at, nodes FROM api_key ORDER BY ord")
+        rows(c, "SELECT id, tenant_id, name, prefix, sha256, created_at, revoked_at, nodes, datasource_scopes FROM api_key ORDER BY ord")
             .await?
     {
         st.api_keys.push(ApiKeyRecord {
@@ -1620,6 +1622,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             created_at: get(&r, "created_at")?,
             revoked_at: get(&r, "revoked_at")?,
             nodes: get(&r, "nodes")?,
+            datasource_scopes: get(&r, "datasource_scopes")?,
         });
     }
 

@@ -48,7 +48,7 @@ fn bind_tools(cx: &RunCx, node: &ResolvedNode) -> Result<Vec<Bound>, Stop> {
                 schema: json!({"type": "object"}),
                 _tool: None,
             },
-            ToolTarget::Mcp { .. } => {
+            ToolTarget::Mcp { .. } | ToolTarget::Builtin { .. } => {
                 let tool = cx.ex.tools.resolve(cx.tenant(), &t.reference).map_err(|e| Stop::Fail(e.to_string()))?;
                 let info = tool.info();
                 Bound {

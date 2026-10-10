@@ -13,6 +13,7 @@
 
 mod auth;
 mod chat;
+pub mod datasource;
 pub mod embedder;
 mod embeddings;
 mod error;

@@ -385,6 +385,8 @@ pub(super) async fn call_tool(
                     node: cx.run.node.clone(),
                     node_version: cx.run.version,
                     run_id: cx.run.id.clone(),
+                    datasource_scopes: node.spec.datasource_scopes(),
+                    invoker_key_hash: cx.run.invoker_key_hash.clone(),
                     step_id: step_id.to_owned(),
                     idempotency_key: idempotency_key(&cx.run.id, step_id),
                 };

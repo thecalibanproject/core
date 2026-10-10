@@ -31,6 +31,10 @@ pub struct ToolCtx {
     pub node: String,
     pub node_version: u32,
     pub run_id: String,
+    /// The calling node's `datasources.scopes`, and the invoking API key (built-in tools narrow
+    /// them to what the key may read).
+    pub datasource_scopes: Vec<String>,
+    pub invoker_key_hash: Option<String>,
     pub step_id: String,
     /// Derived from (run id, step id): a tool with side effects uses it to apply a call once.
     pub idempotency_key: String,

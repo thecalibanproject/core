@@ -119,6 +119,10 @@ pub struct ApiKeyRecord {
     /// Node allowlist: the nodes this key may run. `None`: every published node of the tenant;
     /// empty: none.
     pub nodes: Option<Vec<String>>,
+    /// Datasource scopes the built-in query tool may read for this key's runs (intersected with
+    /// the node's). `None`: every scope of the nodes it runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datasource_scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -444,6 +448,7 @@ impl State {
                     created_at: now,
                     revoked_at: None,
                     nodes: None,
+                    datasource_scopes: None,
                 });
             }
             for p in &t.providers {
@@ -580,6 +585,9 @@ const TENANT_FIELDS: &[&str] = &[
     "node_spend_caps",
     "tool_servers",
     "tools",
+    "datasources",
+    "ontology",
+    "api_key_datasource_scopes",
 ];
 
 fn tenant_settings(t: &TenantConfig) -> Map<String, Value> {
@@ -715,6 +723,43 @@ fn render_nodes(st: &State, tenant: &str, obj: &mut Map<String, Value>) -> Resul
     }
     if !allowlists.is_empty() {
         obj.insert("api_key_nodes".into(), serde_json::to_value(allowlists).map_err(|e| e.to_string())?);
+    }
+    let scopes: BTreeMap<&String, &Vec<String>> = st
+        .api_keys
+        .iter()
+        .filter(|k| k.tenant_id == tenant && k.is_active())
+        .filter_map(|k| k.datasource_scopes.as_ref().map(|s| (&k.hash, s)))
+        .collect();
+    if !scopes.is_empty() {
+        obj.insert("api_key_datasource_scopes".into(), serde_json::to_value(scopes).map_err(|e| e.to_string())?);
+    }
+    // The built-in datasource tool needs the datasources (credentials stay sealed) and the
+    // approved ontology on the data plane, only when a published node uses it.
+    let uses_datasources =
+        st.nodes.iter().filter(|n| n.tenant_id == tenant && n.is_live() && n.state == NodeState::Published).any(|n| {
+            n.spec["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["ref"] == "builtin://datasource_query"))
+        });
+    if uses_datasources {
+        let ds: Vec<caliban_config::DatasourceConfig> = st
+            .datasources
+            .iter()
+            .filter(|d| d.tenant_id == tenant && d.is_live())
+            .map(|d| caliban_config::DatasourceConfig {
+                id: d.id.clone(),
+                name: d.name.clone(),
+                kind: d.kind.clone(),
+                connection: d.connection.clone(),
+            })
+            .collect();
+        obj.insert("datasources".into(), serde_json::to_value(ds).map_err(|e| e.to_string())?);
+        if let Some(o) = st.ontologies.get(tenant) {
+            let approved = Ontology {
+                tenant_id: o.tenant_id.clone(),
+                version: o.version,
+                elements: o.approved().cloned().collect(),
+            };
+            obj.insert("ontology".into(), serde_json::to_value(approved).map_err(|e| e.to_string())?);
+        }
     }
     Ok(())
 }

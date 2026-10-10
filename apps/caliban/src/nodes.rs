@@ -157,12 +157,20 @@ fn tool_registry(gw: &Arc<Gateway>, keyring: &Arc<caliban_config::Keyring>) -> R
         ),
     }
     let client = Arc::new(caliban_mcp::client::McpClient::system(EgressPolicy { allow_loopback }));
-    Ok(Arc::new(caliban_gateway::tools::SnapshotTools::new(
+    let builtins = caliban_gateway::datasource::Builtins::new(
         gw.config.clone(),
         Arc::clone(keyring),
-        client,
-        signer.map(Arc::new),
-    )))
+        Arc::new(caliban_gateway::datasource::MongoLane::default()),
+    );
+    Ok(Arc::new(
+        caliban_gateway::tools::SnapshotTools::new(
+            gw.config.clone(),
+            Arc::clone(keyring),
+            client,
+            signer.map(Arc::new),
+        )
+        .with_builtins(Arc::new(builtins)),
+    ))
 }
 
 /// Retention of finished runs: hourly, in batches (several workers may purge at once).

@@ -512,4 +512,41 @@ mod tests {
         let created = a["entries"].as_array().unwrap().iter().find(|e| e["detail"]["name"] == "triage-only").unwrap();
         assert_eq!(created["detail"]["nodes"], json!(["triage"]));
     }
+
+    #[tokio::test]
+    async fn the_datasource_tool_ships_sealed_datasources_and_the_approved_ontology() {
+        let c = cp(Some(ring()));
+        let app = app(Arc::clone(&c), None);
+        let ds = json!({"tenant_id": "acme", "kind": "mongodb", "name": "shop",
+                        "connection": {"uri": "mongodb://reader:s3cret@db:27017", "database": "shop"}});
+        assert_eq!(call(&app, "POST", "/api/v1/datasources", Some(ds)).await.0, StatusCode::CREATED);
+        let mut s = spec(3);
+        s["tools"] = json!([{"ref": "builtin://datasource_query", "effect": "write"}]);
+        let (st, e) = call(&app, "POST", &format!("{V}/versions"), Some(json!({"spec": s}))).await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "read only: {e}");
+        s["tools"] = json!([{"ref": "builtin://datasource_query", "effect": "read"}]);
+        let (st, e) = call(&app, "POST", &format!("{V}/versions"), Some(json!({"spec": s.clone()}))).await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "needs scopes: {e}");
+        s["datasources"] = json!({"scopes": ["shop.*:read"]});
+        call(&app, "POST", &format!("{V}/versions"), Some(json!({"spec": s}))).await;
+        // Nothing ships before a published node uses the tool.
+        assert!(c.store.config.load().tenant(&"acme".into()).unwrap().datasources.is_empty());
+        assert_eq!(call(&app, "POST", &format!("{V}/versions/1/publish"), None).await.0, StatusCode::OK);
+        let snap = c.store.config.load();
+        let t = snap.tenant(&"acme".into()).unwrap();
+        assert_eq!(t.datasources.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["shop"]);
+        assert!(!serde_json::to_string(&snap.config).unwrap().contains("s3cret"), "credentials stay sealed");
+        // A key can be narrowed to some scopes.
+        let (st, k) = call(
+            &app,
+            "POST",
+            "/api/v1/tenants/acme/api-keys",
+            Some(json!({"name": "orders-only", "datasource_scopes": ["shop.orders:read"]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{k}");
+        let hash = caliban_types::hash_api_key(k["key"].as_str().unwrap());
+        let snap = c.store.config.load();
+        assert_eq!(snap.tenant(&"acme".into()).unwrap().api_key_datasource_scopes[&hash], ["shop.orders:read"]);
+    }
 }

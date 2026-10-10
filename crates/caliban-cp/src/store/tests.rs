@@ -280,6 +280,7 @@ async fn suite(s: &Store) {
         created_at: ts(),
         revoked_at: None,
         nodes: None,
+        datasource_scopes: None,
     };
     s.apply(A, Mutation::CreateApiKey(key.clone())).await.unwrap();
     assert_eq!(s.config.load().tenant_by_key_hash(&"2".repeat(64)).unwrap().id.as_str(), "globex");
@@ -694,6 +695,7 @@ async fn deletes(s: &Store) {
         created_at: ts(),
         revoked_at: None,
         nodes: None,
+        datasource_scopes: None,
     };
     assert!(matches!(s.apply(A, Mutation::CreateApiKey(reuse)).await, Err(StoreError::Conflict(_))));
     // Config-seeded keys can be revoked too.
@@ -761,6 +763,7 @@ async fn deletes(s: &Store) {
         created_at: ts(),
         revoked_at: None,
         nodes: None,
+        datasource_scopes: None,
     };
     s.apply(A, Mutation::CreateApiKey(dkey)).await.unwrap();
     let (dek, rec) = crate::keys::new_dek(&ring(), "doomed");
@@ -1154,6 +1157,8 @@ async fn node_lifecycle(s: &Store) {
         hash: hash.to_string().repeat(64),
         created_at: ts(),
         revoked_at: None,
+        // Keys restricted to some nodes are also narrowed to some datasource scopes here.
+        datasource_scopes: nodes.as_ref().map(|_| vec!["erp.*:read".to_owned()]),
         nodes,
     };
     invalid(
@@ -1162,6 +1167,10 @@ async fn node_lifecycle(s: &Store) {
     );
     s.apply(A, Mutation::CreateApiKey(key("key_n1", '8', Some(vec!["risk".into()])))).await.unwrap();
     s.apply(A, Mutation::CreateApiKey(key("key_n2", '9', None))).await.unwrap();
+    assert_eq!(
+        s.state().api_keys.iter().find(|k| k.id == "key_n1").unwrap().datasource_scopes,
+        Some(vec!["erp.*:read".to_owned()])
+    );
     let snap = s.config.load();
     let t = snap.tenant(&"globex".into()).unwrap();
     assert!(t.key_may_run(&"8".repeat(64), "risk") && !t.key_may_run(&"8".repeat(64), "caller"));

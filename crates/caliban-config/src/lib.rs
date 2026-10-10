@@ -932,6 +932,49 @@ pub struct TenantConfig {
     /// Approved tool manifests (pinned): the only MCP tools the tenant's nodes can call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ApprovedTool>,
+    /// Datasources and the approved ontology, for the built-in datasource query tool. Rendered
+    /// only when a published node of the tenant uses that tool; credentials stay sealed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub datasources: Vec<DatasourceConfig>,
+    /// The approved ontology elements (`caliban_ontology::Ontology` JSON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology: Option<serde_json::Value>,
+    /// API keys restricted to some datasource scopes: key hash to scopes. A key not listed may use
+    /// every scope of the nodes it runs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub api_key_datasource_scopes: BTreeMap<String, Vec<String>>,
+}
+
+/// A datasource as the data plane sees it. Credentials in `connection` stay sealed under the
+/// tenant's data key (`{"$sealed": ...}`); [`open_sealed_values`] opens them for a connector.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DatasourceConfig {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub connection: serde_json::Value,
+}
+
+/// `conn` with every `{"$sealed": ...}` value opened with the tenant's data key.
+pub fn open_sealed_values(conn: &serde_json::Value, tenant: &str, dek: &Dek) -> Result<serde_json::Value, String> {
+    use serde_json::Value;
+    match conn {
+        Value::Object(m) if m.get("$sealed").is_some_and(Value::is_string) => {
+            let ct = m.get("$sealed").and_then(Value::as_str).unwrap_or_default();
+            let plaintext = zeroize::Zeroizing::new(dek.open(tenant, ct)?);
+            serde_json::from_str(&plaintext).map_err(|e| e.to_string())
+        }
+        Value::Object(m) => m
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), open_sealed_values(v, tenant, dek)?)))
+            .collect::<Result<_, _>>()
+            .map(Value::Object),
+        Value::Array(a) => {
+            a.iter().map(|v| open_sealed_values(v, tenant, dek)).collect::<Result<_, _>>().map(Value::Array)
+        }
+        _ => Ok(conn.clone()),
+    }
 }
 
 /// A registered MCP tool server (Streamable HTTP).

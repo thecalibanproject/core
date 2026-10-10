@@ -63,7 +63,13 @@ pub enum ToolTarget {
     Mcp { server: String, tool: String, pin: String },
     /// `node://name@vN`: another node of the same tenant, pinned to a version.
     Node { name: String, version: u32 },
+    /// `builtin://<name>`: a tool Caliban provides itself ([`BUILTIN_TOOLS`]).
+    Builtin { name: String },
 }
+
+/// Built-in tools: `datasource_query` (read-only CQIR queries over the tenant's approved ontology,
+/// within the node's datasource scopes and the invoking key's).
+pub const BUILTIN_TOOLS: &[&str] = &["datasource_query"];
 
 impl ToolTarget {
     pub fn parse(reference: &str) -> Result<Self, SpecError> {
@@ -81,6 +87,12 @@ impl ToolTarget {
         }
         if let Some(rest) = reference.strip_prefix("node://") {
             return parse_node_ref(rest).ok_or_else(|| SpecError::BadNodeRef(reference.to_owned()));
+        }
+        if let Some(name) = reference.strip_prefix("builtin://") {
+            if BUILTIN_TOOLS.contains(&name) {
+                return Ok(ToolTarget::Builtin { name: name.to_owned() });
+            }
+            return Err(SpecError::UnknownToolKind(reference.to_owned()));
         }
         Err(SpecError::UnknownToolKind(reference.to_owned()))
     }
@@ -251,7 +263,7 @@ pub enum SpecError {
     BadToolRef(String),
     #[error("node reference '{0}' is malformed (expected node://name@vN)")]
     BadNodeRef(String),
-    #[error("tool '{0}' has an unknown kind (only mcp:// and node:// are supported)")]
+    #[error("tool '{0}' has an unknown kind (mcp://, node:// and builtin://datasource_query are supported)")]
     UnknownToolKind(String),
     #[error("workflow nodes need a graph")]
     MissingGraph,
@@ -271,6 +283,8 @@ pub enum SpecError {
     BadVertex(String, String),
     #[error("budgets: {0}")]
     BadBudgets(String),
+    #[error("tools: {0}")]
+    BadTool(String),
     #[error("{0}")]
     BadSchema(String),
 }
@@ -287,7 +301,16 @@ impl NodeSpec {
         }
         self.guards_checked()?;
         for t in &self.tools {
-            ToolTarget::parse(&t.reference)?;
+            if let ToolTarget::Builtin { name } = ToolTarget::parse(&t.reference)? {
+                if t.effect != Effect::Read {
+                    return Err(SpecError::BadTool(format!("builtin://{name} is read only: declare it effect: read")));
+                }
+                if name == "datasource_query" && self.datasource_scopes().is_empty() {
+                    return Err(SpecError::BadTool(
+                        "builtin://datasource_query needs datasources.scopes (what it may read)".into(),
+                    ));
+                }
+            }
         }
         if let Some(s) = self.output_schema() {
             schema::check_supported(s).map_err(|e| SpecError::BadSchema(format!("prompt.output_schema: {e}")))?;
@@ -463,7 +486,7 @@ impl NodeSpec {
                 let r = str_field("node").ok_or_else(|| bad("config.node (node://name@vN) is required"))?;
                 match ToolTarget::parse(r)? {
                     ToolTarget::Node { .. } => {}
-                    ToolTarget::Mcp { .. } => return Err(bad("config.node must be a node:// reference")),
+                    _ => return Err(bad("config.node must be a node:// reference")),
                 }
             }
         }
