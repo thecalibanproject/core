@@ -37,6 +37,7 @@ mod stream;
 pub mod telemetry;
 #[cfg(test)]
 mod tests;
+pub mod tools;
 
 pub use auth::{InternalCaller, NodeTag};
 pub use error::{ApiError, Dialect};

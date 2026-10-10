@@ -336,6 +336,8 @@ pub(super) async fn call_tool(
                 let tool = cx.ex.tools.resolve(cx.tenant(), reference).map_err(|e| Stop::Fail(e.to_string()))?;
                 let ctx = ToolCtx {
                     tenant: cx.tenant().to_owned(),
+                    node: cx.run.node.clone(),
+                    node_version: cx.run.version,
                     run_id: cx.run.id.clone(),
                     step_id: step_id.to_owned(),
                     idempotency_key: idempotency_key(&cx.run.id, step_id),
@@ -366,6 +368,18 @@ async fn guarded_call(
             wait.as_secs()
         )));
     }
+    // Personal data: surrogates for a tool not trusted with it.
+    let args = if tool.trusted() {
+        args
+    } else {
+        ex.data
+            .protect(cx.tenant(), args)
+            .await
+            .map_err(|e| {
+                Stop::Fail(format!("tool '{reference}': its arguments could not be checked for personal data: {e}"))
+            })?
+            .0
+    };
     let mut attempt = 0;
     let mut pause = Duration::from_millis(50);
     let result = loop {
@@ -383,12 +397,17 @@ async fn guarded_call(
     if let Some(b) = ex.breakers.lock().get_mut(&key) {
         b.record(!failed, Instant::now(), ex.opts.breaker_failures);
     }
-    result.map_err(|e| match e {
+    let out = result.map_err(|e| match e {
         ToolError::Transient(m) if attempt > 0 => {
             Stop::Fail(format!("tool '{reference}': {m} (after {} attempts)", attempt + 1))
         }
         other => Stop::Fail(format!("tool '{reference}': {other}")),
-    })
+    })?;
+    // Untrusted input: anonymized as it enters the run.
+    ex.data
+        .anonymize(cx.tenant(), out)
+        .await
+        .map_err(|e| Stop::Fail(format!("tool '{reference}': its result could not be anonymized: {e}")))
 }
 
 /// Runs `node://name@vN` inside this run: its steps are journaled under `prefix`, its budget is a

@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use caliban_gateway::Gateway;
 use caliban_gateway::nodes::{Forwarder, LocalRuns, NodeRuns};
-use caliban_nodes::executor::{ExecutorOptions, NoTools};
+use caliban_nodes::executor::{ExecutorOptions, ToolRegistry};
 use caliban_nodes::journal::Journal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -126,9 +126,8 @@ impl NodeArgs {
             max_runs = opts.max_concurrent_runs,
             "node runs execute in this process"
         );
-        // TODO(P3 M4): the tenant tool registry with the MCP client; until then mcp:// tools are
-        // refused at run time with a clear error.
-        let executor = caliban_gateway::nodes::local_executor(gw, journal, Arc::new(NoTools), keyring, worker_id, opts);
+        let tools = tool_registry(gw, &keyring)?;
+        let executor = caliban_gateway::nodes::local_executor(gw, journal, tools, keyring, worker_id, opts);
         let stop = Arc::new(Notify::new());
         tokio::spawn(Arc::clone(&executor).run_loop(Arc::clone(&stop)));
         if self.node_run_retention_days > 0 {
@@ -138,6 +137,32 @@ impl NodeArgs {
         gw.set_nodes(NodeRuns::Local(LocalRuns { executor, sync_wait: self.sync_wait() }));
         Ok(stop)
     }
+}
+
+/// The tenant's approved MCP tools from the snapshot, reached through the egress guard
+/// (`CALIBAN_MCP_ALLOW_LOOPBACK` for development), with tokens signed by `CALIBAN_TOOL_TOKEN_KEY`.
+fn tool_registry(gw: &Arc<Gateway>, keyring: &Arc<caliban_config::Keyring>) -> Result<Arc<dyn ToolRegistry>> {
+    use caliban_mcp::egress::EgressPolicy;
+    let allow_loopback = std::env::var("CALIBAN_MCP_ALLOW_LOOPBACK").is_ok_and(|v| matches!(v.trim(), "1" | "true"));
+    if allow_loopback {
+        tracing::warn!("CALIBAN_MCP_ALLOW_LOOPBACK: node tools may reach loopback addresses (development only)");
+    }
+    let signer = caliban_mcp::token::ToolTokenSigner::from_env()
+        .map_err(anyhow::Error::msg)
+        .context("CALIBAN_TOOL_TOKEN_KEY")?;
+    match &signer {
+        Some(s) => tracing::info!(kid = s.key_id(), issuer = s.issuer(), "tool token signing key loaded"),
+        None => tracing::warn!(
+            "CALIBAN_TOOL_TOKEN_KEY is not set: tools of servers that verify Caliban tokens cannot be called"
+        ),
+    }
+    let client = Arc::new(caliban_mcp::client::McpClient::system(EgressPolicy { allow_loopback }));
+    Ok(Arc::new(caliban_gateway::tools::SnapshotTools::new(
+        gw.config.clone(),
+        Arc::clone(keyring),
+        client,
+        signer.map(Arc::new),
+    )))
 }
 
 /// Retention of finished runs: hourly, in batches (several workers may purge at once).

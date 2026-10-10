@@ -529,7 +529,7 @@ async fn unknown_and_unavailable_tools_fail_clearly() {
         let v = run(&ex, "uses-mcp", json!({})).await;
         assert_eq!(v.status, RunStatus::Failed);
         let e = v.error.unwrap();
-        assert!(e.contains("not available") && e.contains("M4"), "{e}");
+        assert!(e.contains("not available"), "{e}");
         assert_eq!(v.steps[0].status, StepStatus::Failed, "the failed step is recorded");
     }
 }

@@ -6,10 +6,9 @@
 //!   the same tenant, and node-to-node references form no cycle;
 //! - every datasource scope exists for the tenant ([`PublishContext::scope_exists`]);
 //! - its budgets fit inside the tenant's node caps ([`NodeCaps`]);
-//! - every `mcp://` tool stays pinned (static check) and passes [`PublishContext::check_tool`].
-//!   TODO(P3 M4): resolve `mcp://` references against the tenant's approved tool registry (pinned
-//!   manifests, re-approval on change) in that hook; until then any pinned reference passes and the
-//!   executor refuses to call it.
+//! - every `mcp://` tool stays pinned (static check) and passes [`PublishContext::check_tool`]: the
+//!   control plane resolves it against the tenant's approved tool registry (an approved manifest
+//!   with exactly that pin, on a live registered server).
 
 use crate::{NodeSpec, ToolTarget};
 use serde::{Deserialize, Serialize};
@@ -94,7 +93,7 @@ pub trait PublishContext {
     /// Another version of the tenant's nodes.
     fn version(&self, name: &str, version: u32) -> RefState;
     fn caps(&self) -> NodeCaps;
-    /// Hook for the approved tool registry (P3 M4). `mcp://` references reach it pinned.
+    /// The approved tool registry: `mcp://` references reach it pinned.
     fn check_tool(&self, _target: &ToolTarget) -> Result<(), String> {
         Ok(())
     }

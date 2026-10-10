@@ -18,11 +18,17 @@ use caliban_bench::mock::{Mock, MockConfig, Responder};
 use caliban_config::{Config, ConfigHandle, Keyring, Snapshot};
 use caliban_cp::ControlPlane;
 use caliban_cp::store::Store;
+use caliban_cp::tools::ToolsSetup;
 use caliban_gateway::Gateway;
 use caliban_gateway::nodes::{Forwarder, LocalRuns, NodeRuns, WORKER_TOKEN_HEADER, local_executor, worker_app};
+use caliban_gateway::tools::SnapshotTools;
+use caliban_mcp::client::McpClient;
+use caliban_mcp::egress::EgressPolicy;
+use caliban_mcp::testing::{TestMcpServer, TestTool};
+use caliban_mcp::token::ToolTokenSigner;
 use caliban_meter::idempotency::{IdempotencyStore, MemoryIdempotency};
 use caliban_meter::{RecentUsage, ShipOptions, Tee, UsageShipper, UsageSink};
-use caliban_nodes::executor::{Executor, ExecutorOptions, FnTool, StaticTools, Tool, ToolCtx, ToolInfo};
+use caliban_nodes::executor::{Executor, ExecutorOptions};
 use caliban_nodes::journal::memory::MemoryJournal;
 use caliban_nodes::journal::postgres::PgJournal;
 use caliban_nodes::journal::{Journal, RunStatus};
@@ -74,31 +80,40 @@ api_key_hashes = ["{hash}"]
     .unwrap()
 }
 
-/// The pinned catalogue tool of the reference node, stubbed in-process (the MCP client is M4).
-fn catalogue() -> (String, Arc<dyn Tool>) {
-    let info = ToolInfo {
+/// The catalogue tool of the reference node: its manifest, as an MCP server publishes it.
+fn catalogue_manifest() -> caliban_mcp::ToolManifest {
+    caliban_mcp::ToolManifest {
         name: "search_services".into(),
         description: "Searches the service catalogue for services that match a category and a case description.".into(),
         input_schema: json!({"type": "object", "required": ["category", "case"],
                              "properties": {"category": {"type": "string"}, "case": {"type": "string"}}}),
-    };
-    let manifest = caliban_mcp::ToolManifest {
-        name: info.name.clone(),
-        description: info.description.clone(),
-        input_schema: info.input_schema.clone(),
-    };
-    let reference = format!("mcp://catalogue/search_services#{}", manifest.pin());
-    let tool = FnTool {
-        info,
-        f: |_ctx: &ToolCtx, args: Value| {
-            let services = match args["category"].as_str() {
-                Some("clinical") => json!(["cardiology-clinic", "gp-same-day"]),
-                _ => json!(["front-desk"]),
-            };
-            Ok(json!({"services": services}))
-        },
-    };
-    (reference, Arc::new(tool))
+    }
+}
+
+fn catalogue_ref() -> String {
+    format!("mcp://catalogue/search_services#{}", catalogue_manifest().pin())
+}
+
+/// A real MCP server (rmcp, Streamable HTTP) serving the catalogue tool.
+async fn catalogue_server() -> TestMcpServer {
+    let tool = TestTool::new(catalogue_manifest(), |args: &Value| {
+        let services = match args["category"].as_str() {
+            Some("clinical") => json!(["cardiology-clinic", "gp-same-day"]),
+            _ => json!(["front-desk"]),
+        };
+        Ok(json!({"services": services}))
+    });
+    TestMcpServer::start(vec![tool], &[]).await
+}
+
+/// The key that signs minted tool tokens (control plane and workers share it).
+fn tool_signer() -> Arc<ToolTokenSigner> {
+    Arc::new(ToolTokenSigner::new(&[3; 32], "caliban", vec![]))
+}
+
+fn mcp_client() -> Arc<McpClient> {
+    // The test server listens on loopback.
+    Arc::new(McpClient::system(EgressPolicy { allow_loopback: true }))
 }
 
 /// Scripted model answers for the nodes in these tests (anything else gets the echo).
@@ -134,7 +149,8 @@ async fn env(latency: Duration) -> Env {
     let cp = Arc::new(
         ControlPlane::new(Store::new(cfg, handle.clone(), RecentUsage::default()), ADMIN.into(), "standalone")
             .with_keyring(Some(Arc::new(ring())))
-            .with_snapshots(None, Some(ROUTER_TOKEN.into())),
+            .with_snapshots(None, Some(ROUTER_TOKEN.into()))
+            .with_tools(ToolsSetup { client: mcp_client(), signer: Some(tool_signer()) }),
     );
     let cp_app = caliban_cp::app(Arc::clone(&cp), None);
     Env { mock, cp, cp_app, handle }
@@ -207,8 +223,7 @@ fn worker(
     let mut sinks: Vec<Arc<dyn UsageSink>> = vec![Arc::new(usage.clone())];
     sinks.extend(sink);
     let gw = Arc::new(Gateway::new(e.handle.clone(), Arc::new(Tee(sinks))).with_idempotency(Arc::clone(idem)));
-    let (reference, tool) = catalogue();
-    let tools = Arc::new(StaticTools::new().with(reference, tool));
+    let tools = Arc::new(SnapshotTools::new(e.handle.clone(), Arc::new(ring()), mcp_client(), Some(tool_signer())));
     let ex = local_executor(&gw, Arc::clone(journal), tools, Arc::new(ring()), id.into(), options(lease));
     gw.set_nodes(NodeRuns::Local(LocalRuns { executor: Arc::clone(&ex), sync_wait: Duration::from_secs(10) }));
     let app = caliban_gateway::app(Arc::clone(&gw));
@@ -249,8 +264,27 @@ async fn run_status(app: &Router, id: &str) -> Value {
 async fn the_reference_triage_node_runs_end_to_end() {
     let e = env(Duration::ZERO).await;
     let spec: Value = serde_json::from_str(include_str!("../../../config/nodes/triage.node.json")).unwrap();
-    let (reference, _) = catalogue();
-    assert_eq!(spec["tools"][0]["ref"], reference, "the reference node pins the catalogue manifest");
+    assert_eq!(spec["tools"][0]["ref"], catalogue_ref(), "the reference node pins the catalogue manifest");
+    // The catalogue is a real MCP server: registered, discovered, approved, then pinned.
+    let mcp = catalogue_server().await;
+    let jwks = tool_signer().jwks();
+    let audience = format!("http://127.0.0.1:{}", mcp.port);
+    let aud = audience.clone();
+    mcp.require_auth(move |h| {
+        let t = h.and_then(|h| h.strip_prefix("Bearer ")).ok_or("no bearer token")?;
+        caliban_mcp::token::verify(t, &jwks, "caliban", &aud, chrono::Utc::now().timestamp(), 5)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    });
+    let servers = "/api/v1/tenants/acme/tool-servers";
+    let (s, r) = send(&e.cp_app, "POST", servers, ADMIN, Some(json!({"name": "catalogue", "url": mcp.url})), &[]).await;
+    assert_eq!(s, StatusCode::CREATED, "{r}");
+    let (s, d) = send(&e.cp_app, "POST", &format!("{servers}/catalogue/discover"), ADMIN, None, &[]).await;
+    assert_eq!((s, d["tools"][0]["findings"].clone()), (StatusCode::OK, json!([])), "{d}");
+    let approve = json!({"pin": catalogue_manifest().pin()});
+    let uri = format!("{servers}/catalogue/tools/search_services/approve");
+    let (s, a) = send(&e.cp_app, "POST", &uri, ADMIN, Some(approve), &[]).await;
+    assert_eq!((s, a["ref"].as_str()), (StatusCode::OK, Some(catalogue_ref().as_str())), "{a}");
     e.publish("triage", spec).await;
     let j = journal().await;
     let store = idem();
@@ -297,10 +331,35 @@ async fn the_reference_triage_node_runs_end_to_end() {
     let steps: Vec<&str> = v["steps"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
     assert_eq!(steps, ["classify#0", "clarify#0", "catalogue#0", "recommend#0"]);
     assert_eq!(e.mock.len(), 2, "two model calls: classify and recommend");
-    // PII never reached the model server.
+    // PII never reached the model server, nor the (untrusted) tool server.
     for entry in e.mock.log() {
         assert!(!entry.body.to_string().contains(EMAIL), "{}", entry.body);
     }
+    let calls = mcp.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].args["category"], "clinical");
+    assert!(!calls[0].args.to_string().contains(EMAIL), "{:?}", calls[0].args);
+    // Every request to the tool server carried a token minted for this call; never the API key.
+    let auths = mcp.authorizations();
+    assert!(!auths.is_empty());
+    for a in &auths {
+        let a = a.as_deref().unwrap();
+        assert!(!a.contains(KEY), "the client's key never reaches a tool server");
+        let claims = caliban_mcp::token::verify(
+            a.strip_prefix("Bearer ").unwrap(),
+            &tool_signer().jwks(),
+            "caliban",
+            &audience,
+            chrono::Utc::now().timestamp(),
+            60,
+        )
+        .unwrap();
+        if claims.run_id != "discovery" {
+            assert_eq!((claims.sub.as_str(), claims.run_id.as_str()), ("tenant:acme/node:triage@v1", id.as_str()));
+            assert_eq!(claims.scope, "tool:search_services");
+        }
+    }
+    assert!(mcp.rejected().is_empty());
     // The second call was made (and metered) by worker b.
     assert_eq!(b.usage.snapshot(Some("acme"), 10).len(), 1);
 }
@@ -565,4 +624,61 @@ fn lease_owners_are_unique_per_process_under_a_stable_name() {
     let (a, b) = (crate::nodes::lease_owner("worker-0"), crate::nodes::lease_owner("worker-0"));
     assert!(a.starts_with("worker-0-") && b.starts_with("worker-0-"));
     assert_ne!(a, b, "two processes with the same CALIBAN_WORKER_ID never share a lease");
+}
+
+/// Personal data across tools: an untrusted tool server gets the tenant's surrogates (here, the
+/// masked form: the tenant's PII mode is `mask`), a server the tenant marks as trusted gets the
+/// value; results come back anonymized.
+#[tokio::test]
+async fn pii_reaches_only_trusted_tool_servers() {
+    let e = env(Duration::ZERO).await;
+    let echo = |name: &str| {
+        let m = caliban_mcp::ToolManifest {
+            name: name.into(),
+            description: "Records a contact.".into(),
+            input_schema: json!({"type": "object", "properties": {"email": {"type": "string"}}}),
+        };
+        let tool = TestTool::new(m.clone(), |args: &Value| {
+            Ok(json!({"stored": args["email"], "owner": "mary.major@example.org"}))
+        });
+        (m, tool)
+    };
+    let (m, tool) = echo("record");
+    let (crm, notes) =
+        (TestMcpServer::start(vec![tool.clone()], &[]).await, TestMcpServer::start(vec![tool], &[]).await);
+    let servers = "/api/v1/tenants/acme/tool-servers";
+    for (name, srv, trusted) in [("crm", &crm, true), ("notes", &notes, false)] {
+        let body = json!({"name": name, "url": srv.url, "auth": {"method": "none"}, "trusted": trusted});
+        assert_eq!(send(&e.cp_app, "POST", servers, ADMIN, Some(body), &[]).await.0, StatusCode::CREATED);
+        send(&e.cp_app, "POST", &format!("{servers}/{name}/discover"), ADMIN, None, &[]).await;
+        let uri = format!("{servers}/{name}/tools/record/approve");
+        assert_eq!(send(&e.cp_app, "POST", &uri, ADMIN, Some(json!({"pin": m.pin()})), &[]).await.0, StatusCode::OK);
+    }
+    let r = |s: &str| format!("mcp://{s}/record#{}", m.pin());
+    let spec = |s: &str| {
+        json!({
+            "kind": "workflow", "model_policy": {}, "budgets": {"steps": 5, "tokens": 10000, "wall_clock_s": 60},
+            "tools": [{"ref": r(s), "effect": "read"}],
+            "graph": {"vertices": [{"id": "save", "type": "tool", "config": {"tool": r(s), "args": {"email": "{{input.email}}"}}}],
+                      "edges": []}
+        })
+    };
+    e.publish("to-crm", spec("crm")).await;
+    e.publish("to-notes", spec("notes")).await;
+    let j: Arc<dyn Journal> = Arc::new(MemoryJournal::new());
+    let w = worker(&e, &j, &idem(), None, "worker-1", LONG);
+    let mut outputs = vec![];
+    for node in ["to-crm", "to-notes"] {
+        let uri = format!("/v1/nodes/{node}/runs");
+        let (s, v) = send(&w.app, "POST", &uri, KEY, Some(json!({"input": {"email": EMAIL}})), &[]).await;
+        assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("succeeded")), "{v}");
+        outputs.push(v);
+    }
+    assert_eq!(crm.calls()[0].args["email"], EMAIL, "the trusted server gets the value");
+    assert_eq!(notes.calls()[0].args["email"], "[EMAIL]", "the untrusted one never does");
+    // Results are anonymized as they enter the run.
+    for v in outputs {
+        assert!(!v["output"].to_string().contains("mary.major@example.org"), "{v}");
+        assert_eq!(v["output"]["owner"], "[EMAIL]", "{v}");
+    }
 }

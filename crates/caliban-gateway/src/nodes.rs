@@ -211,15 +211,18 @@ pub fn local_executor(
     worker_id: String,
     opts: ExecutorOptions,
 ) -> Arc<Executor> {
-    Arc::new(Executor::new(
-        journal,
-        Arc::new(GatewayModels::new(gw)),
-        tools,
-        Arc::new(SnapshotNodes::new(gw.config.clone(), Arc::clone(&keyring))),
-        snapshot_sealer(gw.config.clone(), keyring),
-        worker_id,
-        opts,
-    ))
+    Arc::new(
+        Executor::new(
+            journal,
+            Arc::new(GatewayModels::new(gw)),
+            tools,
+            Arc::new(SnapshotNodes::new(gw.config.clone(), Arc::clone(&keyring))),
+            snapshot_sealer(gw.config.clone(), keyring),
+            worker_id,
+            opts,
+        )
+        .with_data_guard(Arc::new(crate::tools::PiiGuard::new(gw))),
+    )
 }
 
 // ───────────────────────────── run API ─────────────────────────────

@@ -16,6 +16,7 @@ caliban-route.workspace = true
 caliban-providers.workspace = true
 caliban-meter.workspace = true
 caliban-nodes.workspace = true
+caliban-mcp.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 blake3.workspace = true

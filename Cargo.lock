@@ -807,6 +807,7 @@ dependencies = [
  "caliban-cache",
  "caliban-config",
  "caliban-ir",
+ "caliban-mcp",
  "caliban-meter",
  "caliban-nodes",
  "caliban-pii",

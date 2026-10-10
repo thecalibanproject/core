@@ -211,13 +211,14 @@ async fn human_input_and_timers_wake_runs() {
         let r = j.claim_next("w2", TTL).await.unwrap().expect(n);
         assert_eq!((r.id.as_str(), r.awaiting, r.prompt), ("run_1", None, None), "{n}");
 
-        // A durable sleep: not runnable before wake_at, runnable after.
+        // A durable sleep: not runnable before wake_at, runnable after. Past times are seconds in
+        // the past: the database clock (Postgres `now()`) may lag this host's by a little.
         let later = Utc::now() + chrono::Duration::hours(1);
         assert!(j.suspend("run_1", "w2", sleep_until(later, b)).await.unwrap());
         assert!(j.claim_next("w1", TTL).await.unwrap().is_none(), "{n}: asleep");
         j.create_run(new_run("run_2", "acme", None)).await.unwrap();
         j.claim("run_2", "w1", TTL).await.unwrap().unwrap();
-        let soon = Utc::now() - chrono::Duration::milliseconds(1);
+        let soon = Utc::now() - chrono::Duration::seconds(5);
         assert!(j.suspend("run_2", "w1", sleep_until(soon, b)).await.unwrap());
         assert_eq!(j.claim_next("w1", TTL).await.unwrap().map(|r| r.id), Some("run_2".into()), "{n}");
 
@@ -226,7 +227,7 @@ async fn human_input_and_timers_wake_runs() {
             status: RunStatus::InputRequired,
             awaiting: Some("ask#0".into()),
             prompt: None,
-            wake_at: Some(Utc::now() - chrono::Duration::milliseconds(1)),
+            wake_at: Some(Utc::now() - chrono::Duration::seconds(5)),
             budget: b,
         };
         assert!(j.suspend("run_2", "w1", timeout).await.unwrap());

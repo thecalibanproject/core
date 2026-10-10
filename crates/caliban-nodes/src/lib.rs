@@ -10,8 +10,9 @@
 //! Every model call the executor makes goes through a [`executor::ModelClient`], which the data
 //! plane implements with its own request pipeline (PII, cache, routing, quotas, metering, tracing).
 //!
-//! TODO(P3 M3): USD, depth and fan-out caps in the ledger, tenant spend caps. TODO(P3 M4): MCP
-//! client tools and the approved tool registry. TODO(P3 M8): WASM `code` vertices.
+//! Tools other than `node://` (MCP tools of the tenant's approved registry, built-in tools) are
+//! resolved through an [`executor::ToolRegistry`] the data plane provides. TODO(P3 M8): WASM `code`
+//! vertices.
 
 pub mod budget;
 pub mod diff;

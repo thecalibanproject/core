@@ -24,7 +24,7 @@ mod graph;
 pub mod template;
 pub mod tools;
 
-pub use tools::{FnTool, NoTools, StaticTools, Tool, ToolCtx, ToolError, ToolInfo, ToolRegistry};
+pub use tools::{DataGuard, FnTool, NoGuard, NoTools, StaticTools, Tool, ToolCtx, ToolError, ToolInfo, ToolRegistry};
 
 use crate::budget::{BudgetError, BudgetState, Ledger};
 use crate::journal::{
@@ -269,6 +269,7 @@ pub struct Executor {
     nodes: Arc<dyn NodeSource>,
     sealer: Arc<dyn Sealer>,
     guard: Arc<dyn RunGuard>,
+    data: Arc<dyn DataGuard>,
     worker: String,
     opts: ExecutorOptions,
     /// Wakes the claim loop (a run was created or answered here).
@@ -298,6 +299,7 @@ impl Executor {
             nodes,
             sealer,
             guard: Arc::new(AllowAll),
+            data: Arc::new(NoGuard),
             worker: worker.into(),
             opts,
             wake: Notify::new(),
@@ -318,6 +320,13 @@ impl Executor {
     #[must_use]
     pub fn with_guard(mut self, guard: Arc<dyn RunGuard>) -> Self {
         self.guard = guard;
+        self
+    }
+
+    /// PII handling across tools (see [`DataGuard`]).
+    #[must_use]
+    pub fn with_data_guard(mut self, data: Arc<dyn DataGuard>) -> Self {
+        self.data = data;
         self
     }
 
