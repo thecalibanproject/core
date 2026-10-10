@@ -671,6 +671,7 @@ dependencies = [
  "caliban-meter",
  "caliban-nodes",
  "caliban-pii",
+ "caliban-route",
  "caliban-types",
  "chrono",
  "clap",

@@ -116,6 +116,14 @@ pub struct UsageEvent {
     pub node_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// The path a `caliban/auto` request of a tenant that maps intents to nodes took:
+    /// `node/<name>@v<N>` (on the model calls of the run it started) or `model:<id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// Why such a request was answered by a model rather than a node (`low_confidence`,
+    /// `no_node_for_intent`, `node_not_allowed`, `node_unavailable`, `node_over_budget`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_fallback: Option<String>,
 }
 
 impl UsageEvent {

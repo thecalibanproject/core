@@ -96,6 +96,9 @@ pub struct Tenant {
     pub node_caps: Option<NodeCaps>,
     /// Daily and monthly caps on what the tenant's node runs spend (USD). `None`: no cap.
     pub node_spend_caps: Option<caliban_config::NodeSpendCaps>,
+    /// Intents `caliban/auto` hands to the tenant's nodes (intent to `node/<name>[@v<N>]`).
+    /// Overrides `[routing.tenants.<id>.routes]` of the config file, intent by intent.
+    pub node_routes: Option<BTreeMap<String, String>>,
     pub created_at: DateTime<Utc>,
     pub status: TenantStatus,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -433,6 +436,7 @@ impl State {
                 auto_cache_hit_fraction: t.auto_cache_hit_fraction,
                 node_caps: None,
                 node_spend_caps: None,
+                node_routes: None,
                 created_at: now,
                 status: TenantStatus::Active,
                 deleted_at: None,
@@ -583,6 +587,7 @@ const TENANT_FIELDS: &[&str] = &[
     "api_key_nodes",
     "data_key",
     "node_spend_caps",
+    "node_routes",
     "tool_servers",
     "tools",
     "datasources",
@@ -657,6 +662,9 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
             }
             if let Some(c) = t.node_spend_caps {
                 obj.insert("node_spend_caps".into(), json!(c));
+            }
+            if let Some(r) = t.node_routes.as_ref().filter(|r| !r.is_empty()) {
+                obj.insert("node_routes".into(), json!(r));
             }
             obj.insert(
                 "api_key_hashes".into(),
@@ -874,6 +882,8 @@ pub enum Mutation {
         node_caps: Option<Option<NodeCaps>>,
         /// `Some(None)` clears the spend caps (no cap).
         node_spend_caps: Option<Option<caliban_config::NodeSpendCaps>>,
+        /// `Some(None)` clears the intent to node map.
+        node_routes: Option<Option<BTreeMap<String, String>>>,
     },
     CreateProviderKey(ProviderKeyRecord),
     DeleteProviderKey {
@@ -1102,6 +1112,7 @@ impl Mutation {
                 auto_cache_hit_fraction,
                 node_caps,
                 node_spend_caps,
+                node_routes,
             } => {
                 let t = before.tenant(id);
                 let mut detail = json!({
@@ -1119,6 +1130,9 @@ impl Mutation {
                 }
                 if let Some(to) = node_spend_caps {
                     detail["node_spend_caps"] = json!({"from": t.and_then(|t| t.node_spend_caps), "to": to});
+                }
+                if let Some(to) = node_routes {
+                    detail["node_routes"] = json!({"from": t.and_then(|t| t.node_routes.clone()), "to": to});
                 }
                 d(Some(id), "tenant.update", id, detail)
             }

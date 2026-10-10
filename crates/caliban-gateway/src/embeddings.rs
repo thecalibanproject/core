@@ -111,6 +111,7 @@ async fn run(
         route: None,
         client_usage: true,
         node: None,
+        auto_fallback: None,
     };
     finish(&gw, &outcome, usage, 0, settlement).await;
     let mut resp = axum::Json(out).into_response();

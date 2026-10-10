@@ -506,6 +506,7 @@ struct TenantCreate {
     auto_cache_hit_fraction: Option<f64>,
     node_caps: Option<NodeCaps>,
     node_spend_caps: Option<caliban_config::NodeSpendCaps>,
+    node_routes: Option<std::collections::BTreeMap<String, String>>,
 }
 
 async fn create_tenant(
@@ -523,6 +524,9 @@ async fn create_tenant(
     if let Some(c) = &body.node_spend_caps {
         c.validate().map_err(bad)?;
     }
+    if let Some(r) = &body.node_routes {
+        caliban_config::check_node_routes(r).map_err(bad)?;
+    }
     let t = Tenant {
         id,
         name: body.name,
@@ -533,6 +537,7 @@ async fn create_tenant(
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
         node_caps: body.node_caps,
         node_spend_caps: body.node_spend_caps,
+        node_routes: body.node_routes,
         created_at: now_micros(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -562,6 +567,10 @@ struct TenantUpdate {
     /// Daily and monthly caps on the tenant's node spend (USD). Absent: kept. `null`: no cap.
     #[serde(default, deserialize_with = "present")]
     node_spend_caps: Option<Option<caliban_config::NodeSpendCaps>>,
+    /// Intents `caliban/auto` hands to nodes (`{"triage": "node/triage"}`). Absent: kept. `null`:
+    /// cleared (the config file's `[routing.tenants.<id>.routes]` still apply).
+    #[serde(default, deserialize_with = "present")]
+    node_routes: Option<Option<std::collections::BTreeMap<String, String>>>,
 }
 
 /// Tells an explicit `null` (`Some(None)`) from an absent field (`None`, with `#[serde(default)]`).
@@ -589,6 +598,7 @@ async fn update_tenant(
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
         node_caps: body.node_caps,
         node_spend_caps: body.node_spend_caps,
+        node_routes: body.node_routes,
     };
     let st = cp.store.apply(&p.actor, m).await?;
     st.tenant(&tenant_id).cloned().map(Json).ok_or_else(|| not_found("tenant"))

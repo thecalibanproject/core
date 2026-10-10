@@ -386,7 +386,10 @@ async fn chat_completions_and_messages_run_nodes_with_a_human_step() {
 }
 
 /// A worker serving the run API over HTTP, and a router (no journal) forwarding to it.
-async fn split(e: &crate::nodes_tests::Env, w: &Worker) -> (Arc<Gateway>, Router, tokio::task::JoinHandle<()>) {
+pub(crate) async fn split(
+    e: &crate::nodes_tests::Env,
+    w: &Worker,
+) -> (Arc<Gateway>, Router, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = worker_app(Arc::clone(&w.gw), WORKER_TOKEN.into());

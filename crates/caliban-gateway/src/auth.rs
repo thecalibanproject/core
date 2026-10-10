@@ -25,6 +25,8 @@ pub struct NodeTag {
     pub node: String,
     pub version: u32,
     pub run_id: String,
+    /// `node/<name>@v<N>` when `caliban/auto` started the run (the usage event's `route`).
+    pub route: Option<String>,
 }
 
 /// The caller of a request: the in-process caller when there is one, else the API key in the

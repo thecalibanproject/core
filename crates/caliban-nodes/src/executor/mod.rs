@@ -76,6 +76,8 @@ pub struct CallCtx {
     pub step_id: String,
     /// Derived from (run id, step id): the same for every attempt of the step.
     pub idempotency_key: String,
+    /// What started the run (`auto:<intent>`), if not a run request.
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1100,6 +1102,7 @@ impl RunCx {
             node_version: self.run.version,
             step_id: step_id.to_owned(),
             idempotency_key: idempotency_key(&self.run.id, step_id),
+            origin: self.run.origin.clone(),
         }
     }
 

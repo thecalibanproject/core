@@ -1,6 +1,8 @@
 //! `caliban` — one binary for every deployment shape (SaaS, VPC, air-gapped).
 
 #[cfg(test)]
+mod auto_tests;
+#[cfg(test)]
 mod exposure_tests;
 #[cfg(test)]
 mod kek_checkin_tests;

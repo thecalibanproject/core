@@ -150,6 +150,11 @@ pub struct TenantRouting {
     /// `false` turns Stage-1 kNN off for this tenant (rules only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knn: Option<bool>,
+    /// Intents that `caliban/auto` hands to a node of the tenant: intent to `node/<name>` (its live
+    /// version), `node/<name>@published` (the same) or `node/<name>@v<N>`. The tenant's own
+    /// `node_routes` setting (control plane) overrides these intent by intent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub routes: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_price_in_per_mtok: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,6 +245,10 @@ impl RoutingConfig {
             price("auto_price_in_per_mtok", t.auto_price_in_per_mtok)?;
             price("auto_price_out_per_mtok", t.auto_price_out_per_mtok)?;
         }
+        for (tenant, t) in &self.tenants {
+            check_node_routes(&t.routes)
+                .map_err(|e| ConfigError::Invalid(format!("routing.tenants.{tenant}.routes: {e}")))?;
+        }
         for (intent, us) in self.exemplars.iter().chain(self.tenants.values().flat_map(|t| t.exemplars.iter())) {
             if !valid_intent_id(intent) {
                 return Err(ConfigError::Invalid(format!(
@@ -267,6 +276,46 @@ pub fn valid_intent_id(s: &str) -> bool {
             c.next().is_some_and(|f| f.is_ascii_lowercase())
                 && c.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
         })
+}
+
+/// Where `caliban/auto` sends an intent of a tenant: a node, its live version or a pinned one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRoute {
+    pub name: String,
+    /// `None`: the live (promoted) version.
+    pub version: Option<u32>,
+}
+
+impl NodeRoute {
+    /// `node/<name>`, `node/<name>@published` or `node/<name>@v<N>`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let rest = s.strip_prefix("node/").ok_or_else(|| format!("'{s}' is not node/<name>"))?;
+        let (name, version) = match rest.split_once('@') {
+            None | Some((_, "published")) => (rest.split('@').next().unwrap_or_default(), None),
+            Some((n, v)) => match v.strip_prefix('v').and_then(|v| v.parse::<u32>().ok()) {
+                Some(v) if v > 0 => (n, Some(v)),
+                _ => return Err(format!("'{s}': the version is @v<N> or @published")),
+            },
+        };
+        let ok = !name.is_empty()
+            && name.len() <= 64
+            && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+        if !ok {
+            return Err(format!("'{s}': '{name}' is not a node name"));
+        }
+        Ok(Self { name: name.to_owned(), version })
+    }
+}
+
+/// Checks an intent to node map (intent ids and `node/...` targets).
+pub fn check_node_routes(routes: &BTreeMap<String, String>) -> Result<(), String> {
+    for (intent, target) in routes {
+        if !valid_intent_id(intent) {
+            return Err(format!("invalid intent id {intent:?} (lower snake case, dotted for domain.action)"));
+        }
+        NodeRoute::parse(target)?;
+    }
+    Ok(())
 }
 
 /// Request-rate and token-budget limits. Every field is optional (`None` = unlimited).
@@ -943,6 +992,10 @@ pub struct TenantConfig {
     /// every scope of the nodes it runs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub api_key_datasource_scopes: BTreeMap<String, Vec<String>>,
+    /// Intents that `caliban/auto` hands to nodes (intent to `node/<name>[@v<N>]`), set on the
+    /// control plane; overrides `[routing.tenants.<id>.routes]` intent by intent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_routes: BTreeMap<String, String>,
 }
 
 /// A datasource as the data plane sees it. Credentials in `connection` stay sealed under the
@@ -1301,6 +1354,8 @@ impl Config {
                     return Err(ConfigError::Invalid(format!("api key hash reused across tenants ({})", t.id)));
                 }
             }
+            check_node_routes(&t.node_routes)
+                .map_err(|e| ConfigError::Invalid(format!("tenant {}: node_routes: {e}", t.id)))?;
             if t.api_key_nodes.keys().any(|h| !t.api_key_hashes.iter().any(|k| k.eq_ignore_ascii_case(h))) {
                 return Err(ConfigError::Invalid(format!(
                     "tenant {}: api_key_nodes names a key it does not have",
@@ -1427,6 +1482,18 @@ impl Snapshot {
             .auto_cache_hit_fraction
             .or(self.config.routing.auto_cache_hit_fraction)
             .unwrap_or(DEFAULT_AUTO_CACHE_HIT_FRACTION)
+    }
+
+    /// The intents `caliban/auto` hands to nodes for a tenant: `[routing.tenants.<id>.routes]`
+    /// overlaid with the tenant's `node_routes` setting. Invalid entries are left out (validation
+    /// refuses them before a snapshot is served).
+    pub fn node_routes_for(&self, tenant: &TenantConfig) -> BTreeMap<String, NodeRoute> {
+        let file = self.config.routing.tenants.get(&tenant.id).map(|t| &t.routes);
+        file.into_iter()
+            .flatten()
+            .chain(&tenant.node_routes)
+            .filter_map(|(intent, target)| Some((intent.clone(), NodeRoute::parse(target).ok()?)))
+            .collect()
     }
 
     /// Effective rate limits / budgets for a tenant (`[limits]` overlaid with its override).
@@ -1684,6 +1751,26 @@ mod tests {
         let off =
             Snapshot::new(Config::from_toml_str(&toml.replace("enabled = true", "enabled = false")).unwrap(), "t");
         assert!(!off.semantic_cache_for(off.tenant(&"globex".into()).unwrap()), "deployment switch wins");
+    }
+
+    #[test]
+    fn caliban_auto_maps_intents_to_nodes() {
+        let ok = Config::from_toml_str(&format!(
+            "[routing.tenants.acme.routes]\ntriage = \"node/triage\"\n\"billing.refund\" = \"node/refunds@v3\"\nother = \"node/x@published\"\n{SHARED}"
+        ))
+        .unwrap();
+        assert_eq!(ok.routing.tenants[&TenantId::from("acme")].routes["triage"], "node/triage");
+        assert_eq!(
+            NodeRoute::parse("node/refunds@v3").unwrap(),
+            NodeRoute { name: "refunds".into(), version: Some(3) }
+        );
+        assert_eq!(NodeRoute::parse("node/x@published").unwrap(), NodeRoute { name: "x".into(), version: None });
+        for bad in ["model/x", "node/", "node/Bad Name", "node/x@3", "node/x@v0"] {
+            assert!(NodeRoute::parse(bad).is_err(), "{bad}");
+        }
+        for bad in ["[routing.tenants.acme.routes]\nBad = \"node/x\"", "[routing.tenants.acme.routes]\nok = \"x\""] {
+            assert!(Config::from_toml_str(&format!("{bad}\n{SHARED}")).is_err(), "{bad}");
+        }
     }
 
     #[test]

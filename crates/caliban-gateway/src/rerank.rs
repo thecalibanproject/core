@@ -141,6 +141,7 @@ async fn run(
         route: None,
         client_usage: true,
         node: None,
+        auto_fallback: None,
     };
     let model_id = outcome.model.id.to_string();
     finish(&gw, &outcome, usage, 0, settlement).await;

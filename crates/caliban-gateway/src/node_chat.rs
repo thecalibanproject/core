@@ -93,12 +93,20 @@ pub(crate) async fn maybe_handle(
     dialect: Dialect,
     internal: bool,
 ) -> Option<Response> {
-    // Cheap test first: most chat requests do not name a node.
-    if !body.windows(6).any(|w| w == b"\"node/") {
+    // Cheap test first: most chat requests do not name a node or continue a run.
+    let continued = headers.get(RUN_ID_HEADER).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty());
+    if continued.is_none() && !body.windows(6).any(|w| w == b"\"node/") {
         return None;
     }
     let v: Value = serde_json::from_slice(body).ok()?;
-    let target = parse_target(v.get("model")?.as_str()?)?;
+    let model = v.get("model")?.as_str()?;
+    if model == caliban_route::AUTO_MODEL
+        && let Some(id) = continued
+        && !internal
+    {
+        return Some(continue_auto(gw, headers, &v, dialect, id).await.unwrap_or_else(|e| dialect_error(dialect, e)));
+    }
+    let target = parse_target(model)?;
     Some(match handle(gw, headers, &v, dialect, internal, target).await {
         Ok(r) => r,
         Err(e) => dialect_error(dialect, e),
@@ -132,6 +140,26 @@ async fn handle(
         NodeChat { target, origin: None, check_spend: false, headers: vec![] },
     )
     .await
+    .map_err(ChatError::error)
+}
+
+/// Continuing a run that `caliban/auto` started: `model: "caliban/auto"` with `Caliban-Run-Id`
+/// goes on with the run's node, without classifying again.
+async fn continue_auto(
+    gw: &Arc<Gateway>,
+    headers: &HeaderMap,
+    v: &Value,
+    dialect: Dialect,
+    run_id: &str,
+) -> Result<Response, RunError> {
+    let caller = Caller::from_headers(gw, headers)?;
+    let req = parse_chat(v, dialect)?;
+    let runs = Runs::of(gw).ok_or_else(crate::runs::not_enabled)?;
+    let run = runs.view(&caller, headers, run_id).await?;
+    let name = run["node"].as_str().unwrap_or_default().to_owned();
+    let target = Target { name, version: None };
+    let nc = NodeChat { target, origin: None, check_spend: false, headers: vec![] };
+    respond(&runs, &caller, headers, &req, dialect, nc).await.map_err(ChatError::error)
 }
 
 pub(crate) fn parse_chat(v: &Value, dialect: Dialect) -> Result<ChatRequest, RunError> {
@@ -155,9 +183,25 @@ pub(crate) struct NodeChat {
     pub headers: Vec<(HeaderName, String)>,
 }
 
+/// Why a node chat request was not answered.
+#[derive(Debug)]
+pub(crate) enum ChatError {
+    /// Before a run started (or an answer was taken): `caliban/auto` falls back to a model.
+    NotStarted(RunError),
+    /// The run started (it may have spent): the client gets the error.
+    Run(RunError),
+}
+
+impl ChatError {
+    pub(crate) fn error(self) -> RunError {
+        match self {
+            Self::NotStarted(e) | Self::Run(e) => e,
+        }
+    }
+}
+
 /// Starts (or continues, with `Caliban-Run-Id`) a run for a chat request and answers in the
-/// client's dialect. An error before anything is sent is returned as is (so `caliban/auto` can
-/// fall back to a model).
+/// client's dialect.
 pub(crate) async fn respond(
     runs: &Runs<'_>,
     caller: &Caller,
@@ -165,15 +209,19 @@ pub(crate) async fn respond(
     req: &ChatRequest,
     dialect: Dialect,
     nc: NodeChat,
-) -> Result<Response, RunError> {
+) -> Result<Response, ChatError> {
+    use ChatError::{NotStarted, Run};
     let continued = auth.get(RUN_ID_HEADER).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty());
     let (run_id, version, events) = match continued {
         Some(id) => {
             let text = req
                 .last_user_text()
                 .filter(|t| !t.trim().is_empty())
-                .ok_or_else(|| bad("continuing a run: put the answer in the last user message"))?;
-            let (before, ev) = runs.answer(caller, auth, id, Some(&nc.target.name), answer_from_text(&text)).await?;
+                .ok_or_else(|| NotStarted(bad("continuing a run: put the answer in the last user message")))?;
+            let (before, ev) = runs
+                .answer(caller, auth, id, Some(&nc.target.name), answer_from_text(&text))
+                .await
+                .map_err(NotStarted)?;
             (id.to_owned(), before["version"].as_u64().and_then(|v| u32::try_from(v).ok()).unwrap_or_default(), ev)
         }
         None => {
@@ -187,7 +235,7 @@ pub(crate) async fn respond(
                 check_spend: nc.check_spend,
                 ..Start::default()
             };
-            runs.start(caller, auth, start).await?
+            runs.start(caller, auth, start).await.map_err(NotStarted)?
         }
     };
     let mut extra = nc.headers;
@@ -201,9 +249,11 @@ pub(crate) async fn respond(
     }
     let wait = runs.sync_wait();
     let run = match tokio::time::timeout(wait, last_run(events)).await {
-        Ok(r) => r.map_err(|m| RunError::new(StatusCode::BAD_GATEWAY, "upstream_error", Some("node_run_error"), m))?,
+        Ok(r) => {
+            r.map_err(|m| Run(RunError::new(StatusCode::BAD_GATEWAY, "upstream_error", Some("node_run_error"), m)))?
+        }
         Err(_) => {
-            return Err(RunError::new(
+            return Err(Run(RunError::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "timeout_error",
                 Some("node_run_timeout"),
@@ -211,10 +261,10 @@ pub(crate) async fn respond(
                     "run {run_id} is still going after {} s; it continues: follow it with GET /v1/runs/{run_id}",
                     wait.as_secs()
                 ),
-            ));
+            )));
         }
     };
-    ended_badly(&run)?;
+    ended_badly(&run).map_err(Run)?;
     let body = match dialect {
         Dialect::OpenAi => openai_body(&run),
         Dialect::Anthropic => anthropic_body(&run),

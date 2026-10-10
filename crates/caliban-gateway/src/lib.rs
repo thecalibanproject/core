@@ -12,6 +12,7 @@
 //! TODO: ontology grounding, Prometheus metrics.
 
 mod auth;
+mod auto_nodes;
 mod chat;
 pub mod datasource;
 pub mod embedder;

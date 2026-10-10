@@ -414,6 +414,8 @@ mod tests {
             node: None,
             node_version: None,
             run_id: None,
+            route: None,
+            route_fallback: None,
         }
     }
 

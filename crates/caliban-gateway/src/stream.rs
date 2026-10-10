@@ -920,6 +920,7 @@ trust_tier = "t2_contracted"
             route: None,
             client_usage,
             node: None,
+            auto_fallback: None,
         }
     }
 

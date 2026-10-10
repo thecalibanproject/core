@@ -57,6 +57,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (20, "api_key_datasource_scopes", include_str!("../../../../migrations/0020_api_key_datasource_scopes.sql")),
     (21, "node_exposure", include_str!("../../../../migrations/0021_node_exposure.sql")),
     (22, "audit_ingest", include_str!("../../../../migrations/0022_audit_ingest.sql")),
+    (23, "auto_node_routes", include_str!("../../../../migrations/0023_auto_node_routes.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -323,12 +324,12 @@ impl PgBackend {
                                       cached_prompt_tokens, tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts,
                                       requested_model, intent_confidence, route_stage, routed_model_cost_usd, flat_price_usd,
                                       cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens, billed_usd, saved_usd,
-                                      node, node_version, run_id)
+                                      node, node_version, run_id, route, route_fallback)
              SELECT * FROM UNNEST($1::TEXT[], $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::BIGINT[], $6::BIGINT[],
                                   $7::BIGINT[], $8::BIGINT[], $9::TEXT[], $10::INTEGER[], $11::FLOAT8[], $12::BIGINT[],
                                   $13::TIMESTAMPTZ[], $14::TEXT[], $15::REAL[], $16::TEXT[], $17::FLOAT8[], $18::FLOAT8[],
                                   $19::TEXT[], $20::TEXT[], $21::BIGINT[], $22::BIGINT[], $23::FLOAT8[], $24::FLOAT8[],
-                                  $25::TEXT[], $26::INTEGER[], $27::TEXT[])
+                                  $25::TEXT[], $26::INTEGER[], $27::TEXT[], $28::TEXT[], $29::TEXT[])
              ON CONFLICT (request_id) DO NOTHING",
         )
         .bind(col(&|e| e.request_id.clone()))
@@ -358,6 +359,8 @@ impl PgBackend {
         .bind(opt(&|e| e.node.clone()))
         .bind(events.iter().map(|e| e.node_version.map(|v| i32::try_from(v).unwrap_or(i32::MAX))).collect::<Vec<_>>())
         .bind(opt(&|e| e.run_id.clone()))
+        .bind(opt(&|e| e.route.clone()))
+        .bind(opt(&|e| e.route_fallback.clone()))
         .execute(&self.pool)
         .await
         .map_err(db)?;
@@ -639,7 +642,7 @@ impl Backend for PgBackend {
             "SELECT request_id, tenant_id, model, intent, prompt_tokens, completion_tokens, cached_prompt_tokens,
                     tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts, requested_model, intent_confidence,
                     route_stage, routed_model_cost_usd, flat_price_usd, cache_tier, usage_source, cache_write_tokens,
-                    cache_write_1h_tokens, billed_usd, saved_usd, node, node_version, run_id
+                    cache_write_1h_tokens, billed_usd, saved_usd, node, node_version, run_id, route, route_fallback
              FROM usage_event
              WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2)
                    AND ($3::TEXT IS NULL OR run_id = $3)
@@ -850,6 +853,8 @@ fn usage_row(r: &PgRow) -> Result<caliban_meter::UsageEvent, StoreError> {
         node: get(r, "node")?,
         node_version: get::<Option<i32>>(r, "node_version")?.map(|v| u32::try_from(v).unwrap_or(0)),
         run_id: get(r, "run_id")?,
+        route: get(r, "route")?,
+        route_fallback: get(r, "route_fallback")?,
     })
 }
 
@@ -888,7 +893,7 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
         Mutation::UpdateTenant { id, .. } => {
             let t = next.tenant(id).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
             let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3, semantic_cache = $4, auto_cache_hit_fraction = $5,
-                                       node_caps = $6, node_spend_caps = $7
+                                       node_caps = $6, node_spend_caps = $7, node_routes = $8
                      WHERE id = $1 AND status = 'active'";
             exec(
                 c,
@@ -899,7 +904,8 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
                     .bind(t.semantic_cache.as_str())
                     .bind(t.auto_cache_hit_fraction)
                     .bind(caps_json(t.node_caps)?)
-                    .bind(spend_json(t.node_spend_caps)?),
+                    .bind(spend_json(t.node_spend_caps)?)
+                    .bind(t.node_routes.as_ref().map(|r| Json(json_of(r)))),
             )
             .await
         }
@@ -1227,8 +1233,8 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         c,
         sqlx::query(
             "INSERT INTO tenant (id, name, region, pii_default, pii_surrogate_scope, semantic_cache, settings, created_at, status, deleted_at,
-                                 auto_cache_hit_fraction, node_caps, node_spend_caps)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                                 auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(&t.id)
         .bind(&t.name)
@@ -1242,9 +1248,14 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         .bind(t.deleted_at)
         .bind(t.auto_cache_hit_fraction)
         .bind(caps_json(t.node_caps)?)
-        .bind(spend_json(t.node_spend_caps)?),
+        .bind(spend_json(t.node_spend_caps)?)
+        .bind(t.node_routes.as_ref().map(|r| Json(json_of(r)))),
     )
     .await
+}
+
+fn json_of<T: Serialize>(v: &T) -> Value {
+    serde_json::to_value(v).unwrap_or(Value::Null)
 }
 
 fn spend_json(c: Option<caliban_config::NodeSpendCaps>) -> Result<Option<Json<Value>>, StoreError> {
@@ -1614,7 +1625,7 @@ async fn rows(c: &mut PgConnection, sql: &'static str) -> Result<Vec<PgRow>, Sto
 async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     let mut st = State::default();
 
-    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, node_spend_caps, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
         st.tenants.push(Tenant {
             id: get(&r, "id")?,
             name: get(&r, "name")?,
@@ -1625,6 +1636,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             auto_cache_hit_fraction: get(&r, "auto_cache_hit_fraction")?,
             node_caps: get::<Option<Json<Value>>>(&r, "node_caps")?.map(|j| parse(j.0)).transpose()?,
             node_spend_caps: get::<Option<Json<Value>>>(&r, "node_spend_caps")?.map(|j| parse(j.0)).transpose()?,
+            node_routes: get::<Option<Json<Value>>>(&r, "node_routes")?.map(|j| parse(j.0)).transpose()?,
             created_at: get(&r, "created_at")?,
             status: match get::<String>(&r, "status")?.as_str() {
                 "deleted" => TenantStatus::Deleted,

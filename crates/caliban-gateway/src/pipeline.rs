@@ -15,7 +15,7 @@ use crate::metering::{self, Metered};
 use crate::route_embed::{self, RouteMeta};
 use crate::{ApiError, Gateway, auth, limits, quirks, semantic, stream, telemetry};
 use axum::body::Bytes;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use caliban_cache::{CacheKeyParts, CachedResponse, cache_key};
 use caliban_config::{ModelEntry, ModelKind, ProviderConfig, Snapshot, TenantConfig};
@@ -56,6 +56,9 @@ pub(crate) struct Outcome {
     pub client_usage: bool,
     /// The node run that made the call (in-process node model calls).
     pub node: Option<auth::NodeTag>,
+    /// A `caliban/auto` request of a tenant that maps intents to nodes, answered by a model: why
+    /// it did not go to a node (`x-caliban-route-fallback`, the usage event's `route_fallback`).
+    pub auto_fallback: Option<&'static str>,
 }
 
 /// Entry point for both chat dialects.
@@ -138,6 +141,42 @@ async fn run(
     let route_meta = RouteMeta::new(&decision, &snap, &tenant, &req);
     span.record("caliban.route.intent", decision.intent.as_str());
     span.record("caliban.route.stage", decision.stage);
+
+    // caliban/auto may hand the request to one of the tenant's nodes, with this classification
+    // (see `auto_nodes`). Never for a node's own model calls.
+    let mut auto_fallback = None;
+    if decision.auto && internal.is_none() {
+        use crate::auto_nodes::{Choice, choose, reason};
+        match choose(&gw, &snap, &tenant, &caller.key_hash, &decision) {
+            Choice::NoRoutes => {}
+            Choice::Fallback(r) => auto_fallback = Some(r),
+            Choice::Node(target) => {
+                let runs = crate::runs::Runs::of(&gw).ok_or(CalibanError::Internal("node runs vanished".into()))?;
+                let node_caller = crate::runs::Caller {
+                    tenant: tenant.id.to_string(),
+                    key_hash: caller.key_hash.clone(),
+                    nodes: tenant.api_key_nodes.get(&caller.key_hash).cloned(),
+                };
+                let nc = crate::node_chat::NodeChat {
+                    target,
+                    origin: Some(format!("auto:{}", decision.intent)),
+                    check_spend: true,
+                    headers: vec![(HeaderName::from_static("x-caliban-intent"), route_meta.header.clone())],
+                };
+                match crate::node_chat::respond(&runs, &node_caller, headers, &req, dialect, nc).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(crate::node_chat::ChatError::NotStarted(e)) => {
+                        tracing::info!(request_id = %request_id, error = %e.message, "caliban/auto: the node did not start; answering with a model");
+                        auto_fallback = Some(reason(&e));
+                    }
+                    Err(crate::node_chat::ChatError::Run(e)) => return Ok(crate::node_chat::dialect_error(dialect, e)),
+                }
+            }
+        }
+        if let Some(r) = auto_fallback {
+            span.record("caliban.route.fallback", r);
+        }
+    }
 
     // Pseudonymize once; the protected copy is only sent to destinations outside the trust
     // boundary. Credentials block the request regardless. Tenant scope (default) uses the
@@ -275,6 +314,7 @@ async fn run(
             route: Some(route_meta.clone()),
             client_usage,
             node: internal.and_then(|i| i.node.clone()),
+            auto_fallback,
         };
 
         if let Some(k) = &key {
@@ -552,6 +592,10 @@ pub(crate) fn caliban_headers(h: &mut HeaderMap, o: &Outcome) {
         set("x-caliban-cache-tier", t.as_str().to_owned());
     }
     set("x-caliban-pii-entities", o.pii_entities.to_string());
+    if let Some(reason) = o.auto_fallback {
+        set(crate::node_chat::ROUTE_HEADER, format!("model:{}", o.model.id));
+        set(crate::node_chat::ROUTE_FALLBACK_HEADER, reason.to_owned());
+    }
     if o.dialect == Dialect::Anthropic {
         // Anthropic SDKs surface this as `_request_id`.
         set("request-id", o.request_id.to_string());
@@ -663,6 +707,12 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
         node: o.node.as_ref().map(|n| n.node.clone()),
         node_version: o.node.as_ref().map(|n| n.version),
         run_id: o.node.as_ref().map(|n| n.run_id.clone()),
+        route: o
+            .node
+            .as_ref()
+            .and_then(|n| n.route.clone())
+            .or_else(|| o.auto_fallback.map(|_| format!("model:{}", o.model.id))),
+        route_fallback: o.auto_fallback.map(str::to_owned),
     };
     let billed = if auto.is_some() { event.billed_usd } else { cost };
     gw.usage.record(event).await;

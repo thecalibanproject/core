@@ -50,9 +50,11 @@ pub(crate) fn ring() -> Keyring {
     Keyring::new([7; 32], [])
 }
 
-pub(crate) fn config(upstream: &str) -> Config {
+/// The test config with `extra` TOML in front (top-level tables such as `[routing]`).
+pub(crate) fn config_with(upstream: &str, extra: &str) -> Config {
     Config::from_toml_str(&format!(
         r#"
+{extra}
 [[models]]
 id = "oa/m"
 provider = "oa"
@@ -147,9 +149,14 @@ pub(crate) async fn env(latency: Duration) -> Env {
 
 /// An environment whose control plane reads `journal` (the console's run endpoints).
 pub(crate) async fn env_with(latency: Duration, journal: Option<Arc<dyn Journal>>) -> Env {
+    env_toml(latency, journal, "").await
+}
+
+/// An environment whose config file starts with `extra`.
+pub(crate) async fn env_toml(latency: Duration, journal: Option<Arc<dyn Journal>>, extra: &str) -> Env {
     let cfg = MockConfig { latency, responder: Some(responder()), ..MockConfig::default() };
     let mock = Mock::start("127.0.0.1:0", cfg).await.unwrap();
-    let cfg = config(&mock.base_url());
+    let cfg = config_with(&mock.base_url(), extra);
     let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "boot"));
     let cp = Arc::new(
         ControlPlane::new(Store::new(cfg, handle.clone(), RecentUsage::default()), ADMIN.into(), "standalone")

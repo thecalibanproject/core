@@ -143,6 +143,7 @@ pub(crate) fn request_span(op: &'static str, dialect: Dialect, request_id: &Requ
         caliban.pii.entities = Empty,
         caliban.route.intent = Empty,
         caliban.route.stage = Empty,
+        caliban.route.fallback = Empty,
         caliban.fallbacks = Empty,
     )
 }

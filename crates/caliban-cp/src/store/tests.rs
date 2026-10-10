@@ -92,6 +92,7 @@ fn tenant(id: &str) -> Tenant {
         auto_cache_hit_fraction: None,
         node_caps: None,
         node_spend_caps: None,
+        node_routes: None,
         created_at: ts(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -196,6 +197,7 @@ async fn suite(s: &Store) {
         auto_cache_hit_fraction: None,
         node_caps: None,
         node_spend_caps: None,
+        node_routes: None,
     };
     s.apply(A, to_session).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
@@ -213,6 +215,7 @@ async fn suite(s: &Store) {
         auto_cache_hit_fraction: None,
         node_caps: None,
         node_spend_caps: None,
+        node_routes: None,
     };
     s.apply(A, on).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
@@ -234,6 +237,7 @@ async fn suite(s: &Store) {
         auto_cache_hit_fraction: f,
         node_caps: None,
         node_spend_caps: None,
+        node_routes: None,
     };
     s.apply(A, fraction(Some(Some(0.1)))).await.unwrap();
     assert_eq!(s.state().tenant("globex").unwrap().auto_cache_hit_fraction, Some(0.1));
@@ -269,6 +273,7 @@ async fn suite(s: &Store) {
         auto_cache_hit_fraction: None,
         node_caps: None,
         node_spend_caps: None,
+        node_routes: None,
     };
     assert_eq!(s.apply(A, ghost).await.unwrap_err(), StoreError::NotFound("tenant".into()));
     let key = ApiKeyRecord {
@@ -1146,6 +1151,7 @@ async fn node_lifecycle(s: &Store) {
         auto_cache_hit_fraction: None,
         node_caps: Some(c),
         node_spend_caps: None,
+        node_routes: None,
     };
     invalid(s.apply(A, caps(Some(NodeCaps { steps: 0, ..NodeCaps::DEFAULT }))).await, "positive");
     s.apply(A, caps(Some(NodeCaps { steps: 3, ..NodeCaps::DEFAULT }))).await.unwrap();
@@ -1163,6 +1169,7 @@ async fn node_lifecycle(s: &Store) {
         auto_cache_hit_fraction: None,
         node_caps: None,
         node_spend_caps: Some(c),
+        node_routes: None,
     };
     let daily = caliban_config::NodeSpendCaps { daily_usd: Some(5.0), monthly_usd: None };
     invalid(
@@ -1172,6 +1179,23 @@ async fn node_lifecycle(s: &Store) {
     s.apply(A, spend(Some(daily))).await.unwrap();
     assert_eq!(s.state().tenant("globex").unwrap().node_spend_caps, Some(daily));
     assert_eq!(s.config.load().tenant(&"globex".into()).unwrap().node_spend_caps, Some(daily));
+    // caliban/auto's intent to node map: a tenant setting shipped in the snapshot, validated.
+    let routes = |r: Option<BTreeMap<String, String>>| Mutation::UpdateTenant {
+        id: "globex".into(),
+        pii_default: None,
+        pii_surrogate_scope: None,
+        semantic_cache: None,
+        auto_cache_hit_fraction: None,
+        node_caps: None,
+        node_spend_caps: None,
+        node_routes: Some(r),
+    };
+    let map = BTreeMap::from([("triage".to_owned(), "node/risk@v2".to_owned())]);
+    invalid(s.apply(A, routes(Some(BTreeMap::from([("Bad".to_owned(), "node/x".to_owned())])))).await, "intent");
+    invalid(s.apply(A, routes(Some(BTreeMap::from([("ok".to_owned(), "model/x".to_owned())])))).await, "node/<name>");
+    s.apply(A, routes(Some(map.clone()))).await.unwrap();
+    assert_eq!(s.state().tenant("globex").unwrap().node_routes, Some(map.clone()));
+    assert_eq!(s.config.load().tenant(&"globex".into()).unwrap().node_routes, map);
 
     // Retire: not while a published version calls it; a published version is not deleted.
     conflict(s.apply(A, retire("risk", 1)).await);
@@ -1320,7 +1344,7 @@ async fn usage_ingest(s: &Store) -> usage::UsageReport {
             json!({"requested_model": "ext/gpt", "routed_model_cost_usd": null,
                                               "flat_price_usd": null, "billed_usd": null, "usage_source": "estimated"}),
         ),
-        usage_event("r4", "globex", 4, json!({})),
+        usage_event("r4", "globex", 4, json!({"route": "model:ext/gpt", "route_fallback": "low_confidence"})),
     ];
     let r = s.ingest_usage(batch.clone()).await.unwrap();
     assert_eq!((r.accepted, r.duplicates, r.rejected), (4, 0, 0));
@@ -1363,6 +1387,11 @@ async fn usage_ingest(s: &Store) -> usage::UsageReport {
         "tokens_saved": 120, "cost_usd": 0.0, "routed_model_cost_usd": 0.0, "billed_usd": 0.0002, "saved_usd": 0.0008})
         ),
         "events round-trip"
+    );
+    assert_eq!(
+        (all.events[1].route.as_deref(), all.events[1].route_fallback.as_deref()),
+        (Some("model:ext/gpt"), Some("low_confidence")),
+        "the caliban/auto path round-trips"
     );
 
     let acme = s.usage_report(Some(&["acme".to_owned()]), 2).await.unwrap();

@@ -100,7 +100,12 @@ impl ModelClient for GatewayModels {
             .header(idempotency::HEADER, &ctx.idempotency_key)
             .body(Body::from(body.to_string()))
             .map_err(|e| ModelError::Rejected(e.to_string()))?;
-        let node = NodeTag { node: ctx.node.clone(), version: ctx.node_version, run_id: ctx.run_id.clone() };
+        let route = ctx
+            .origin
+            .as_deref()
+            .filter(|o| o.starts_with("auto:"))
+            .map(|_| format!("node/{}@v{}", ctx.node, ctx.node_version));
+        let node = NodeTag { node: ctx.node.clone(), version: ctx.node_version, run_id: ctx.run_id.clone(), route };
         req.extensions_mut().insert(InternalCaller { tenant: ctx.tenant.clone(), key_hash, node: Some(node) });
         let resp = crate::app(gw).oneshot(req).await.map_err(|e| ModelError::Unavailable(e.to_string()))?;
         let status = resp.status();

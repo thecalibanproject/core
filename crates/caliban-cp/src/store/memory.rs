@@ -264,6 +264,7 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             auto_cache_hit_fraction,
             node_caps,
             node_spend_caps,
+            node_routes,
         } => {
             let t = st
                 .tenants
@@ -294,6 +295,12 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                     c.validate().map_err(StoreError::Invalid)?;
                 }
                 t.node_spend_caps = *c;
+            }
+            if let Some(r) = node_routes {
+                if let Some(r) = r {
+                    caliban_config::check_node_routes(r).map_err(StoreError::Invalid)?;
+                }
+                t.node_routes.clone_from(r);
             }
         }
         Mutation::CreateApiKey(k) => {
