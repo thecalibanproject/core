@@ -844,21 +844,27 @@ async fn usage(State(cp): State<Cp>, Extension(p): Extension<Principal>, Query(q
         "estimated_requests": all.iter().filter(|e| e.usage_source == Some(caliban_meter::UsageSource::Estimated)).count(),
         "cache_hits": all.iter().filter(|e| e.cache == caliban_types::CacheStatus::Hit).count(),
         // What cache hits of both tiers saved customers (see `UsageEvent::saved_usd`).
-        "saved_usd": all.iter().filter_map(|e| e.saved_usd).sum::<f64>(),
+        "saved_usd": usd_total(all.iter().filter_map(|e| e.saved_usd)),
         "semantic_cache_hits": all.iter().filter(|e| e.cache_tier == Some(caliban_types::CacheTier::Semantic)).count(),
         "tokens_saved": all.iter().map(|e| e.tokens_saved + e.cached_prompt_tokens).sum::<u64>(),
-        "cost_usd": all.iter().filter_map(|e| e.cost_usd).sum::<f64>(),
+        "cost_usd": usd_total(all.iter().filter_map(|e| e.cost_usd)),
         // caliban/auto: the full flat price and what was billed (discounted on cache hits) vs the
         // routed models' real cost, over events with both prices.
         "auto_requests": auto.clone().count(),
         "auto_cache_hits": auto.clone().filter(|e| e.cache == caliban_types::CacheStatus::Hit).count(),
-        "flat_price_usd": priced.clone().filter_map(|e| e.flat_price_usd).sum::<f64>(),
-        "billed_usd": priced.clone().filter_map(caliban_meter::UsageEvent::auto_billed_usd).sum::<f64>(),
-        "auto_saved_usd": priced.clone().filter_map(|e| e.saved_usd).sum::<f64>(),
-        "routed_model_cost_usd": priced.clone().filter_map(|e| e.routed_model_cost_usd).sum::<f64>(),
-        "margin_usd": priced.filter_map(caliban_meter::UsageEvent::margin_usd).sum::<f64>(),
+        "flat_price_usd": usd_total(priced.clone().filter_map(|e| e.flat_price_usd)),
+        "billed_usd": usd_total(priced.clone().filter_map(caliban_meter::UsageEvent::auto_billed_usd)),
+        "auto_saved_usd": usd_total(priced.clone().filter_map(|e| e.saved_usd)),
+        "routed_model_cost_usd": usd_total(priced.clone().filter_map(|e| e.routed_model_cost_usd)),
+        "margin_usd": usd_total(priced.filter_map(caliban_meter::UsageEvent::margin_usd)),
     });
     Json(json!({ "events": events, "totals": totals }))
+}
+
+/// Sum of USD amounts, starting from +0.0: `Iterator::sum::<f64>()` returns -0.0 for an empty
+/// iterator, which the API would serialize as `-0.0` (and the console show as "-$0.00").
+fn usd_total(amounts: impl Iterator<Item = f64>) -> f64 {
+    amounts.fold(0.0, |acc, x| acc + x)
 }
 
 #[cfg(test)]
@@ -1085,6 +1091,21 @@ mod tests {
         close("margin_usd", 1.7 - 0.5);
         close("auto_saved_usd", 0.8);
         close("saved_usd", 0.8 + 0.3);
+    }
+
+    #[tokio::test]
+    async fn empty_usd_totals_are_positive_zero() {
+        assert!(std::iter::empty::<f64>().sum::<f64>().is_sign_negative(), "the pitfall usd_total avoids");
+        assert!(usd_total(std::iter::empty()).is_sign_positive());
+        let app = app(cp(), None);
+        let (s, u) = call(&app, "GET", "/api/v1/usage", None, true).await;
+        assert_eq!(s, StatusCode::OK);
+        let usd = ["cost_usd", "saved_usd", "flat_price_usd", "billed_usd", "auto_saved_usd", "routed_model_cost_usd"];
+        for k in usd.into_iter().chain(["margin_usd"]) {
+            let v = &u["totals"][k];
+            assert!(v.as_f64().is_some_and(|x| x == 0.0 && x.is_sign_positive()), "{k}: {v}");
+            assert_eq!(serde_json::to_string(v).unwrap(), "0.0", "{k}");
+        }
     }
 
     #[tokio::test]
