@@ -271,6 +271,13 @@ async fn the_reference_triage_node_runs_end_to_end() {
     assert_eq!((s, again["id"].as_str()), (StatusCode::ACCEPTED, Some(id.as_str())));
     assert_eq!(e.mock.len(), calls);
 
+    // The version is retired while the run waits: new runs are refused, this one drains.
+    let (s, r) = send(&e.cp_app, "POST", "/api/v1/tenants/acme/nodes/triage/versions/1/retire", ADMIN, None, &[]).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    let fresh = json!({"input": {"case": "Another case"}, "async": true});
+    let (s, _) = send(&a.app, "POST", "/v1/nodes/triage/runs", KEY, Some(fresh), &[]).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a retired version takes no new runs");
+
     // The worker restarts (a new process on the same journal); the answer goes to the new one.
     drop(a);
     let b = worker(&e, &j, &store, None, "worker-b", LONG);
@@ -463,4 +470,76 @@ async fn node_model_calls_reach_the_control_plane_usage_totals() {
     assert!(e.cp.store.state().has_tenant("acme"));
     shipper.shutdown(Duration::from_secs(2)).await;
     server.abort();
+}
+
+/// Workers never migrate: they refuse a database whose schema is behind or ahead of their build,
+/// and leave it untouched.
+#[tokio::test]
+async fn workers_refuse_a_schema_mismatch_and_never_migrate() {
+    use caliban_cp::store::postgres::MIGRATIONS;
+    use sqlx::{AssertSqlSafe, Row};
+    let Ok(url) = std::env::var("CALIBAN_TEST_DATABASE_URL") else {
+        eprintln!("CALIBAN_TEST_DATABASE_URL not set; skipping the worker schema test");
+        return;
+    };
+    let schema = format!("w_{}", uuid::Uuid::now_v7().simple());
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::raw_sql(AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&admin).await.unwrap();
+    let scoped = format!("{url}{}options=-c%20search_path%3D{schema}", if url.contains('?') { "&" } else { "?" });
+    let pool = sqlx::PgPool::connect(&scoped).await.unwrap();
+    let count = async |pool: &sqlx::PgPool| -> i64 {
+        sqlx::query("SELECT count(*) FROM caliban_schema_migrations").fetch_one(pool).await.unwrap().get(0)
+    };
+
+    // An empty database: refused, nothing created.
+    let e = crate::nodes::worker_journal(&scoped).await.err().unwrap();
+    assert!(format!("{e:#}").contains("no Caliban schema"), "{e:#}");
+    let tables: i64 = sqlx::query("SELECT count(*) FROM pg_tables WHERE schemaname = $1")
+        .bind(&schema)
+        .fetch_one(&admin)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(tables, 0, "the worker created nothing");
+
+    // Behind: the control plane of the previous release applied up to the second-to-last migration.
+    sqlx::raw_sql(
+        "CREATE TABLE caliban_schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
+                                                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let record = async |pool: &sqlx::PgPool, version: i64, name: &str, sql: &str| {
+        sqlx::query("INSERT INTO caliban_schema_migrations (version, name, checksum) VALUES ($1, $2, $3)")
+            .bind(version)
+            .bind(name)
+            .bind(hex_sha256(sql))
+            .execute(pool)
+            .await
+            .unwrap();
+    };
+    for &(version, name, sql) in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+        sqlx::raw_sql(AssertSqlSafe(sql)).execute(&pool).await.unwrap();
+        record(&pool, version, name, sql).await;
+    }
+    let e = crate::nodes::worker_journal(&scoped).await.err().unwrap();
+    assert!(format!("{e:#}").contains("behind this build"), "{e:#}");
+    assert_eq!(count(&pool).await, MIGRATIONS.len() as i64 - 1, "the worker did not migrate");
+
+    // Current: accepted.
+    let &(version, name, sql) = MIGRATIONS.last().unwrap();
+    sqlx::raw_sql(AssertSqlSafe(sql)).execute(&pool).await.unwrap();
+    record(&pool, version, name, sql).await;
+    crate::nodes::worker_journal(&scoped).await.unwrap();
+
+    // Ahead: a newer control plane applied a migration this worker does not know.
+    record(&pool, version + 1, "from_the_future", "SELECT 1").await;
+    let e = crate::nodes::worker_journal(&scoped).await.err().unwrap();
+    assert!(format!("{e:#}").contains("ahead of this build"), "{e:#}");
+}
+
+fn hex_sha256(s: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(s.as_bytes()))
 }

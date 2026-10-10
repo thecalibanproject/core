@@ -91,6 +91,11 @@ impl Nodes {
         spec.validate().unwrap();
         self.0.lock().insert((name.to_owned(), version), Arc::new(spec));
     }
+
+    /// The version leaves the data plane (retired).
+    fn retire(&self, name: &str, version: u32) {
+        self.0.lock().remove(&(name.to_owned(), version));
+    }
 }
 
 impl NodeSource for Nodes {
@@ -693,5 +698,40 @@ async fn run_data_is_sealed_at_rest_in_postgres() {
             "{s}"
         );
         assert!(h.sealer.open("acme", &v.id, s).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn retiring_a_version_drains_its_runs() {
+    for j in journals().await {
+        let h = Harness::new(j);
+        h.nodes.add(
+            "inner",
+            1,
+            json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(5, 10_000),
+                   "graph": {"vertices": [{"id": "say", "type": "llm", "config": {"prompt": "inner {{input}}"}}], "edges": []}}),
+        );
+        h.nodes.add(
+            "outer",
+            1,
+            json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(10, 10_000),
+                   "graph": {"vertices": [{"id": "ask", "type": "human", "config": {"question": "Go?"}},
+                                          {"id": "call", "type": "subnode", "config": {"node": "node://inner@v1", "input": "{{input.answer}}"}}],
+                             "edges": [{"from": "ask", "to": "call"}]}}),
+        );
+        let model = FakeModel::new(|body| text(&format!("<{}>", last_user(body))));
+        let ex = h.executor(&model, "w1");
+        let v = run(&ex, "outer", json!({"case": 1})).await;
+        assert_eq!(v.status, RunStatus::InputRequired, "{v:?}");
+        // Both versions are retired while the run waits: new runs are refused...
+        h.nodes.retire("outer", 1);
+        h.nodes.retire("inner", 1);
+        assert!(matches!(ex.create(start("outer", json!({}))).await, Err(ExecError::NotFound(_))));
+        // ...but the run in flight finishes on the versions it started on, the subnode included.
+        let ex2 = h.executor(&model, "w2");
+        assert_eq!(ex2.deliver_input("acme", &v.id, None, &json!("yes")).await.unwrap(), Delivered::Accepted);
+        assert!(ex2.run_now(&v.id).await.unwrap());
+        let v = ex2.view("acme", &v.id).await.unwrap().unwrap();
+        assert_eq!((v.status, v.output.clone()), (RunStatus::Succeeded, Some(json!("<inner yes>"))), "{v:?}");
     }
 }

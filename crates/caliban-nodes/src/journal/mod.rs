@@ -93,6 +93,9 @@ pub struct NewRun {
     pub budget: BudgetState,
     /// `Idempotency-Key` of the creating request and the request's fingerprint.
     pub idempotency: Option<(String, String)>,
+    /// Sealed: the specs of the run's version and of every version it can reach (`node://`), so a
+    /// run finishes on what it started on even if a version is retired meanwhile.
+    pub specs: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +109,8 @@ pub struct RunRecord {
     pub invoker_key_hash: Option<String>,
     /// Sealed.
     pub input: String,
+    /// Sealed: the node versions the run started on (see [`NewRun::specs`]).
+    pub specs: Option<String>,
     /// Sealed.
     pub output: Option<String>,
     pub status: RunStatus,

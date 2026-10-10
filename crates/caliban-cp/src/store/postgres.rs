@@ -48,7 +48,60 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (11, "router_status", include_str!("../../../../migrations/0011_router_status.sql")),
     (12, "node_versions", include_str!("../../../../migrations/0012_node_versions.sql")),
     (13, "node_journal", include_str!("../../../../migrations/0013_node_journal.sql")),
+    (14, "node_run_specs", include_str!("../../../../migrations/0014_node_run_specs.sql")),
 ];
+
+/// The schema version this build expects: its last embedded migration.
+pub fn schema_version() -> i64 {
+    MIGRATIONS.last().map_or(0, |m| m.0)
+}
+
+/// See [`PgBackend::check_schema`].
+pub async fn check_schema(pool: &PgPool) -> Result<(), StoreError> {
+    let want = schema_version();
+    let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('caliban_schema_migrations')::TEXT")
+        .fetch_one(pool)
+        .await
+        .map_err(db)?;
+    if exists.is_none() {
+        return Err(StoreError::Invalid(format!(
+            "the database has no Caliban schema; start the control plane of this release first (it applies the \
+             migrations, up to {want:04})"
+        )));
+    }
+    let rows: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT version, name, checksum FROM caliban_schema_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await
+            .map_err(db)?;
+    let applied = rows.last().map_or(0, |r| r.0);
+    if let Some(ahead) = rows.iter().find(|r| !MIGRATIONS.iter().any(|m| m.0 == r.0)) {
+        return Err(StoreError::Invalid(format!(
+            "the database schema is ahead of this build (migration {:04}_{} is applied, this build knows up to \
+             {want:04}); upgrade this process to the control plane's release",
+            ahead.0, ahead.1
+        )));
+    }
+    for &(version, name, sql) in MIGRATIONS {
+        match rows.iter().find(|r| r.0 == version) {
+            None => {
+                return Err(StoreError::Invalid(format!(
+                    "the database schema is behind this build (applied up to {applied:04}, this build needs \
+                     {want:04}; {version:04}_{name} is missing); upgrade the control plane first, it applies the \
+                     migrations"
+                )));
+            }
+            Some(r) if r.2 != hex::encode(Sha256::digest(sql.as_bytes())) => {
+                return Err(StoreError::Invalid(format!(
+                    "migration {version:04}_{name} in the database differs from this build's; the database and \
+                     this process come from different releases"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
 
 /// Advisory lock keys ("calibn" + n).
 const MIGRATE_LOCK: i64 = 0x6361_6c69_626e_0001;
@@ -261,6 +314,13 @@ impl PgBackend {
         }
         tx.commit().await.map_err(db)?;
         Ok(applied)
+    }
+
+    /// For processes that do not own migrations (node workers): the database schema must be exactly
+    /// the one this build embeds. Never writes anything. `Err` names what to do: run the control
+    /// plane of this release first (the schema is behind), or upgrade this process (it is ahead).
+    pub async fn check_schema(&self) -> Result<(), StoreError> {
+        check_schema(&self.pool).await
     }
 
     /// Writes `seed` if the database has never been seeded. Returns whether it did.

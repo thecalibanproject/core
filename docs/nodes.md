@@ -111,6 +111,12 @@ is a `422` listing every problem):
 Retiring a version that another published version calls is a `409`, as is deleting a published
 version (retire it first).
 
+**Retiring drains.** Runs already started finish on the version they started on; only new runs
+are refused (`404`). A run carries what it needs: when it is created, the spec of its version and
+of every version it can reach through `node://` references are stored with it (`node_run.specs`,
+sealed under the tenant's data key with the run id as associated data), so a worker can resume it
+after the version left the snapshot.
+
 **What the data plane receives.** Only published versions travel to routers and workers, in the
 signed snapshot, with the spec sealed under the tenant's data key (a self-contained `tenant_sealed`
 envelope, like BYOK keys; the key is created on the tenant's first secret or publish, and
@@ -170,8 +176,28 @@ CALIBAN_WORKER_URLS=http://worker-1:8082,http://worker-2:8082 CALIBAN_WORKER_TOK
 
 A router sends a run request to the next worker in turn and moves on when one cannot be reached.
 Workers share the journal, so any worker answers for any run, and an async run is picked up by
-whichever worker claims it first. A worker applies the embedded migrations at startup, like the
-control plane.
+whichever worker claims it first.
+
+**The control plane owns migrations.** A worker never changes the schema: at startup it checks
+that the database holds exactly the migrations it was built with (same versions, same checksums)
+and refuses to start otherwise, saying whether to upgrade the control plane first (the schema is
+behind) or the worker (the schema is ahead). Upgrade the control plane, then the workers. A worker
+needs no DDL rights; its database role needs:
+
+```sql
+GRANT SELECT ON caliban_schema_migrations TO caliban_worker;
+GRANT SELECT, INSERT, UPDATE, DELETE ON node_run, node_step, node_event TO caliban_worker;
+ALTER ROLE caliban_worker BYPASSRLS;  -- the journal tables have per-tenant row-level security; a worker serves every tenant
+```
+
+(`DELETE` on `node_run` is for the retention purge, which removes a finished run's steps and
+events with it. Later releases add tables to this list; see [Budgets](#budgets).)
+
+**More than one worker needs Valkey.** Exactly-once model calls across workers (a run taken over
+after a crash replays its in-flight call against the stored response) need the shared
+`Idempotency-Key` store: `[limits] store = "valkey"` with `CALIBAN_VALKEY_URL`. With the in-memory
+store the guarantee holds within one worker only, and a worker that starts with it logs a
+prominent warning.
 
 | Variable | Where | Meaning |
 |---|---|---|
@@ -265,6 +291,5 @@ against the mock model server with the catalogue tool stubbed in-process.
 - **P3 M5:** streaming run events (SSE), `model: "node/<name>"` on chat completions, the MCP server,
   run listing and cancellation.
 - **P3 M8:** `code` vertices (WASM), the console views, evals as promotion gates.
-- Runs of a version that is retired while they are in flight fail when they next need it. The
-  journal is not purged yet (rows of a deleted tenant stay, unreadable). Node specs are stored in
+- The journal is not purged yet (rows of a deleted tenant stay, unreadable). Node specs are stored in
   clear in the control-plane database, as before; they are sealed only in snapshots and journals.

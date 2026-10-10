@@ -367,11 +367,7 @@ pub(super) async fn subnode(
     if depth + 1 > max {
         return Err(Stop::Budget(format!("subnode {name}@v{version} would nest deeper than budgets.depth ({max})")));
     }
-    let child = cx
-        .ex
-        .nodes
-        .resolve(cx.tenant(), &name, Some(version))
-        .map_err(|e| Stop::Fail(format!("subnode {name}@v{version}: {e}")))?;
+    let child = cx.node(&name, version).map_err(|e| Stop::Fail(format!("subnode {name}@v{version}: {e}")))?;
     let b = &child.spec.budgets;
     let child_ledger = ledger.child(Budget { steps: b.steps, tokens: b.tokens });
     run_node(cx, &child, input, prefix, &child_ledger, depth + 1).await

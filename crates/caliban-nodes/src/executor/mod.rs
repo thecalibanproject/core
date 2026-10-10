@@ -294,6 +294,10 @@ impl Executor {
         }
         let id = format!("run_{}", uuid::Uuid::now_v7().simple());
         let input = self.sealer.seal(&req.tenant, &id, &req.input.to_string()).map_err(ExecError::Internal)?;
+        // The run keeps the versions it starts on: retiring one later drains it instead of
+        // failing the runs in flight.
+        let specs = pin_specs(&self.nodes, &req.tenant, &node);
+        let specs = self.sealer.seal(&req.tenant, &id, &specs.to_string()).map_err(ExecError::Internal)?;
         let b = &node.spec.budgets;
         let run = NewRun {
             id,
@@ -306,6 +310,7 @@ impl Executor {
             input,
             budget: BudgetState::new(b.steps, b.tokens, b.wall_clock_s),
             idempotency: req.idempotency,
+            specs: Some(specs),
         };
         let out = match self.journal.create_run(run).await? {
             Created::New(r) => (r, true),
@@ -623,6 +628,8 @@ pub(crate) struct RunCx {
     pub ex: Arc<Executor>,
     pub run: RunRecord,
     pub root: ResolvedNode,
+    /// The versions the run started on (`node_run.specs`), by (name, version).
+    pinned: HashMap<(String, u32), ResolvedNode>,
     pub input: Value,
     pub ledger: Ledger,
     recorded: HashMap<String, StepRecord>,
@@ -637,10 +644,23 @@ pub(crate) struct RunCx {
 
 impl RunCx {
     async fn load(ex: Arc<Executor>, run: RunRecord) -> Result<Self, Stop> {
-        let root = ex
-            .nodes
-            .resolve(&run.tenant_id, &run.node, Some(run.version))
-            .map_err(|e| Stop::Fail(format!("node {}@v{} cannot run: {e}", run.node, run.version)))?;
+        let pinned = match &run.specs {
+            Some(sealed) => {
+                let text = ex
+                    .sealer
+                    .open(&run.tenant_id, &run.id, sealed)
+                    .map_err(|e| Stop::Fail(format!("the run's node versions cannot be opened: {e}")))?;
+                open_pinned(&text).map_err(Stop::Fail)?
+            }
+            None => HashMap::new(),
+        };
+        let root = match pinned.get(&(run.node.clone(), run.version)) {
+            Some(n) => n.clone(),
+            None => ex
+                .nodes
+                .resolve(&run.tenant_id, &run.node, Some(run.version))
+                .map_err(|e| Stop::Fail(format!("node {}@v{} cannot run: {e}", run.node, run.version)))?,
+        };
         if root.hash != run.spec_hash {
             return Err(Stop::Fail(format!(
                 "node {}@v{} changed under the run (hash {} instead of {})",
@@ -666,6 +686,7 @@ impl RunCx {
             elapsed_base_ms: b.wall_clock_ms_used,
             ex,
             root,
+            pinned,
             input,
             ledger,
             recorded,
@@ -679,6 +700,15 @@ impl RunCx {
 
     pub fn tenant(&self) -> &str {
         &self.run.tenant_id
+    }
+
+    /// A version this run calls: the one it started on, else (runs created before versions were
+    /// pinned) the published one.
+    pub fn node(&self, name: &str, version: u32) -> Result<ResolvedNode, String> {
+        match self.pinned.get(&(name.to_owned(), version)) {
+            Some(n) => Ok(n.clone()),
+            None => self.ex.nodes.resolve(self.tenant(), name, Some(version)),
+        }
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -929,6 +959,48 @@ impl RunCx {
             .map_err(|e| Stop::Fail(format!("the answer to {step_id} cannot be opened: {e}")))?;
         Ok(Some(serde_json::from_str(&text).unwrap_or(Value::String(text))))
     }
+}
+
+/// The run's version and every version it can reach through `node://` references, as JSON:
+/// `{"name@vN": {"hash": ..., "spec": ...}}`. A reference that cannot be resolved now is left out
+/// (it fails when the run reaches it, as it would have without pinning).
+fn pin_specs(nodes: &Arc<dyn NodeSource>, tenant: &str, root: &ResolvedNode) -> Value {
+    let mut all: Vec<ResolvedNode> = vec![root.clone()];
+    let mut i = 0;
+    while i < all.len() {
+        for (name, version) in all[i].spec.node_refs() {
+            if !all.iter().any(|n| n.name == name && n.version == version)
+                && let Ok(n) = nodes.resolve(tenant, &name, Some(version))
+            {
+                all.push(n);
+            }
+        }
+        i += 1;
+    }
+    let mut out = serde_json::Map::new();
+    for n in all {
+        out.insert(format!("{}@v{}", n.name, n.version), json!({"hash": n.hash, "spec": n.spec.as_ref()}));
+    }
+    Value::Object(out)
+}
+
+/// Parses what [`pin_specs`] stored.
+fn open_pinned(text: &str) -> Result<HashMap<(String, u32), ResolvedNode>, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("the run's node versions: {e}"))?;
+    let mut out = HashMap::new();
+    for (key, entry) in v.as_object().into_iter().flatten() {
+        let Some((name, version)) = key.split_once("@v").and_then(|(n, v)| Some((n, v.parse::<u32>().ok()?))) else {
+            return Err(format!("the run's node versions: bad key '{key}'"));
+        };
+        let spec: NodeSpec = serde_json::from_value(entry.get("spec").cloned().unwrap_or(Value::Null))
+            .map_err(|e| format!("the run's node version {key}: {e}"))?;
+        let hash = entry.get("hash").and_then(Value::as_str).unwrap_or_default().to_owned();
+        out.insert(
+            (name.to_owned(), version),
+            ResolvedNode { name: name.to_owned(), version, hash, spec: Arc::new(spec) },
+        );
+    }
+    Ok(out)
 }
 
 /// Aborts the task when dropped.

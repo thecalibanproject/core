@@ -318,6 +318,8 @@ async fn main() -> Result<()> {
         let keyring = keyring.context("a node worker needs CALIBAN_KEK (it opens node specs and tenant data keys)")?;
         let url = database_url().context("a node worker needs CALIBAN_DATABASE_URL (the node run journal)")?;
         let worker_token = cli.nodes.worker_token()?;
+        // Before the snapshot: a worker on the wrong schema refuses to start (it never migrates).
+        let journal = nodes::worker_journal(&url).await?;
         let token = std::env::var("CALIBAN_ROUTER_TOKEN").context("CALIBAN_ROUTER_TOKEN is required for a worker")?;
         let keys = std::env::var("CALIBAN_SNAPSHOT_PUBLIC_KEY")
             .context("CALIBAN_SNAPSHOT_PUBLIC_KEY is required for a worker")?;
@@ -346,7 +348,7 @@ async fn main() -> Result<()> {
         };
         let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default(), shipper.as_ref()))?);
         spawn_router_warmup(&gw);
-        let journal = nodes::postgres_journal(&url, true).await?;
+        nodes::warn_if_local_idempotency(&gw);
         let stop = cli.nodes.run_locally(&gw, journal, Arc::new(keyring.clone()), worker_id)?;
         let res = serve("worker", args.listen.clone(), caliban_gateway::nodes::worker_app(gw, worker_token)).await;
         stop.notify_waiters();
@@ -399,7 +401,7 @@ async fn main() -> Result<()> {
             let stop = match keyring {
                 Some(k) => {
                     let journal: Arc<dyn caliban_nodes::journal::Journal> = match database_url() {
-                        Some(url) => nodes::postgres_journal(&url, false).await?,
+                        Some(url) => nodes::postgres_journal(&url).await?,
                         None => Arc::new(caliban_nodes::journal::memory::MemoryJournal::new()),
                     };
                     Some(cli.nodes.run_locally(&purge_gw, journal, Arc::new(k.clone()), nodes::worker_id())?)

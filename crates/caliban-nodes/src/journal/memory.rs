@@ -92,6 +92,7 @@ impl Journal for MemoryJournal {
             invoker: run.invoker,
             invoker_key_hash: run.invoker_key_hash,
             input: run.input,
+            specs: run.specs,
             output: None,
             status: RunStatus::Pending,
             wake_at: None,

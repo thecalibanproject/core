@@ -134,20 +134,34 @@ pub fn worker_id() -> String {
     format!("{base}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
 }
 
-/// The Postgres journal. `migrate`: apply the embedded migrations first (workers; in standalone
-/// the control-plane store already did).
-pub async fn postgres_journal(url: &str, migrate: bool) -> Result<Arc<dyn Journal>> {
-    if migrate {
-        let pg = caliban_cp::store::postgres::PgBackend::connect(url)
-            .await
-            .context("connecting to Postgres (CALIBAN_DATABASE_URL)")?;
-        let applied = pg.migrate().await.context("applying migrations")?;
-        if !applied.is_empty() {
-            tracing::info!(?applied, "applied migrations");
-        }
-    }
+/// The Postgres journal of a worker. Workers never migrate (the control plane owns migrations, and
+/// a worker needs no DDL rights): the schema must be exactly the one this build expects, else the
+/// worker refuses to start with what to do.
+pub async fn worker_journal(url: &str) -> Result<Arc<dyn Journal>> {
+    let pg = caliban_cp::store::postgres::PgBackend::connect(url)
+        .await
+        .context("connecting to Postgres (CALIBAN_DATABASE_URL)")?;
+    pg.check_schema().await.map_err(|e| anyhow::anyhow!("{e}")).context("checking the database schema")?;
+    let j = caliban_nodes::journal::postgres::PgJournal::from_pool(pg.pool().clone());
+    Ok(Arc::new(j))
+}
+
+/// The Postgres journal of a standalone process (its control plane migrated the database).
+pub async fn postgres_journal(url: &str) -> Result<Arc<dyn Journal>> {
     let j = caliban_nodes::journal::postgres::PgJournal::connect(url)
         .await
         .context("opening the node journal (CALIBAN_DATABASE_URL)")?;
     Ok(Arc::new(j))
+}
+
+/// Exactly-once model calls across workers need a shared `Idempotency-Key` store: with the
+/// in-memory one, a step replayed on another worker after a crash may pay its model call twice.
+pub fn warn_if_local_idempotency(gw: &Gateway) {
+    if gw.idempotency.kind() == "memory" {
+        tracing::warn!(
+            "IDEMPOTENCY STORE IS IN MEMORY: model calls are exactly-once only within this worker. With more than \
+             one worker, set [limits] store = \"valkey\" (CALIBAN_VALKEY_URL) on the control plane, or a run taken \
+             over after a crash may pay an in-flight model call twice"
+        );
+    }
 }

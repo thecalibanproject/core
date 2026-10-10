@@ -34,6 +34,7 @@ pub(crate) fn new_run(id: &str, tenant: &str, key: Option<(&str, &str)>) -> NewR
         input: "sealed-input".into(),
         budget: BudgetState::new(10, 1000, 60),
         idempotency: key.map(|(k, f)| (k.to_owned(), f.to_owned())),
+        specs: Some("sealed-specs".into()),
     }
 }
 
@@ -76,6 +77,7 @@ async fn idempotency_keys_return_the_first_run() {
             panic!("{n}")
         };
         assert_eq!((a.status, a.claims, a.output.is_none()), (RunStatus::Pending, 0, true), "{n}");
+        assert_eq!(a.specs.as_deref(), Some("sealed-specs"), "{n}: the pinned versions are stored");
         assert_eq!(
             j.create_run(new_run("run_b", "acme", Some(("k1", "fp1")))).await.unwrap(),
             Created::Existing(a.clone()),

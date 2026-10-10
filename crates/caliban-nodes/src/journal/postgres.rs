@@ -1,5 +1,5 @@
 //! Postgres journal (`CALIBAN_DATABASE_URL`): the tables of `migrations/0013_node_journal.sql`,
-//! which the control plane's migration runner applies (workers run it at startup too).
+//! which the control plane's migration runner applies (workers only check the schema version).
 //!
 //! Workers claim with `UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED)`: a row locked by
 //! one claimer is skipped by the others, so concurrent workers never claim the same run, and the
@@ -12,12 +12,16 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 use sqlx::types::Json;
 use sqlx::{Postgres, Row};
 
-/// The journal migration (also registered in the control plane's migration list).
-pub const MIGRATION: &str = include_str!("../../../../migrations/0013_node_journal.sql");
+/// The journal's migrations, in order (also registered in the control plane's migration list,
+/// which applies them; workers only check the schema version).
+pub const MIGRATIONS: &[&str] = &[
+    include_str!("../../../../migrations/0013_node_journal.sql"),
+    include_str!("../../../../migrations/0014_node_run_specs.sql"),
+];
 
 macro_rules! run_columns {
     () => {
-        "id, tenant_id, node, version, spec_hash, invoker, invoker_key_hash, input, output, status, wake_at, awaiting, \
+        "id, tenant_id, node, version, spec_hash, invoker, invoker_key_hash, input, specs, output, status, wake_at, awaiting, \
          prompt, budget, lease_owner, lease_expires_at, claims, error, stop_reason, idempotency_key, \
          idempotency_fingerprint, created_at, updated_at, started_at, finished_at"
     };
@@ -75,6 +79,7 @@ fn run_row(r: &PgRow) -> JResult<RunRecord> {
         invoker: get(r, "invoker")?,
         invoker_key_hash: get(r, "invoker_key_hash")?,
         input: get(r, "input")?,
+        specs: get(r, "specs")?,
         output: get(r, "output")?,
         status: RunStatus::parse(&status).ok_or_else(|| JournalError(format!("unknown run status {status}")))?,
         wake_at: get(r, "wake_at")?,
@@ -153,7 +158,9 @@ impl PgJournal {
             .map_err(|e| JournalError(format!("database url: {e}")))?
             .options([("search_path", schema.as_str())]);
         let j = Self::connect_with(opts).await?;
-        sqlx::raw_sql(MIGRATION).execute(&j.pool).await.map_err(db)?;
+        for m in MIGRATIONS {
+            sqlx::raw_sql(*m).execute(&j.pool).await.map_err(db)?;
+        }
         Ok(j)
     }
 
@@ -179,8 +186,8 @@ impl Journal for PgJournal {
         let (key, fp) = run.idempotency.clone().map_or((None, None), |(k, f)| (Some(k), Some(f)));
         let inserted = sqlx::query(concat!(
             "INSERT INTO node_run (id, tenant_id, node, version, spec_hash, invoker, invoker_key_hash, input, status,
-                                   budget, idempotency_key, idempotency_fingerprint)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11)
+                                   budget, idempotency_key, idempotency_fingerprint, specs)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12)
              ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
              RETURNING ",
             run_columns!()
@@ -196,6 +203,7 @@ impl Journal for PgJournal {
         .bind(budget_json(&run.budget)?)
         .bind(&key)
         .bind(&fp)
+        .bind(&run.specs)
         .fetch_optional(&self.pool)
         .await
         .map_err(db)?;
