@@ -468,6 +468,22 @@ async fn node_model_calls_reach_the_control_plane_usage_totals() {
     want.sort_unstable();
     assert_eq!(ids, want);
     assert!(e.cp.store.state().has_tenant("acme"));
+    // Tagged with the node, its version and the run: the run's cost is its usage.
+    let run_id = v["id"].as_str().unwrap();
+    for ev in u["events"].as_array().unwrap() {
+        assert_eq!(
+            (&ev["node"], &ev["node_version"], &ev["run_id"]),
+            (&json!("two"), &json!(1), &json!(run_id)),
+            "{ev}"
+        );
+    }
+    let (_, by_run) = send(&e.cp_app, "GET", &format!("/api/v1/usage?run_id={run_id}"), ADMIN, None, &[]).await;
+    let charged = by_run["totals"]["charged_usd"].as_f64().unwrap();
+    assert!(charged > 0.0, "{by_run}");
+    let cost = v["cost_usd"].as_f64().unwrap();
+    assert!((cost - charged).abs() < 1e-9, "run cost {cost} vs usage {charged}");
+    let (_, by_node) = send(&e.cp_app, "GET", "/api/v1/usage?node=two", ADMIN, None, &[]).await;
+    assert_eq!(by_node["by_node"], json!([{"node": "two", "node_version": 1, "totals": by_run["totals"]}]));
     shipper.shutdown(Duration::from_secs(2)).await;
     server.abort();
 }

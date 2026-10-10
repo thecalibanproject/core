@@ -54,6 +54,8 @@ pub(crate) struct Outcome {
     /// for Anthropic clients, whose events carry usage). Usage is requested upstream regardless,
     /// and stripped from what the client receives when this is false.
     pub client_usage: bool,
+    /// The node run that made the call (in-process node model calls).
+    pub node: Option<auth::NodeTag>,
 }
 
 /// Entry point for both chat dialects.
@@ -272,6 +274,7 @@ async fn run(
             est_prompt_tokens: est_prompt,
             route: Some(route_meta.clone()),
             client_usage,
+            node: internal.and_then(|i| i.node.clone()),
         };
 
         if let Some(k) = &key {
@@ -657,6 +660,9 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
         flat_price_usd: billing.flat_price_usd,
         billed_usd: billing.billed_usd,
         saved_usd: billing.saved_usd,
+        node: o.node.as_ref().map(|n| n.node.clone()),
+        node_version: o.node.as_ref().map(|n| n.version),
+        run_id: o.node.as_ref().map(|n| n.run_id.clone()),
     };
     let billed = if auto.is_some() { event.billed_usd } else { cost };
     gw.usage.record(event).await;

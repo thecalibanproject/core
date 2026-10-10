@@ -53,6 +53,9 @@ pub struct CallCtx {
     /// The invoking API key's hash: the call is authorized, rate-limited and metered as that key.
     pub invoker_key_hash: Option<String>,
     pub run_id: String,
+    /// The run's node and version (a subnode's calls are the run's: they carry the root node).
+    pub node: String,
+    pub node_version: u32,
     pub step_id: String,
     /// Derived from (run id, step id): the same for every attempt of the step.
     pub idempotency_key: String,
@@ -824,6 +827,8 @@ impl RunCx {
             tenant: self.run.tenant_id.clone(),
             invoker_key_hash: self.run.invoker_key_hash.clone(),
             run_id: self.run.id.clone(),
+            node: self.run.node.clone(),
+            node_version: self.run.version,
             step_id: step_id.to_owned(),
             idempotency_key: idempotency_key(&self.run.id, step_id),
         }

@@ -78,6 +78,8 @@ fn ctx(step: &str, key: &str) -> CallCtx {
         run_id: "run_1".into(),
         step_id: step.into(),
         idempotency_key: idempotency_key("run_1", step),
+        node: "n".into(),
+        node_version: 1,
     }
 }
 

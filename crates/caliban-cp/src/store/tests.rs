@@ -1233,12 +1233,21 @@ async fn router_checkins(s: &Store) {
     assert_eq!(a.snapshot_version, "cp-2");
 }
 
+/// Usage events are dated from yesterday (whole seconds), well inside the raw usage retention.
+fn usage_base() -> DateTime<Utc> {
+    static BASE: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| {
+        let d = Utc::now() - chrono::Duration::days(1);
+        d.date_naive().and_hms_opt(12, 0, 0).unwrap().and_utc()
+    })
+}
+
 fn usage_event(id: &str, tenant: &str, at_secs: i64, extra: Value) -> caliban_meter::UsageEvent {
     let mut v = json!({
         "request_id": id, "tenant_id": tenant, "model": "ext/gpt", "intent": "chat", "prompt_tokens": 100,
         "completion_tokens": 20, "cached_prompt_tokens": 10, "tokens_saved": 0, "cache": "miss",
         "usage_source": "provider", "pii_entities": 1, "cost_usd": 0.0005, "latency_ms": 12,
-        "ts": (ts() + chrono::Duration::seconds(at_secs)).to_rfc3339(), "requested_model": "caliban/auto",
+        "ts": (usage_base() + chrono::Duration::seconds(at_secs)).to_rfc3339(), "requested_model": "caliban/auto",
         "intent_confidence": 0.75, "route_stage": "knn", "routed_model_cost_usd": 0.0005,
         "flat_price_usd": 0.001, "billed_usd": 0.001
     });
@@ -1313,6 +1322,146 @@ async fn usage_ingest(s: &Store) -> usage::UsageReport {
     assert_eq!((none.events.len(), none.totals.requests), (0, 0));
     assert!(none.totals.billed_usd.is_sign_positive() && none.totals.margin_usd.is_sign_positive());
     all
+}
+
+/// Node calls: filters by node and run, totals per node version, the charged amount (billed for
+/// `caliban/auto`, the model's cost otherwise) that a run's `cost_usd` also sums.
+async fn usage_by_node(s: &Store) -> usage::UsageReport {
+    let node = |n: &str, v: u32, run: &str| json!({"node": n, "node_version": v, "run_id": run});
+    let pinned = |n: &str, v: u32, run: &str| {
+        let mut x = node(n, v, run);
+        x.as_object_mut().unwrap().extend(
+            json!({"requested_model": "ext/gpt", "routed_model_cost_usd": null, "flat_price_usd": null, "billed_usd": null})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        x
+    };
+    let r = s
+        .ingest_usage(vec![
+            usage_event("n1", "initech", 1, node("triage", 1, "run_a")),
+            usage_event("n2", "initech", 2, node("triage", 1, "run_a")),
+            usage_event("n3", "initech", 3, pinned("triage", 2, "run_b")),
+            usage_event("n4", "initech", 4, node("other", 1, "run_c")),
+            usage_event("n5", "initech", 5, json!({})),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(r.accepted, 5);
+    let q = |node: Option<&str>, run: Option<&str>| usage::UsageFilter {
+        tenants: Some(vec!["initech".into()]),
+        node: node.map(str::to_owned),
+        run_id: run.map(str::to_owned),
+        limit: 100,
+    };
+    let close = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} vs {b}");
+    let all = s.usage_query(&q(None, None)).await.unwrap();
+    assert_eq!(all.totals.requests, 5);
+    // auto events charge their billed price ($0.001), the pinned one its cost ($0.0005).
+    close(all.totals.charged_usd, 0.001 * 4.0 + 0.0005);
+    let triage = s.usage_query(&q(Some("triage"), None)).await.unwrap();
+    assert_eq!((triage.totals.requests, triage.events.len()), (3, 3));
+    close(triage.totals.charged_usd, 0.0025);
+    let run = s.usage_query(&q(None, Some("run_a"))).await.unwrap();
+    assert_eq!(run.totals.requests, 2);
+    close(run.totals.charged_usd, 0.002);
+    let groups: Vec<(String, u32, u64)> =
+        all.by_node.iter().map(|g| (g.node.clone(), g.node_version, g.totals.requests)).collect();
+    assert_eq!(groups, [("other".into(), 1, 1), ("triage".into(), 1, 2), ("triage".into(), 2, 1)]);
+    close(all.by_node[2].totals.charged_usd, 0.0005);
+    assert_eq!(all.events.iter().find(|e| e.request_id == "n3").unwrap().run_id.as_deref(), Some("run_b"));
+    all
+}
+
+#[tokio::test]
+async fn memory_usage_by_node() {
+    let cfg = base();
+    usage_by_node(&Store::new(cfg.clone(), handle(&cfg), RecentUsage::default())).await;
+}
+
+#[tokio::test]
+async fn postgres_usage_by_node_matches_memory() {
+    let Some(pg) = pg_backend().await else { return };
+    let cfg = base();
+    let s = Store::open_postgres(pg, cfg.clone(), handle(&cfg), RecentUsage::default()).await.unwrap();
+    let pg_report = usage_by_node(&s).await;
+    let mem_report = usage_by_node(&Store::new(cfg.clone(), handle(&cfg), RecentUsage::default())).await;
+    assert_eq!(pg_report.events, mem_report.events);
+    assert_eq!(serde_json::to_value(&pg_report.by_node).unwrap(), serde_json::to_value(&mem_report.by_node).unwrap());
+}
+
+/// Raw usage retention: old days move into the daily roll-up and every total (all-time, per
+/// tenant, per node) is the same before and after; two control planes purging at once never
+/// count an event twice; an event older than the retention is refused at ingestion (its day may
+/// be rolled up, so a retry could not be told apart).
+#[tokio::test]
+async fn postgres_usage_retention_keeps_totals_identical() {
+    let Some(pg) = pg_backend().await else { return };
+    let pool = pg.pool().clone();
+    let cfg = base();
+    let s = Store::open_postgres(pg, cfg.clone(), handle(&cfg), RecentUsage::default()).await.unwrap();
+    // A second control plane on the same database.
+    let other = PgBackend::connect_with(pool.connect_options().as_ref().clone()).await.unwrap();
+    let s2 = Store::open_postgres(other, cfg.clone(), handle(&cfg), RecentUsage::default()).await.unwrap();
+    let old = |id: &str, days: i64, extra: Value| {
+        let mut e = usage_event(id, "initech", 0, extra);
+        e.ts = Utc::now() - chrono::Duration::days(days);
+        e
+    };
+    s.set_usage_retention_days(0);
+    let node = json!({"node": "triage", "node_version": 1, "run_id": "run_old"});
+    let mut events = vec![];
+    for i in 0..30 {
+        events.push(old(&format!("o{i}"), 100 + i % 3, if i % 2 == 0 { node.clone() } else { json!({}) }));
+    }
+    events.push(old("hit", 120, json!({"cache": "hit", "cache_tier": "exact", "billed_usd": 0.0002, "saved_usd": 0.0008, "routed_model_cost_usd": 0.0})));
+    events.push(old("new", 1, node.clone()));
+    assert_eq!(s.ingest_usage(events).await.unwrap().accepted, 32);
+    let f = usage::UsageFilter { limit: 1000, ..Default::default() };
+    let tenant = usage::UsageFilter { tenants: Some(vec!["initech".into()]), limit: 1000, ..Default::default() };
+    let by_node = usage::UsageFilter { node: Some("triage".into()), limit: 1000, ..Default::default() };
+    let before = (
+        s.usage_query(&f).await.unwrap(),
+        s.usage_query(&tenant).await.unwrap(),
+        s.usage_query(&by_node).await.unwrap(),
+    );
+
+    let (a, b) = tokio::join!(s.rollup_usage(90), s2.rollup_usage(90));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    // Whichever ran first moved everything; the other found nothing (or waited its turn).
+    assert_eq!(a + b, 31, "{a} + {b}");
+    assert_eq!(s.rollup_usage(90).await.unwrap(), 0, "idempotent");
+    assert_eq!(scalar_of(&pool, "SELECT count(*) FROM usage_event").await, 1, "only the recent event stays raw");
+    let after = (
+        s.usage_query(&f).await.unwrap(),
+        s.usage_query(&tenant).await.unwrap(),
+        s.usage_query(&by_node).await.unwrap(),
+    );
+    // Counts are identical; USD sums differ at most by floating-point summation order.
+    let same = |x: &usage::UsageTotals, y: &usage::UsageTotals| {
+        let (x, y) = (serde_json::to_value(x).unwrap(), serde_json::to_value(y).unwrap());
+        for (k, v) in x.as_object().unwrap() {
+            match (v.as_u64(), y[k].as_u64()) {
+                (Some(a), Some(b)) => assert_eq!(a, b, "{k}"),
+                _ => assert!((v.as_f64().unwrap() - y[k].as_f64().unwrap()).abs() < 1e-12, "{k}: {v} vs {}", y[k]),
+            }
+        }
+    };
+    for (x, y) in [(&before.0, &after.0), (&before.1, &after.1), (&before.2, &after.2)] {
+        same(&x.totals, &y.totals);
+    }
+    assert_eq!(before.0.by_node.len(), after.0.by_node.len());
+    for (x, y) in before.0.by_node.iter().zip(&after.0.by_node) {
+        assert_eq!((&x.node, x.node_version), (&y.node, y.node_version));
+        same(&x.totals, &y.totals);
+    }
+    assert_eq!(after.0.events.len(), 1, "raw events are gone; their totals are not");
+
+    // With retention on, an event older than it is refused; a retried recent one is a duplicate.
+    s.set_usage_retention_days(90);
+    let r = s.ingest_usage(vec![old("o3", 100, json!({})), old("new", 1, node)]).await.unwrap();
+    assert_eq!((r.accepted, r.duplicates, r.rejected), (0, 1, 1));
 }
 
 #[tokio::test]
@@ -1746,4 +1895,92 @@ async fn postgres_rejects_edited_migrations() {
         .await
         .unwrap();
     assert!(pg.migrate().await.unwrap_err().to_string().contains("modified"));
+}
+
+/// The grants docs/nodes.md lists for a worker's database role are enough for everything a worker
+/// does (schema check, claims, checkpoints, spend, events, retention), and give no DDL.
+#[tokio::test]
+async fn postgres_worker_grants_are_enough() {
+    use caliban_nodes::budget::BudgetState;
+    use caliban_nodes::journal::postgres::PgJournal;
+    use caliban_nodes::journal::{EventKind, Finish, Journal, NewRun, RunStatus, StepRecord, StepStatus};
+    use std::time::Duration;
+    let Some(url) = std::env::var("CALIBAN_TEST_DATABASE_URL").ok() else { return };
+    let Some(pg) = pg_backend().await else { return };
+    pg.migrate().await.unwrap();
+    let schema: String = sqlx::query_scalar("SELECT current_schema()").fetch_one(pg.pool()).await.unwrap();
+    let role = format!("w_{}", &uuid::Uuid::now_v7().simple().to_string()[20..]);
+    let grants = format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'worker-test' BYPASSRLS;
+         GRANT USAGE ON SCHEMA {schema} TO {role};
+         GRANT SELECT ON caliban_schema_migrations TO {role};
+         GRANT SELECT, INSERT, UPDATE, DELETE ON node_run, node_step, node_event TO {role};
+         GRANT SELECT, INSERT, UPDATE ON node_spend TO {role};"
+    );
+    sqlx::raw_sql(AssertSqlSafe(grants)).execute(pg.pool()).await.unwrap();
+    let opts: PgConnectOptions = url
+        .parse::<PgConnectOptions>()
+        .unwrap()
+        .username(&role)
+        .password("worker-test")
+        .options([("search_path", schema.as_str())]);
+    let worker = PgBackend::connect_with(opts).await.unwrap();
+    let result = async {
+        worker.check_schema().await.map_err(|e| e.to_string())?;
+        let j = PgJournal::from_pool(worker.pool().clone());
+        let run = NewRun {
+            id: "run_g".into(),
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: 1,
+            spec_hash: "sha256:00".into(),
+            invoker: "api_key:x".into(),
+            invoker_key_hash: None,
+            input: "sealed".into(),
+            budget: BudgetState::new(5, 100, 60),
+            idempotency: Some(("k".into(), "fp".into())),
+            specs: None,
+        };
+        j.create_run(run).await.map_err(|e| e.to_string())?;
+        j.claim_next("w", Duration::from_secs(30)).await.map_err(|e| e.to_string())?.ok_or("nothing claimed")?;
+        j.heartbeat("run_g", "w", Duration::from_secs(30)).await.map_err(|e| e.to_string())?;
+        let now = Utc::now();
+        let step = StepRecord {
+            run_id: "run_g".into(),
+            tenant_id: "acme".into(),
+            step_id: "a#0".into(),
+            attempt: 1,
+            vertex: "a".into(),
+            kind: "llm".into(),
+            input_hash: "h".into(),
+            status: StepStatus::Completed,
+            result: None,
+            tokens: 3,
+            usd: 0.01,
+            started_at: now,
+            finished_at: now,
+        };
+        j.put_step("w", step, &BudgetState::new(5, 100, 60)).await.map_err(|e| e.to_string())?;
+        j.tenant_spend("acme").await.map_err(|e| e.to_string())?;
+        j.put_event("acme", "run_g", "t", EventKind::Timer, None).await.map_err(|e| e.to_string())?;
+        let f = Finish {
+            status: RunStatus::Succeeded,
+            output: None,
+            error: None,
+            stop_reason: None,
+            budget: BudgetState::new(5, 100, 60),
+        };
+        j.finish("run_g", "w", f).await.map_err(|e| e.to_string())?;
+        j.purge_finished(Duration::ZERO, 10).await.map_err(|e| e.to_string())?;
+        // No DDL.
+        let ddl = sqlx::raw_sql("CREATE TABLE should_fail (x INT)").execute(worker.pool()).await;
+        if ddl.is_ok() {
+            return Err("the worker role could create a table".to_owned());
+        }
+        Ok::<_, String>(())
+    }
+    .await;
+    worker.pool().close().await;
+    sqlx::raw_sql(AssertSqlSafe(format!("DROP OWNED BY {role}; DROP ROLE {role};"))).execute(pg.pool()).await.unwrap();
+    result.unwrap();
 }

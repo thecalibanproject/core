@@ -227,6 +227,24 @@ impl Journal for MemoryJournal {
         })
     }
 
+    async fn purge_finished(&self, older_than: Duration, batch: usize) -> JResult<u64> {
+        let cutoff = Utc::now() - lease(older_than);
+        let mut t = self.t.lock();
+        let gone: Vec<String> = t
+            .runs
+            .iter()
+            .filter(|r| r.status.is_terminal() && r.finished_at.is_some_and(|f| f < cutoff))
+            .take(batch)
+            .map(|r| r.id.clone())
+            .collect();
+        t.runs.retain(|r| !gone.contains(&r.id));
+        for id in &gone {
+            t.steps.remove(id);
+        }
+        t.events.retain(|(run, _), _| !gone.contains(run));
+        Ok(gone.len() as u64)
+    }
+
     async fn tenant_spend(&self, tenant: &str) -> JResult<TenantSpend> {
         use chrono::Datelike;
         let today = Utc::now().date_naive();

@@ -108,6 +108,14 @@ pub struct UsageEvent {
     /// answer's tokens at the input and output price). Absent on misses and for unpriced models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_usd: Option<f64>,
+    /// The node whose run made this call (node model calls only), its version and the run: cost
+    /// per run and per node fall out of usage data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 impl UsageEvent {

@@ -300,6 +300,7 @@ exemplars = { "legal.review" = ["review this NDA clause for risky terms", "check
 | `CALIBAN_USAGE_WAL_FSYNC` | data plane | `off` (default) or `batch` (`fdatasync` after every written batch) |
 | `CALIBAN_USAGE_WAL_QUEUE` | data plane | Usage events queued for the WAL writer before requests wait (up to 20 ms) or drop and count (default 16384) |
 | `CALIBAN_USAGE_SHIP`, `CALIBAN_USAGE_SHIP_*`, `CALIBAN_USAGE_SPOOL_*` | data plane | Usage shipping to the control plane; see [Usage shipping](#usage-shipping) |
+| `CALIBAN_USAGE_RETENTION_DAYS` | control plane | Days raw usage events are kept in Postgres before they move into the daily roll-up (default 90; 0 keeps them). Totals are unchanged by the move; see [Usage and retention](docs/nodes.md#usage-and-retention) |
 | `CALIBAN_QDRANT_URL` | data plane | Qdrant REST endpoint for the semantic cache, e.g. `http://qdrant:6333` (overrides `[cache.semantic] qdrant_url`) |
 | `CALIBAN_QDRANT_API_KEY` | data plane | Qdrant API key, used when `[cache.semantic] qdrant_api_key` is unset |
 | `CALIBAN_LOG` | all | Log filter (default `info,tower_http=info`) |

@@ -38,7 +38,7 @@ pub mod telemetry;
 #[cfg(test)]
 mod tests;
 
-pub use auth::InternalCaller;
+pub use auth::{InternalCaller, NodeTag};
 pub use error::{ApiError, Dialect};
 pub use limits::{idempotency_store, quota_store};
 

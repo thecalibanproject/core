@@ -139,6 +139,27 @@ pub fn spawn_refresh(cp: Cp, every: Duration) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// Usage retention (Postgres store): hourly, raw usage events older than `days` move into the
+/// daily roll-up; totals stay the same. Several control planes may run it; one does the work.
+pub fn spawn_usage_retention(cp: Cp, days: u32, every: Duration) -> tokio::task::JoinHandle<()> {
+    cp.store.set_usage_retention_days(days);
+    tokio::spawn(async move {
+        if days == 0 {
+            return;
+        }
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            match cp.store.rollup_usage(days).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(events = n, days, "rolled up usage events past retention"),
+                Err(e) => tracing::warn!(error = %e, "usage roll-up failed; retrying later"),
+            }
+        }
+    })
+}
+
 pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiError {
@@ -856,6 +877,10 @@ async fn review_element(
 struct UsageQuery {
     tenant_id: Option<String>,
     limit: Option<usize>,
+    /// Only the model calls of this node's runs.
+    node: Option<String>,
+    /// Only the model calls of this run.
+    run_id: Option<String>,
 }
 
 /// Usage events (newest first) and totals; without `tenant_id`, over the tenants the caller sees.
@@ -872,7 +897,9 @@ async fn usage(
         (auth::rbac::Visible::Only(set), None) => Some(set.into_iter().collect()),
         (auth::rbac::Visible::Only(set), Some(t)) => Some(set.into_iter().filter(|v| *v == t).collect()),
     };
-    let report = cp.store.usage_report(tenants.as_deref(), q.limit.unwrap_or(100).min(1000)).await?;
+    let f =
+        store::usage::UsageFilter { tenants, node: q.node, run_id: q.run_id, limit: q.limit.unwrap_or(100).min(1000) };
+    let report = cp.store.usage_query(&f).await?;
     Ok(Json(json!(report)))
 }
 

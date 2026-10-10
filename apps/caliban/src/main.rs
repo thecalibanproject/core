@@ -541,6 +541,11 @@ async fn control_plane(
     if postgres {
         // Picks up writes made through other control-plane replicas.
         caliban_cp::spawn_refresh(Arc::clone(&cp), Duration::from_secs(5));
+        let days = match std::env::var("CALIBAN_USAGE_RETENTION_DAYS").ok().filter(|v| !v.trim().is_empty()) {
+            Some(v) => v.trim().parse::<u32>().context("CALIBAN_USAGE_RETENTION_DAYS must be a number of days")?,
+            None => caliban_cp::store::usage::DEFAULT_RETENTION_DAYS,
+        };
+        caliban_cp::spawn_usage_retention(Arc::clone(&cp), days, Duration::from_secs(3600));
     }
     if let Some(t) = local_ship {
         let _ = t.cp.set(Arc::clone(&cp));

@@ -186,6 +186,7 @@ behind) or the worker (the schema is ahead). Upgrade the control plane, then the
 needs no DDL rights; its database role needs:
 
 ```sql
+GRANT USAGE ON SCHEMA public TO caliban_worker;  -- the schema holding Caliban's tables
 GRANT SELECT ON caliban_schema_migrations TO caliban_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON node_run, node_step, node_event TO caliban_worker;
 GRANT SELECT, INSERT, UPDATE ON node_spend TO caliban_worker;
@@ -193,7 +194,11 @@ ALTER ROLE caliban_worker BYPASSRLS;  -- the journal tables have per-tenant row-
 ```
 
 (`DELETE` on `node_run` is for the retention purge, which removes a finished run's steps and
-events with it; `node_spend` holds the tenants' spend per day, see [Budgets](#budgets).)
+events with it; `node_spend` holds the tenants' spend per day, see [Budgets](#budgets). No
+sequence grants are needed: `node_step.seq` is an identity column. Workers write nothing else:
+usage goes to the control plane over HTTP, and tools reach them in the snapshot. The test
+`postgres_worker_grants_are_enough` runs a worker's journal operations as a role with exactly these
+grants.)
 
 **More than one worker needs Valkey.** Exactly-once model calls across workers (a run taken over
 after a crash replays its in-flight call against the stored response) need the shared
@@ -211,6 +216,7 @@ prominent warning.
 | `CALIBAN_NODE_LEASE_SECS` | workers, standalone | Lease on a running run, default 30, renewed every third of it |
 | `CALIBAN_NODE_POLL_MS` | workers, standalone | How often an idle worker looks for runnable runs, default 500 |
 | `CALIBAN_NODE_MAX_RUNS` | workers, standalone | Runs executed at once per process, default 64 |
+| `CALIBAN_NODE_RUN_RETENTION_DAYS` | workers, standalone | Days finished runs (with their steps and events) are kept, default 30; 0 keeps them |
 | `CALIBAN_NODE_BREAKER_FAILURES` | workers, standalone | Consecutive failed calls that open a tool's circuit breaker, default 5 |
 | `CALIBAN_NODE_BREAKER_COOLDOWN_SECS` | workers, standalone | How long an open breaker refuses calls before a trial call, default 30 |
 
@@ -314,6 +320,32 @@ most one call per run in flight).
 | Loop guard | `guards.max_repeats` (default 3, at least 1) | A vertex that receives the same input (same vertex, same input hash, same `map` branch, same subnode path) more than this many times ends the run (`budget_exhausted`, `stop_reason: loop guard: ...`). Iteration counters do not count as a difference, so a loop that makes no progress trips it; an agent that calls the same tool with the same arguments again and again too |
 | Tool retries | `guards.tool_retries` (default 2) | A tool call that fails transiently (network, a 5xx) is retried this many times, with a short backoff, then counts as failed |
 | Circuit breaker | `CALIBAN_NODE_BREAKER_FAILURES` (default 5), `CALIBAN_NODE_BREAKER_COOLDOWN_SECS` (default 30) | Per tool and tenant, in each worker process: after that many failed calls in a row the breaker opens and calls fail at once without reaching the tool; after the cool-down one trial call goes through (half-open); success closes it, failure opens it again |
+
+## Usage and retention
+
+**Usage per run and per node.** Every model call of a run is metered like any other request, and
+its usage event carries `node`, `node_version` and `run_id` (a subnode's calls carry the run's
+root node: the run pays for them). `GET /api/v1/usage` takes `node` and `run_id` filters next to
+`tenant_id`, and returns `by_node` (the totals per node version) next to `totals`. `charged_usd`
+is what the customer is charged (the billed `caliban/auto` price, discounted on cache hits; the
+model's cost otherwise): over a run's events it equals the run's `cost_usd`.
+
+**Retention of finished runs.** Every worker (and a standalone process) deletes runs that finished
+more than `CALIBAN_NODE_RUN_RETENTION_DAYS` ago (default 30; 0 keeps them), with their steps and
+events, hourly and in batches of 500 (`FOR UPDATE SKIP LOCKED`, so workers purging at once take
+different rows). Runs not finished are never purged. The tenants' daily spend (`node_spend`) is
+not purged with them.
+
+**Retention of usage events.** The control plane (Postgres store) moves raw usage events older
+than `CALIBAN_USAGE_RETENTION_DAYS` (default 90 whole UTC days; 0 keeps them) into `usage_daily`,
+one row per (tenant, day, node, node version) with every total, hourly. Each batch deletes the raw
+events and adds them to their day in one statement, so an event is counted raw or rolled up,
+never both; reports add the two, so all-time totals (per tenant and per node) are the same before
+and after a purge. One control plane at a time does it (an advisory lock; the others skip the
+round). Rolled-up days keep no run ids or event rows: `run_id` filters and the event list cover
+the raw retention only. An event delivered later than the retention (a router offline for months)
+is refused at ingestion and counted as `rejected`: its day may be rolled up already, and a retry
+could no longer be told from a new event.
 
 ## The reference node
 

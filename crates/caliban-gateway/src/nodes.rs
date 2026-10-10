@@ -22,7 +22,7 @@
 //! carries `Idempotency-Key: caliban-node-<hash(run id, step id)>`, so a step replayed after a
 //! worker died gets the stored response instead of paying twice.
 
-use crate::auth::{self, InternalCaller};
+use crate::auth::{self, InternalCaller, NodeTag};
 use crate::{Gateway, idempotency};
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -107,7 +107,8 @@ impl ModelClient for GatewayModels {
             .header(idempotency::HEADER, &ctx.idempotency_key)
             .body(Body::from(body.to_string()))
             .map_err(|e| ModelError::Rejected(e.to_string()))?;
-        req.extensions_mut().insert(InternalCaller { tenant: ctx.tenant.clone(), key_hash });
+        let node = NodeTag { node: ctx.node.clone(), version: ctx.node_version, run_id: ctx.run_id.clone() };
+        req.extensions_mut().insert(InternalCaller { tenant: ctx.tenant.clone(), key_hash, node: Some(node) });
         let resp = crate::app(gw).oneshot(req).await.map_err(|e| ModelError::Unavailable(e.to_string()))?;
         let status = resp.status();
         let headers = resp.headers().clone();

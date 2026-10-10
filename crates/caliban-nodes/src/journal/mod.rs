@@ -279,6 +279,11 @@ pub trait Journal: Send + Sync {
     async fn suspend(&self, run_id: &str, worker: &str, s: Suspend) -> JResult<bool>;
     async fn finish(&self, run_id: &str, worker: &str, f: Finish) -> JResult<bool>;
 
+    /// Retention: deletes runs that finished more than `older_than` ago, with their steps and
+    /// events, at most `batch` per call (call again while it returns `batch`). Safe on several
+    /// workers at once. Returns how many runs were deleted.
+    async fn purge_finished(&self, older_than: Duration, batch: usize) -> JResult<u64>;
+
     /// The tenant's node spend today and this month (UTC), across every worker.
     async fn tenant_spend(&self, tenant: &str) -> JResult<TenantSpend>;
 

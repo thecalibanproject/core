@@ -411,6 +411,9 @@ mod tests {
             flat_price_usd: None,
             billed_usd: None,
             saved_usd: None,
+            node: None,
+            node_version: None,
+            run_id: None,
         }
     }
 

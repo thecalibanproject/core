@@ -1121,12 +1121,21 @@ pub trait Backend: Send + Sync {
     async fn insert_usage(&self, _events: &[caliban_meter::UsageEvent]) -> Result<Option<u64>, StoreError> {
         Ok(None)
     }
-    /// The newest `limit` events and the totals over every event of `tenants` (`None`: all).
-    async fn usage_report(
-        &self,
-        _tenants: Option<&[String]>,
-        _limit: usize,
-    ) -> Result<Option<usage::UsageReport>, StoreError> {
+    /// The newest events and the totals over every event the filter matches.
+    async fn usage_report(&self, _f: &usage::UsageFilter) -> Result<Option<usage::UsageReport>, StoreError> {
+        Ok(None)
+    }
+
+    /// Moves raw usage events older than `days` (whole UTC days) into the daily roll-up, keeping
+    /// every total the same. Returns how many events were moved. Backends without a durable usage
+    /// log keep nothing to roll up.
+    async fn rollup_usage(&self, _days: u32) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
+    /// The oldest timestamp a raw usage event may have with this retention (midnight UTC, `days`
+    /// days ago, by the database clock); `None` when the backend rolls nothing up.
+    async fn usage_boundary(&self, _days: u32) -> Result<Option<DateTime<Utc>>, StoreError> {
         Ok(None)
     }
 }
@@ -1161,6 +1170,8 @@ pub struct Store {
     router_writes: parking_lot::Mutex<std::collections::HashMap<String, RouterStatus>>,
     /// Deduplication of ingested usage events when the backend keeps no usage log (memory).
     memory_usage: usage::MemoryUsage,
+    /// Raw usage retention in days (0: forever); see [`Store::rollup_usage`].
+    usage_retention_days: std::sync::atomic::AtomicU32,
 }
 
 impl Store {
@@ -1216,6 +1227,7 @@ impl Store {
             usage,
             router_writes: parking_lot::Mutex::default(),
             memory_usage: usage::MemoryUsage::new(),
+            usage_retention_days: std::sync::atomic::AtomicU32::new(usage::DEFAULT_RETENTION_DAYS),
         };
         s.install(state);
         s
@@ -1300,8 +1312,15 @@ impl Store {
         let mut out = usage::Ingested::default();
         let mut ids = std::collections::HashSet::new();
         let mut batch = Vec::with_capacity(events.len());
+        let days = self.usage_retention_days.load(std::sync::atomic::Ordering::Relaxed);
+        // The database clock: every control-plane replica and the roll-up agree on the boundary.
+        let oldest = if days > 0 { self.backend.usage_boundary(days).await? } else { None };
         for e in events {
-            if !usage::valid_event(&e) {
+            if oldest.is_some_and(|b| e.ts < b) {
+                // Its day may already be rolled up: a retry could not be told from a new event.
+                tracing::warn!(request_id = %e.request_id, ts = %e.ts, "refused a usage event older than the usage retention");
+                out.rejected += 1;
+            } else if !usage::valid_event(&e) {
                 out.rejected += 1;
             } else if !ids.insert(e.request_id.clone()) {
                 out.duplicates += 1;
@@ -1332,10 +1351,31 @@ impl Store {
         tenants: Option<&[String]>,
         limit: usize,
     ) -> Result<usage::UsageReport, StoreError> {
-        match self.backend.usage_report(tenants, limit).await? {
+        let f = usage::UsageFilter { tenants: tenants.map(<[String]>::to_vec), limit, ..Default::default() };
+        self.usage_query(&f).await
+    }
+
+    /// Usage events and totals matching `f` (tenants, node, run).
+    pub async fn usage_query(&self, f: &usage::UsageFilter) -> Result<usage::UsageReport, StoreError> {
+        match self.backend.usage_report(f).await? {
             Some(r) => Ok(r),
-            None => Ok(usage::MemoryUsage::report(&self.usage, tenants, limit)),
+            None => Ok(usage::MemoryUsage::report(&self.usage, f)),
         }
+    }
+
+    /// Usage retention: raw events older than `days` move into the daily roll-up (Postgres; see
+    /// [`usage`]). Safe to run on several control planes at once (one at a time does the work).
+    pub async fn rollup_usage(&self, days: u32) -> Result<u64, StoreError> {
+        if days == 0 {
+            return Ok(0);
+        }
+        self.backend.rollup_usage(days).await
+    }
+
+    /// Events older than the raw retention cannot be deduplicated any more (their day was rolled
+    /// up): ingestion refuses them.
+    pub fn set_usage_retention_days(&self, days: u32) {
+        self.usage_retention_days.store(days, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether usage events are kept in the backend (Postgres) rather than the process ring. A

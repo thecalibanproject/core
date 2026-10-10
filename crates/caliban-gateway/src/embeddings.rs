@@ -110,6 +110,7 @@ async fn run(
         est_prompt_tokens: est,
         route: None,
         client_usage: true,
+        node: None,
     };
     finish(&gw, &outcome, usage, 0, settlement).await;
     let mut resp = axum::Json(out).into_response();

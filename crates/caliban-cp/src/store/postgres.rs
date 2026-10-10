@@ -51,6 +51,8 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (14, "node_run_specs", include_str!("../../../../migrations/0014_node_run_specs.sql")),
     (15, "node_spend", include_str!("../../../../migrations/0015_node_spend.sql")),
     (16, "node_spend_caps", include_str!("../../../../migrations/0016_node_spend_caps.sql")),
+    (17, "node_run_retention", include_str!("../../../../migrations/0017_node_run_retention.sql")),
+    (18, "usage_nodes", include_str!("../../../../migrations/0018_usage_nodes.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -105,9 +107,92 @@ pub async fn check_schema(pool: &PgPool) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// "priced" in `UsageEvent::margin_usd().is_some()` terms: a billed (or legacy flat) price and a
+/// routed cost.
+const USAGE_PRICED: &str = "(COALESCE(billed_usd, flat_price_usd) IS NOT NULL AND routed_model_cost_usd IS NOT NULL)";
+
+/// The usage totals: column, aggregate over raw events (`u`, with `priced`), integer or float.
+/// The same totals as `UsageTotals::from_events`, and the columns of `usage_daily`.
+const USAGE_TOTALS: &[(&str, &str, bool)] = &[
+    ("requests", "COUNT(*)", true),
+    ("prompt_tokens", "SUM(prompt_tokens)", true),
+    ("completion_tokens", "SUM(completion_tokens)", true),
+    ("cached_prompt_tokens", "SUM(cached_prompt_tokens)", true),
+    ("cache_write_tokens", "SUM(cache_write_tokens)", true),
+    ("estimated_requests", "COUNT(*) FILTER (WHERE usage_source = 'estimated')", true),
+    ("cache_hits", "COUNT(*) FILTER (WHERE cache = 'hit')", true),
+    ("saved_usd", "SUM(saved_usd)", false),
+    ("semantic_cache_hits", "COUNT(*) FILTER (WHERE cache_tier = 'semantic')", true),
+    ("tokens_saved", "SUM(tokens_saved + cached_prompt_tokens)", true),
+    ("cost_usd", "SUM(cost_usd)", false),
+    (
+        "charged_usd",
+        "SUM(CASE WHEN requested_model = 'caliban/auto' THEN COALESCE(billed_usd, flat_price_usd, cost_usd) ELSE cost_usd END)",
+        false,
+    ),
+    ("auto_requests", "COUNT(*) FILTER (WHERE requested_model = 'caliban/auto')", true),
+    ("auto_cache_hits", "COUNT(*) FILTER (WHERE requested_model = 'caliban/auto' AND cache = 'hit')", true),
+    ("flat_price_usd", "SUM(flat_price_usd) FILTER (WHERE priced)", false),
+    ("billed_usd", "SUM(COALESCE(billed_usd, flat_price_usd)) FILTER (WHERE priced)", false),
+    ("auto_saved_usd", "SUM(saved_usd) FILTER (WHERE priced)", false),
+    ("routed_model_cost_usd", "SUM(routed_model_cost_usd) FILTER (WHERE priced)", false),
+    ("margin_usd", "SUM(COALESCE(billed_usd, flat_price_usd) - routed_model_cost_usd) FILTER (WHERE priced)", false),
+];
+
+fn usage_columns() -> String {
+    USAGE_TOTALS.iter().map(|(c, _, _)| *c).collect::<Vec<_>>().join(", ")
+}
+
+fn usage_aggregates() -> String {
+    USAGE_TOTALS
+        .iter()
+        .map(|(c, agg, int)| format!("COALESCE({agg}, 0)::{} AS {c}", if *int { "BIGINT" } else { "FLOAT8" }))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn usage_sums() -> String {
+    USAGE_TOTALS
+        .iter()
+        .map(|(c, _, int)| format!("COALESCE(SUM({c}), 0)::{} AS {c}", if *int { "BIGINT" } else { "FLOAT8" }))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn usage_totals(t: &PgRow) -> Result<super::usage::UsageTotals, StoreError> {
+    let n = |c: &str| -> Result<u64, StoreError> { get::<i64>(t, c).map(|v| u64::try_from(v).unwrap_or(0)) };
+    // `+ 0.0` turns a -0.0 from the database into +0.0.
+    let f = |c: &str| -> Result<f64, StoreError> { get::<f64>(t, c).map(|v| v + 0.0) };
+    Ok(super::usage::UsageTotals {
+        requests: n("requests")?,
+        prompt_tokens: n("prompt_tokens")?,
+        completion_tokens: n("completion_tokens")?,
+        cached_prompt_tokens: n("cached_prompt_tokens")?,
+        cache_write_tokens: n("cache_write_tokens")?,
+        estimated_requests: n("estimated_requests")?,
+        cache_hits: n("cache_hits")?,
+        saved_usd: f("saved_usd")?,
+        semantic_cache_hits: n("semantic_cache_hits")?,
+        tokens_saved: n("tokens_saved")?,
+        cost_usd: f("cost_usd")?,
+        charged_usd: f("charged_usd")?,
+        auto_requests: n("auto_requests")?,
+        auto_cache_hits: n("auto_cache_hits")?,
+        flat_price_usd: f("flat_price_usd")?,
+        billed_usd: f("billed_usd")?,
+        auto_saved_usd: f("auto_saved_usd")?,
+        routed_model_cost_usd: f("routed_model_cost_usd")?,
+        margin_usd: f("margin_usd")?,
+    })
+}
+
+/// Raw usage events moved into the roll-up per transaction.
+const ROLLUP_BATCH: i64 = 5_000;
+
 /// Advisory lock keys ("calibn" + n).
 const MIGRATE_LOCK: i64 = 0x6361_6c69_626e_0001;
 const WRITE_LOCK: i64 = 0x6361_6c69_626e_0002;
+const ROLLUP_LOCK: i64 = 0x6361_6c69_626e_0003;
 
 pub struct PgBackend {
     pool: PgPool,
@@ -233,11 +318,13 @@ impl PgBackend {
             "INSERT INTO usage_event (request_id, tenant_id, model, intent, prompt_tokens, completion_tokens,
                                       cached_prompt_tokens, tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts,
                                       requested_model, intent_confidence, route_stage, routed_model_cost_usd, flat_price_usd,
-                                      cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens, billed_usd, saved_usd)
+                                      cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens, billed_usd, saved_usd,
+                                      node, node_version, run_id)
              SELECT * FROM UNNEST($1::TEXT[], $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::BIGINT[], $6::BIGINT[],
                                   $7::BIGINT[], $8::BIGINT[], $9::TEXT[], $10::INTEGER[], $11::FLOAT8[], $12::BIGINT[],
                                   $13::TIMESTAMPTZ[], $14::TEXT[], $15::REAL[], $16::TEXT[], $17::FLOAT8[], $18::FLOAT8[],
-                                  $19::TEXT[], $20::TEXT[], $21::BIGINT[], $22::BIGINT[], $23::FLOAT8[], $24::FLOAT8[])
+                                  $19::TEXT[], $20::TEXT[], $21::BIGINT[], $22::BIGINT[], $23::FLOAT8[], $24::FLOAT8[],
+                                  $25::TEXT[], $26::INTEGER[], $27::TEXT[])
              ON CONFLICT (request_id) DO NOTHING",
         )
         .bind(col(&|e| e.request_id.clone()))
@@ -264,6 +351,9 @@ impl PgBackend {
         .bind(int(&|e| e.cache_write_1h_tokens))
         .bind(usd(&|e| e.billed_usd))
         .bind(usd(&|e| e.saved_usd))
+        .bind(opt(&|e| e.node.clone()))
+        .bind(events.iter().map(|e| e.node_version.map(|v| i32::try_from(v).unwrap_or(i32::MAX))).collect::<Vec<_>>())
+        .bind(opt(&|e| e.run_id.clone()))
         .execute(&self.pool)
         .await
         .map_err(db)?;
@@ -516,78 +606,150 @@ impl Backend for PgBackend {
 
     async fn usage_report(
         &self,
-        tenants: Option<&[String]>,
-        limit: usize,
+        f: &super::usage::UsageFilter,
     ) -> Result<Option<super::usage::UsageReport>, StoreError> {
-        let tenants: Option<Vec<String>> = tenants.map(<[String]>::to_vec);
+        let tenants = f.tenants.clone();
         let rows = sqlx::query(
             "SELECT request_id, tenant_id, model, intent, prompt_tokens, completion_tokens, cached_prompt_tokens,
                     tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts, requested_model, intent_confidence,
                     route_stage, routed_model_cost_usd, flat_price_usd, cache_tier, usage_source, cache_write_tokens,
-                    cache_write_1h_tokens, billed_usd, saved_usd
-             FROM usage_event WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1))
-             ORDER BY ts DESC, request_id DESC LIMIT $2",
+                    cache_write_1h_tokens, billed_usd, saved_usd, node, node_version, run_id
+             FROM usage_event
+             WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2)
+                   AND ($3::TEXT IS NULL OR run_id = $3)
+             ORDER BY ts DESC, request_id DESC LIMIT $4",
         )
         .bind(&tenants)
-        .bind(i64_of(limit as u64))
+        .bind(&f.node)
+        .bind(&f.run_id)
+        .bind(i64_of(f.limit as u64))
         .fetch_all(&self.pool)
         .await
         .map_err(db)?;
         let events = rows.iter().map(usage_row).collect::<Result<Vec<_>, _>>()?;
-        // The same totals as `UsageTotals::from_events`, aggregated in the database. "priced" is
-        // `UsageEvent::margin_usd().is_some()`: a billed (or legacy flat) price and a routed cost.
-        let t = sqlx::query(
-            "SELECT COUNT(*)::BIGINT AS requests,
-                    COALESCE(SUM(prompt_tokens), 0)::BIGINT AS prompt_tokens,
-                    COALESCE(SUM(completion_tokens), 0)::BIGINT AS completion_tokens,
-                    COALESCE(SUM(cached_prompt_tokens), 0)::BIGINT AS cached_prompt_tokens,
-                    COALESCE(SUM(cache_write_tokens), 0)::BIGINT AS cache_write_tokens,
-                    COUNT(*) FILTER (WHERE usage_source = 'estimated')::BIGINT AS estimated_requests,
-                    COUNT(*) FILTER (WHERE cache = 'hit')::BIGINT AS cache_hits,
-                    COALESCE(SUM(saved_usd), 0)::FLOAT8 AS saved_usd,
-                    COUNT(*) FILTER (WHERE cache_tier = 'semantic')::BIGINT AS semantic_cache_hits,
-                    COALESCE(SUM(tokens_saved + cached_prompt_tokens), 0)::BIGINT AS tokens_saved,
-                    COALESCE(SUM(cost_usd), 0)::FLOAT8 AS cost_usd,
-                    COUNT(*) FILTER (WHERE requested_model = 'caliban/auto')::BIGINT AS auto_requests,
-                    COUNT(*) FILTER (WHERE requested_model = 'caliban/auto' AND cache = 'hit')::BIGINT AS auto_cache_hits,
-                    COALESCE(SUM(flat_price_usd) FILTER (WHERE priced), 0)::FLOAT8 AS flat_price_usd,
-                    COALESCE(SUM(COALESCE(billed_usd, flat_price_usd)) FILTER (WHERE priced), 0)::FLOAT8 AS billed_usd,
-                    COALESCE(SUM(saved_usd) FILTER (WHERE priced), 0)::FLOAT8 AS auto_saved_usd,
-                    COALESCE(SUM(routed_model_cost_usd) FILTER (WHERE priced), 0)::FLOAT8 AS routed_model_cost_usd,
-                    COALESCE(SUM(COALESCE(billed_usd, flat_price_usd) - routed_model_cost_usd) FILTER (WHERE priced), 0)::FLOAT8
-                        AS margin_usd
-             FROM (SELECT *, (COALESCE(billed_usd, flat_price_usd) IS NOT NULL AND routed_model_cost_usd IS NOT NULL)
-                             AS priced
-                   FROM usage_event WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1))) u",
+        // Raw events aggregated like `UsageTotals::from_events`, plus the rolled-up days (none
+        // when filtering by run: rolled-up days keep no run ids).
+        let totals_sql = format!(
+            "SELECT {outer} FROM (
+                 SELECT {raw} FROM (SELECT *, {priced} AS priced FROM usage_event
+                                    WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2)
+                                          AND ($3::TEXT IS NULL OR run_id = $3)) u
+                 UNION ALL
+                 SELECT {cols} FROM usage_daily
+                 WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2) AND $3::TEXT IS NULL
+             ) t",
+            outer = usage_sums(),
+            raw = usage_aggregates(),
+            priced = USAGE_PRICED,
+            cols = usage_columns(),
+        );
+        let t = sqlx::query(sqlx::AssertSqlSafe(totals_sql))
+            .bind(&tenants)
+            .bind(&f.node)
+            .bind(&f.run_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)?;
+        let totals = usage_totals(&t)?;
+        let by_node_sql = format!(
+            "SELECT node, node_version, {outer} FROM (
+                 SELECT node, COALESCE(node_version, 0) AS node_version, {raw}
+                 FROM (SELECT *, {priced} AS priced FROM usage_event
+                       WHERE node IS NOT NULL AND ($1::TEXT[] IS NULL OR tenant_id = ANY($1))
+                             AND ($2::TEXT IS NULL OR node = $2) AND ($3::TEXT IS NULL OR run_id = $3)) u
+                 GROUP BY 1, 2
+                 UNION ALL
+                 SELECT node, node_version, {cols} FROM usage_daily
+                 WHERE node <> '' AND ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2)
+                       AND $3::TEXT IS NULL
+             ) t GROUP BY node, node_version ORDER BY node, node_version",
+            outer = usage_sums(),
+            raw = usage_aggregates(),
+            priced = USAGE_PRICED,
+            cols = usage_columns(),
+        );
+        let groups = sqlx::query(sqlx::AssertSqlSafe(by_node_sql))
+            .bind(&tenants)
+            .bind(&f.node)
+            .bind(&f.run_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        let by_node = groups
+            .iter()
+            .map(|r| {
+                Ok(super::usage::NodeUsage {
+                    node: get(r, "node")?,
+                    node_version: u32::try_from(get::<i32>(r, "node_version")?).unwrap_or(0),
+                    totals: usage_totals(r)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(Some(super::usage::UsageReport { events, totals, by_node }))
+    }
+
+    async fn usage_boundary(&self, days: u32) -> Result<Option<DateTime<Utc>>, StoreError> {
+        let b: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT (date_trunc('day', now() AT TIME ZONE 'UTC') - make_interval(days => $1)) AT TIME ZONE 'UTC'",
         )
-        .bind(&tenants)
+        .bind(i32::try_from(days).unwrap_or(i32::MAX))
         .fetch_one(&self.pool)
         .await
         .map_err(db)?;
-        let n = |c: &str| -> Result<u64, StoreError> { get::<i64>(&t, c).map(|v| u64::try_from(v).unwrap_or(0)) };
-        // `+ 0.0` turns a -0.0 from the database into +0.0.
-        let f = |c: &str| -> Result<f64, StoreError> { get::<f64>(&t, c).map(|v| v + 0.0) };
-        let totals = super::usage::UsageTotals {
-            requests: n("requests")?,
-            prompt_tokens: n("prompt_tokens")?,
-            completion_tokens: n("completion_tokens")?,
-            cached_prompt_tokens: n("cached_prompt_tokens")?,
-            cache_write_tokens: n("cache_write_tokens")?,
-            estimated_requests: n("estimated_requests")?,
-            cache_hits: n("cache_hits")?,
-            saved_usd: f("saved_usd")?,
-            semantic_cache_hits: n("semantic_cache_hits")?,
-            tokens_saved: n("tokens_saved")?,
-            cost_usd: f("cost_usd")?,
-            auto_requests: n("auto_requests")?,
-            auto_cache_hits: n("auto_cache_hits")?,
-            flat_price_usd: f("flat_price_usd")?,
-            billed_usd: f("billed_usd")?,
-            auto_saved_usd: f("auto_saved_usd")?,
-            routed_model_cost_usd: f("routed_model_cost_usd")?,
-            margin_usd: f("margin_usd")?,
-        };
-        Ok(Some(super::usage::UsageReport { events, totals }))
+        Ok(Some(b))
+    }
+
+    async fn rollup_usage(&self, days: u32) -> Result<u64, StoreError> {
+        let mut moved = 0;
+        loop {
+            let mut tx = self.pool.begin().await.map_err(db)?;
+            // One control plane at a time; the others skip this round.
+            let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                .bind(ROLLUP_LOCK)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db)?;
+            if !got {
+                return Ok(moved);
+            }
+            // Delete a batch of raw events and add them to their day in one statement: an event is
+            // counted raw or rolled up, never both.
+            let sql = format!(
+                "WITH boundary AS (SELECT (date_trunc('day', now() AT TIME ZONE 'UTC') - make_interval(days => $1))
+                                          AT TIME ZONE 'UTC' AS b),
+                      moved AS (DELETE FROM usage_event WHERE request_id IN (
+                                    SELECT request_id FROM usage_event, boundary WHERE ts < boundary.b
+                                    ORDER BY ts LIMIT $2 FOR UPDATE OF usage_event SKIP LOCKED)
+                                RETURNING *),
+                      added AS (INSERT INTO usage_daily (tenant_id, day, node, node_version, {cols})
+                                SELECT tenant_id, (ts AT TIME ZONE 'UTC')::date, COALESCE(node, ''),
+                                       COALESCE(node_version, 0), {raw}
+                                FROM (SELECT *, {priced} AS priced FROM moved) u
+                                GROUP BY 1, 2, 3, 4
+                                ON CONFLICT (tenant_id, day, node, node_version) DO UPDATE SET {upsert}
+                                RETURNING 1)
+                 SELECT (SELECT count(*) FROM moved)::BIGINT",
+                cols = usage_columns(),
+                raw = usage_aggregates(),
+                priced = USAGE_PRICED,
+                upsert = USAGE_TOTALS
+                    .iter()
+                    .map(|(c, _, _)| format!("{c} = usage_daily.{c} + EXCLUDED.{c}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .bind(i32::try_from(days).unwrap_or(i32::MAX))
+                .bind(ROLLUP_BATCH)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db)?;
+            tx.commit().await.map_err(db)?;
+            moved += u64::try_from(n).unwrap_or(0);
+            if n < ROLLUP_BATCH {
+                return Ok(moved);
+            }
+        }
     }
 
     async fn put_router(&self, r: &RouterStatus) -> Result<(), StoreError> {
@@ -659,6 +821,9 @@ fn usage_row(r: &PgRow) -> Result<caliban_meter::UsageEvent, StoreError> {
         flat_price_usd: get(r, "flat_price_usd")?,
         billed_usd: get(r, "billed_usd")?,
         saved_usd: get(r, "saved_usd")?,
+        node: get(r, "node")?,
+        node_version: get::<Option<i32>>(r, "node_version")?.map(|v| u32::try_from(v).unwrap_or(0)),
+        run_id: get(r, "run_id")?,
     })
 }
 

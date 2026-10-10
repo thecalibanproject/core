@@ -24,6 +24,9 @@ use std::collections::{HashSet, VecDeque};
 /// Request ids the memory store remembers for deduplication.
 pub const MEMORY_DEDUP: usize = 200_000;
 
+/// Raw usage events are kept this many days by default (`CALIBAN_USAGE_RETENTION_DAYS`).
+pub const DEFAULT_RETENTION_DAYS: u32 = 90;
+
 /// What an ingest did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Ingested {
@@ -62,6 +65,9 @@ pub struct UsageTotals {
     pub semantic_cache_hits: u64,
     pub tokens_saved: u64,
     pub cost_usd: f64,
+    /// What the customer is charged: the billed price for `caliban/auto` (discounted on cache
+    /// hits), the model's cost otherwise. A node run's `cost_usd` is the same sum over its calls.
+    pub charged_usd: f64,
     // caliban/auto: the full flat price and what was billed (discounted on cache hits) vs the
     // routed models' real cost, over events with both prices.
     pub auto_requests: u64,
@@ -90,6 +96,7 @@ impl UsageTotals {
             semantic_cache_hits: count(&|e| e.cache_tier == Some(CacheTier::Semantic)),
             tokens_saved: all.iter().map(|e| e.tokens_saved + e.cached_prompt_tokens).sum(),
             cost_usd: usd_total(all.iter().filter_map(|e| e.cost_usd)),
+            charged_usd: usd_total(all.iter().filter_map(charged)),
             auto_requests: count(&auto),
             auto_cache_hits: count(&|e| auto(e) && e.cache == CacheStatus::Hit),
             flat_price_usd: usd_total(priced().filter_map(|e| e.flat_price_usd)),
@@ -101,11 +108,47 @@ impl UsageTotals {
     }
 }
 
-/// Newest events (up to the requested limit) and the totals over all matching events.
+/// What an event charges the customer (see [`UsageTotals::charged_usd`]).
+pub fn charged(e: &UsageEvent) -> Option<f64> {
+    if e.requested_model.as_deref() == Some("caliban/auto") { e.auto_billed_usd().or(e.cost_usd) } else { e.cost_usd }
+}
+
+/// Which events a usage report covers.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageFilter {
+    /// `None`: every tenant.
+    pub tenants: Option<Vec<String>>,
+    /// Only the calls of this node's runs.
+    pub node: Option<String>,
+    /// Only the calls of this run (raw events only: rolled-up days carry no run ids).
+    pub run_id: Option<String>,
+    /// Newest events returned at most.
+    pub limit: usize,
+}
+
+impl UsageFilter {
+    pub fn matches(&self, e: &UsageEvent) -> bool {
+        self.tenants.as_ref().is_none_or(|t| t.contains(&e.tenant_id))
+            && self.node.as_ref().is_none_or(|n| e.node.as_ref() == Some(n))
+            && self.run_id.as_ref().is_none_or(|r| e.run_id.as_ref() == Some(r))
+    }
+}
+
+/// Totals of one node version's runs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct NodeUsage {
+    pub node: String,
+    pub node_version: u32,
+    pub totals: UsageTotals,
+}
+
+/// Newest events (up to the requested limit), the totals over all matching events (raw and rolled
+/// up), and the same totals per node version (node calls only).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct UsageReport {
     pub events: Vec<UsageEvent>,
     pub totals: UsageTotals,
+    pub by_node: Vec<NodeUsage>,
 }
 
 /// The memory store's usage: the process ring plus a bounded set of ingested request ids.
@@ -146,14 +189,22 @@ impl MemoryUsage {
         out
     }
 
-    pub(crate) fn report(ring: &RecentUsage, tenants: Option<&[String]>, limit: usize) -> UsageReport {
+    pub(crate) fn report(ring: &RecentUsage, f: &UsageFilter) -> UsageReport {
         let mut all = ring.snapshot(None, usize::MAX);
-        if let Some(t) = tenants {
-            all.retain(|e| t.contains(&e.tenant_id));
-        }
+        all.retain(|e| f.matches(e));
         let totals = UsageTotals::from_events(&all);
-        all.truncate(limit);
-        UsageReport { events: all, totals }
+        let mut groups: std::collections::BTreeMap<(String, u32), Vec<UsageEvent>> = Default::default();
+        for e in &all {
+            if let Some(n) = &e.node {
+                groups.entry((n.clone(), e.node_version.unwrap_or(0))).or_default().push(e.clone());
+            }
+        }
+        let by_node = groups
+            .into_iter()
+            .map(|((node, node_version), ev)| NodeUsage { node, node_version, totals: UsageTotals::from_events(&ev) })
+            .collect();
+        all.truncate(f.limit);
+        UsageReport { events: all, totals, by_node }
     }
 }
 
@@ -173,6 +224,7 @@ mod tests {
             "auto_saved_usd",
             "routed_model_cost_usd",
             "margin_usd",
+            "charged_usd",
         ] {
             assert_eq!(serde_json::to_string(&t[k]).unwrap(), "0.0", "{k}");
         }

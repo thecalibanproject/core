@@ -18,6 +18,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../../../migrations/0013_node_journal.sql"),
     include_str!("../../../../migrations/0014_node_run_specs.sql"),
     include_str!("../../../../migrations/0015_node_spend.sql"),
+    include_str!("../../../../migrations/0017_node_run_retention.sql"),
 ];
 
 macro_rules! run_columns {
@@ -417,6 +418,23 @@ impl Journal for PgJournal {
         .await
         .map_err(db)?;
         Ok(r.rows_affected() == 1)
+    }
+
+    async fn purge_finished(&self, older_than: Duration, batch: usize) -> JResult<u64> {
+        // SKIP LOCKED: several workers purging at once take different rows.
+        let r = sqlx::query(
+            "DELETE FROM node_run WHERE id IN (
+                 SELECT id FROM node_run
+                 WHERE status IN ('succeeded', 'failed', 'budget_exhausted') AND finished_at IS NOT NULL
+                       AND finished_at < now() - make_interval(secs => $1)
+                 ORDER BY finished_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        )
+        .bind(secs(older_than))
+        .bind(i64::try_from(batch).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(r.rows_affected())
     }
 
     async fn tenant_spend(&self, tenant: &str) -> JResult<TenantSpend> {

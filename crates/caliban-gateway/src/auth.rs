@@ -15,6 +15,16 @@ pub struct Caller<'a> {
 pub struct InternalCaller {
     pub tenant: String,
     pub key_hash: String,
+    /// The node run the call is for: its usage event is tagged with it.
+    pub node: Option<NodeTag>,
+}
+
+/// Which node run a model call belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeTag {
+    pub node: String,
+    pub version: u32,
+    pub run_id: String,
 }
 
 /// The caller of a request: the in-process caller when there is one, else the API key in the

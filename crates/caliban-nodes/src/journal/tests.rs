@@ -277,3 +277,54 @@ async fn concurrent_claimers_take_each_run_exactly_once() {
         }
     }
 }
+
+#[tokio::test]
+async fn retention_purges_finished_runs_with_their_steps_and_events() {
+    for j in journals().await {
+        let n = j.name();
+        let done =
+            |budget| Finish { status: RunStatus::Succeeded, output: None, error: None, stop_reason: None, budget };
+        let b = BudgetState::new(10, 1000, 60);
+        for i in 0..6 {
+            let id = format!("run_{i}");
+            j.create_run(new_run(&id, "acme", None)).await.unwrap();
+            j.claim(&id, "w1", TTL).await.unwrap().unwrap();
+            j.put_step("w1", step(&id, "classify#0"), &b).await.unwrap();
+            j.put_event("acme", &id, "timer", EventKind::Timer, None).await.unwrap();
+            assert!(j.finish(&id, "w1", done(b)).await.unwrap());
+        }
+        // Not finished: never purged.
+        j.create_run(new_run("run_live", "acme", None)).await.unwrap();
+        j.create_run(new_run("run_busy", "acme", None)).await.unwrap();
+        j.claim("run_busy", "w1", TTL).await.unwrap().unwrap();
+        let spent = j.tenant_spend("acme").await.unwrap();
+        assert!(spent.today_usd > 0.0, "{n}");
+
+        assert_eq!(j.purge_finished(Duration::from_secs(3600), 100).await.unwrap(), 0, "{n}: too recent");
+        // Two workers purge at once, in small batches: every finished run goes exactly once.
+        let (a, b2) = (Arc::clone(&j), Arc::clone(&j));
+        let purge = |j: Arc<dyn Journal>| async move {
+            let mut total = 0;
+            loop {
+                let k = j.purge_finished(Duration::ZERO, 2).await.unwrap();
+                total += k;
+                if k == 0 {
+                    return total;
+                }
+            }
+        };
+        let (x, y) = tokio::join!(purge(a), purge(b2));
+        assert_eq!(x + y, 6, "{n}: {x} + {y}");
+        for i in 0..6 {
+            let id = format!("run_{i}");
+            assert!(j.get_run("acme", &id).await.unwrap().is_none(), "{n}");
+            assert!(j.steps(&id).await.unwrap().is_empty(), "{n}: steps go with the run");
+            assert!(j.event(&id, "timer").await.unwrap().is_none(), "{n}: events go with the run");
+        }
+        assert!(
+            j.get_run("acme", "run_live").await.unwrap().is_some()
+                && j.get_run("acme", "run_busy").await.unwrap().is_some()
+        );
+        assert_eq!(j.tenant_spend("acme").await.unwrap(), spent, "{n}: the spend totals are not purged");
+    }
+}

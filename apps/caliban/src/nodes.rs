@@ -43,6 +43,10 @@ pub struct NodeArgs {
     /// Consecutive failed calls of a tool (per tenant) that open its circuit breaker.
     #[arg(long, env = "CALIBAN_NODE_BREAKER_FAILURES", default_value_t = 5, global = true)]
     node_breaker_failures: u32,
+    /// Days finished node runs (with their steps and events) are kept in the journal; 0 keeps them
+    /// forever. Every worker purges, in small batches, hourly.
+    #[arg(long, env = "CALIBAN_NODE_RUN_RETENTION_DAYS", default_value_t = 30, global = true)]
+    node_run_retention_days: u64,
     /// Seconds an open circuit breaker refuses calls before it lets one trial call through.
     #[arg(long, env = "CALIBAN_NODE_BREAKER_COOLDOWN_SECS", default_value_t = 30, global = true)]
     node_breaker_cooldown_secs: u64,
@@ -127,8 +131,41 @@ impl NodeArgs {
         let executor = caliban_gateway::nodes::local_executor(gw, journal, Arc::new(NoTools), keyring, worker_id, opts);
         let stop = Arc::new(Notify::new());
         tokio::spawn(Arc::clone(&executor).run_loop(Arc::clone(&stop)));
+        if self.node_run_retention_days > 0 {
+            let keep = Duration::from_secs(self.node_run_retention_days.saturating_mul(86_400));
+            tokio::spawn(purge_runs(Arc::clone(executor.journal()), keep, Arc::clone(&stop)));
+        }
         gw.set_nodes(NodeRuns::Local(LocalRuns { executor, sync_wait: self.sync_wait() }));
         Ok(stop)
+    }
+}
+
+/// Retention of finished runs: hourly, in batches (several workers may purge at once).
+async fn purge_runs(journal: Arc<dyn Journal>, keep: Duration, stop: Arc<Notify>) {
+    const BATCH: usize = 500;
+    loop {
+        let mut total = 0;
+        loop {
+            match journal.purge_finished(keep, BATCH).await {
+                Ok(n) => {
+                    total += n;
+                    if (n as usize) < BATCH {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "purging finished node runs failed; retrying next hour");
+                    break;
+                }
+            }
+        }
+        if total > 0 {
+            tracing::info!(runs = total, days = keep.as_secs() / 86_400, "purged finished node runs past retention");
+        }
+        tokio::select! {
+            () = stop.notified() => return,
+            () = tokio::time::sleep(Duration::from_secs(3600)) => {}
+        }
     }
 }
 

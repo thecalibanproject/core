@@ -919,6 +919,7 @@ trust_tier = "t2_contracted"
             est_prompt_tokens: 0,
             route: None,
             client_usage,
+            node: None,
         }
     }
 
