@@ -428,6 +428,31 @@ async fn suite(s: &Store) {
     deletes(s).await;
     identity(s).await;
 
+    // ── data-plane decisions: each recorded once by its id, unknown actions refused ──
+    let ev = |id: &str, action: &str| caliban_nodes::journal::AuditEvent {
+        id: id.into(),
+        tenant_id: "acme".into(),
+        actor: "api_key:abc".into(),
+        action: action.into(),
+        target: Some("run_1".into()),
+        detail: json!({"node": "triage", "version": 1, "step": "write#0@approve"}),
+        at: ts(),
+    };
+    let r = s
+        .ingest_audit(vec![
+            ev("run_1/write#0@approve/answer", "node.write.approve"),
+            ev("run_1/cancel", "node.run.cancel"),
+        ])
+        .await
+        .unwrap();
+    assert_eq!((r.accepted, r.duplicates, r.rejected), (2, 0, 0));
+    let r = s.ingest_audit(vec![ev("run_1/cancel", "node.run.cancel"), ev("x", "tenant.delete")]).await.unwrap();
+    assert_eq!((r.accepted, r.duplicates, r.rejected), (0, 1, 1), "a retry appends nothing; a CP action is refused");
+    let last = s.audit(2).await.unwrap();
+    assert_eq!((last[0].action.as_str(), last[0].actor.as_str()), ("node.write.approve", "api_key:abc"));
+    assert_eq!(last[1].detail["event_id"], "run_1/cancel");
+    assert_eq!(last[1].target.as_deref(), Some("run_1"));
+
     // ── concurrent writers: serialized, chain stays intact ──
     let writes = (0..8).map(|i| s.apply("ops", Mutation::CreateTenant(tenant(&format!("burst-{i}")))));
     for r in futures::future::join_all(writes).await {

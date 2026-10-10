@@ -56,6 +56,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (19, "tool_registry", include_str!("../../../../migrations/0019_tool_registry.sql")),
     (20, "api_key_datasource_scopes", include_str!("../../../../migrations/0020_api_key_datasource_scopes.sql")),
     (21, "node_exposure", include_str!("../../../../migrations/0021_node_exposure.sql")),
+    (22, "audit_ingest", include_str!("../../../../migrations/0022_audit_ingest.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -493,6 +494,28 @@ impl Backend for PgBackend {
         post.audit_head = append_audit(&mut tx, actor, &draft).await?.seq;
         tx.commit().await.map_err(db)?;
         Ok(post)
+    }
+
+    async fn record_once(&self, actor: &str, event_id: &str, d: &AuditDraft) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(WRITE_LOCK).execute(&mut *tx).await.map_err(db)?;
+        let known: Option<i64> = sqlx::query_scalar("SELECT seq FROM audit_ingest WHERE event_id = $1")
+            .bind(event_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+        if known.is_some() {
+            return Ok(false);
+        }
+        let e = append_audit(&mut tx, actor, d).await?;
+        sqlx::query("INSERT INTO audit_ingest (event_id, seq) VALUES ($1, $2)")
+            .bind(event_id)
+            .bind(i64_of(e.seq))
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
     }
 
     async fn audit(&self, limit: usize) -> Result<Vec<AuditEntry>, StoreError> {

@@ -572,3 +572,65 @@ async fn mcp_tasks_follow_long_runs_when_enabled() {
     let _ = client.cancel().await;
     task.abort();
 }
+
+/// Human answers and cancellations made on a worker reach the control plane's hash-chained audit
+/// log through the outbox, once each, even when a batch is delivered again.
+#[tokio::test]
+async fn run_decisions_land_in_the_audit_chain_once() {
+    use crate::nodes::{AuditTransport, ship_audit};
+    let e = env(Duration::ZERO).await;
+    e.publish("flow", flow()).await;
+    let j = journal().await;
+    let w = worker(&e, &j, &idem(), None, "worker-a", LONG);
+    let (cp_url, cp_task) = serve(e.cp_app.clone()).await;
+    let transport = Arc::new(
+        crate::split::HttpAuditTransport::new(&cp_url, crate::nodes_tests::ROUTER_TOKEN.into(), "worker-a".into())
+            .unwrap(),
+    );
+    // A question answered, and a run cancelled while it waits.
+    let (_, v) = send(&w.app, "POST", "/v1/nodes/flow/runs", KEY, Some(json!({"input": {"case": "x"}})), &[]).await;
+    let answered = v["id"].as_str().unwrap().to_owned();
+    send(&w.app, "POST", &format!("/v1/runs/{answered}/input"), KEY, Some(json!({"answer": "today"})), &[]).await;
+    let (_, v) = send(&w.app, "POST", "/v1/nodes/flow/runs", KEY, Some(json!({"input": {"case": "y"}})), &[]).await;
+    let cancelled = v["id"].as_str().unwrap().to_owned();
+    send(&w.app, "POST", &format!("/v1/runs/{cancelled}/cancel"), KEY, None, &[]).await;
+    // Kept for a redelivery below (as if the acknowledgement had been lost).
+    let pending = j.claim_audit("peek", Duration::ZERO, 10).await.unwrap();
+    assert_eq!(pending.len(), 2);
+
+    let stop = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(ship_audit(
+        Arc::clone(&j),
+        transport.clone(),
+        "worker-a".into(),
+        Duration::from_millis(20),
+        Arc::clone(&stop),
+    ));
+    let decisions = async || {
+        let (_, a) = send(&e.cp_app, "GET", "/api/v1/audit?limit=50", ADMIN, None, &[]).await;
+        let mine: Vec<Value> = a["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| {
+                x["action"].as_str().is_some_and(|a| a.starts_with("node.run.") || a.starts_with("node.write."))
+            })
+            .cloned()
+            .collect();
+        (a["chain_verified"].as_bool(), mine)
+    };
+    until("both decisions in the chain", async || decisions().await.1.len() == 2).await;
+    until("the outbox to empty", async || j.claim_audit("peek", Duration::ZERO, 10).await.unwrap().is_empty()).await;
+    stop.notify_waiters();
+    transport.send(&pending).await.unwrap();
+    let (verified, mine) = decisions().await;
+    assert_eq!(verified, Some(true));
+    assert_eq!(mine.len(), 2, "a redelivered batch records nothing new: {mine:?}");
+    let by_target = |t: &str| mine.iter().find(|x| x["target"] == t).unwrap().clone();
+    let a = by_target(&answered);
+    assert_eq!((a["action"].as_str(), a["tenant_id"].as_str()), (Some("node.run.answer"), Some("acme")));
+    assert!(a["actor"].as_str().unwrap().starts_with("api_key:"));
+    assert_eq!((a["detail"]["node"].as_str(), a["detail"]["step"].as_str()), (Some("flow"), Some("clarify#0")));
+    assert_eq!(by_target(&cancelled)["action"], "node.run.cancel");
+    cp_task.abort();
+}

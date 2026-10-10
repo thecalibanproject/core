@@ -277,6 +277,52 @@ impl caliban_meter::UsageTransport for HttpUsageTransport {
     }
 }
 
+/// Delivers a worker's audit events to the control plane (`POST /api/v1/audit/ingest`, router
+/// token), which records each once by its id.
+pub struct HttpAuditTransport {
+    client: reqwest::Client,
+    url: String,
+    token: String,
+    router_id: String,
+}
+
+impl HttpAuditTransport {
+    pub fn new(control_plane_url: &str, token: String, router_id: String) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .context("building HTTP client")?;
+        Ok(Self {
+            client,
+            url: format!("{}/api/v1/audit/ingest", control_plane_url.trim_end_matches('/')),
+            token,
+            router_id,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::nodes::AuditTransport for HttpAuditTransport {
+    async fn send(&self, events: &[caliban_nodes::journal::AuditEvent]) -> Result<(), String> {
+        let body = serde_json::json!({ "router_id": self.router_id, "events": events });
+        let resp = self
+            .client
+            .post(&self.url)
+            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("POST {}: {e}", self.url))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
+        Err(format!("control plane returned {status}: {text}"))
+    }
+}
+
 /// Write-then-rename so a crash never leaves a torn cache file. Owner-only permissions: the
 /// snapshot holds key hashes and sealed (encrypted) BYOK credentials.
 fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {

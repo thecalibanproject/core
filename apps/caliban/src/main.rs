@@ -141,6 +141,25 @@ impl caliban_meter::UsageTransport for LocalUsageTransport {
     }
 }
 
+/// What the control plane knows of node runs: the journal it reads (console endpoints), and where to
+/// leave itself for the in-process data plane (standalone).
+#[derive(Default)]
+struct ControlPlaneNodes {
+    journal: Option<Arc<dyn caliban_nodes::journal::Journal>>,
+    slot: Option<Arc<std::sync::OnceLock<Arc<caliban_cp::ControlPlane>>>>,
+}
+
+/// Standalone: data-plane audit events go straight to this process's control plane.
+struct LocalAuditTransport(Arc<std::sync::OnceLock<Arc<caliban_cp::ControlPlane>>>);
+
+#[async_trait::async_trait]
+impl nodes::AuditTransport for LocalAuditTransport {
+    async fn send(&self, events: &[caliban_nodes::journal::AuditEvent]) -> Result<(), String> {
+        let cp = self.0.get().ok_or("control plane starting")?;
+        cp.store.ingest_audit(events.to_vec()).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
 fn database_url() -> Option<String> {
     std::env::var("CALIBAN_DATABASE_URL").ok().filter(|u| !u.trim().is_empty())
 }
@@ -357,7 +376,7 @@ async fn main() -> Result<()> {
         tokio::spawn(source.run(handle.clone(), every));
         let shipper = if cli.ship.usage_ship {
             let transport =
-                Arc::new(split::HttpUsageTransport::new(&args.control_plane_url, token, worker_id.clone())?);
+                Arc::new(split::HttpUsageTransport::new(&args.control_plane_url, token.clone(), worker_id.clone())?);
             Some(cli.ship.start(transport, args.snapshot_cache.as_deref())?)
         } else {
             None
@@ -365,7 +384,10 @@ async fn main() -> Result<()> {
         let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default(), shipper.as_ref()))?);
         spawn_router_warmup(&gw);
         nodes::warn_if_local_idempotency(&gw);
-        let stop = cli.nodes.run_locally(&gw, journal, Arc::new(keyring.clone()), nodes::lease_owner(&worker_id))?;
+        let audit =
+            Arc::new(split::HttpAuditTransport::new(&args.control_plane_url, token.clone(), worker_id.clone())?);
+        let stop =
+            cli.nodes.run_locally(&gw, journal, Arc::new(keyring.clone()), nodes::lease_owner(&worker_id), audit)?;
         let res = serve("worker", args.listen.clone(), caliban_gateway::nodes::worker_app(gw, worker_token)).await;
         stop.notify_waiters();
         flush_wal(wal.as_deref()).await;
@@ -403,31 +425,40 @@ async fn main() -> Result<()> {
             router_task().await
         }
         Cmd::ControlPlane => {
-            let cp = control_plane(&cfg, &handle, &recent, "control-plane", None).await?;
+            // The console reads node runs from the journal (Postgres only: workers share it).
+            let cp = control_plane(&cfg, &handle, &recent, "control-plane", None, ControlPlaneNodes::default()).await?;
             cp.await
         }
         Cmd::Standalone => {
+            // Node runs execute in this process: Postgres journal with a database, else in memory.
+            // Publishing needs a KEK, so without one there is nothing to run. The control plane
+            // (console endpoints) reads the same journal.
+            let journal: Option<Arc<dyn caliban_nodes::journal::Journal>> = match keyring {
+                Some(_) => Some(Arc::new(caliban_nodes::journal::memory::MemoryJournal::new())),
+                None => None,
+            };
+            let local_cp = Arc::new(std::sync::OnceLock::new());
+            let cpn = ControlPlaneNodes { journal: journal.clone(), slot: Some(Arc::clone(&local_cp)) };
             // The control plane publishes the store's state (Postgres wins over the file) into
-            // `handle` before the data plane starts serving. Tenant purges start from that state.
-            let cp = control_plane(&cfg, &handle, &recent, "standalone", local_ship.as_deref()).await?;
+            // `handle` before the data plane starts serving (and migrates a database before the
+            // journal is opened). Tenant purges start from that state.
+            let cp = control_plane(&cfg, &handle, &recent, "standalone", local_ship.as_deref(), cpn).await?;
             purge_gw.spawn_tenant_purge(PURGE_EVERY);
-            // Node runs execute in this process: Postgres journal with a database (the control
-            // plane migrated it), else in memory. Publishing needs a KEK, so without one there is
-            // nothing to run.
-            let stop = match keyring {
-                Some(k) => {
-                    let journal: Arc<dyn caliban_nodes::journal::Journal> = match database_url() {
-                        Some(url) => nodes::postgres_journal(&url).await?,
-                        None => Arc::new(caliban_nodes::journal::memory::MemoryJournal::new()),
+            let stop = match (keyring, journal) {
+                (Some(k), Some(memory)) => {
+                    let journal = match local_cp.get().and_then(|cp: &Arc<caliban_cp::ControlPlane>| cp.journal()) {
+                        Some(j) => j,
+                        None => memory,
                     };
                     Some(cli.nodes.run_locally(
                         &purge_gw,
                         journal,
                         Arc::new(k.clone()),
                         nodes::lease_owner(&nodes::worker_name()),
+                        Arc::new(LocalAuditTransport(local_cp.clone())),
                     )?)
                 }
-                None => {
+                _ => {
                     tracing::warn!("node runs disabled: CALIBAN_KEK is not set (nodes cannot be published without it)");
                     None
                 }
@@ -475,6 +506,7 @@ async fn control_plane(
     recent: &RecentUsage,
     mode: &'static str,
     local_ship: Option<&LocalUsageTransport>,
+    nodes: ControlPlaneNodes,
 ) -> Result<impl std::future::Future<Output = Result<()>>> {
     let oidc = control_plane_sso(cfg)?;
     let break_glass = match std::env::var("CALIBAN_BREAK_GLASS").ok().filter(|v| !v.trim().is_empty()) {
@@ -549,8 +581,15 @@ async fn control_plane(
         ),
     }
     let sso = oidc.is_some();
+    // The node journal the console reads: the database's (shared with workers), else the
+    // in-memory one of a standalone process.
+    let journal = match database_url() {
+        Some(url) => Some(nodes::postgres_journal(&url).await?),
+        None => nodes.journal,
+    };
     let cp = Arc::new(
         caliban_cp::ControlPlane::new(store, admin_token, mode)
+            .with_journal(journal)
             .with_snapshots(signer, router_token)
             .with_keyring(keyring)
             .with_oidc(oidc)
@@ -567,6 +606,9 @@ async fn control_plane(
     }
     if let Some(t) = local_ship {
         let _ = t.cp.set(Arc::clone(&cp));
+    }
+    if let Some(slot) = nodes.slot {
+        let _ = slot.set(Arc::clone(&cp));
     }
     if sso {
         caliban_cp::auth::spawn_purge(Arc::clone(&cp), Duration::from_secs(600));

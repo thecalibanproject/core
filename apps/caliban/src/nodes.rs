@@ -117,6 +117,7 @@ impl NodeArgs {
         journal: Arc<dyn Journal>,
         keyring: Arc<caliban_config::Keyring>,
         worker_id: String,
+        audit: Arc<dyn AuditTransport>,
     ) -> Result<Arc<Notify>> {
         let opts = self.options();
         tracing::info!(
@@ -130,6 +131,13 @@ impl NodeArgs {
         let executor = caliban_gateway::nodes::local_executor(gw, journal, tools, keyring, worker_id, opts);
         let stop = Arc::new(Notify::new());
         tokio::spawn(Arc::clone(&executor).run_loop(Arc::clone(&stop)));
+        tokio::spawn(ship_audit(
+            Arc::clone(executor.journal()),
+            audit,
+            worker_id_of(&executor),
+            Duration::from_secs(1),
+            Arc::clone(&stop),
+        ));
         if self.node_run_retention_days > 0 {
             let keep = Duration::from_secs(self.node_run_retention_days.saturating_mul(86_400));
             tokio::spawn(purge_runs(Arc::clone(executor.journal()), keep, Arc::clone(&stop)));
@@ -173,6 +181,60 @@ fn tool_registry(gw: &Arc<Gateway>, keyring: &Arc<caliban_config::Keyring>) -> R
     ))
 }
 
+/// Delivers data-plane audit events (human answers, approvals and denials of tainted writes,
+/// cancellations) to the control plane's audit log.
+#[async_trait::async_trait]
+pub trait AuditTransport: Send + Sync {
+    /// `Ok` once the control plane recorded (or already had) every event.
+    async fn send(&self, events: &[caliban_nodes::journal::AuditEvent]) -> Result<(), String>;
+}
+
+/// How long a worker holds the outbox entries it is shipping before another worker may take them.
+const AUDIT_HOLD: Duration = Duration::from_secs(60);
+
+/// Ships the journal's audit outbox to the control plane, at least once: entries are taken (held
+/// by this worker), sent, and deleted only once the control plane acknowledged them; it records
+/// each by its stable id, so a batch sent again after a lost acknowledgement (or by another worker
+/// after this one died) is not recorded twice. Runs until `stop`.
+pub async fn ship_audit(
+    journal: Arc<dyn Journal>,
+    transport: Arc<dyn AuditTransport>,
+    owner: String,
+    every: Duration,
+    stop: Arc<Notify>,
+) {
+    let mut backoff = every;
+    loop {
+        let wait = match journal.claim_audit(&owner, AUDIT_HOLD, 200).await {
+            Ok(batch) if !batch.is_empty() => match transport.send(&batch).await {
+                Ok(()) => {
+                    let ids: Vec<String> = batch.into_iter().map(|e| e.id).collect();
+                    if let Err(e) = journal.ack_audit(&ids).await {
+                        tracing::warn!(error = %e, "acknowledging shipped audit events failed; they will be sent again");
+                    }
+                    backoff = every;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, events = batch.len(), "shipping audit events to the control plane failed; retrying");
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    backoff
+                }
+            },
+            Ok(_) => every,
+            Err(e) => {
+                tracing::warn!(error = %e, "reading the audit outbox failed");
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                backoff
+            }
+        };
+        tokio::select! {
+            () = stop.notified() => return,
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
 /// Retention of finished runs: hourly, in batches (several workers may purge at once).
 async fn purge_runs(journal: Arc<dyn Journal>, keep: Duration, stop: Arc<Notify>) {
     const BATCH: usize = 500;
@@ -200,6 +262,10 @@ async fn purge_runs(journal: Arc<dyn Journal>, keep: Duration, stop: Arc<Notify>
             () = tokio::time::sleep(Duration::from_secs(3600)) => {}
         }
     }
+}
+
+fn worker_id_of(ex: &caliban_nodes::executor::Executor) -> String {
+    ex.worker_id().to_owned()
 }
 
 /// This worker's stable name: `CALIBAN_WORKER_ID` as is when set (deploy sets the pod name), else

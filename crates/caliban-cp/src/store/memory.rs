@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 
 pub struct MemoryBackend {
     inner: Mutex<(State, Vec<AuditEntry>)>,
+    /// Ids of recorded data-plane audit events (see `Backend::record_once`). Locked after `inner`.
+    recorded: Mutex<std::collections::HashSet<String>>,
     /// Sessions (by id) and pending logins (by state). Locked after `inner`, never before.
     auth: Mutex<AuthTables>,
     /// Router check-ins by router id (not part of the audited state).
@@ -32,7 +34,12 @@ impl MemoryBackend {
     pub fn seeded(mut seed: State) -> Self {
         let entry = AuditEntry::next(None, "system", &seed_draft(&seed), now_micros());
         seed.audit_head = entry.seq;
-        Self { inner: Mutex::new((seed, vec![entry])), auth: Mutex::default(), routers: Mutex::default() }
+        Self {
+            inner: Mutex::new((seed, vec![entry])),
+            recorded: Mutex::default(),
+            auth: Mutex::default(),
+            routers: Mutex::default(),
+        }
     }
 
     pub fn state(&self) -> State {
@@ -82,6 +89,18 @@ impl Backend for MemoryBackend {
         log.push(entry);
         *committed = st.clone();
         Ok(st)
+    }
+
+    async fn record_once(&self, actor: &str, event_id: &str, d: &super::audit::AuditDraft) -> Result<bool, StoreError> {
+        let mut guard = self.inner.lock();
+        if !self.recorded.lock().insert(event_id.to_owned()) {
+            return Ok(false);
+        }
+        let (committed, log) = &mut *guard;
+        let entry = AuditEntry::next(log.last(), actor, d, now_micros());
+        committed.audit_head = entry.seq;
+        log.push(entry);
+        Ok(true)
     }
 
     async fn audit(&self, limit: usize) -> Result<Vec<AuditEntry>, StoreError> {

@@ -54,6 +54,9 @@ pub struct ControlPlane {
     keyring: Option<Arc<Keyring>>,
     /// The MCP client for tool discovery and the tool token key (JWKS).
     tools: Option<Arc<tools::ToolsSetup>>,
+    /// The node run journal (console run endpoints): the database's, shared with workers, or a
+    /// standalone process's in-memory one. `None`: those endpoints answer 503.
+    journal: Option<Arc<dyn caliban_nodes::journal::Journal>>,
 }
 
 /// The last signed snapshot, re-served while the rendered config is unchanged.
@@ -77,7 +80,19 @@ impl ControlPlane {
             exported: Mutex::new(None),
             keyring: None,
             tools: None,
+            journal: None,
         }
+    }
+
+    /// The node run journal the console endpoints read.
+    #[must_use]
+    pub fn with_journal(mut self, journal: Option<Arc<dyn caliban_nodes::journal::Journal>>) -> Self {
+        self.journal = journal;
+        self
+    }
+
+    pub fn journal(&self) -> Option<Arc<dyn caliban_nodes::journal::Journal>> {
+        self.journal.clone()
     }
 
     /// The MCP client used for tool discovery (default: the system resolver, no loopback) and
@@ -284,6 +299,7 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         // Router token, not the admin token: a compromised router cannot administer.
         .route("/snapshot", get(snapshot))
         .route("/usage/ingest", post(ingest_usage).layer(axum::extract::DefaultBodyLimit::max(INGEST_MAX_BYTES)))
+        .route("/audit/ingest", post(ingest_audit))
         .route("/health", get(health));
 
     let mut app = Router::new()
@@ -1019,6 +1035,43 @@ async fn ingest_usage(State(cp): State<Cp>, headers: HeaderMap, body: axum::body
             Json(json!(r)).into_response()
         }
         // The router keeps the batch and retries.
+        Err(e) => ApiError::from(e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AuditIngest {
+    #[serde(default)]
+    router_id: Option<String>,
+    events: Vec<caliban_nodes::journal::AuditEvent>,
+}
+
+/// `POST /api/v1/audit/ingest`: a worker delivers decisions made on the data plane (human answers,
+/// approvals and denials of tainted writes, cancellations), with the router token. Each is
+/// recorded in the hash-chained audit log once (by its id), so retries are harmless.
+async fn ingest_audit(State(cp): State<Cp>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let Some(token) = cp.router_token.as_deref() else {
+        return ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "split mode is not enabled: set CALIBAN_ROUTER_TOKEN on the control plane".into(),
+        )
+        .into_response();
+    };
+    if !bearer_is(&headers, token) {
+        return ApiError(StatusCode::UNAUTHORIZED, "invalid router token".into()).into_response();
+    }
+    let batch: AuditIngest = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return bad(format!("invalid audit batch: {e}")).into_response(),
+    };
+    if batch.events.len() > 1000 {
+        return ApiError(StatusCode::PAYLOAD_TOO_LARGE, "at most 1000 events per batch".into()).into_response();
+    }
+    match cp.store.ingest_audit(batch.events).await {
+        Ok(r) => {
+            tracing::debug!(router = ?batch.router_id, accepted = r.accepted, duplicates = r.duplicates, "audit events ingested");
+            Json(json!(r)).into_response()
+        }
         Err(e) => ApiError::from(e).into_response(),
     }
 }

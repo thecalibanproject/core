@@ -1373,6 +1373,9 @@ pub trait Backend: Send + Sync {
     async fn apply(&self, actor: &str, m: &Mutation, check: Check<'_>) -> Result<State, StoreError>;
     /// Newest `limit` audit rows, ascending by `seq`.
     async fn audit(&self, limit: usize) -> Result<Vec<AuditEntry>, StoreError>;
+    /// Appends one audit row for an event recorded elsewhere (the data plane), unless an event with
+    /// this id was recorded before. Returns whether it was appended.
+    async fn record_once(&self, actor: &str, event_id: &str, d: &AuditDraft) -> Result<bool, StoreError>;
 
     // Sessions and pending logins: per-request reads and housekeeping, not audited. Creating and
     // revoking sessions goes through `apply` (`Login`, `Logout`, `RevokeUserSessions`).
@@ -1628,6 +1631,45 @@ impl Store {
         Ok(out)
     }
 
+    /// Records data-plane decisions (human answers, approvals and denials of tainted writes,
+    /// cancellations) in the audit chain, each once by its id however often it is delivered.
+    /// Unknown actions and malformed events are counted as rejected.
+    pub async fn ingest_audit(
+        &self,
+        events: Vec<caliban_nodes::journal::AuditEvent>,
+    ) -> Result<usage::Ingested, StoreError> {
+        let mut out = usage::Ingested::default();
+        for e in events {
+            let Some(action) = DATA_PLANE_ACTIONS.iter().find(|a| **a == e.action).copied() else {
+                tracing::warn!(action = %e.action, id = %e.id, "refused an audit event with an unknown action");
+                out.rejected += 1;
+                continue;
+            };
+            if e.id.is_empty() || e.id.len() > 512 || e.actor.is_empty() || e.actor.len() > 512 {
+                out.rejected += 1;
+                continue;
+            }
+            let mut detail = match e.detail {
+                Value::Object(m) => m,
+                _ => Map::new(),
+            };
+            detail.insert("event_id".into(), json!(e.id));
+            detail.insert("at".into(), json!(e.at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)));
+            let draft = AuditDraft {
+                tenant_id: Some(e.tenant_id.clone()),
+                action,
+                target: e.target,
+                detail: Value::Object(detail),
+            };
+            if self.backend.record_once(&e.actor, &e.id, &draft).await? {
+                out.accepted += 1;
+            } else {
+                out.duplicates += 1;
+            }
+        }
+        Ok(out)
+    }
+
     /// Usage events (newest first, at most `limit`) and totals, over `tenants` (`None`: all).
     pub async fn usage_report(
         &self,
@@ -1735,6 +1777,10 @@ impl Store {
         }
     }
 }
+
+/// Audit actions the data plane may record (`POST /api/v1/audit/ingest`).
+pub const DATA_PLANE_ACTIONS: &[&str] =
+    &["node.run.answer", "node.write.approve", "node.write.deny", "node.run.cancel"];
 
 pub fn default_base_url(kind: ProviderKind) -> Option<String> {
     match kind {
