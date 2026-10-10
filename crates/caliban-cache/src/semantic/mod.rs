@@ -10,7 +10,8 @@
 //!   dates and IDs, currency codes, units, languages, codes and capitalised names: "Q3 2025" never
 //!   matches "Q3 2026", "USD to EUR" never matches "EUR to USD", "into Spanish" never matches
 //!   "into Italian") and its modifier classes ("briefly" never matches "in detail", "enable"
-//!   never matches "disable", a negation never matches its absence);
+//!   never matches "disable", a negation never matches its absence) and its date and time
+//!   format specs (`YYYY-MM-DD` never matches `DD/MM/YYYY`);
 //! - the instruction prefix the prompt was embedded with (`[cache.semantic] query_prefix`), so
 //!   vectors from different instructions are never compared;
 //! - the set of PII surrogates in the request (tenant-scoped surrogates are deterministic, so
@@ -77,8 +78,10 @@ impl SemanticKey {
     pub fn new(p: &KeyParts<'_>) -> Self {
         let route = format!("{}|{}", p.model, p.shape.as_str());
         let mut h = blake3::Hasher::new();
-        // v2: ordered guard slots and modifier classes (v1 hashed sorted numeric tokens only).
-        h.update(b"caliban/t2/v2\0");
+        // v3: guard format specs, possessives and inflections (v2: ordered guard slots and modifier
+        // classes; v1 hashed sorted numeric tokens only). A new version never compares with
+        // entries written under an older one.
+        h.update(b"caliban/t2/v3\0");
         h.update(p.tenant.as_str().as_bytes());
         h.update(&[0]);
         h.update(route.as_bytes());
@@ -93,6 +96,11 @@ impl SemanticKey {
         }
         h.update(&[1]);
         h.update(&sig.modifiers.to_le_bytes());
+        for f in &sig.formats {
+            h.update(f.as_bytes());
+            h.update(&[0]);
+        }
+        h.update(&[2]);
         let mut surrogates: Vec<String> = p.surrogates.iter().map(|s| s.to_lowercase()).collect();
         surrogates.sort_unstable();
         surrogates.dedup();
@@ -401,6 +409,18 @@ mod tests {
         assert_eq!(p("Translate 'good morning' into Spanish."), p("How do you say 'good morning' in Spanish?"));
         assert_eq!(p("Convert 100 USD to EUR."), p("How much is 100 USD in EUR?"));
         assert_eq!(p("Explain the CAP theorem briefly."), p("Give me a brief explanation of the CAP theorem."));
+        // Second AWS run (bench/RESULTS-aws-2026-10b.md): possessives, inflections and format specs.
+        assert_eq!(p("What is the VAT rate in Germany?"), p("What's Germany's VAT rate?"));
+        assert_eq!(
+            p("Who approves expense reports over 5000 EUR?"),
+            p("Who has to approve expense reports above 5000 EUR?")
+        );
+        assert_eq!(
+            p("How do I format a date as YYYY-MM-DD in JavaScript?"),
+            p("In JavaScript, how can I format a date as YYYY-MM-DD?")
+        );
+        assert_ne!(p("Format a date as DD/MM/YYYY"), p("Format a date as MM/DD/YYYY"), "format specs must match");
+        assert_ne!(p("Show orders over 5"), p("Show orders under 5"));
     }
 
     #[test]

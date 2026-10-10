@@ -20,6 +20,13 @@
 //!   maximum/minimum, first/last, before/after, add/remove, above/below, buy/sell,
 //!   import/export, encrypt/decrypt, ascending/descending, start/stop, today/tomorrow.
 //!
+//! - **Format specs**, as a sorted set: date and time patterns such as `YYYY-MM-DD`, `DD/MM/YYYY`
+//!   or `HH:mm:ss` (lower-cased). They must be equal, but they are not ordered slots, so "format a
+//!   date as YYYY-MM-DD in JavaScript" matches "in JavaScript, format a date as YYYY-MM-DD".
+//!
+//! Possessives are the entity: `Germany's` is the slot `germany`, and "X's Y" is ordered as "Y of
+//! X" (`Germany's VAT rate` has the slots of `VAT rate in Germany`) when `Y` is itself a slot.
+//!
 //! Every rule can only turn a would-be hit into a miss, never the reverse: a word list that misses
 //! a language or a synonym just leaves that pair to the threshold, as before. Prompts in scripts
 //! without letter case (Chinese, Japanese, Arabic, ...) still get number, code and symbol slots.
@@ -34,6 +41,8 @@ pub struct Signature {
     pub slots: Vec<String>,
     /// Bit set of the modifier classes present (see [`Modifier`]).
     pub modifiers: u64,
+    /// Date and time format specs (`yyyy-mm-dd`), lower-cased, sorted and deduplicated.
+    pub formats: Vec<String>,
 }
 
 impl Signature {
@@ -308,25 +317,119 @@ pub fn signature(text: &str) -> Signature {
     let lower: Vec<String> = toks.iter().map(|t| t.text.to_lowercase()).collect();
     let has_number = toks.iter().any(|t| t.text.chars().any(char::is_numeric));
     let mut sig = Signature::default();
+    let in_format = format_specs(text, &toks, &mut sig.formats);
+    // A possessive slot ("Germany's") waiting to be placed after the slot that follows it.
+    let mut possessor: Option<(usize, String)> = None;
     for (i, (t, l)) in toks.iter().zip(&lower).enumerate() {
+        if in_format[i] {
+            continue;
+        }
         let prev = i.checked_sub(1).map(|j| lower[j].as_str());
-        if let Some(m) = modifier(l, prev) {
+        // "today's" is "today".
+        if let Some(m) = modifier(strip_possessive(l).0, prev) {
             sig.modifiers |= m.bit();
             continue;
         }
-        if t.text.chars().any(char::is_numeric) || t.text.chars().all(symbol_slot) {
-            sig.slots.push(l.clone());
-        } else if let Some(code) = language(l) {
-            sig.slots.push(format!("lang:{code}"));
-        } else if let Some(code) = currency(t.text, l) {
-            sig.slots.push(code);
-        } else if let Some(unit) = unit(l).filter(|_| has_number) {
-            sig.slots.push(unit.to_owned());
-        } else if is_code(t.text) || (is_capitalised(t.text) && !t.initial && !is_pronoun_i(l)) {
-            sig.slots.push(l.clone());
+        let (word, possessive) = strip_possessive(t.text);
+        let l = if possessive { word.to_lowercase() } else { l.clone() };
+        let Some(slot) = slot(word, &l, has_number, t.initial) else { continue };
+        let possessed = possessor.take().map(|(at, p)| (at + 1 == i, p));
+        match possessed {
+            // "Germany's VAT" is "VAT of Germany": the possessed slot first.
+            Some((true, p)) => {
+                sig.slots.push(slot);
+                sig.slots.push(p);
+            }
+            Some((false, p)) => {
+                sig.slots.push(p);
+                if possessive {
+                    possessor = Some((i, slot));
+                } else {
+                    sig.slots.push(slot);
+                }
+            }
+            None if possessive => possessor = Some((i, slot)),
+            None => sig.slots.push(slot),
         }
     }
+    if let Some((_, p)) = possessor {
+        sig.slots.push(p);
+    }
     sig
+}
+
+/// The slot a (non-modifier) token contributes, if any. `l` is the lower-cased token.
+fn slot(t: &str, l: &str, has_number: bool, initial: bool) -> Option<String> {
+    if t.chars().any(char::is_numeric) || t.chars().all(symbol_slot) {
+        Some(l.to_owned())
+    } else if let Some(code) = language(l) {
+        Some(format!("lang:{code}"))
+    } else if let Some(code) = currency(t, l) {
+        Some(code)
+    } else if let Some(unit) = unit(l).filter(|_| has_number) {
+        Some(unit.to_owned())
+    } else if is_code(t) || (is_capitalised(t) && !initial && !is_pronoun_i(l)) {
+        Some(l.to_owned())
+    } else {
+        None
+    }
+}
+
+/// `Germany's` → (`Germany`, true). English possessive `'s` / `’s` only; `it's` and other
+/// lower-case words never become slots anyway.
+fn strip_possessive(t: &str) -> (&str, bool) {
+    for suffix in ["'s", "’s", "'S", "’S"] {
+        if let Some(w) = t.strip_suffix(suffix)
+            && !w.is_empty()
+        {
+            return (w, true);
+        }
+    }
+    (t, false)
+}
+
+/// Components of a date or time format spec (case-insensitive).
+fn format_component(t: &str) -> bool {
+    matches!(
+        t.to_ascii_lowercase().as_str(),
+        "yyyy" | "yy" | "mm" | "mmm" | "mmmm" | "m" | "dd" | "d" | "ddd" | "dddd" | "hh" | "h" | "ss" | "s" | "sss"
+    )
+}
+
+/// Finds date and time format specs (`YYYY-MM-DD`, `DD.MM.YYYY`, `HH:mm:ss`): two or more
+/// components, at least one of two letters or more, joined by `-`, `/`, `:` or `.`. Adds each
+/// spec, lower-cased, to `out` (sorted, deduplicated) and returns which tokens belong to one.
+fn format_specs(text: &str, toks: &[Token<'_>], out: &mut Vec<String>) -> Vec<bool> {
+    let mut in_format = vec![false; toks.len()];
+    let offset = |t: &Token<'_>| t.text.as_ptr() as usize - text.as_ptr() as usize;
+    // A token is a run of components joined by `.` (`DD.MM.YYYY` is one token).
+    let is_component_run = |t: &Token<'_>| t.text.split('.').all(format_component);
+    let mut i = 0;
+    while i < toks.len() {
+        if !is_component_run(&toks[i]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j + 1 < toks.len() && is_component_run(&toks[j + 1]) {
+            let end = offset(&toks[j]) + toks[j].text.len();
+            let gap = &text[end..offset(&toks[j + 1])];
+            if !matches!(gap, "-" | "/" | ":") {
+                break;
+            }
+            j += 1;
+        }
+        let spec = &text[offset(&toks[i])..offset(&toks[j]) + toks[j].text.len()];
+        let parts: Vec<&str> = spec.split(['-', '/', ':', '.']).collect();
+        if parts.len() >= 2 && parts.iter().any(|p| p.len() >= 2) {
+            out.push(spec.to_lowercase());
+            in_format[i..=j].iter_mut().for_each(|f| *f = true);
+        }
+        i = j + 1;
+    }
+    out.sort_unstable();
+    out.dedup();
+    in_format
 }
 
 /// Two or more letters, all upper case (acronyms and codes: `CAP`, `SQL`, `GDPR`).
@@ -461,8 +564,10 @@ fn modifier(w: &str, prev: Option<&str>) -> Option<Modifier> {
         "technical" | "technically" | "advanced" | "expert" | "experts" => Technical,
         "only" | "solely" | "exclusively" | "nur" | "seulement" | "solo" | "solamente" | "apenas" => Only,
         "against" | "versus" | "vs" => Against,
-        "accept" | "accepted" | "approve" | "approved" | "approval" => Accept,
-        "reject" | "rejected" | "deny" | "denied" | "refuse" | "refused" => Reject,
+        "accept" | "accepts" | "accepted" | "accepting" | "approve" | "approves" | "approved" | "approving"
+        | "approval" => Accept,
+        "reject" | "rejects" | "rejected" | "rejecting" | "deny" | "denies" | "denied" | "denying" | "refuse"
+        | "refuses" | "refused" | "refusing" => Reject,
         "cheap" | "cheaper" | "cheapest" | "inexpensive" | "affordable" => Cheap,
         "expensive" | "pricier" | "priciest" | "costly" => Expensive,
         "fast" | "faster" | "fastest" => Fast,
@@ -737,6 +842,70 @@ mod tests {
         ] {
             assert!(same(a, b), "must be comparable: {a:?} vs {b:?}\n{:?}\n{:?}", signature(a), signature(b));
         }
+    }
+
+    /// The three paraphrases the guards cost in the second AWS run
+    /// (`bench/RESULTS-aws-2026-10b.md`, section 2), now comparable.
+    #[test]
+    fn possessives_comparatives_and_format_specs_match() {
+        for (a, b) in [
+            ("What is the VAT rate in Germany?", "What's Germany's VAT rate?"),
+            ("What is the capital of Australia?", "Which city is Australia's capital?"),
+            ("What is the VAT rate in Germany?", "What is Germany’s VAT rate?"),
+            ("Who approves expense reports over 5000 EUR?", "Who has to approve expense reports above 5000 EUR?"),
+            ("Show invoices over 5000 EUR", "Show invoices exceeding 5000 EUR"),
+            ("Show invoices above 5000 EUR", "Show invoices greater than 5000 EUR"),
+            (
+                "How do I format a date as YYYY-MM-DD in JavaScript?",
+                "In JavaScript, how can I format a date as YYYY-MM-DD?",
+            ),
+            ("Format a date as yyyy-mm-dd in Python", "Format a date as YYYY-MM-DD in Python"),
+            ("What's today's weather in Paris?", "What's the weather in Paris today?"),
+        ] {
+            assert!(same(a, b), "must be comparable: {a:?} vs {b:?}\n{:?}\n{:?}", signature(a), signature(b));
+        }
+    }
+
+    /// The loosening above stays narrow.
+    #[test]
+    fn loosened_guards_still_block_near_misses() {
+        for (a, b) in [
+            // Comparatives: opposite directions and different amounts.
+            ("Who approves expense reports over 5000 EUR?", "Who approves expense reports under 5000 EUR?"),
+            ("Show orders over 5", "Show orders under 5"),
+            ("Show orders above 5", "Show orders below 5"),
+            ("Who approves expense reports over 5000 EUR?", "Who approves expense reports above 500 EUR?"),
+            ("Who approves expense reports?", "Who rejects expense reports?"),
+            // Possessives: other entities, swapped roles.
+            ("What's Germany's VAT rate?", "What's Greece's VAT rate?"),
+            ("What is the VAT rate in Germany?", "What's Greece's VAT rate?"),
+            ("Forward Alice's email to Bob", "Forward Bob's email to Alice"),
+            ("What is Acme Corp's outstanding balance?", "What is Globex Corp's outstanding balance?"),
+            ("What's today's weather in Paris?", "What's tomorrow's weather in Paris?"),
+            // Dates and format specs.
+            ("What happened on 2025-01-01?", "What happened on 2025-01-02?"),
+            ("Show orders from 2025-03-01 to 2025-03-31", "Show orders from 2025-03-01 to 2025-04-30"),
+            ("Format a date as DD/MM/YYYY in JavaScript", "Format a date as MM/DD/YYYY in JavaScript"),
+            ("Format a date as YYYY-MM-DD in JavaScript", "Format a date as YYYY-MM-DD in Python"),
+            ("Format a date as YYYY-MM-DD", "Format a time as HH:mm:ss"),
+            ("Parse dates like DD.MM.YYYY", "Parse dates like MM.DD.YYYY"),
+        ] {
+            assert!(!same(a, b), "must not share an answer: {a:?} vs {b:?}\n{:?}\n{:?}", signature(a), signature(b));
+        }
+    }
+
+    #[test]
+    fn format_specs_and_possessives() {
+        let s = signature("In JavaScript, format a date as YYYY-MM-DD or DD.MM.YYYY, then HH:mm");
+        assert_eq!(s.slots, ["lang:code:javascript"]);
+        assert_eq!(s.formats, ["dd.mm.yyyy", "hh:mm", "yyyy-mm-dd"]);
+        // A lone "MM" or single letters are not a format spec.
+        assert!(signature("Convert 5 MM to inches").formats.is_empty());
+        assert!(signature("Plot M/D values").formats.is_empty());
+        assert_eq!(signature("What's Germany's VAT rate?").slots, ["vat", "germany"]);
+        assert_eq!(signature("Ask Germany's tax office about VAT").slots, ["germany", "vat"]);
+        assert_eq!(signature("Compare Germany's and France's VAT").slots, ["germany", "vat", "france"]);
+        assert_eq!(signature("Revenue in Q3's last week").slots, ["q3", "wk"]);
     }
 
     #[test]
