@@ -648,8 +648,8 @@ pub(crate) async fn respond(
             completion_tokens: m.payload.completion_tokens,
             ..Usage::default()
         };
-        finish(&gw, &outcome, crate::metering::Metered::hit(cached), 0, settlement).await;
-        return json_response(&outcome, body, Some(0.0));
+        let billed = finish(&gw, &outcome, crate::metering::Metered::hit(cached), 0, settlement).await;
+        return json_response(&outcome, body, Some(0.0), billed);
     }
     let v: Value = serde_json::from_slice(&body).unwrap_or_default();
     let sse = match m.payload.shape {

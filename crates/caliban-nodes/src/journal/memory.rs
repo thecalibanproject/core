@@ -12,6 +12,8 @@ struct Tables {
     runs: Vec<RunRecord>,
     steps: HashMap<String, Vec<StepRecord>>,
     events: HashMap<(String, String), EventRecord>,
+    /// (tenant, UTC day) to USD.
+    spend: HashMap<(String, chrono::NaiveDate), f64>,
 }
 
 #[derive(Default)]
@@ -168,11 +170,15 @@ impl Journal for MemoryJournal {
         };
         run.budget = *budget;
         run.updated_at = Utc::now();
-        let steps = t.steps.entry(step.run_id.clone()).or_default();
-        if let Some(existing) = steps.iter().find(|s| s.step_id == step.step_id) {
+        if let Some(existing) =
+            t.steps.get(&step.run_id).and_then(|steps| steps.iter().find(|s| s.step_id == step.step_id))
+        {
             return Ok(StepWrite::Existing(Box::new(existing.clone())));
         }
-        steps.push(step);
+        if step.usd > 0.0 {
+            *t.spend.entry((step.tenant_id.clone(), Utc::now().date_naive())).or_default() += step.usd;
+        }
+        t.steps.entry(step.run_id.clone()).or_default().push(step);
         Ok(StepWrite::Written)
     }
 
@@ -219,6 +225,22 @@ impl Journal for MemoryJournal {
             }
             None => false,
         })
+    }
+
+    async fn tenant_spend(&self, tenant: &str) -> JResult<TenantSpend> {
+        use chrono::Datelike;
+        let today = Utc::now().date_naive();
+        let t = self.t.lock();
+        let mut out = TenantSpend::default();
+        for ((tn, day), usd) in &t.spend {
+            if tn == tenant && day.year() == today.year() && day.month() == today.month() {
+                out.month_usd += usd;
+                if *day == today {
+                    out.today_usd += usd;
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn event(&self, run_id: &str, name: &str) -> JResult<Option<EventRecord>> {

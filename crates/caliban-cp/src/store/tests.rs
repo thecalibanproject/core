@@ -91,6 +91,7 @@ fn tenant(id: &str) -> Tenant {
         semantic_cache: SemanticCacheMode::Off,
         auto_cache_hit_fraction: None,
         node_caps: None,
+        node_spend_caps: None,
         created_at: ts(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -194,6 +195,7 @@ async fn suite(s: &Store) {
         semantic_cache: None,
         auto_cache_hit_fraction: None,
         node_caps: None,
+        node_spend_caps: None,
     };
     s.apply(A, to_session).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
@@ -210,6 +212,7 @@ async fn suite(s: &Store) {
         semantic_cache: Some(SemanticCacheMode::On),
         auto_cache_hit_fraction: None,
         node_caps: None,
+        node_spend_caps: None,
     };
     s.apply(A, on).await.unwrap();
     let g = s.state().tenant("globex").cloned().unwrap();
@@ -230,6 +233,7 @@ async fn suite(s: &Store) {
         semantic_cache: None,
         auto_cache_hit_fraction: f,
         node_caps: None,
+        node_spend_caps: None,
     };
     s.apply(A, fraction(Some(Some(0.1)))).await.unwrap();
     assert_eq!(s.state().tenant("globex").unwrap().auto_cache_hit_fraction, Some(0.1));
@@ -264,6 +268,7 @@ async fn suite(s: &Store) {
         semantic_cache: None,
         auto_cache_hit_fraction: None,
         node_caps: None,
+        node_spend_caps: None,
     };
     assert_eq!(s.apply(A, ghost).await.unwrap_err(), StoreError::NotFound("tenant".into()));
     let key = ApiKeyRecord {
@@ -1097,6 +1102,7 @@ async fn node_lifecycle(s: &Store) {
         semantic_cache: None,
         auto_cache_hit_fraction: None,
         node_caps: Some(c),
+        node_spend_caps: None,
     };
     invalid(s.apply(A, caps(Some(NodeCaps { steps: 0, ..NodeCaps::DEFAULT }))).await, "positive");
     s.apply(A, caps(Some(NodeCaps { steps: 3, ..NodeCaps::DEFAULT }))).await.unwrap();
@@ -1104,6 +1110,25 @@ async fn node_lifecycle(s: &Store) {
     s.apply(A, promote("risk", 1)).await.unwrap();
     s.apply(A, caps(None)).await.unwrap();
     assert_eq!(s.state().node_caps("globex"), NodeCaps::DEFAULT);
+
+    // Spend caps: a tenant setting shipped to workers in the snapshot.
+    let spend = |c: Option<caliban_config::NodeSpendCaps>| Mutation::UpdateTenant {
+        id: "globex".into(),
+        pii_default: None,
+        pii_surrogate_scope: None,
+        semantic_cache: None,
+        auto_cache_hit_fraction: None,
+        node_caps: None,
+        node_spend_caps: Some(c),
+    };
+    let daily = caliban_config::NodeSpendCaps { daily_usd: Some(5.0), monthly_usd: None };
+    invalid(
+        s.apply(A, spend(Some(caliban_config::NodeSpendCaps { daily_usd: Some(-1.0), monthly_usd: None }))).await,
+        "non-negative",
+    );
+    s.apply(A, spend(Some(daily))).await.unwrap();
+    assert_eq!(s.state().tenant("globex").unwrap().node_spend_caps, Some(daily));
+    assert_eq!(s.config.load().tenant(&"globex".into()).unwrap().node_spend_caps, Some(daily));
 
     // Retire: not while a published version calls it; a published version is not deleted.
     conflict(s.apply(A, retire("risk", 1)).await);

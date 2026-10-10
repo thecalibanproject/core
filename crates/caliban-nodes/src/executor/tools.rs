@@ -35,6 +35,10 @@ pub enum ToolError {
     Unavailable(String, String),
     #[error("tool '{0}' has an unknown kind")]
     UnknownKind(String),
+    /// The call failed and is worth retrying (network, a 5xx): retried up to `guards.tool_retries`
+    /// times, then counted against the tool's circuit breaker.
+    #[error("{0}")]
+    Transient(String),
     #[error("{0}")]
     Failed(String),
 }

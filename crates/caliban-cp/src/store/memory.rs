@@ -239,6 +239,7 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             semantic_cache,
             auto_cache_hit_fraction,
             node_caps,
+            node_spend_caps,
         } => {
             let t = st
                 .tenants
@@ -263,6 +264,12 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                     c.validate().map_err(StoreError::Invalid)?;
                 }
                 t.node_caps = *c;
+            }
+            if let Some(c) = node_spend_caps {
+                if let Some(c) = c {
+                    c.validate().map_err(StoreError::Invalid)?;
+                }
+                t.node_spend_caps = *c;
             }
         }
         Mutation::CreateApiKey(k) => {

@@ -428,6 +428,7 @@ struct TenantCreate {
     semantic_cache: Option<SemanticCacheMode>,
     auto_cache_hit_fraction: Option<f64>,
     node_caps: Option<NodeCaps>,
+    node_spend_caps: Option<caliban_config::NodeSpendCaps>,
 }
 
 async fn create_tenant(
@@ -442,6 +443,9 @@ async fn create_tenant(
     if let Some(c) = &body.node_caps {
         c.validate().map_err(bad)?;
     }
+    if let Some(c) = &body.node_spend_caps {
+        c.validate().map_err(bad)?;
+    }
     let t = Tenant {
         id,
         name: body.name,
@@ -451,6 +455,7 @@ async fn create_tenant(
         semantic_cache: body.semantic_cache.unwrap_or_default(),
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
         node_caps: body.node_caps,
+        node_spend_caps: body.node_spend_caps,
         created_at: now_micros(),
         status: TenantStatus::Active,
         deleted_at: None,
@@ -477,6 +482,9 @@ struct TenantUpdate {
     /// cleared (the defaults apply).
     #[serde(default, deserialize_with = "present")]
     node_caps: Option<Option<NodeCaps>>,
+    /// Daily and monthly caps on the tenant's node spend (USD). Absent: kept. `null`: no cap.
+    #[serde(default, deserialize_with = "present")]
+    node_spend_caps: Option<Option<caliban_config::NodeSpendCaps>>,
 }
 
 /// Tells an explicit `null` (`Some(None)`) from an absent field (`None`, with `#[serde(default)]`).
@@ -503,6 +511,7 @@ async fn update_tenant(
         semantic_cache: body.semantic_cache,
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
         node_caps: body.node_caps,
+        node_spend_caps: body.node_spend_caps,
     };
     let st = cp.store.apply(&p.actor, m).await?;
     st.tenant(&tenant_id).cloned().map(Json).ok_or_else(|| not_found("tenant"))

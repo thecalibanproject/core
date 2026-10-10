@@ -1839,18 +1839,30 @@ api_key_hashes = ["{acme}"]
         let (_, h, _) = call(&env.app, "/v1/chat/completions", BEARER, body.clone()).await;
         assert_eq!(h["x-caliban-cache"], "miss");
         let miss = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
+        if body["stream"] != true {
+            let billed = miss.billed_usd.or(miss.cost_usd).map(|b| format!("{b:.8}"));
+            let header = h.get("x-caliban-billed-usd").map(|v| v.to_str().unwrap().to_owned());
+            assert_eq!(header, billed, "the billed header");
+        }
+        let mut billed_header = None;
         for _ in 0..200 {
             let (_, h, _) = call(&env.app, "/v1/chat/completions", BEARER, body.clone()).await;
             if h["x-caliban-cache"] == "hit" {
                 assert_eq!(h["x-caliban-cache-tier"], tier.as_str());
                 if body["stream"] != true {
                     assert_eq!(h["x-caliban-cost-usd"], "0.00000000", "no model was called");
+                    billed_header = h.get("x-caliban-billed-usd").map(|v| v.to_str().unwrap().to_owned());
                 }
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let hit = env.usage.snapshot(Some("acme"), 1).pop().unwrap();
+        if body["stream"] != true {
+            // Node runs count this against their budgets: the discounted price of a hit.
+            let billed = hit.billed_usd.or(hit.cost_usd).map(|b| format!("{b:.8}"));
+            assert_eq!(billed_header, billed, "{tier:?}");
+        }
         assert_eq!((hit.cache, hit.cache_tier), (CacheStatus::Hit, Some(tier)), "{tier:?}");
         (miss, hit)
     }

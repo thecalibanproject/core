@@ -921,6 +921,33 @@ pub struct TenantConfig {
     /// when the tenant has published nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_key: Option<WrappedDek>,
+    /// Caps on what the tenant's node runs spend on model calls, per UTC day and month, across all
+    /// workers (the journal is the source of truth). Rendered by the control plane when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_spend_caps: Option<NodeSpendCaps>,
+}
+
+/// Tenant-wide caps on node spend (USD, priced like the metering), checked before every model
+/// call of every run against the journal's per-day totals. A cap reached ends runs gracefully
+/// (`budget_exhausted`, with their partial results); `None` means no cap.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeSpendCaps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_usd: Option<f64>,
+}
+
+impl NodeSpendCaps {
+    pub fn validate(&self) -> Result<(), String> {
+        for (k, v) in [("daily_usd", self.daily_usd), ("monthly_usd", self.monthly_usd)] {
+            if v.is_some_and(|v| !v.is_finite() || v < 0.0) {
+                return Err(format!("node_spend_caps.{k} must be a non-negative number"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A published node version in the data-plane snapshot. The spec travels sealed under the tenant's

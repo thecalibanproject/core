@@ -11,7 +11,7 @@
 
 use super::agent;
 use super::template::{Scope, as_text, extract_json, render_str, render_value};
-use super::tools::ToolCtx;
+use super::tools::{ToolCtx, ToolError};
 use super::{ResolvedNode, RunCx, StepOut, Stop, Suspension, idempotency_key};
 use crate::budget::{Budget, Ledger};
 use crate::journal::RunStatus;
@@ -19,7 +19,7 @@ use crate::{NodeKind, ToolTarget, Vertex, VertexKind};
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Runs a node (workflow or agent) inside the current run, under `ledger`.
 pub(super) fn run_node<'a>(
@@ -340,7 +340,7 @@ pub(super) async fn call_tool(
                     step_id: step_id.to_owned(),
                     idempotency_key: idempotency_key(&cx.run.id, step_id),
                 };
-                tool.call(&ctx, args).await.map_err(|e| Stop::Fail(format!("tool '{reference}': {e}")))?
+                guarded_call(cx, reference, tool.as_ref(), &ctx, args).await?
             }
         };
         Ok(StepOut::value(out))
@@ -348,11 +348,54 @@ pub(super) async fn call_tool(
     .await
 }
 
+/// A tool call behind its circuit breaker, retried while it fails transiently (at most
+/// `guards.tool_retries` times).
+async fn guarded_call(
+    cx: &RunCx,
+    reference: &str,
+    tool: &dyn super::tools::Tool,
+    ctx: &ToolCtx,
+    args: Value,
+) -> Result<Value, Stop> {
+    let ex = &cx.ex;
+    let key = (cx.tenant().to_owned(), super::breaker::tool_key(reference));
+    let admitted = ex.breakers.lock().entry(key.clone()).or_default().admit(Instant::now(), ex.opts.breaker_cooldown);
+    if let Err(wait) = admitted {
+        return Err(Stop::Fail(format!(
+            "tool '{reference}': circuit open after repeated failures; next trial in {} s",
+            wait.as_secs()
+        )));
+    }
+    let mut attempt = 0;
+    let mut pause = Duration::from_millis(50);
+    let result = loop {
+        match tool.call(ctx, args.clone()).await {
+            Err(ToolError::Transient(e)) if attempt < cx.guards.tool_retries => {
+                tracing::debug!(tool = reference, attempt, error = %e, "tool call failed transiently; retrying");
+                attempt += 1;
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_secs(2));
+            }
+            other => break other,
+        }
+    };
+    let failed = matches!(result, Err(ToolError::Transient(_) | ToolError::Unavailable(..)));
+    if let Some(b) = ex.breakers.lock().get_mut(&key) {
+        b.record(!failed, Instant::now(), ex.opts.breaker_failures);
+    }
+    result.map_err(|e| match e {
+        ToolError::Transient(m) if attempt > 0 => {
+            Stop::Fail(format!("tool '{reference}': {m} (after {} attempts)", attempt + 1))
+        }
+        other => Stop::Fail(format!("tool '{reference}': {other}")),
+    })
+}
+
 /// Runs `node://name@vN` inside this run: its steps are journaled under `prefix`, its budget is a
 /// child of `ledger` (capped by both), and nesting is limited by `budgets.depth`.
 pub(super) async fn subnode(
     cx: &RunCx,
-    parent: &ResolvedNode,
+    _parent: &ResolvedNode,
     reference: &str,
     input: Value,
     prefix: &str,
@@ -362,14 +405,20 @@ pub(super) async fn subnode(
     let Ok(ToolTarget::Node { name, version }) = ToolTarget::parse(reference) else {
         return Err(Stop::Fail(format!("'{reference}' is not a node reference")));
     };
-    // TODO(P3 M3): depth as a ledger dimension; for now the parent's `budgets.depth` bounds nesting.
-    let max = parent.spec.budgets.depth;
-    if depth + 1 > max {
-        return Err(Stop::Budget(format!("subnode {name}@v{version} would nest deeper than budgets.depth ({max})")));
-    }
     let child = cx.node(&name, version).map_err(|e| Stop::Fail(format!("subnode {name}@v{version}: {e}")))?;
     let b = &child.spec.budgets;
-    let child_ledger = ledger.child(Budget { steps: b.steps, tokens: b.tokens });
+    let cap = Budget {
+        steps: b.steps,
+        tokens: b.tokens,
+        usd: b.usd.unwrap_or(f64::INFINITY),
+        wall_clock_ms: b.wall_clock_s.saturating_mul(1000),
+        depth: b.depth,
+        fanout: b.fanout,
+    };
+    let child_ledger = ledger
+        .child(cap, cx.elapsed_ms())
+        .map_err(|e| Stop::Budget(format!("subnode {name}@v{version} cannot start: {e}")))?;
+    cx.note_depth(child_ledger.level());
     run_node(cx, &child, input, prefix, &child_ledger, depth + 1).await
 }
 
@@ -396,12 +445,14 @@ async fn map(
     if body.id.is_empty() {
         body.id = format!("{}.body", v.id);
     }
-    // TODO(P3 M3): fan-out as a ledger dimension; for now `budgets.fanout` bounds concurrency.
+    // At most the ledger's fan-out (the node's `budgets.fanout`, capped by its parents').
+    let cap = ledger.fanout();
     let width = c
         .get("concurrency")
         .and_then(Value::as_u64)
-        .map_or(node.spec.budgets.fanout, |n| u32::try_from(n).unwrap_or(u32::MAX).min(node.spec.budgets.fanout))
+        .map_or(cap, |n| u32::try_from(n).unwrap_or(u32::MAX).min(cap))
         .max(1) as usize;
+    cx.note_fanout(u32::try_from(width.min(items.len())).unwrap_or(u32::MAX));
     let slots = tokio::sync::Semaphore::new(width);
     let branches = items.iter().enumerate().map(|(i, item)| {
         let (slots, body) = (&slots, &body);

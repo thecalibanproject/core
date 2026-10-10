@@ -49,6 +49,8 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (12, "node_versions", include_str!("../../../../migrations/0012_node_versions.sql")),
     (13, "node_journal", include_str!("../../../../migrations/0013_node_journal.sql")),
     (14, "node_run_specs", include_str!("../../../../migrations/0014_node_run_specs.sql")),
+    (15, "node_spend", include_str!("../../../../migrations/0015_node_spend.sql")),
+    (16, "node_spend_caps", include_str!("../../../../migrations/0016_node_spend_caps.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -689,7 +691,7 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
         Mutation::UpdateTenant { id, .. } => {
             let t = next.tenant(id).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
             let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3, semantic_cache = $4, auto_cache_hit_fraction = $5,
-                                       node_caps = $6
+                                       node_caps = $6, node_spend_caps = $7
                      WHERE id = $1 AND status = 'active'";
             exec(
                 c,
@@ -699,7 +701,8 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
                     .bind(t.pii_surrogate_scope.as_str())
                     .bind(t.semantic_cache.as_str())
                     .bind(t.auto_cache_hit_fraction)
-                    .bind(caps_json(t.node_caps)?),
+                    .bind(caps_json(t.node_caps)?)
+                    .bind(spend_json(t.node_spend_caps)?),
             )
             .await
         }
@@ -1006,8 +1009,8 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         c,
         sqlx::query(
             "INSERT INTO tenant (id, name, region, pii_default, pii_surrogate_scope, semantic_cache, settings, created_at, status, deleted_at,
-                                 auto_cache_hit_fraction, node_caps)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                                 auto_cache_hit_fraction, node_caps, node_spend_caps)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&t.id)
         .bind(&t.name)
@@ -1020,9 +1023,14 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         .bind(t.status.as_str())
         .bind(t.deleted_at)
         .bind(t.auto_cache_hit_fraction)
-        .bind(caps_json(t.node_caps)?),
+        .bind(caps_json(t.node_caps)?)
+        .bind(spend_json(t.node_spend_caps)?),
     )
     .await
+}
+
+fn spend_json(c: Option<caliban_config::NodeSpendCaps>) -> Result<Option<Json<Value>>, StoreError> {
+    c.map(|c| serde_json::to_value(c).map(Json).map_err(|e| StoreError::Backend(e.to_string()))).transpose()
 }
 
 fn caps_json(c: Option<caliban_nodes::publish::NodeCaps>) -> Result<Option<Json<Value>>, StoreError> {
@@ -1334,7 +1342,7 @@ async fn rows(c: &mut PgConnection, sql: &'static str) -> Result<Vec<PgRow>, Sto
 async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     let mut st = State::default();
 
-    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, node_spend_caps, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
         st.tenants.push(Tenant {
             id: get(&r, "id")?,
             name: get(&r, "name")?,
@@ -1344,6 +1352,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             semantic_cache: parse_enum(get(&r, "semantic_cache")?)?,
             auto_cache_hit_fraction: get(&r, "auto_cache_hit_fraction")?,
             node_caps: get::<Option<Json<Value>>>(&r, "node_caps")?.map(|j| parse(j.0)).transpose()?,
+            node_spend_caps: get::<Option<Json<Value>>>(&r, "node_spend_caps")?.map(|j| parse(j.0)).transpose()?,
             created_at: get(&r, "created_at")?,
             status: match get::<String>(&r, "status")?.as_str() {
                 "deleted" => TenantStatus::Deleted,

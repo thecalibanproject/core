@@ -17,6 +17,7 @@ use sqlx::{Postgres, Row};
 pub const MIGRATIONS: &[&str] = &[
     include_str!("../../../../migrations/0013_node_journal.sql"),
     include_str!("../../../../migrations/0014_node_run_specs.sql"),
+    include_str!("../../../../migrations/0015_node_spend.sql"),
 ];
 
 macro_rules! run_columns {
@@ -343,6 +344,18 @@ impl Journal for PgJournal {
         .await
         .map_err(db)?;
         let out = if inserted.rows_affected() == 1 {
+            // The step's cost counts towards the tenant's spend once: the step is written once.
+            if step.usd > 0.0 {
+                sqlx::query(
+                    "INSERT INTO node_spend (tenant_id, day, usd) VALUES ($1, (now() AT TIME ZONE 'UTC')::date, $2)
+                     ON CONFLICT (tenant_id, day) DO UPDATE SET usd = node_spend.usd + EXCLUDED.usd",
+                )
+                .bind(&step.tenant_id)
+                .bind(step.usd)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            }
             StepWrite::Written
         } else {
             let r = sqlx::query(
@@ -404,6 +417,20 @@ impl Journal for PgJournal {
         .await
         .map_err(db)?;
         Ok(r.rows_affected() == 1)
+    }
+
+    async fn tenant_spend(&self, tenant: &str) -> JResult<TenantSpend> {
+        let (today, month): (f64, f64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(usd) FILTER (WHERE day = (now() AT TIME ZONE 'UTC')::date), 0)::FLOAT8,
+                    COALESCE(SUM(usd), 0)::FLOAT8
+             FROM node_spend
+             WHERE tenant_id = $1 AND day >= date_trunc('month', now() AT TIME ZONE 'UTC')::date",
+        )
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(TenantSpend { today_usd: today, month_usd: month })
     }
 
     async fn event(&self, run_id: &str, name: &str) -> JResult<Option<EventRecord>> {

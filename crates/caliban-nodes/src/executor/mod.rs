@@ -19,13 +19,14 @@
 //! execution time only (not time spent waiting for a human or a timer).
 
 mod agent;
+pub mod breaker;
 mod graph;
 pub mod template;
 pub mod tools;
 
 pub use tools::{FnTool, NoTools, StaticTools, Tool, ToolCtx, ToolError, ToolInfo, ToolRegistry};
 
-use crate::budget::{Budget, BudgetError, BudgetState, Ledger};
+use crate::budget::{BudgetError, BudgetState, Ledger};
 use crate::journal::{
     Created, Delivered, EventKind, Finish, Journal, NewRun, RunRecord, RunStatus, StepRecord, StepStatus, StepWrite,
     Suspend,
@@ -106,12 +107,25 @@ pub struct ResolvedNode {
 pub trait NodeSource: Send + Sync {
     /// `version: None` is the promoted (live) version.
     fn resolve(&self, tenant: &str, name: &str, version: Option<u32>) -> Result<ResolvedNode, String>;
+
+    /// The tenant's settings that apply to every run (the data plane: the snapshot).
+    fn tenant_policy(&self, _tenant: &str) -> TenantPolicy {
+        TenantPolicy::default()
+    }
 }
 
-/// Hook for P3 M3 guards (USD caps, tenant spend caps, loop guards), called before every model
-/// call. The default allows everything.
+/// Tenant settings the executor enforces on every run.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TenantPolicy {
+    /// Daily and monthly node spend caps, checked against the journal before every model call.
+    pub spend: caliban_config::NodeSpendCaps,
+}
+
+/// An extra check before every model call (after the budget and tenant spend checks). The default
+/// allows everything. `Err` ends the run gracefully with that reason.
+#[async_trait::async_trait]
 pub trait RunGuard: Send + Sync {
-    fn before_model_call(&self, _ctx: &CallCtx, _budget: &BudgetState) -> Result<(), String> {
+    async fn before_model_call(&self, _ctx: &CallCtx, _budget: &BudgetState) -> Result<(), String> {
         Ok(())
     }
 }
@@ -133,6 +147,10 @@ pub struct ExecutorOptions {
     /// How long a model call is retried while it fails transiently (e.g. the same step is still
     /// in flight on a worker that died: its idempotency key is busy until that call ends).
     pub model_retry_for: Duration,
+    /// Consecutive failed calls of one tool (per tenant) that open its circuit breaker.
+    pub breaker_failures: u32,
+    /// How long an open breaker refuses calls before it lets one trial call through (half-open).
+    pub breaker_cooldown: Duration,
 }
 
 impl Default for ExecutorOptions {
@@ -143,6 +161,8 @@ impl Default for ExecutorOptions {
             poll: Duration::from_millis(500),
             max_concurrent_runs: 64,
             model_retry_for: Duration::from_secs(60),
+            breaker_failures: 5,
+            breaker_cooldown: Duration::from_secs(30),
         }
     }
 }
@@ -161,6 +181,18 @@ pub struct StartRun {
     pub invoker_key_hash: Option<String>,
     /// Client `Idempotency-Key` and the request fingerprint.
     pub idempotency: Option<(String, String)>,
+    /// Run-level limits: each one lowers the version's budget for this run (never raises it).
+    pub budget: Option<RunBudget>,
+}
+
+/// Run-level budget (`"budget"` on `POST /v1/nodes/{name}/runs`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunBudget {
+    pub steps: Option<u32>,
+    pub tokens: Option<u64>,
+    pub usd: Option<f64>,
+    pub wall_clock_s: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -199,6 +231,8 @@ pub struct RunView {
     pub stop_reason: Option<String>,
     pub awaiting: Option<Awaiting>,
     pub budget: BudgetState,
+    /// What the run spent on model calls so far (USD, priced like the metering).
+    pub cost_usd: f64,
     pub steps: Vec<StepView>,
     pub claims: u32,
     pub created_at: DateTime<Utc>,
@@ -240,6 +274,8 @@ pub struct Executor {
     watchers: Mutex<HashMap<String, Arc<Notify>>>,
     /// Runs this process is executing.
     active: Mutex<std::collections::HashSet<String>>,
+    /// Circuit breakers per (tenant, tool), in this process.
+    breakers: Mutex<HashMap<(String, String), breaker::Breaker>>,
 }
 
 impl Executor {
@@ -264,7 +300,16 @@ impl Executor {
             wake: Notify::new(),
             watchers: Mutex::default(),
             active: Mutex::default(),
+            breakers: Mutex::default(),
         }
+    }
+
+    /// The state of a tool's circuit breaker for a tenant (`Closed` when it never failed).
+    pub fn breaker_state(&self, tenant: &str, tool: &str) -> breaker::State {
+        self.breakers
+            .lock()
+            .get(&(tenant.to_owned(), breaker::tool_key(tool)))
+            .map_or(breaker::State::Closed, |b| b.state(Instant::now(), self.opts.breaker_cooldown))
     }
 
     #[must_use]
@@ -298,7 +343,7 @@ impl Executor {
         // failing the runs in flight.
         let specs = pin_specs(&self.nodes, &req.tenant, &node);
         let specs = self.sealer.seal(&req.tenant, &id, &specs.to_string()).map_err(ExecError::Internal)?;
-        let b = &node.spec.budgets;
+        let budget = run_budget(&node.spec, req.budget.as_ref()).map_err(ExecError::Invalid)?;
         let run = NewRun {
             id,
             tenant_id: req.tenant,
@@ -308,7 +353,7 @@ impl Executor {
             invoker: req.invoker,
             invoker_key_hash: req.invoker_key_hash,
             input,
-            budget: BudgetState::new(b.steps, b.tokens, b.wall_clock_s),
+            budget,
             idempotency: req.idempotency,
             specs: Some(specs),
         };
@@ -393,6 +438,7 @@ impl Executor {
             stop_reason: r.stop_reason.clone(),
             awaiting: r.awaiting.clone().map(|step| Awaiting { step, question }),
             budget: r.budget,
+            cost_usd: r.budget.usd,
             steps: steps
                 .iter()
                 .map(|s| StepView {
@@ -634,6 +680,12 @@ pub(crate) struct RunCx {
     pub ledger: Ledger,
     recorded: HashMap<String, StepRecord>,
     usd: Mutex<f64>,
+    /// Deepest nesting level and widest `map` the run reached (reported in its budget).
+    depth_used: std::sync::atomic::AtomicU32,
+    fanout_used: std::sync::atomic::AtomicU32,
+    /// Loop guard: executions per (vertex, input hash, map branch).
+    repeats: Mutex<HashMap<String, u32>>,
+    pub guards: crate::Guards,
     elapsed_base_ms: u64,
     t0: Instant,
     /// Last completed value (partial result on a budget stop).
@@ -681,9 +733,14 @@ impl RunCx {
             .map(|s| (s.step_id.clone(), s))
             .collect();
         let b = run.budget;
-        let ledger = Ledger::root(Budget { steps: b.steps_limit, tokens: b.tokens_limit });
+        let ledger = Ledger::root(b.ledger_limits());
+        let guards = root.spec.guards();
         Ok(Self {
             elapsed_base_ms: b.wall_clock_ms_used,
+            depth_used: std::sync::atomic::AtomicU32::new(0),
+            fanout_used: std::sync::atomic::AtomicU32::new(0),
+            repeats: Mutex::default(),
+            guards,
             ex,
             root,
             pinned,
@@ -711,7 +768,7 @@ impl RunCx {
         }
     }
 
-    fn elapsed_ms(&self) -> u64 {
+    pub fn elapsed_ms(&self) -> u64 {
         self.elapsed_base_ms + u64::try_from(self.t0.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
@@ -725,7 +782,37 @@ impl RunCx {
             wall_clock_ms_limit: self.run.budget.wall_clock_ms_limit,
             wall_clock_ms_used: self.elapsed_ms(),
             usd: *self.usd.lock(),
+            usd_limit: self.run.budget.usd_limit,
+            depth_limit: limit.depth,
+            depth_used: self.depth_used.load(Ordering::Relaxed),
+            fanout_limit: limit.fanout,
+            fanout_used: self.fanout_used.load(Ordering::Relaxed),
         }
+    }
+
+    /// Records the nesting level and map width the run reached.
+    pub fn note_depth(&self, level: u32) {
+        self.depth_used.fetch_max(level, Ordering::Relaxed);
+    }
+
+    pub fn note_fanout(&self, width: u32) {
+        self.fanout_used.fetch_max(width, Ordering::Relaxed);
+    }
+
+    /// The loop guard: the same vertex with the same input (in the same `map` branch) at most
+    /// `guards.max_repeats` times.
+    fn count_repeat(&self, step_id: &str, vertex: &str, input_hash: &str) -> Result<(), Stop> {
+        let key = format!("{}\0{vertex}\0{input_hash}", loop_key(step_id));
+        let mut r = self.repeats.lock();
+        let n = r.entry(key).or_default();
+        *n += 1;
+        if *n > self.guards.max_repeats {
+            return Err(Stop::Budget(format!(
+                "loop guard: vertex '{vertex}' received the same input {} times (guards.max_repeats = {})",
+                *n, self.guards.max_repeats
+            )));
+        }
+        Ok(())
     }
 
     pub fn set_last(&self, v: &Value) {
@@ -753,10 +840,7 @@ impl RunCx {
 
     /// Before running (or waiting for) a new step: budget and wall clock.
     pub fn admit_step(&self, ledger: &Ledger) -> Result<(), Stop> {
-        let (used, limit) = (self.elapsed_ms(), self.run.budget.wall_clock_ms_limit);
-        if limit > 0 && used >= limit {
-            return Err(Self::budget_stop(BudgetError::WallClock { used_ms: used, limit_ms: limit }));
-        }
+        ledger.ensure_time(self.elapsed_ms()).map_err(Self::budget_stop)?;
         ledger.ensure_step().map_err(Self::budget_stop)
     }
 
@@ -774,6 +858,7 @@ impl RunCx {
         F: std::future::Future<Output = Result<StepOut, Stop>>,
     {
         let input_hash = hash_value(input);
+        self.count_repeat(step_id, vertex, &input_hash)?;
         if let Some(rec) = self.recorded.get(step_id) {
             if rec.input_hash != input_hash {
                 return Err(Stop::Fail(format!(
@@ -786,7 +871,7 @@ impl RunCx {
                 // The same error as when it failed, so a replay sees exactly what the run saw.
                 return Err(Stop::Fail(out.output.as_str().unwrap_or("unknown error").to_owned()));
             }
-            if let Err(e) = ledger.charge_spent(rec.tokens) {
+            if let Err(e) = ledger.charge_spent(rec.tokens, rec.usd) {
                 self.set_last(&out.output);
                 return Err(Self::budget_stop(e));
             }
@@ -806,7 +891,7 @@ impl RunCx {
             Err(other) => return Err(other),
         };
         *self.usd.lock() += out.usd;
-        let charged = ledger.charge_spent(out.tokens);
+        let charged = ledger.charge_spent(out.tokens, out.usd);
         let out = self.checkpoint(ledger, step_id, vertex, kind, &input_hash, status, &out, started).await?;
         if let Err(e) = charged {
             // The step completed: its result is part of the partial result.
@@ -879,7 +964,8 @@ impl RunCx {
     /// A model call through the gateway, retried while it fails transiently.
     pub async fn model(&self, step_id: &str, body: Value) -> Result<ModelReply, Stop> {
         let ctx = self.call_ctx(step_id);
-        self.ex.guard.before_model_call(&ctx, &self.budget_state()).map_err(Stop::Budget)?;
+        self.check_tenant_spend().await?;
+        self.ex.guard.before_model_call(&ctx, &self.budget_state()).await.map_err(Stop::Budget)?;
         let deadline = Instant::now() + self.ex.opts.model_retry_for;
         let mut wait = Duration::from_millis(50);
         loop {
@@ -901,6 +987,27 @@ impl RunCx {
                 }
             }
         }
+    }
+
+    /// The tenant's daily and monthly node spend caps, against the journal (shared by every worker).
+    async fn check_tenant_spend(&self) -> Result<(), Stop> {
+        let caps = self.ex.nodes.tenant_policy(self.tenant()).spend;
+        if caps.daily_usd.is_none() && caps.monthly_usd.is_none() {
+            return Ok(());
+        }
+        let spent = self.ex.journal.tenant_spend(self.tenant()).await.map_err(|e| Stop::Fail(e.to_string()))?;
+        for (what, cap, used) in
+            [("daily", caps.daily_usd, spent.today_usd), ("monthly", caps.monthly_usd, spent.month_usd)]
+        {
+            if let Some(cap) = cap
+                && used >= cap
+            {
+                return Err(Stop::Budget(format!(
+                    "the tenant's {what} node spend cap is reached (${used:.6} spent of ${cap:.6}, UTC)"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// A rate-limited step: a durable sleep (timer `<step>:throttled:<n>`) until the limit resets,
@@ -959,6 +1066,48 @@ impl RunCx {
             .map_err(|e| Stop::Fail(format!("the answer to {step_id} cannot be opened: {e}")))?;
         Ok(Some(serde_json::from_str(&text).unwrap_or(Value::String(text))))
     }
+}
+
+/// A step id without its iteration counters (`#n` and `.n`), keeping `map` branch indices (`/n`)
+/// and subnode nesting (`>`): `draft#2` and `draft#0` are the same place in the graph,
+/// `each#0/1` and `each#0/2` are not.
+fn loop_key(step_id: &str) -> String {
+    let mut out = String::with_capacity(step_id.len());
+    let mut skipping = false;
+    for c in step_id.chars() {
+        if skipping && c.is_ascii_digit() {
+            continue;
+        }
+        skipping = c == '#' || c == '.';
+        out.push(c);
+    }
+    out
+}
+
+/// The run's limits: the version's budgets, each lowered by the run request's `budget` when it
+/// asks for less.
+fn run_budget(spec: &NodeSpec, req: Option<&RunBudget>) -> Result<BudgetState, String> {
+    let b = &spec.budgets;
+    let r = req.copied().unwrap_or_default();
+    if r.steps == Some(0) || r.tokens == Some(0) || r.wall_clock_s == Some(0) {
+        return Err("budget: steps, tokens and wall_clock_s must be positive".into());
+    }
+    if r.usd.is_some_and(|u| !u.is_finite() || u <= 0.0) {
+        return Err("budget: usd must be a positive number".into());
+    }
+    let min = |a: Option<u64>, b: u64| a.map_or(b, |a| a.min(b));
+    let mut st = BudgetState::new(
+        r.steps.map_or(b.steps, |s| s.min(b.steps)),
+        min(r.tokens, b.tokens),
+        min(r.wall_clock_s, b.wall_clock_s),
+    );
+    st.usd_limit = match (r.usd, b.usd) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    st.depth_limit = b.depth;
+    st.fanout_limit = b.fanout;
+    Ok(st)
 }
 
 /// The run's version and every version it can reach through `node://` references, as JSON:

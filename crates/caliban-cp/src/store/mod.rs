@@ -94,6 +94,8 @@ pub struct Tenant {
     /// Caps on the budgets of every node version the tenant publishes. `None`: the defaults
     /// ([`NodeCaps::DEFAULT`]).
     pub node_caps: Option<NodeCaps>,
+    /// Daily and monthly caps on what the tenant's node runs spend (USD). `None`: no cap.
+    pub node_spend_caps: Option<caliban_config::NodeSpendCaps>,
     pub created_at: DateTime<Utc>,
     pub status: TenantStatus,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -352,6 +354,7 @@ impl State {
                 semantic_cache: t.semantic_cache,
                 auto_cache_hit_fraction: t.auto_cache_hit_fraction,
                 node_caps: None,
+                node_spend_caps: None,
                 created_at: now,
                 status: TenantStatus::Active,
                 deleted_at: None,
@@ -483,6 +486,7 @@ const TENANT_FIELDS: &[&str] = &[
     "nodes",
     "api_key_nodes",
     "data_key",
+    "node_spend_caps",
 ];
 
 fn tenant_settings(t: &TenantConfig) -> Map<String, Value> {
@@ -549,6 +553,9 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
             obj.insert("semantic_cache".into(), json!(t.semantic_cache));
             if let Some(f) = t.auto_cache_hit_fraction {
                 obj.insert("auto_cache_hit_fraction".into(), json!(f));
+            }
+            if let Some(c) = t.node_spend_caps {
+                obj.insert("node_spend_caps".into(), json!(c));
             }
             obj.insert(
                 "api_key_hashes".into(),
@@ -663,6 +670,8 @@ pub enum Mutation {
         auto_cache_hit_fraction: Option<Option<f64>>,
         /// `Some(None)` clears the caps (back to the defaults).
         node_caps: Option<Option<NodeCaps>>,
+        /// `Some(None)` clears the spend caps (no cap).
+        node_spend_caps: Option<Option<caliban_config::NodeSpendCaps>>,
     },
     CreateProviderKey(ProviderKeyRecord),
     DeleteProviderKey {
@@ -858,6 +867,7 @@ impl Mutation {
                 semantic_cache,
                 auto_cache_hit_fraction,
                 node_caps,
+                node_spend_caps,
             } => {
                 let t = before.tenant(id);
                 let mut detail = json!({
@@ -872,6 +882,9 @@ impl Mutation {
                 }
                 if let Some(to) = node_caps {
                     detail["node_caps"] = json!({"from": t.and_then(|t| t.node_caps), "to": to});
+                }
+                if let Some(to) = node_spend_caps {
+                    detail["node_spend_caps"] = json!({"from": t.and_then(|t| t.node_spend_caps), "to": to});
                 }
                 d(Some(id), "tenant.update", id, detail)
             }

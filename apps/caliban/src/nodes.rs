@@ -40,6 +40,12 @@ pub struct NodeArgs {
     /// Runs one process executes at once.
     #[arg(long, env = "CALIBAN_NODE_MAX_RUNS", default_value_t = 64, global = true)]
     node_max_runs: usize,
+    /// Consecutive failed calls of a tool (per tenant) that open its circuit breaker.
+    #[arg(long, env = "CALIBAN_NODE_BREAKER_FAILURES", default_value_t = 5, global = true)]
+    node_breaker_failures: u32,
+    /// Seconds an open circuit breaker refuses calls before it lets one trial call through.
+    #[arg(long, env = "CALIBAN_NODE_BREAKER_COOLDOWN_SECS", default_value_t = 30, global = true)]
+    node_breaker_cooldown_secs: u64,
 }
 
 #[derive(clap::Args)]
@@ -67,6 +73,8 @@ impl NodeArgs {
             heartbeat: lease / 3,
             poll: Duration::from_millis(self.node_poll_ms.max(10)),
             max_concurrent_runs: self.node_max_runs.max(1),
+            breaker_failures: self.node_breaker_failures.max(1),
+            breaker_cooldown: Duration::from_secs(self.node_breaker_cooldown_secs),
             ..ExecutorOptions::default()
         }
     }

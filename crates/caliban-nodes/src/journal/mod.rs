@@ -239,6 +239,13 @@ pub enum Delivered {
     NotFound,
 }
 
+/// What a tenant's node runs spent on model calls (USD), in the current UTC day and month.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TenantSpend {
+    pub today_usd: f64,
+    pub month_usd: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("journal: {0}")]
 pub struct JournalError(pub String);
@@ -266,10 +273,14 @@ pub trait Journal: Send + Sync {
     /// Gives the run back (`pending`) without finishing it, e.g. on shutdown.
     async fn release(&self, run_id: &str, worker: &str) -> JResult<bool>;
 
-    /// Checkpoints a step (first write wins) and the run's budget, fenced by the lease.
+    /// Checkpoints a step (first write wins) and the run's budget, fenced by the lease. A step
+    /// written for the first time adds its cost to its tenant's spend of the day.
     async fn put_step(&self, worker: &str, step: StepRecord, budget: &BudgetState) -> JResult<StepWrite>;
     async fn suspend(&self, run_id: &str, worker: &str, s: Suspend) -> JResult<bool>;
     async fn finish(&self, run_id: &str, worker: &str, f: Finish) -> JResult<bool>;
+
+    /// The tenant's node spend today and this month (UTC), across every worker.
+    async fn tenant_spend(&self, tenant: &str) -> JResult<TenantSpend>;
 
     async fn event(&self, run_id: &str, name: &str) -> JResult<Option<EventRecord>>;
     /// Records an event once (first write wins). Returns whether this call wrote it.

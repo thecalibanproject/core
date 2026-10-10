@@ -20,7 +20,8 @@ checked by `NodeSpec::validate` (`crates/caliban-nodes`). The parts the core enf
 | `model_policy.model` | The model the calls ask for; default: the first `candidates` entry that is a model id (not `tier:...`), else `caliban/auto` |
 | `tools` | `mcp://server/tool#sha256:<hash>` (pinned, see below) or `node://name@vN` (another node of the tenant, pinned to a version) |
 | `datasources.scopes` | `<datasource>.<object>:<read\|write>` |
-| `budgets` | `steps`, `tokens`, `wall_clock_s`; `depth` (subnode nesting, default 3) and `fanout` (map concurrency, default 8) |
+| `budgets` | `steps`, `tokens`, `wall_clock_s`, optional `usd`; `depth` (subnode nesting, default 3) and `fanout` (map concurrency, default 8). See [Budgets](#budgets) |
+| `guards` | `max_repeats` (loop guard, default 3), `tool_retries` (default 2). See [Guards](#guards) |
 | `graph` | `entry` (default: the first vertex), `vertices`, `edges` (`from`, `to`, optional `when`) |
 | `agent.max_turns` | Agent nodes: model turns at most (default `budgets.steps`) |
 
@@ -147,8 +148,8 @@ Data plane, tenant API key as bearer token, the key allowed to run the node:
 
 | Endpoint | Does |
 |---|---|
-| `POST /v1/nodes/{name}/runs` `{"input": ..., "version"?: v, "async"?: false, "wait_s"?: s}` | Starts a run of the live version (or `version`). Sync by default: waits until the run ends or waits for a human, at most `CALIBAN_NODE_SYNC_WAIT_SECS` (default 60) or `wait_s`; `200` when it ended, else `202` with the run so far. `"async": true` answers `202` at once. `Idempotency-Key` returns the run the first request created (`Idempotent-Replayed: true`); the same key with another body is a `422`. The input is checked against `prompt.input_schema` (`400`) |
-| `GET /v1/runs/{id}` | The run: `status`, `output`, `partial`, `error`, `stop_reason`, `awaiting` (`step`, `question`), `budget` (limits and spend), `steps` (id, vertex, kind, status, tokens, usd, duration) |
+| `POST /v1/nodes/{name}/runs` `{"input": ..., "version"?: v, "async"?: false, "wait_s"?: s, "budget"?: {...}}` | Starts a run of the live version (or `version`). Sync by default: waits until the run ends or waits for a human, at most `CALIBAN_NODE_SYNC_WAIT_SECS` (default 60) or `wait_s`; `200` when it ended, else `202` with the run so far. `"async": true` answers `202` at once. `Idempotency-Key` returns the run the first request created (`Idempotent-Replayed: true`); the same key with another body is a `422`. The input is checked against `prompt.input_schema` (`400`) |
+| `GET /v1/runs/{id}` | The run: `status`, `output`, `partial`, `error`, `stop_reason`, `awaiting` (`step`, `question`), `budget` (limits and spend), `cost_usd`, `steps` (id, vertex, kind, status, tokens, usd, duration) |
 | `POST /v1/runs/{id}/input` `{"answer": ..., "step"?: id}` | Answers the human step the run waits for; `202`, the run resumes. `409` when it is not waiting |
 
 Statuses: `pending`, `running`, `sleeping`, `input_required`, `succeeded`, `failed`,
@@ -187,11 +188,12 @@ needs no DDL rights; its database role needs:
 ```sql
 GRANT SELECT ON caliban_schema_migrations TO caliban_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON node_run, node_step, node_event TO caliban_worker;
+GRANT SELECT, INSERT, UPDATE ON node_spend TO caliban_worker;
 ALTER ROLE caliban_worker BYPASSRLS;  -- the journal tables have per-tenant row-level security; a worker serves every tenant
 ```
 
 (`DELETE` on `node_run` is for the retention purge, which removes a finished run's steps and
-events with it. Later releases add tables to this list; see [Budgets](#budgets).)
+events with it; `node_spend` holds the tenants' spend per day, see [Budgets](#budgets).)
 
 **More than one worker needs Valkey.** Exactly-once model calls across workers (a run taken over
 after a crash replays its in-flight call against the stored response) need the shared
@@ -209,6 +211,8 @@ prominent warning.
 | `CALIBAN_NODE_LEASE_SECS` | workers, standalone | Lease on a running run, default 30, renewed every third of it |
 | `CALIBAN_NODE_POLL_MS` | workers, standalone | How often an idle worker looks for runnable runs, default 500 |
 | `CALIBAN_NODE_MAX_RUNS` | workers, standalone | Runs executed at once per process, default 64 |
+| `CALIBAN_NODE_BREAKER_FAILURES` | workers, standalone | Consecutive failed calls that open a tool's circuit breaker, default 5 |
+| `CALIBAN_NODE_BREAKER_COOLDOWN_SECS` | workers, standalone | How long an open breaker refuses calls before a trial call, default 30 |
 
 ### Model calls go through the pipeline
 
@@ -262,13 +266,54 @@ runs against both. Tables (`migrations/0013_node_journal.sql`):
 
 ## Budgets
 
-The run's ledger counts steps (vertex executions that call something: a model, a tool, a human)
-and tokens (prompt plus completion of every model call), and the wall clock counts execution time
-only (not time waiting for a human or a timer). A `subnode` or `node://` tool runs under a child
-ledger capped by both the child's budgets and what the parent has left. The spend is persisted with
-every checkpoint, and a resumed run rebuilds its ledger by replaying its steps, so it keeps what it
-spent. An overrun ends the run gracefully: status `budget_exhausted`, the partial result (the last
-completed value) in `output`, the reason in `stop_reason`. USD is recorded per step and per run.
+Budgets nest: **tenant** (daily and monthly spend caps) above the **node version** (its
+`budgets`) above the **run** (the run request may lower the version's budget) above each
+**subnode** (a child gets at most what its parent has left).
+
+| Dimension | Spent by | Where it is set |
+|---|---|---|
+| `steps` | Every vertex execution that calls something (a model, a tool, a human) | `budgets.steps`; run `budget.steps` |
+| `tokens` | Prompt plus completion of every model call | `budgets.tokens`; run `budget.tokens` |
+| `usd` | Every model call, priced as the metering prices it: the flat `caliban/auto` price (a cache hit at the tenant's discounted fraction) or the pinned model's price | `budgets.usd` (optional); run `budget.usd` |
+| wall clock | Execution time (not time waiting for a human or a timer), across workers | `budgets.wall_clock_s`; run `budget.wall_clock_s` |
+| depth | One level per `subnode` vertex or `node://` tool | `budgets.depth` (default 3) |
+| fan-out | The most `map` branches running at once | `budgets.fanout` (default 8) |
+
+A run request may send `"budget": {"steps"?, "tokens"?, "usd"?, "wall_clock_s"?}`: each value
+lowers the version's limit for that run (a larger value is ignored). A `subnode` or `node://` tool
+runs under a child ledger: steps, tokens and USD it spends count against every ancestor, and its
+limits, depth, fan-out and deadline are the smaller of its own budgets and what the parent has
+left. The tenant's `node_caps` (publish time) can include `usd`: every version must then declare a
+`budgets.usd` within it.
+
+**The spend is persisted.** Every checkpoint writes the run's budget (limits and spend, including
+USD, the deepest nesting and the widest map reached) with the step. A resumed run (after a human
+answer, a durable sleep, or on another worker after a crash) rebuilds its ledger by replaying its
+steps, which charges their recorded tokens and USD again, and continues the wall clock from the
+persisted value, so it keeps what it already spent. The USD of each step comes from the model
+call's `x-caliban-billed-usd` (the billed amount; a replayed call returns the stored header, so a
+call paid once is counted once).
+
+**Tenant spend caps.** `PATCH /api/v1/tenants/{t}` with `{"node_spend_caps": {"daily_usd": 50,
+"monthly_usd": 1000}}` (either may be omitted; `null` removes the caps; shipped to workers in the
+snapshot). Days and months are UTC. Every step's cost is added to `node_spend` (tenant, day) in the
+same transaction that checkpoints the step, and before every model call the executor compares the
+tenant's spend today and this month with the caps: the journal is the source of truth, so the caps
+hold across workers. Calls already in flight when the cap is reached complete (the overshoot is at
+most one call per run in flight).
+
+**Overruns end gracefully.** Status `budget_exhausted`, the last completed value in `output`
+(`partial: true`), the reason in `stop_reason` (`USD budget exhausted ($0.003 spent of $0.0025)`,
+`the tenant's daily node spend cap is reached ...`). `GET /v1/runs/{id}` shows `budget` and
+`cost_usd` (what the run spent so far).
+
+### Guards
+
+| Guard | Spec | Does |
+|---|---|---|
+| Loop guard | `guards.max_repeats` (default 3, at least 1) | A vertex that receives the same input (same vertex, same input hash, same `map` branch, same subnode path) more than this many times ends the run (`budget_exhausted`, `stop_reason: loop guard: ...`). Iteration counters do not count as a difference, so a loop that makes no progress trips it; an agent that calls the same tool with the same arguments again and again too |
+| Tool retries | `guards.tool_retries` (default 2) | A tool call that fails transiently (network, a 5xx) is retried this many times, with a short backoff, then counts as failed |
+| Circuit breaker | `CALIBAN_NODE_BREAKER_FAILURES` (default 5), `CALIBAN_NODE_BREAKER_COOLDOWN_SECS` (default 30) | Per tool and tenant, in each worker process: after that many failed calls in a row the breaker opens and calls fail at once without reaching the tool; after the cool-down one trial call goes through (half-open); success closes it, failure opens it again |
 
 ## The reference node
 
@@ -281,10 +326,6 @@ against the mock model server with the catalogue tool stubbed in-process.
 
 ## Not in this release
 
-- **P3 M3:** USD, depth and fan-out as ledger dimensions and caps; tenant (daily, monthly) and node
-  spend caps; loop guards on repeated (vertex, input hash) pairs; tool circuit breakers; usage
-  events tagged with `node`, `node_version` and `run_id`. Hooks: `RunGuard::before_model_call`, and
-  `budgets.depth` and `budgets.fanout` bound nesting and map concurrency today.
 - **P3 M4:** the MCP client and the per-tenant approved tool registry (`mcp://` tools refuse to run;
   `PublishContext::check_tool` is the publish-time hook), minted per-call tokens, the egress
   allowlist, taint labels.

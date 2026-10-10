@@ -83,7 +83,7 @@ fn system(body: &Value) -> String {
 }
 
 #[derive(Default)]
-struct Nodes(Mutex<HashMap<(String, u32), Arc<NodeSpec>>>);
+struct Nodes(Mutex<HashMap<(String, u32), Arc<NodeSpec>>>, Mutex<TenantPolicy>);
 
 impl Nodes {
     fn add(&self, name: &str, version: u32, spec: Value) {
@@ -109,6 +109,10 @@ impl NodeSource for Nodes {
         let hash = crate::hash::content_hash(&serde_json::to_value(spec.as_ref()).unwrap());
         Ok(ResolvedNode { name: key.0.clone(), version: key.1, hash, spec: Arc::clone(spec) })
     }
+
+    fn tenant_policy(&self, _tenant: &str) -> TenantPolicy {
+        self.1.lock().clone()
+    }
 }
 
 struct Harness {
@@ -129,6 +133,25 @@ impl Harness {
     }
 
     fn executor(&self, model: &Arc<FakeModel>, worker: &str) -> Arc<Executor> {
+        self.executor_with(model, worker, |_| {})
+    }
+
+    fn executor_with(
+        &self,
+        model: &Arc<FakeModel>,
+        worker: &str,
+        tune: impl FnOnce(&mut ExecutorOptions),
+    ) -> Arc<Executor> {
+        let mut opts = ExecutorOptions {
+            // Long enough that a slow machine never loses a lease by accident; the takeover
+            // test waits for it once.
+            lease_ttl: Duration::from_secs(1),
+            heartbeat: Duration::from_millis(100),
+            poll: Duration::from_millis(20),
+            model_retry_for: Duration::from_secs(5),
+            ..ExecutorOptions::default()
+        };
+        tune(&mut opts);
         Arc::new(Executor::new(
             Arc::clone(&self.journal),
             Arc::clone(model) as Arc<dyn ModelClient>,
@@ -136,15 +159,7 @@ impl Harness {
             Arc::clone(&self.nodes) as Arc<dyn NodeSource>,
             Arc::clone(&self.sealer) as Arc<dyn Sealer>,
             worker,
-            ExecutorOptions {
-                // Long enough that a slow machine never loses a lease by accident; the takeover
-                // test waits for it once.
-                lease_ttl: Duration::from_secs(1),
-                heartbeat: Duration::from_millis(100),
-                poll: Duration::from_millis(20),
-                model_retry_for: Duration::from_secs(5),
-                ..ExecutorOptions::default()
-            },
+            opts,
         ))
     }
 }
@@ -158,6 +173,7 @@ fn start(node: &str, input: Value) -> StartRun {
         invoker: "api_key:test".into(),
         invoker_key_hash: None,
         idempotency: None,
+        budget: None,
     }
 }
 
@@ -734,4 +750,229 @@ async fn retiring_a_version_drains_its_runs() {
         let v = ex2.view("acme", &v.id).await.unwrap().unwrap();
         assert_eq!((v.status, v.output.clone()), (RunStatus::Succeeded, Some(json!("<inner yes>"))), "{v:?}");
     }
+}
+
+/// Each model call of `FakeModel` costs $0.001.
+fn chain(n: usize, budgets: Value) -> Value {
+    let vertices: Vec<Value> = (0..n).map(|i| json!({"id": format!("s{i}"), "type": "llm"})).collect();
+    let edges: Vec<Value> = (1..n).map(|i| json!({"from": format!("s{}", i - 1), "to": format!("s{i}")})).collect();
+    json!({"kind": "workflow", "model_policy": {}, "budgets": budgets, "graph": {"vertices": vertices, "edges": edges}})
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+}
+
+#[tokio::test]
+async fn usd_caps_stop_runs_gracefully_and_run_budgets_only_lower_them() {
+    for j in journals().await {
+        let h = Harness::new(j);
+        h.nodes.add("spend", 1, chain(5, json!({"steps": 20, "tokens": 100_000, "wall_clock_s": 60, "usd": 0.0025})));
+        let model = FakeModel::new(|body| text(&format!("<{}>", last_user(body))));
+        let ex = h.executor(&model, "w1");
+        let v = run(&ex, "spend", json!("x")).await;
+        assert_eq!(v.status, RunStatus::BudgetExhausted, "{v:?}");
+        assert!(v.stop_reason.as_deref().unwrap().starts_with("USD budget exhausted"), "{v:?}");
+        assert_eq!(v.steps.len(), 3, "the third call overruns $0.0025 and the run stops after it");
+        assert!(close(v.cost_usd, 0.003) && close(v.budget.usd, 0.003), "{v:?}");
+        assert_eq!(v.budget.usd_limit, Some(0.0025));
+        assert_eq!(v.output, Some(json!("<<<x>>>")), "partial result");
+
+        // The run asks for less: honoured. It cannot ask for more than the version allows.
+        let mut req = start("spend", json!("x"));
+        req.budget = Some(RunBudget { usd: Some(0.0015), ..RunBudget::default() });
+        let (r, _) = ex.create(req).await.unwrap();
+        ex.run_now(&r.id).await.unwrap();
+        let v = ex.view("acme", &r.id).await.unwrap().unwrap();
+        assert_eq!((v.status, v.steps.len(), v.budget.usd_limit), (RunStatus::BudgetExhausted, 2, Some(0.0015)));
+        let mut req = start("spend", json!("x"));
+        req.budget = Some(RunBudget { usd: Some(5.0), steps: Some(2), ..RunBudget::default() });
+        let (r, _) = ex.create(req).await.unwrap();
+        assert_eq!((r.budget.usd_limit, r.budget.steps_limit), (Some(0.0025), 2));
+        let mut bad = start("spend", json!("x"));
+        bad.budget = Some(RunBudget { usd: Some(-1.0), ..RunBudget::default() });
+        assert!(matches!(ex.create(bad).await, Err(ExecError::Invalid(_))));
+    }
+}
+
+#[tokio::test]
+async fn a_subnode_gets_at_most_what_its_parent_has_left() {
+    for j in journals().await {
+        let h = Harness::new(j);
+        // The child would allow $1; the parent has $0.0025 left when it calls it.
+        h.nodes.add("child", 1, chain(5, json!({"steps": 20, "tokens": 100_000, "wall_clock_s": 60, "usd": 1.0})));
+        h.nodes.add(
+            "parent",
+            1,
+            json!({"kind": "workflow", "model_policy": {}, "budgets": {"steps": 20, "tokens": 100_000, "wall_clock_s": 60, "usd": 0.0035},
+                   "graph": {"vertices": [{"id": "first", "type": "llm"},
+                                          {"id": "call", "type": "subnode", "config": {"node": "node://child@v1"}}],
+                             "edges": [{"from": "first", "to": "call"}]}}),
+        );
+        let model = FakeModel::new(|body| text(&format!("<{}>", last_user(body))));
+        let v = run(&h.executor(&model, "w1"), "parent", json!("x")).await;
+        assert_eq!(v.status, RunStatus::BudgetExhausted, "{v:?}");
+        assert_eq!(
+            v.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["first#0", "call#0>s0#0", "call#0>s1#0", "call#0>s2#0"]
+        );
+        assert!(close(v.cost_usd, 0.004), "{v:?}");
+        assert_eq!((v.budget.depth_used, v.budget.depth_limit), (1, 3));
+    }
+}
+
+#[tokio::test]
+async fn a_resumed_run_keeps_what_it_spent() {
+    for j in journals().await {
+        let h = Harness::new(j);
+        h.nodes.add(
+            "pause",
+            1,
+            json!({"kind": "workflow", "model_policy": {}, "budgets": {"steps": 20, "tokens": 100_000, "wall_clock_s": 60, "usd": 0.0025},
+                   "graph": {"vertices": [{"id": "a", "type": "llm"}, {"id": "b", "type": "llm"},
+                                          {"id": "ask", "type": "human", "config": {"question": "go on?"}},
+                                          {"id": "c", "type": "llm"}, {"id": "d", "type": "llm"}],
+                             "edges": [{"from": "a", "to": "b"}, {"from": "b", "to": "ask"}, {"from": "ask", "to": "c"}, {"from": "c", "to": "d"}]}}),
+        );
+        let model = FakeModel::new(|body| text(&format!("<{}>", last_user(body))));
+        let v = run(&h.executor(&model, "w1"), "pause", json!("x")).await;
+        assert_eq!(v.status, RunStatus::InputRequired);
+        assert!(close(v.budget.usd, 0.002), "the spend is persisted while the run waits: {v:?}");
+        // Another worker resumes it: it starts from $0.002 spent, not from zero, so c overruns.
+        let w2 = h.executor(&model, "w2");
+        w2.deliver_input("acme", &v.id, None, &json!("yes")).await.unwrap();
+        w2.run_now(&v.id).await.unwrap();
+        let v = w2.view("acme", &v.id).await.unwrap().unwrap();
+        assert_eq!(v.status, RunStatus::BudgetExhausted, "{v:?}");
+        assert_eq!(v.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["a#0", "b#0", "ask#0", "c#0"]);
+        assert!(close(v.cost_usd, 0.003), "{v:?}");
+        assert_eq!((model.calls_for("a#0"), model.calls_for("d#0")), (1, 0));
+    }
+}
+
+#[tokio::test]
+async fn the_tenant_daily_cap_holds_across_workers() {
+    for j in journals().await {
+        let h = Harness::new(j);
+        h.nodes.add("spend", 1, chain(10, json!({"steps": 20, "tokens": 100_000, "wall_clock_s": 60})));
+        h.nodes.1.lock().spend = caliban_config::NodeSpendCaps { daily_usd: Some(0.0025), monthly_usd: Some(1.0) };
+        let model = FakeModel::new(|body| text(&format!("<{}>", last_user(body))));
+        // Worker 1 spends until the cap: three calls, the fourth is refused before it is made.
+        let w1 = h.executor(&model, "w1");
+        let v = run(&w1, "spend", json!("x")).await;
+        assert_eq!((v.status, v.steps.len()), (RunStatus::BudgetExhausted, 3), "{v:?}");
+        assert!(v.stop_reason.as_deref().unwrap().contains("daily node spend cap"), "{v:?}");
+        let spent = h.journal.tenant_spend("acme").await.unwrap();
+        assert!(close(spent.today_usd, 0.003) && close(spent.month_usd, 0.003), "{spent:?}");
+        // Worker 2 (another process, the same journal) refuses at once: nothing is called.
+        let w2 = h.executor(&model, "w2");
+        let calls = model.calls.lock().len();
+        let v = run(&w2, "spend", json!("y")).await;
+        assert_eq!((v.status, v.steps.len()), (RunStatus::BudgetExhausted, 0), "{v:?}");
+        assert_eq!(model.calls.lock().len(), calls);
+        // Another tenant is not affected; the monthly cap works the same way.
+        assert!(close(h.journal.tenant_spend("globex").await.unwrap().today_usd, 0.0));
+        h.nodes.1.lock().spend = caliban_config::NodeSpendCaps { daily_usd: None, monthly_usd: Some(0.003) };
+        let v = run(&w2, "spend", json!("z")).await;
+        assert!(v.stop_reason.as_deref().unwrap().contains("monthly node spend cap"), "{v:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_loop_guard_stops_a_loop_that_makes_no_progress() {
+    for j in journals().await {
+        let h = Harness::new(j);
+        h.nodes.add(
+            "stuck",
+            1,
+            json!({
+                "kind": "workflow", "model_policy": {}, "budgets": budgets(50, 100_000), "guards": {"max_repeats": 2},
+                "graph": {
+                    "vertices": [{"id": "draft", "type": "llm", "config": {"prompt": "improve"}},
+                                 {"id": "check", "type": "verify", "config": {"check": "llm"}, "max_iterations": 10}],
+                    "edges": [{"from": "draft", "to": "check"}, {"from": "check", "to": "draft", "when": "fail"}]
+                }
+            }),
+        );
+        // The model answers the same thing every time: the loop never progresses.
+        let model =
+            FakeModel::new(|body| if system(body).contains("criteria") { text("FAIL: no") } else { text("same") });
+        let v = run(&h.executor(&model, "w1"), "stuck", json!("x")).await;
+        assert_eq!(v.status, RunStatus::BudgetExhausted, "{v:?}");
+        assert!(v.stop_reason.as_deref().unwrap().starts_with("loop guard: vertex 'draft'"), "{v:?}");
+        assert!(v.steps.len() < 10, "stopped long before max_iterations: {}", v.steps.len());
+        let spec: NodeSpec =
+            serde_json::from_value(json!({"kind": "agent", "model_policy": {}, "budgets": budgets(1, 1),
+            "guards": {"max_repeats": 0}}))
+            .unwrap();
+        assert!(spec.validate().is_err(), "max_repeats must be at least 1");
+    }
+}
+
+/// A tool that fails transiently while `failing` is set.
+struct Flaky {
+    calls: AtomicUsize,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Tool for Flaky {
+    fn info(&self) -> ToolInfo {
+        ToolInfo {
+            name: "flaky".into(),
+            description: "Sometimes down.".into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<Value, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.failing.load(Ordering::SeqCst) {
+            Err(ToolError::Transient("503 from the server".into()))
+        } else {
+            Ok(json!({"ok": true}))
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_retries_are_capped_and_the_breaker_opens_and_recovers() {
+    let reference = format!("mcp://ops/flaky#{PIN}");
+    let tool = Arc::new(Flaky { calls: AtomicUsize::new(0), failing: std::sync::atomic::AtomicBool::new(true) });
+    let h = Harness::new(Arc::new(MemoryJournal::new()))
+        .with_tools(StaticTools::new().with(reference.clone(), tool.clone() as Arc<dyn Tool>));
+    h.nodes.add(
+        "ops",
+        1,
+        json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(5, 100), "guards": {"tool_retries": 1},
+               "tools": [{"ref": reference, "effect": "read"}],
+               "graph": {"vertices": [{"id": "t", "type": "tool", "config": {"tool": reference}}], "edges": []}}),
+    );
+    let model = FakeModel::new(|_| text("unused"));
+    let ex = h.executor_with(&model, "w1", |o| {
+        o.breaker_failures = 2;
+        o.breaker_cooldown = Duration::from_millis(50);
+    });
+    // Each failing run tries the tool twice (one retry).
+    let v = run(&ex, "ops", json!({})).await;
+    assert_eq!(v.status, RunStatus::Failed);
+    assert!(v.error.as_deref().unwrap().contains("after 2 attempts"), "{v:?}");
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(ex.breaker_state("acme", &reference), breaker::State::Closed);
+    run(&ex, "ops", json!({})).await;
+    assert_eq!(ex.breaker_state("acme", &reference), breaker::State::Open, "two failed calls in a row");
+    // Open: refused without reaching the tool.
+    let v = run(&ex, "ops", json!({})).await;
+    assert!(v.error.as_deref().unwrap().contains("circuit open"), "{v:?}");
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(ex.breaker_state("globex", &reference), breaker::State::Closed, "per tenant");
+    // The server recovers; after the cool-down one trial call closes the breaker.
+    tool.failing.store(false, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ex.breaker_state("acme", &reference) != breaker::State::HalfOpen {
+        assert!(Instant::now() < deadline, "the breaker never half-opened");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let v = run(&ex, "ops", json!({})).await;
+    assert_eq!(v.status, RunStatus::Succeeded, "{v:?}");
+    assert_eq!(ex.breaker_state("acme", &reference), breaker::State::Closed);
 }

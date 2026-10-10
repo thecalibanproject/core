@@ -104,6 +104,25 @@ pub struct Budgets {
     pub fanout: u32,
     pub tokens: u64,
     pub wall_clock_s: u64,
+    /// Most a run of this version may spend on model calls, in USD (priced like the metering:
+    /// the flat `caliban/auto` price or the pinned model's price). `None`: no per-run USD cap (the
+    /// tenant's daily and monthly node spend caps still apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+}
+
+/// Loop and failure guards of a node (`guards` in the spec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Guards {
+    /// How many times one vertex may run with the same input (same vertex, same input hash, same
+    /// `map` branch) before the run stops: a loop that makes no progress.
+    pub max_repeats: u32,
+    /// Retries of a tool call that failed transiently (network, a 5xx), before it counts as failed.
+    pub tool_retries: u32,
+}
+
+impl Guards {
+    pub const DEFAULT: Guards = Guards { max_repeats: 3, tool_retries: 2 };
 }
 
 fn d3() -> u32 {
@@ -258,6 +277,10 @@ impl NodeSpec {
         if b.steps == 0 || b.tokens == 0 || b.wall_clock_s == 0 || b.depth == 0 || b.fanout == 0 {
             return Err(SpecError::BadBudgets("steps, tokens, wall_clock_s, depth and fanout must be positive".into()));
         }
+        if b.usd.is_some_and(|u| !u.is_finite() || u <= 0.0) {
+            return Err(SpecError::BadBudgets("usd must be a positive number".into()));
+        }
+        self.guards_checked()?;
         for t in &self.tools {
             ToolTarget::parse(&t.reference)?;
         }
@@ -272,6 +295,31 @@ impl NodeSpec {
             }
         }
         Ok(())
+    }
+
+    /// `guards`, with defaults for what is not set ([`Guards::DEFAULT`]).
+    pub fn guards(&self) -> Guards {
+        self.guards_checked().unwrap_or(Guards::DEFAULT)
+    }
+
+    fn guards_checked(&self) -> Result<Guards, SpecError> {
+        let Some(g) = self.rest.get("guards") else { return Ok(Guards::DEFAULT) };
+        let bad = |m: &str| SpecError::BadBudgets(format!("guards: {m}"));
+        let g = g.as_object().ok_or_else(|| bad("must be an object"))?;
+        let num = |k: &str, default: u32, min: u32| -> Result<u32, SpecError> {
+            match g.get(k) {
+                None => Ok(default),
+                Some(v) => v
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| *n >= min)
+                    .ok_or_else(|| bad(&format!("{k} must be an integer of at least {min}"))),
+            }
+        };
+        Ok(Guards {
+            max_repeats: num("max_repeats", Guards::DEFAULT.max_repeats, 1)?,
+            tool_retries: num("tool_retries", Guards::DEFAULT.tool_retries, 0)?,
+        })
     }
 
     /// `prompt.system`, if any.

@@ -286,8 +286,8 @@ async fn run(
                     completion_tokens: hit.completion_tokens,
                     ..Usage::default()
                 };
-                finish(&gw, &outcome, Metered::hit(cached), 0, settlement).await;
-                return Ok(json_response(&outcome, body, Some(0.0)));
+                let billed = finish(&gw, &outcome, Metered::hit(cached), 0, settlement).await;
+                return Ok(json_response(&outcome, body, Some(0.0), billed));
             }
         }
         if let Some(s) = sem.as_mut()
@@ -364,8 +364,8 @@ async fn run(
                 telemetry::record_usage(&us, usage.usage);
                 drop(us);
                 let cost = metering::model_cost(&model, usage.usage);
-                finish(&gw, &outcome, usage, 0, settlement).await;
-                return Ok(json_response(&outcome, client_body, cost));
+                let billed = finish(&gw, &outcome, usage, 0, settlement).await;
+                return Ok(json_response(&outcome, client_body, cost, billed));
             }
             Ok(ProviderResponse::Stream(upstream)) => {
                 let capture = sem.map(semantic::Semantic::into_capture);
@@ -555,13 +555,18 @@ pub(crate) fn caliban_headers(h: &mut HeaderMap, o: &Outcome) {
     }
 }
 
-/// Non-streaming responses also carry `x-caliban-cost-usd` when the model has prices (streams
-/// report cost only in usage events, since it is known after the last chunk).
-pub(crate) fn json_response(o: &Outcome, body: Bytes, cost: Option<f64>) -> Response {
+/// Non-streaming responses also carry `x-caliban-cost-usd` (the routed model's cost) when the
+/// model has prices, and `x-caliban-billed-usd`: what the customer is billed for the request (the
+/// flat `caliban/auto` price, discounted on a cache hit, or the model's cost; node runs count it
+/// against their budgets). Streams report both only in usage events (known after the last chunk).
+pub(crate) fn json_response(o: &Outcome, body: Bytes, cost: Option<f64>, billed: Option<f64>) -> Response {
     let mut resp = (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], body).into_response();
     caliban_headers(resp.headers_mut(), o);
     if let Some(c) = cost.and_then(|c| HeaderValue::from_str(&format!("{c:.8}")).ok()) {
         resp.headers_mut().insert("x-caliban-cost-usd", c);
+    }
+    if let Some(b) = billed.and_then(|b| HeaderValue::from_str(&format!("{b:.8}")).ok()) {
+        resp.headers_mut().insert("x-caliban-billed-usd", b);
     }
     resp
 }
@@ -570,7 +575,16 @@ pub(crate) fn json_response(o: &Outcome, body: Bytes, cost: Option<f64>) -> Resp
 /// nothing was consumed: `m.usage` is the cached answer's usage (as stored with the entry, or as
 /// a replayed stream reports it). It becomes `tokens_saved` (when `tokens_saved` is 0) and prices
 /// the hit: the full and discounted `caliban/auto` price, or the avoided model cost.
-pub(crate) async fn finish(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: u64, settlement: Settlement) {
+///
+/// Returns what the request is billed (see [`record`]).
+pub(crate) async fn finish(
+    gw: &Gateway,
+    o: &Outcome,
+    m: Metered,
+    tokens_saved: u64,
+    settlement: Settlement,
+) -> Option<f64> {
+    let billed;
     let m = if o.cache == CacheStatus::Hit {
         // Prompt and completion only: what the cache stores with an entry, for both tiers and
         // both transports, so a hit is priced the same however it is served.
@@ -580,7 +594,7 @@ pub(crate) async fn finish(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
             ..Usage::default()
         };
         let saved = if tokens_saved == 0 { cached.prompt_tokens + cached.completion_tokens } else { tokens_saved };
-        record(gw, o, Metered::hit(cached), saved).await;
+        billed = record(gw, o, Metered::hit(cached), saved).await;
         settlement.settle(Amount { tokens: 0, usd: 0.0 }).await;
         Metered::hit(Usage::default())
     } else {
@@ -589,7 +603,7 @@ pub(crate) async fn finish(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
                 completion_tokens = m.usage.completion_tokens, "usage estimated (no complete provider usage report)");
         }
         metering::warn_once_if_unpriced_cache(gw, &o.model, m.usage);
-        record(gw, o, m, tokens_saved).await;
+        billed = record(gw, o, m, tokens_saved).await;
         let usd = metering::model_cost(&o.model, m.usage).unwrap_or(0.0);
         settlement.settle(Amount { tokens: m.usage.prompt_tokens + m.usage.completion_tokens, usd }).await;
         m
@@ -599,12 +613,16 @@ pub(crate) async fn finish(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
     s.record("caliban.pii.entities", o.pii_entities);
     s.record("gen_ai.response.model", o.model.id.as_str());
     telemetry::record_usage(s, m.usage);
+    billed
 }
 
 /// Writes the usage event. On a gateway cache hit, `m.usage` is the cached answer's usage: the
 /// event reports no tokens and no cost, and the cached usage prices the hit
 /// ([`metering::HitBilling`]).
-pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: u64) {
+///
+/// Returns what the request is billed: `billed_usd` for `caliban/auto`, else the model's cost (0 on
+/// a cache hit); `None` for an unpriced model.
+pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: u64) -> Option<f64> {
     let auto = o.route.as_ref().filter(|r| r.auto);
     let hit = o.cache == CacheStatus::Hit;
     let usage = if hit { Usage::default() } else { m.usage };
@@ -640,5 +658,7 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
         billed_usd: billing.billed_usd,
         saved_usd: billing.saved_usd,
     };
+    let billed = if auto.is_some() { event.billed_usd } else { cost };
     gw.usage.record(event).await;
+    billed
 }

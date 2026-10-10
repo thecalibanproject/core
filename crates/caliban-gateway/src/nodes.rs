@@ -35,7 +35,7 @@ use caliban_config::{ConfigHandle, Dek, Keyring};
 use caliban_nodes::NodeSpec;
 use caliban_nodes::executor::{
     CallCtx, ExecError, Executor, ExecutorOptions, ModelClient, ModelError, ModelReply, NodeSource, ResolvedNode,
-    RunView, StartRun, ToolRegistry,
+    RunView, StartRun, TenantPolicy, ToolRegistry,
 };
 use caliban_nodes::journal::{Delivered, Journal, RunStatus};
 use caliban_nodes::seal::{DekSealer, Sealer};
@@ -139,10 +139,11 @@ impl ModelClient for GatewayModels {
             .cloned()
             .ok_or_else(|| ModelError::Rejected("the response has no message".into()))?;
         let u = |k: &str| v.pointer(&format!("/usage/{k}")).and_then(Value::as_u64).unwrap_or(0);
-        let usd = headers
-            .get("x-caliban-cost-usd")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<f64>().ok())
+        // Priced like the metering prices it: the flat caliban/auto price (cache hits discounted)
+        // or the pinned model's price.
+        let usd = ["x-caliban-billed-usd", "x-caliban-cost-usd"]
+            .iter()
+            .find_map(|h| headers.get(*h).and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<f64>().ok()))
             .unwrap_or(0.0);
         let replayed = headers.get(idempotency::REPLAYED).is_some();
         Ok(ModelReply { message, tokens: u("prompt_tokens") + u("completion_tokens"), usd, replayed })
@@ -177,6 +178,12 @@ impl NodeSource for SnapshotNodes {
         }
         let spec: NodeSpec = serde_json::from_value(value).map_err(|e| format!("node {name}@v{}: {e}", n.version))?;
         Ok(ResolvedNode { name: n.name.clone(), version: n.version, hash: n.hash.clone(), spec: Arc::new(spec) })
+    }
+
+    fn tenant_policy(&self, tenant: &str) -> TenantPolicy {
+        let snap = self.config.load();
+        let Some(t) = snap.tenant(&tenant.into()) else { return TenantPolicy::default() };
+        TenantPolicy { spend: t.node_spend_caps.unwrap_or_default() }
     }
 }
 
@@ -287,6 +294,8 @@ struct RunCreate {
     is_async: bool,
     /// Wait at most this long (seconds) for a sync run; capped by the server.
     wait_s: Option<f64>,
+    /// Lowers the version's budget for this run (`steps`, `tokens`, `usd`, `wall_clock_s`).
+    budget: Option<caliban_nodes::executor::RunBudget>,
 }
 
 #[derive(Deserialize)]
@@ -344,6 +353,7 @@ async fn create_run(
         invoker: format!("api_key:{}", &key_hash[..key_hash.len().min(12)]),
         invoker_key_hash: Some(key_hash),
         idempotency,
+        budget: rc.budget,
     };
     let (run, new) = match runs.executor.create(start).await {
         Ok(x) => x,

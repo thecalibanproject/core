@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 /// Upper bounds a tenant puts on every node version it publishes. Tenant settings
 /// (`PATCH /api/v1/tenants/{id}` with `node_caps`); [`NodeCaps::DEFAULT`] when unset.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeCaps {
     pub steps: u32,
@@ -25,14 +25,22 @@ pub struct NodeCaps {
     pub wall_clock_s: u64,
     pub depth: u32,
     pub fanout: u32,
+    /// Most a version may let one run spend (USD). When set, every version must declare a
+    /// `budgets.usd` within it. `None`: no cap (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
 }
 
 impl NodeCaps {
-    pub const DEFAULT: NodeCaps = NodeCaps { steps: 200, tokens: 2_000_000, wall_clock_s: 3600, depth: 5, fanout: 32 };
+    pub const DEFAULT: NodeCaps =
+        NodeCaps { steps: 200, tokens: 2_000_000, wall_clock_s: 3600, depth: 5, fanout: 32, usd: None };
 
     pub fn validate(&self) -> Result<(), String> {
         if self.steps == 0 || self.tokens == 0 || self.wall_clock_s == 0 || self.depth == 0 || self.fanout == 0 {
             return Err("node_caps: every cap must be positive".into());
+        }
+        if self.usd.is_some_and(|u| !u.is_finite() || u <= 0.0) {
+            return Err("node_caps: usd must be a positive number".into());
         }
         Ok(())
     }
@@ -51,6 +59,15 @@ impl NodeCaps {
         over("wall_clock_s", b.wall_clock_s, self.wall_clock_s);
         over("depth", b.depth.into(), self.depth.into());
         over("fanout", b.fanout.into(), self.fanout.into());
+        match (self.usd, b.usd) {
+            (Some(cap), None) => {
+                out.push(format!("budgets.usd is required: the tenant caps what one run may spend at ${cap}"))
+            }
+            (Some(cap), Some(got)) if got > cap => {
+                out.push(format!("budgets.usd = {got} exceeds the tenant's node cap of {cap}"));
+            }
+            _ => {}
+        }
         out
     }
 }
@@ -247,9 +264,16 @@ mod tests {
 
     #[test]
     fn caps_are_checked() {
-        let caps = NodeCaps { steps: 5, tokens: 10, wall_clock_s: 1, depth: 1, fanout: 1 };
+        let caps = NodeCaps { steps: 5, tokens: 10, wall_clock_s: 1, depth: 1, fanout: 1, usd: None };
         let v = caps.violations(&spec(&[], &[], 5));
         assert_eq!(v.len(), 4, "{v:?}"); // tokens, wall clock, depth (3 > 1), fanout (8 > 1)
         assert!(NodeCaps { steps: 0, ..caps }.validate().is_err());
+        let usd = NodeCaps { usd: Some(0.5), ..NodeCaps::DEFAULT };
+        assert!(usd.violations(&spec(&[], &[], 5))[0].contains("budgets.usd is required"));
+        let mut s = spec(&[], &[], 5);
+        s.budgets.usd = Some(0.75);
+        assert!(usd.violations(&s)[0].contains("budgets.usd = 0.75 exceeds"));
+        s.budgets.usd = Some(0.25);
+        assert!(usd.violations(&s).is_empty());
     }
 }
