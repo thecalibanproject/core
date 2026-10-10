@@ -132,13 +132,31 @@ only**. For air-gapped builds, point `ORT_LIB_LOCATION` at a vendored ONNX Runti
   - Ignored: `MISC`, `DATE`, `TIME`, `AGE`, `GENDER`, `COUNTRY`, `STATE`, `URL`.
 - **Concurrency**: `sessions` independent ONNX sessions (default `min(cores / 2, 4)`), each
   behind a `Mutex` (`run` needs `&mut Session`), with `intra_threads` ONNX threads each
-  (default `cores / (2 × sessions)`, 1 to 4) and spin-waiting off (`intra_spinning`).
+  (default 2, `ner::default_intra_threads`; 1 on a single-core machine) and spin-waiting off
+  (`intra_spinning`). On 8 vCPU x86, 2 threads per session cut a request from 43 to 29.7 ms and
+  raised throughput from 96 to 103 req/s against 1 thread (`bench/RESULTS-aws-2026-10b.md`,
+  section 7).
   `NerDetector` is `Send + Sync` and reports `Detector::is_heavy`, so the gateway runs it on its
   dedicated PII worker pool (one worker per session, bounded queue, fail-closed `503` when full;
   see the README) rather than on async workers.
 - **Failure**: an inference error makes `PiiEngine::protect` return
   `PiiError::DetectorFailed`, so the request fails closed. `Detector::detect` is best-effort
   and counts failures in `NerDetector::failures()`.
+
+### Hardware
+
+Prefer recent x86 CPUs with AVX-512 VNNI or AMX (for example AWS c7i, Sapphire Rapids) over Arm
+(Graviton4) for NER-heavy deployments. Same build, same int8 model
+(`nym-pii-multilingual-small-int8` 3.0.0), 8 vCPU each (`bench/RESULTS-aws-2026-10b.md`,
+section 7):
+
+| Host | Per request (c = 1) | Saturated throughput |
+|---|---:|---:|
+| c8g.2xlarge (Graviton4), 4 sessions x 1 thread | 77 ms | 41 req/s |
+| c7i.2xlarge (Sapphire Rapids), 4 x 1 | 43 ms | 96 req/s |
+| c7i.2xlarge, 4 x 2 (the default since then) | 29.7 ms | 103 req/s |
+
+The prebuilt ONNX Runtime likely lacks fast int8 kernels on aarch64; this was not profiled.
 
 ### Measured (dev machine, see the crate report for numbers)
 

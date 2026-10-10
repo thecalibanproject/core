@@ -18,7 +18,8 @@ use tokenizers::models::ModelWrapper;
 /// Runtime options for [`NerDetector::load`].
 #[derive(Debug, Clone)]
 pub struct NerOptions {
-    /// ONNX Runtime intra-op threads per session (default: [`NerOptions::default_intra_threads`]).
+    /// ONNX Runtime intra-op threads per session (default: [`NerOptions::default_intra_threads`],
+    /// 2).
     pub intra_threads: usize,
     /// Let idle intra-op threads spin-wait for the next run (ONNX Runtime's default). Off by
     /// default: spinning shaves a little latency off back-to-back runs but burns whole cores that
@@ -58,11 +59,10 @@ impl NerOptions {
         (cores / 2).clamp(1, 4)
     }
 
-    /// Default intra-op threads per session for `cores` CPUs and `sessions` sessions: the half of
-    /// the cores given to inference, shared between the sessions, between 1 and 4. With every
-    /// session busy, inference then uses at most about half of the cores.
-    pub fn default_intra_threads(cores: usize, sessions: usize) -> usize {
-        (cores / (2 * sessions.max(1))).clamp(1, 4)
+    /// Default intra-op threads per session: [`super::default_intra_threads`] (2, fewer only on
+    /// a machine with fewer cores).
+    pub fn default_intra_threads(cores: usize) -> usize {
+        super::default_intra_threads(cores)
     }
 }
 
@@ -71,7 +71,7 @@ impl Default for NerOptions {
         let cores = available_cores();
         let sessions = Self::default_sessions(cores);
         Self {
-            intra_threads: Self::default_intra_threads(cores, sessions),
+            intra_threads: Self::default_intra_threads(cores),
             intra_spinning: false,
             sessions,
             max_tokens: None,

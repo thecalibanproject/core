@@ -453,9 +453,9 @@ fn env_count(name: &str) -> Result<Option<usize>> {
 }
 
 /// Loads the NER model with `CALIBAN_PII_NER_SESSIONS` sessions (default `min(cores / 2, 4)`) of
-/// `CALIBAN_PII_NER_THREADS` intra-op threads each (default: half the cores shared between the
-/// sessions, 1 to 4), and the pool's queue and overflow policy (`CALIBAN_PII_NER_QUEUE`,
-/// `CALIBAN_PII_NER_QUEUE_WAIT_MS`, `CALIBAN_PII_NER_OVERFLOW`).
+/// `CALIBAN_PII_NER_THREADS` intra-op threads each (default 2, see
+/// [`caliban_pii::ner::default_intra_threads`]), and the pool's queue and overflow policy
+/// (`CALIBAN_PII_NER_QUEUE`, `CALIBAN_PII_NER_QUEUE_WAIT_MS`, `CALIBAN_PII_NER_OVERFLOW`).
 #[cfg(feature = "ner")]
 fn load_ner(dir: &str) -> Result<(caliban_pii::PiiEngine, caliban_gateway::pii_pool::PiiPoolOptions)> {
     use caliban_pii::ner::NerOptions;
@@ -463,11 +463,8 @@ fn load_ner(dir: &str) -> Result<(caliban_pii::PiiEngine, caliban_gateway::pii_p
     let mut opts = NerOptions::default();
     if let Some(n) = env_count("CALIBAN_PII_NER_SESSIONS")? {
         opts.sessions = n;
-        opts.intra_threads = NerOptions::default_intra_threads(cores, n);
     }
-    if let Some(n) = env_count("CALIBAN_PII_NER_THREADS")? {
-        opts.intra_threads = n;
-    }
+    opts.intra_threads = ner_threads(env_count("CALIBAN_PII_NER_THREADS")?, cores);
     let started = std::time::Instant::now();
     let ner = caliban_pii::ner::NerDetector::load(std::path::Path::new(dir), opts.clone())
         .with_context(|| format!("loading PII NER model from {dir}"))?;
@@ -485,6 +482,13 @@ fn load_ner(dir: &str) -> Result<(caliban_pii::PiiEngine, caliban_gateway::pii_p
         "PII NER model loaded (L1)"
     );
     Ok((caliban_pii::PiiEngine::default().with_detector(ner), pool))
+}
+
+/// Intra-op threads per NER session: `CALIBAN_PII_NER_THREADS` when set, otherwise 2 (fewer on a
+/// machine with fewer cores).
+#[cfg_attr(not(feature = "ner"), allow(dead_code))]
+fn ner_threads(env: Option<usize>, cores: usize) -> usize {
+    env.unwrap_or_else(|| caliban_pii::ner::default_intra_threads(cores))
 }
 
 #[cfg(not(feature = "ner"))]
@@ -535,6 +539,17 @@ async fn shutdown() {
     let term = std::future::pending::<()>();
     tokio::select! { () = ctrl_c => {}, () = term => {} }
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod ner_threads_tests {
+    #[test]
+    fn two_threads_unless_overridden() {
+        assert_eq!(super::ner_threads(None, 8), 2);
+        assert_eq!(super::ner_threads(None, 1), 1);
+        assert_eq!(super::ner_threads(Some(4), 8), 4);
+        assert_eq!(super::ner_threads(Some(1), 64), 1);
+    }
 }
 
 #[cfg(test)]

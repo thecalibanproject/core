@@ -21,6 +21,19 @@ pub use detector::{NerDetector, NerOptions};
 use crate::{EntityType, Span};
 use std::path::PathBuf;
 
+/// Default ONNX Runtime intra-op threads per NER session (`CALIBAN_PII_NER_THREADS` overrides).
+pub const DEFAULT_INTRA_THREADS: usize = 2;
+
+/// Default intra-op threads per session for a machine with `cores` CPUs: [`DEFAULT_INTRA_THREADS`],
+/// fewer only when the machine has fewer cores. Measured on 8 vCPU
+/// (`bench/RESULTS-aws-2026-10b.md`, section 7): 2 threads per session cut a request from 43 to
+/// 30 ms on x86 (Sapphire Rapids) and raised throughput from 96 to 103 req/s with 4 sessions.
+/// With every session busy, inference can then use `2 x sessions` cores (all of an 8-vCPU host
+/// with the default 4 sessions); non-PII requests on that host stayed at 1.7 ms p50.
+pub fn default_intra_threads(cores: usize) -> usize {
+    DEFAULT_INTRA_THREADS.min(cores).max(1)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum NerError {
     #[error("{path}: {source}")]
@@ -119,6 +132,16 @@ pub fn join_adjacent(text: &str, mut spans: Vec<Span>) -> Vec<Span> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_intra_threads_by_default() {
+        assert_eq!(DEFAULT_INTRA_THREADS, 2);
+        for cores in [2, 4, 8, 16, 64] {
+            assert_eq!(default_intra_threads(cores), 2, "{cores} cores");
+        }
+        assert_eq!(default_intra_threads(1), 1);
+        assert_eq!(default_intra_threads(0), 1);
+    }
 
     #[test]
     fn maps_conll_and_pii_labels() {
