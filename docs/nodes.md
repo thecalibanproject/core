@@ -206,7 +206,7 @@ prominent warning.
 | `CALIBAN_WORKER_URLS` | routers | Worker base URLs, comma separated |
 | `CALIBAN_WORKER_TOKEN` | routers and workers | Shared secret on router-to-worker requests |
 | `CALIBAN_WORKER_ADDR` | workers | Listen address, default `0.0.0.0:8082` |
-| `CALIBAN_WORKER_ID` | workers, standalone | Lease owner id prefix (default: the host name); a random suffix keeps it unique per process |
+| `CALIBAN_WORKER_ID` | workers, standalone | The worker's stable name, used as is for snapshot check-ins and usage shipping (default: the host name). Leases are owned by this name plus a random per-process suffix, so two processes with the same name never share a lease |
 | `CALIBAN_NODE_SYNC_WAIT_SECS` | workers, standalone, routers | Longest a sync run request waits, default 60 |
 | `CALIBAN_NODE_LEASE_SECS` | workers, standalone | Lease on a running run, default 30, renewed every third of it |
 | `CALIBAN_NODE_POLL_MS` | workers, standalone | How often an idle worker looks for runnable runs, default 500 |

@@ -132,14 +132,26 @@ impl NodeArgs {
     }
 }
 
-/// This process's worker id (the lease owner on the runs it executes): `CALIBAN_WORKER_ID`, else
-/// the host's id, plus a random suffix so that two processes never share one.
-pub fn worker_id() -> String {
-    let base = std::env::var("CALIBAN_WORKER_ID")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(crate::split::router_id);
-    format!("{base}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
+/// This worker's stable name: `CALIBAN_WORKER_ID` as is when set (deploy sets the pod name), else
+/// the host's id (like a router's). Snapshot check-ins and usage shipping use it, so a restarted
+/// worker keeps its check-in row.
+pub fn worker_name() -> String {
+    std::env::var("CALIBAN_WORKER_ID").ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty()).map_or_else(
+        crate::split::router_id,
+        |v| {
+            v.chars()
+                .take(120)
+                .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') { c } else { '-' })
+                .collect()
+        },
+    )
+}
+
+/// The lease owner of this process's runs: the worker's name plus a per-process instance suffix,
+/// so two processes started with the same name can never both hold a lease (and a restarted
+/// worker never mistakes its predecessor's leases for its own).
+pub fn lease_owner(name: &str) -> String {
+    format!("{name}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
 }
 
 /// The Postgres journal of a worker. Workers never migrate (the control plane owns migrations, and

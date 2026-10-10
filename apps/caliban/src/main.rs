@@ -324,7 +324,7 @@ async fn main() -> Result<()> {
         let keys = std::env::var("CALIBAN_SNAPSHOT_PUBLIC_KEY")
             .context("CALIBAN_SNAPSHOT_PUBLIC_KEY is required for a worker")?;
         let verifier = SnapshotVerifier::from_b64_list(&keys).context("CALIBAN_SNAPSHOT_PUBLIC_KEY")?;
-        let worker_id = nodes::worker_id();
+        let worker_id = nodes::worker_name();
         let every = Duration::from_secs(args.poll_interval_secs.max(1));
         let keyring_ids = keyring.ids().into_iter().map(str::to_owned).collect();
         let mut source = split::SnapshotSource::new(
@@ -349,7 +349,7 @@ async fn main() -> Result<()> {
         let gw = Arc::new(new_gateway(handle, usage_sinks(&RecentUsage::default(), shipper.as_ref()))?);
         spawn_router_warmup(&gw);
         nodes::warn_if_local_idempotency(&gw);
-        let stop = cli.nodes.run_locally(&gw, journal, Arc::new(keyring.clone()), worker_id)?;
+        let stop = cli.nodes.run_locally(&gw, journal, Arc::new(keyring.clone()), nodes::lease_owner(&worker_id))?;
         let res = serve("worker", args.listen.clone(), caliban_gateway::nodes::worker_app(gw, worker_token)).await;
         stop.notify_waiters();
         flush_wal(wal.as_deref()).await;
@@ -404,7 +404,12 @@ async fn main() -> Result<()> {
                         Some(url) => nodes::postgres_journal(&url).await?,
                         None => Arc::new(caliban_nodes::journal::memory::MemoryJournal::new()),
                     };
-                    Some(cli.nodes.run_locally(&purge_gw, journal, Arc::new(k.clone()), nodes::worker_id())?)
+                    Some(cli.nodes.run_locally(
+                        &purge_gw,
+                        journal,
+                        Arc::new(k.clone()),
+                        nodes::lease_owner(&nodes::worker_name()),
+                    )?)
                 }
                 None => {
                     tracing::warn!("node runs disabled: CALIBAN_KEK is not set (nodes cannot be published without it)");

@@ -543,3 +543,10 @@ fn hex_sha256(s: &str) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(s.as_bytes()))
 }
+
+#[test]
+fn lease_owners_are_unique_per_process_under_a_stable_name() {
+    let (a, b) = (crate::nodes::lease_owner("worker-0"), crate::nodes::lease_owner("worker-0"));
+    assert!(a.starts_with("worker-0-") && b.starts_with("worker-0-"));
+    assert_ne!(a, b, "two processes with the same CALIBAN_WORKER_ID never share a lease");
+}
