@@ -61,10 +61,13 @@ jobs:
       - run: cargo test -p caliban-cp -- store::tests::postgres auth::tests::postgres
       # The node journal parity suite and the executor on the Postgres journal (claims with
       # SKIP LOCKED, lease takeover, human input, durable sleeps, spend caps across workers,
-      # retention, taint and approvals), then the end-to-end node tests (workers, crash and replay,
-      # exactly-once runs, split mode, usage shipping, schema checks, MCP tools, PII across tools).
+      # retention, taint and approvals, run events, cancellation, listing, the audit outbox), then
+      # the end-to-end node tests (workers, crash and replay, exactly-once runs, split mode, usage
+      # shipping, schema checks, MCP tools, PII across tools), the exposure tests (event streams
+      # resumed on another worker, listing and cancellation across workers, the chat shortcut, the
+      # MCP server and Tasks, the console inbox, the audit chain) and caliban/auto handing to nodes.
       - run: cargo test -p caliban-nodes
-      - run: cargo test -p caliban --bin caliban -- nodes_tests
+      - run: cargo test -p caliban --bin caliban -- nodes_tests exposure_tests auto_tests
 
   valkey:
     name: Valkey quota store

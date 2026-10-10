@@ -173,10 +173,40 @@ async fn key_for(e: &crate::nodes_tests::Env, nodes: Option<Vec<&str>>) -> Strin
     v["key"].as_str().unwrap().to_owned()
 }
 
+/// A model server whose first answer waits until the test opens the gate; counts the calls.
+async fn gated_upstream()
+-> (String, Arc<std::sync::atomic::AtomicUsize>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (calls, arrived, gate) =
+        (Arc::new(AtomicUsize::new(0)), Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+    let (c, a, g) = (Arc::clone(&calls), Arc::clone(&arrived), Arc::clone(&gate));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |axum::Json(b): axum::Json<Value>| {
+            let (c, a, g) = (Arc::clone(&c), Arc::clone(&a), Arc::clone(&g));
+            async move {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    a.notify_one();
+                    g.notified().await;
+                }
+                axum::Json(json!({"id": "x", "object": "chat.completion", "model": b["model"],
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}}))
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (url, calls, arrived, gate)
+}
+
 #[tokio::test]
 async fn runs_are_listed_and_cancelled_across_workers() {
-    // Model calls take 300 ms: a run is surely in its first call when it is cancelled.
-    let e = env(Duration::from_millis(300)).await;
+    use std::sync::atomic::Ordering;
+    // The first model call waits for the gate: the run is surely in it when it is cancelled.
+    let (upstream, calls, arrived, gate) = gated_upstream().await;
+    let e = crate::nodes_tests::env_full(Duration::ZERO, None, "", Some(&upstream)).await;
     e.publish("chain", chain()).await;
     e.publish("flow", flow()).await;
     let j = journal().await;
@@ -190,9 +220,10 @@ async fn runs_are_listed_and_cancelled_across_workers() {
     assert_eq!(s, StatusCode::ACCEPTED, "{v}");
     let running = v["id"].as_str().unwrap().to_owned();
     a.ex.spawn_run(running.clone());
-    until("the first model call", async || e.mock.len() == 1).await;
+    arrived.notified().await;
     let (s, v) = send(&b.app, "POST", &format!("/v1/runs/{running}/cancel"), KEY, None, &[]).await;
     assert_eq!((s, v["cancel_requested"].as_bool()), (StatusCode::ACCEPTED, Some(true)), "{v}");
+    gate.notify_one();
     until("the run to stop", async || {
         j.get_run("acme", &running).await.unwrap().is_some_and(|r| r.status.is_terminal())
     })
@@ -200,7 +231,7 @@ async fn runs_are_listed_and_cancelled_across_workers() {
     let v = crate::nodes_tests::run_status(&b.app, &running).await;
     assert_eq!(v["status"], "cancelled", "{v}");
     assert_eq!(v["steps"].as_array().unwrap().len(), 1, "the call in flight was recorded, nothing after it: {v}");
-    assert_eq!(e.mock.len(), 1, "the second step never called the model");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the second step never called the model");
     assert!(v["stop_reason"].as_str().unwrap().starts_with("cancelled by api_key:"));
 
     // Waiting runs end at once; ended runs are a conflict, repeats are fine.

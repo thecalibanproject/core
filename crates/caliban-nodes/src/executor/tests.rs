@@ -1269,11 +1269,19 @@ async fn a_cancelled_run_stops_at_its_next_step_and_its_model_call_is_not_repeat
 
 #[tokio::test]
 async fn a_failing_model_call_is_not_retried_once_the_run_is_cancelled() {
-    struct Down(AtomicUsize);
+    /// Fails every call; the first one only once the test has cancelled the run.
+    struct Down {
+        calls: AtomicUsize,
+        held: Notify,
+        release: Notify,
+    }
     #[async_trait::async_trait]
     impl ModelClient for Down {
         async fn chat(&self, _: &CallCtx, _: Value) -> Result<ModelReply, ModelError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.held.notify_one();
+                self.release.notified().await;
+            }
             Err(ModelError::Unavailable("upstream down".into()))
         }
     }
@@ -1285,7 +1293,7 @@ async fn a_failing_model_call_is_not_retried_once_the_run_is_cancelled() {
             json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(5, 1000),
                                       "graph": {"vertices": [{"id": "a", "type": "llm"}], "edges": []}}),
         );
-        let down = Arc::new(Down(AtomicUsize::new(0)));
+        let down = Arc::new(Down { calls: AtomicUsize::new(0), held: Notify::new(), release: Notify::new() });
         let ex = Arc::new(Executor::new(
             Arc::clone(&j),
             Arc::clone(&down) as Arc<dyn ModelClient>,
@@ -1300,16 +1308,14 @@ async fn a_failing_model_call_is_not_retried_once_the_run_is_cancelled() {
             let (ex, id) = (Arc::clone(&ex), r.id.clone());
             tokio::spawn(async move { ex.run_now(&id).await })
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while down.0.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        ex.cancel("acme", &r.id, "api_key:abc").await.unwrap();
+        // The first call is in flight; the run is cancelled; then the call fails transiently.
+        down.held.notified().await;
+        assert_eq!(ex.cancel("acme", &r.id, "api_key:abc").await.unwrap(), Cancelled::Requested);
+        down.release.notify_one();
         task.await.unwrap().unwrap();
         let v = ex.view("acme", &r.id).await.unwrap().unwrap();
         assert_eq!(v.status, RunStatus::Cancelled, "{v:?}");
-        let calls = down.0.load(Ordering::SeqCst);
-        assert!(calls <= 2, "at most the call in flight when the cancel came, then none: {calls}");
+        assert_eq!(down.calls.load(Ordering::SeqCst), 1, "the failed call was not retried");
     }
 }
 

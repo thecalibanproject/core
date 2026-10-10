@@ -8,7 +8,9 @@
 # revoked and a tenant deleted on the CP are rejected (401) by the router after its next poll;
 # the router's usage events reach the CP's /usage (also those served while the CP was down, across
 # a router restart, exactly once); the router reports the KEK of the snapshot it serves; a node
-# published on the CP runs on a `caliban worker` through the router (human step included).
+# published on the CP runs on a `caliban worker` through the router (human step included), its
+# events stream back through the router, `model: node/<name>` works there, the router's MCP server
+# lists the node, and the answers reach the CP's audit chain from the worker.
 #
 # Needs docker (Postgres 17), python3, curl. Set SPLIT_DATABASE_URL to use an existing database
 # instead of a throwaway container.
@@ -170,6 +172,22 @@ for _ in $(seq 50); do [[ $(run_status) == succeeded ]] && break; sleep 0.1; don
 [[ $(run_status) == succeeded ]] && pass "answered through the router, the run completed" || fail "run: $(run_status)"
 [[ $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WP/v1/runs/$RUN" -H "authorization: Bearer $KEY") == 401 ]] \
   && pass "the worker refuses requests without the worker token" || fail "worker token"
+curl -s -N --max-time 10 "http://127.0.0.1:$DP/v1/runs/$RUN/events" -H "authorization: Bearer $KEY" -H 'last-event-id: 2' > "$WORK/events"
+grep -q '^event: run.finished' "$WORK/events" && ! grep -q '^id: 1$' "$WORK/events" \
+  && pass "run events streamed back through the router, resumed after Last-Event-ID" || fail "events: $(cat "$WORK/events")"
+chat_node() { curl -s "http://127.0.0.1:$DP/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' "$@"; }
+chat_node -d '{"model":"node/smoke","messages":[{"role":"user","content":"the chat plan"}]}' > "$WORK/chat"
+CHAT_RUN=$(python3 -c 'import sys,json;d=json.load(open(sys.argv[1]));assert d["choices"][0]["finish_reason"]=="input_required",d;print(d["caliban"]["run_id"])' "$WORK/chat") \
+  && pass "model node/smoke on chat completions: the human step's question, with the run id" || fail "chat shortcut: $(cat "$WORK/chat")"
+chat_node -H "caliban-run-id: $CHAT_RUN" -d '{"model":"node/smoke","messages":[{"role":"user","content":"yes"}]}' \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d["choices"][0]["finish_reason"]=="stop",d' \
+  && pass "answered with Caliban-Run-Id: the run finished on the worker" || fail "chat continuation"
+curl -s "http://127.0.0.1:$DP/mcp" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+  -H 'mcp-protocol-version: 2025-11-25' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' > "$WORK/mcp"
+grep -q '"name":"smoke"' "$WORK/mcp" && pass "MCP tools/list on the router lists the node" || fail "mcp: $(cat "$WORK/mcp")"
+audited() { adm '/audit?limit=50' | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["chain_verified"] and sum(e["action"]=="node.run.answer" for e in d["entries"])==2)'; }
+for _ in $(seq 50); do [[ $(audited) == True ]] && break; sleep 0.2; done
+[[ $(audited) == True ]] && pass "both answers reached the CP's audit chain from the worker, once each" || fail "audit: $(adm '/audit?limit=5')"
 
 echo "fail-static"
 kill $CP_PID; wait $CP_PID 2>/dev/null || true

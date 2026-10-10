@@ -154,9 +154,19 @@ pub(crate) async fn env_with(latency: Duration, journal: Option<Arc<dyn Journal>
 
 /// An environment whose config file starts with `extra`.
 pub(crate) async fn env_toml(latency: Duration, journal: Option<Arc<dyn Journal>>, extra: &str) -> Env {
+    env_full(latency, journal, extra, None).await
+}
+
+/// An environment whose tenant reaches models at `upstream` (default: the mock model server).
+pub(crate) async fn env_full(
+    latency: Duration,
+    journal: Option<Arc<dyn Journal>>,
+    extra: &str,
+    upstream: Option<&str>,
+) -> Env {
     let cfg = MockConfig { latency, responder: Some(responder()), ..MockConfig::default() };
     let mock = Mock::start("127.0.0.1:0", cfg).await.unwrap();
-    let cfg = config_with(&mock.base_url(), extra);
+    let cfg = config_with(upstream.unwrap_or(&mock.base_url()), extra);
     let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "boot"));
     let cp = Arc::new(
         ControlPlane::new(Store::new(cfg, handle.clone(), RecentUsage::default()), ADMIN.into(), "standalone")
