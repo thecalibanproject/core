@@ -289,8 +289,12 @@ async fn router(
 ) -> Result<StepOut, Stop> {
     let scope = Scope { input, outputs };
     let c = &v.config;
-    let routes = c.get("routes").and_then(Value::as_object).cloned().unwrap_or_default();
-    let labels: Vec<String> = routes.keys().cloned().collect();
+    // Sorted: the prompt (and so the step's input hash) must not depend on the JSON map's key
+    // order, which differs between builds (`serde_json`'s `preserve_order`).
+    let mut routes: Vec<(String, Value)> =
+        c.get("routes").and_then(Value::as_object).map(|m| m.clone().into_iter().collect()).unwrap_or_default();
+    routes.sort_by(|a, b| a.0.cmp(&b.0));
+    let labels: Vec<String> = routes.iter().map(|(l, _)| l.clone()).collect();
     let mut system = c.get("system").and_then(Value::as_str).map(|s| render_str(s, &scope)).unwrap_or_else(|| {
         "Classify the input into exactly one of the labels below. Answer with the label only.".to_owned()
     });
