@@ -15,6 +15,7 @@
 
 pub mod artifact;
 pub mod embed;
+pub mod eval;
 pub mod exemplars;
 pub mod knn;
 pub mod policy;
