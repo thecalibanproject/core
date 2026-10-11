@@ -405,6 +405,7 @@ paths:
         `null` on the last).
       parameters:
         - { name: node, in: query, schema: { type: string } }
+        - { name: version, in: query, schema: { type: integer, minimum: 1 }, description: 'Only runs of this version (with `node`: that node''s version)' }
         - { name: status, in: query, schema: { type: string }, description: 'Comma-separated run statuses' }
         - { name: created_after, in: query, schema: { type: string, format: date-time } }
         - { name: created_before, in: query, schema: { type: string, format: date-time } }
@@ -831,6 +832,35 @@ paths:
         '409': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
 
+  /api/v1/tenants/{tenantId}/runs/{runId}/cancel:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: runId, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [nodes]
+      summary: Cancel a run (console)
+      description: |
+        As the signed-in user (permission `runs.answer`: whoever may deny a write, which fails the
+        run, may stop it). Audited once as `node.run.cancel`. A waiting run (pending, sleeping,
+        input required) ends at once (`200`); a running run is asked to stop and its worker stops
+        at the next step boundary (`202`); a run already cancelled is a `200`; a run that ended
+        otherwise is a `409` (`run_already_ended`).
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConsoleRun' }
+        '202':
+          description: Asked to stop
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConsoleRun' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
   /api/v1/tenants/{tenantId}/inbox:
     parameters: [ { $ref: '#/components/parameters/TenantId' } ]
     get:
@@ -865,6 +895,14 @@ paths:
                         invoker: { type: string }
                         waiting_since: { type: string, format: date-time }
                         expires_at: { type: [string, 'null'], format: date-time, description: 'When the human step times out (its `timeout_s`)' }
+                        approval:
+                          type: [object, 'null']
+                          description: '`kind: approval` only: what the gated call would do, structured (the `question` text says the same). `arguments` with `runs.data` only. Null for runs from a worker that recorded none.'
+                          properties:
+                            tool: { type: string, description: 'The tool reference (`mcp://server/tool#sha256:...`)' }
+                            effect: { type: string, description: '`write`, or `read, reaches the network through its arguments`' }
+                            labels: { type: array, items: { type: string }, description: 'The untrusted taint labels its arguments carry' }
+                            arguments: { description: 'With `runs.data`: the arguments it would be called with' }
         '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
@@ -1201,15 +1239,7 @@ paths:
           description: OK
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  object: { type: string, enum: [node.eval_policy] }
-                  node: { type: string }
-                  policy: { $ref: '#/components/schemas/EvalPolicy' }
-                  injection_bar: { type: number }
-                  updated_at: { type: [string, 'null'], format: date-time }
-                  updated_by: { type: [string, 'null'] }
+              schema: { $ref: '#/components/schemas/EvalPolicyView' }
     put:
       tags: [evals]
       summary: Set the node's promotion bar
@@ -1218,7 +1248,11 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/EvalPolicy' } } }
       responses:
-        '200': { description: Stored }
+        '200':
+          description: Stored; the bar now in effect
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvalPolicyView' }
         '422': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/evals:
@@ -1283,8 +1317,11 @@ paths:
                   version: { type: integer }
                   has_write_tools: { type: boolean }
                   allowed: { type: boolean }
-                  evidence: { description: 'The evals that meet the bar (`golden`, `injection`), null when no gate applies' }
-                  problems: { type: array, items: { type: object } }
+                  evidence: { oneOf: [ { $ref: '#/components/schemas/GateEvidence' }, { type: 'null' } ], description: 'The evals that meet the bar; null when no gate applies' }
+                  problems:
+                    type: array
+                    description: 'Every reason it cannot be promoted (kind `eval_gate`; `path` names a subnode whose own gate failed)'
+                    items: { $ref: '#/components/schemas/Problem' }
 
   /api/v1/tenants/{tenantId}/eval-key:
     parameters: [ { $ref: '#/components/parameters/TenantId' } ]
@@ -2409,13 +2446,15 @@ components:
             problems:
               type: array
               description: 'Node version refusals (`422`, `validation_failed`): every reason, one by one, next to `message` (which joins them).'
-              items:
-                type: object
-                required: [kind, message]
-                properties:
-                  kind: { type: string, enum: [spec, tool, datasource_scope, budget, node_ref, cycle, eval_gate, golden_set] }
-                  message: { type: string }
-                  path: { type: string, description: 'Where in the spec: `tools[0]`, `datasources.scopes[1]`, `budgets.steps`, `node://risk@v2`' }
+              items: { $ref: '#/components/schemas/Problem' }
+
+    Problem:
+      type: object
+      required: [kind, message]
+      properties:
+        kind: { type: string, enum: [spec, tool, datasource_scope, budget, node_ref, cycle, eval_gate, golden_set, allowlist], description: '`allowlist` appears in `warnings` only' }
+        message: { type: string }
+        path: { type: string, description: 'Where in the spec: `tools[0]`, `datasources.scopes[1]`, `budgets.steps`, `node://risk@v2` (for `eval_gate`: the subnode whose own gate failed)' }
 
     Health:
       type: object
@@ -2925,6 +2964,154 @@ components:
           required: [min_pass_rate]
           properties:
             min_pass_rate: { type: number, minimum: 0, maximum: 1, description: 'Least share of attacks blocked. Default 1 (every attack). An injection eval is required for versions with write tools whatever the bar.' }
+    EvalPolicyView:
+      type: object
+      required: [object, node, policy, injection_bar]
+      properties:
+        object: { type: string, enum: [node.eval_policy] }
+        node: { type: string }
+        policy: { $ref: '#/components/schemas/EvalPolicy' }
+        injection_bar: { type: number, description: 'The injection bar in effect for versions with write tools (default 1)' }
+        updated_at: { type: [string, 'null'], format: date-time }
+        updated_by: { type: [string, 'null'] }
+    GateEvidence:
+      type: object
+      description: 'The evals that met the bar (in the audit entries `node.publish` and `node.promote` as `evals`)'
+      properties:
+        golden:
+          type: object
+          required: [eval, k, pass_hat_k]
+          properties:
+            eval: { type: string }
+            k: { type: integer }
+            pass_hat_k: { type: number }
+        injection:
+          type: object
+          required: [eval, pass_rate, bar]
+          properties:
+            eval: { type: string }
+            pass_rate: { type: number }
+            bar: { type: number }
+        subnodes:
+          type: object
+          description: 'Per pinned subnode version (`name@vN`): its own evidence, or null when no gate applies to it'
+          additionalProperties:
+            oneOf: [ { $ref: '#/components/schemas/GateEvidence' }, { type: 'null' } ]
+    LatencyPercentiles:
+      type: object
+      required: [p50, p95]
+      properties:
+        p50: { type: [integer, 'null'], description: 'Nearest rank, ms' }
+        p95: { type: [integer, 'null'] }
+    GoldenSummary:
+      type: object
+      required: [suite, k, cases, trials, passed_trials, errors, pass_hat_k, pass_at_1, pass_at_k, cost_usd, judge_cost_usd, tokens, latency_ms, by_case]
+      properties:
+        suite: { type: string, enum: [golden] }
+        k: { type: integer }
+        cases: { type: integer }
+        trials: { type: integer }
+        passed_trials: { type: integer }
+        errors: { type: integer }
+        pass_hat_k: { type: number, description: 'pass^k: the share of cases whose k runs all passed' }
+        pass_at_1: { type: number }
+        pass_at_k: { type: number }
+        cost_usd: { type: number }
+        cost_per_success_usd: { type: [number, 'null'] }
+        judge_cost_usd: { type: number }
+        tokens: { type: integer }
+        latency_ms: { $ref: '#/components/schemas/LatencyPercentiles' }
+        by_case:
+          type: array
+          items:
+            type: object
+            required: [case, trials, passed, all_passed]
+            properties:
+              case: { type: string }
+              trials: { type: integer }
+              passed: { type: integer }
+              all_passed: { type: boolean }
+        golden_hash: { type: string }
+        judge:
+          type: object
+          properties:
+            default_model: { type: string }
+            prompt_version: { type: integer }
+            prompt_sha256: { type: string }
+            temperature: { type: number }
+    InjectionSummary:
+      type: object
+      required: [suite, suite_version, trials, blocked, pass_rate, attack_success_rate, attacks_succeeded, errors, attacked, utility_under_attack, by_category, not_applicable, cost_usd, latency_ms, cases]
+      properties:
+        suite: { type: string, enum: [injection] }
+        suite_version: { type: integer }
+        trials: { type: integer }
+        blocked: { type: integer }
+        pass_rate: { type: number, description: 'Share of attacks blocked' }
+        attack_success_rate: { type: number }
+        attacks_succeeded: { type: integer }
+        errors: { type: integer }
+        attacked: { type: integer, description: 'Trials where the model followed the injection' }
+        utility_under_attack: { type: number, description: 'Share of runs that still did their job' }
+        by_category:
+          type: object
+          additionalProperties:
+            type: object
+            required: [trials, blocked, pass_rate]
+            properties:
+              trials: { type: integer }
+              blocked: { type: integer }
+              pass_rate: { type: number }
+        not_applicable:
+          type: array
+          description: 'Cases this version offers no surface for, with why'
+          items:
+            type: object
+            required: [case, reason]
+            properties:
+              case: { type: string }
+              reason: { type: string }
+        cost_usd: { type: number }
+        latency_ms: { $ref: '#/components/schemas/LatencyPercentiles' }
+        cases:
+          type: array
+          items:
+            type: object
+            required: [case, trial, blocked]
+            properties:
+              case: { type: string }
+              trial: { type: integer }
+              blocked: { type: boolean }
+              attacked: { type: [boolean, 'null'] }
+              defenses: { type: [array, 'null'], items: { type: string } }
+              run_id: { type: [string, 'null'] }
+    GoldenVerdict:
+      type: object
+      required: [run_status, checks]
+      properties:
+        run_status: { $ref: '#/components/schemas/RunStatus' }
+        checks:
+          type: array
+          items:
+            type: object
+            required: [type, passed]
+            properties:
+              type: { type: string, enum: [exact, contains, regex, json_schema, llm_judge] }
+              passed: { type: boolean }
+              score: { type: [number, 'null'], description: 'The judge''s score (llm_judge)' }
+        judge_usd: { type: number }
+    InjectionVerdict:
+      type: object
+      required: [case, category, succeeded, attacked, defenses, tool_calls]
+      properties:
+        case: { type: string }
+        category: { type: string, enum: [tainted_write, exfiltration, pii_leak, tool_poisoning, replay, subnode, caller_data] }
+        succeeded: { type: boolean, description: 'The attack reached its goal' }
+        attacked: { type: boolean, description: 'The model followed the injection' }
+        defenses: { type: array, items: { type: string, enum: [approval_required, pii_guard, declared_tools_only, manifest_scan] } }
+        tool_calls: { type: integer, description: 'Sandboxed calls of the run' }
+        utility: { type: boolean, description: 'The run still did its job (absent for the manifest scan)' }
+        run_status: { $ref: '#/components/schemas/RunStatus' }
     Eval:
       type: object
       required: [id, object, node, version, hash, suite, k, status, case_count, created_at]
@@ -2942,16 +3129,11 @@ components:
         created_by: { type: string }
         api_key_id: { type: [string, 'null'] }
         summary:
-          type: [object, 'null']
-          description: |
-            Metrics only. Golden: `k`, `cases`, `trials`, `passed_trials`, `errors`, `pass_hat_k`
-            (pass^k), `pass_at_1`, `pass_at_k`, `cost_usd`, `cost_per_success_usd`,
-            `judge_cost_usd`, `tokens`, `latency_ms` (`p50`, `p95`), `by_case`, `golden_hash`,
-            `judge` (default model, prompt version and hash, temperature). Injection:
-            `suite_version`, `trials`, `blocked`, `pass_rate`, `attack_success_rate`,
-            `attacks_succeeded`, `attacked` (the model followed the injection),
-            `utility_under_attack`, `by_category`, `not_applicable` (`case`, `reason`), `cases`,
-            `cost_usd`, `latency_ms`.
+          description: 'Metrics only, never content; null until the eval ends. The shape follows `suite`.'
+          oneOf:
+            - $ref: '#/components/schemas/GoldenSummary'
+            - $ref: '#/components/schemas/InjectionSummary'
+            - type: 'null'
         error: { type: [string, 'null'] }
         cancel_requested: { type: boolean }
         cancelled_by: { type: [string, 'null'] }
@@ -2973,7 +3155,14 @@ components:
               cost_usd: { type: number }
               latency_ms: { type: integer }
               tokens: { type: integer }
-              verdict: { type: object, description: 'Metadata: checks passed (golden); category, attacked, succeeded, defenses, utility (injection)' }
+              verdict:
+                description: 'Metadata, never content. The shape follows the eval''s suite; `{"error"}` when the trial''s run could not be created.'
+                oneOf:
+                  - $ref: '#/components/schemas/GoldenVerdict'
+                  - $ref: '#/components/schemas/InjectionVerdict'
+                  - type: object
+                    required: [error]
+                    properties: { error: { type: string } }
               detail: { description: 'With runs.data only: the output and what the scorers said, or what the sandboxed tools received' }
               finished_at: { type: [string, 'null'], format: date-time }
         content_visible: { type: boolean }
@@ -3017,7 +3206,7 @@ components:
           type: array
           items: { $ref: '#/components/schemas/RunStep' }
         claims: { type: integer, description: 'How many times a worker claimed the run (more than 1 after a takeover or a resume)' }
-        origin: { type: string, description: 'What started the run when not a run request: `auto:<intent>` (caliban/auto)' }
+        origin: { type: string, description: 'What started the run when not a run request: `auto` (caliban/auto; the intent is not recorded with the run)' }
         input_labels: { type: array, items: { type: string }, description: 'Taint labels the run input carries from the start: `caller` when it holds untrusted caller data' }
         cancel_requested: { type: boolean, description: 'A cancellation was asked for and the run has not stopped yet' }
         last_event: { type: integer, description: 'Number of the run''s last event (resume its event stream after it)' }
@@ -3346,7 +3535,7 @@ components:
              tenant.read, tenant.write, tenant.delete, api_keys.read, api_keys.write, provider_keys.read,
              provider_keys.write, routes.read, routes.write, datasources.read, datasources.write, ontology.read,
              ontology.review, nodes.read, nodes.write, nodes.publish, nodes.run, tools.read, tools.write,
-             tools.approve, usage.read]
+             tools.approve, runs.read, runs.data, runs.answer, usage.read]
     RoleInfo:
       type: object
       required: [role, scope, description, permissions]

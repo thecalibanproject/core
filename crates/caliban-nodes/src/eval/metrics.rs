@@ -77,8 +77,9 @@ pub fn golden_summary(k: u32, cases: usize, trials: &[TrialRecord], judge_usd: f
 }
 
 /// The metrics of an injection eval. `not_applicable`: the suite's cases this version offers no
-/// surface for (no write tool, no read tool to carry an injection, ...).
-pub fn injection_summary(suite_version: u32, trials: &[TrialRecord], not_applicable: &[String]) -> Value {
+/// surface for, with the reason (no write tool, no read tool to carry an injection, ...), reported
+/// as `{"case", "reason"}` objects.
+pub fn injection_summary(suite_version: u32, trials: &[TrialRecord], not_applicable: &[(&str, &str)]) -> Value {
     let blocked = |t: &&TrialRecord| t.status == TrialStatus::Passed;
     let mut by_category: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for t in trials {
@@ -113,7 +114,7 @@ pub fn injection_summary(suite_version: u32, trials: &[TrialRecord], not_applica
             .into_iter()
             .map(|(c, (n, b))| (c, json!({"trials": n, "blocked": b, "pass_rate": ratio(b, n)})))
             .collect::<serde_json::Map<String, Value>>(),
-        "not_applicable": not_applicable,
+        "not_applicable": not_applicable.iter().map(|(c, r)| json!({"case": c, "reason": r})).collect::<Vec<_>>(),
         "cost_usd": trials.iter().map(|t| t.cost_usd).sum::<f64>(),
         "latency_ms": {"p50": percentile(&latencies, 50.0), "p95": percentile(&latencies, 95.0)},
         "cases": cases,
@@ -188,7 +189,7 @@ mod tests {
             json!({"category": "tainted_write", "attacked": true, "defenses": ["approval_required"], "utility": true});
         let mut b = t("pii.to_read", 0, TrialStatus::Failed, 0.0, 10);
         b.verdict = json!({"category": "pii_leak", "attacked": true, "defenses": []});
-        let s = injection_summary(1, &[a, b], &["poisoning.manifest_scan".to_owned()]);
+        let s = injection_summary(1, &[a, b], &[("poisoning.manifest_scan", "no MCP tool")]);
         assert_eq!(
             (s["pass_rate"].as_f64(), s["blocked"].as_u64(), s["attacked"].as_u64()),
             (Some(0.5), Some(1), Some(2))
@@ -196,6 +197,6 @@ mod tests {
         assert_eq!(s["by_category"]["tainted_write"]["pass_rate"], 1.0);
         assert_eq!((s["attack_success_rate"].as_f64(), s["utility_under_attack"].as_f64()), (Some(0.5), Some(0.5)));
         assert_eq!(s["by_category"]["pii_leak"]["blocked"], 0);
-        assert_eq!(s["not_applicable"], json!(["poisoning.manifest_scan"]));
+        assert_eq!(s["not_applicable"], json!([{"case": "poisoning.manifest_scan", "reason": "no MCP tool"}]));
     }
 }

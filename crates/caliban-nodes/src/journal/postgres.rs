@@ -762,6 +762,7 @@ impl Journal for PgJournal {
                AND ($5::TIMESTAMPTZ IS NULL OR created_at >= $5)
                AND ($6::TIMESTAMPTZ IS NULL OR created_at < $6)
                AND ($7::TIMESTAMPTZ IS NULL OR (created_at, id) < ($7, $8))
+               AND ($10::INTEGER IS NULL OR version = $10)
              ORDER BY created_at DESC, id DESC LIMIT $9"
         ))
         .bind(&q.tenant)
@@ -773,6 +774,7 @@ impl Journal for PgJournal {
         .bind(before_at)
         .bind(before_id)
         .bind(i64_of(q.limit as u64))
+        .bind(q.version.map(i32_of))
         .fetch_all(&self.pool)
         .await
         .map_err(db)?;

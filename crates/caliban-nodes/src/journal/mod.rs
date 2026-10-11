@@ -217,7 +217,9 @@ pub struct StepRecord {
 pub enum EventKind {
     Input,
     Timer,
-    /// What a sandboxed tool of an injection-suite run received (`sandbox:<step>`, sealed).
+    /// What a sandboxed tool of an injection-suite run received (`sandbox:<step>`, sealed), and
+    /// what a gated call waiting for approval would do (`<step>@approve:approval`, sealed: the tool,
+    /// its effect, the taint labels and the arguments), for the console's inbox.
     Observation,
 }
 
@@ -410,6 +412,11 @@ pub fn decode_cursor(c: &str) -> Option<(DateTime<Utc>, String)> {
     Some((DateTime::from_timestamp_nanos(ns.parse().ok()?), id.to_owned()))
 }
 
+/// The name of the event that holds what an approval step is about (see [`EventKind::Observation`]).
+pub fn approval_event(step: &str) -> String {
+    format!("{step}:approval")
+}
+
 /// A run listing query from `?node=&status=&created_after=&created_before=&limit=&cursor=`
 /// (the data plane's `GET /v1/runs` and the console's run list).
 pub fn run_query(
@@ -438,6 +445,7 @@ pub fn run_query(
         tenant: tenant.to_owned(),
         nodes,
         node,
+        version: None,
         statuses,
         created_after: created.0,
         created_before: created.1,
@@ -453,6 +461,8 @@ pub struct RunQuery {
     /// Only these nodes (an API key's allowlist); `None`: all.
     pub nodes: Option<Vec<String>>,
     pub node: Option<String>,
+    /// Only runs of this version (of any node, or of `node`).
+    pub version: Option<u32>,
     pub statuses: Vec<RunStatus>,
     pub created_after: Option<DateTime<Utc>>,
     pub created_before: Option<DateTime<Utc>>,
@@ -466,6 +476,7 @@ impl RunQuery {
         r.tenant_id == self.tenant
             && self.nodes.as_ref().is_none_or(|n| n.contains(&r.node))
             && self.node.as_ref().is_none_or(|n| *n == r.node)
+            && self.version.is_none_or(|v| v == r.version)
             && (self.statuses.is_empty() || self.statuses.contains(&r.status))
             && self.created_after.is_none_or(|t| r.created_at >= t)
             && self.created_before.is_none_or(|t| r.created_at < t)

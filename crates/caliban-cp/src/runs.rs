@@ -16,6 +16,10 @@
 //! - `runs.answer` (owner, admin, tenant_admin): answer a question, approve or deny a tainted
 //!   write, as the signed-in user. Kept apart from building nodes, like approving tools.
 //!
+//! Cancelling a run from the console (`POST .../runs/{id}/cancel`) needs `runs.answer` too: the
+//! people who may deny a write (which fails the run) may stop it; a separate permission would only
+//! add a grant every console admin needs.
+//!
 //! An answer is recorded with the user as its author (journaled with the answer, and in the audit
 //! log as `node.run.answer`, `node.write.approve` or `node.write.deny`, once).
 
@@ -64,6 +68,8 @@ pub(crate) fn journal_error(e: impl std::fmt::Display) -> ApiError {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListQuery {
     node: Option<String>,
+    /// Only runs of this version (with `node`: of that node's version).
+    version: Option<u32>,
     /// Comma-separated statuses.
     status: Option<String>,
     created_after: Option<DateTime<Utc>>,
@@ -80,7 +86,7 @@ pub(crate) async fn list(
 ) -> ApiResult<Json<Value>> {
     crate::ensure_tenant(&cp, &tenant_id)?;
     let j = journal(&cp)?;
-    let query = run_query(
+    let mut query = run_query(
         &tenant_id,
         None,
         q.node,
@@ -90,6 +96,7 @@ pub(crate) async fn list(
         q.cursor.as_deref(),
     )
     .map_err(bad)?;
+    query.version = q.version;
     let page = j.list_runs(&query).await.map_err(journal_error)?;
     let next = (page.len() == query.limit).then(|| page.last().map(|r| encode_cursor(r.created_at, &r.id))).flatten();
     let data: Vec<RunSummary> = page.iter().map(RunSummary::of).collect();
@@ -178,26 +185,51 @@ pub(crate) async fn inbox(
     waiting.sort_by_key(|r| r.updated_at);
     let content = p.allows(Perm::RunsData, Some(&tenant_id));
     let s = if content { Some(sealer(&cp)?) } else { None };
-    let items: Vec<Value> = waiting
-        .iter()
-        .map(|r| {
-            let step = r.awaiting.clone().unwrap_or_default();
-            let question =
-                s.as_ref().and_then(|s| r.prompt.as_deref().and_then(|x| s.open(&r.tenant_id, &r.id, x).ok()));
-            json!({
-                "run_id": r.id,
-                "node": r.node,
-                "version": r.version,
-                "step": step,
-                "kind": kind_of(&step),
-                "question": question,
-                "invoker": r.invoker,
-                "waiting_since": r.updated_at,
-                "expires_at": r.wake_at,
-            })
-        })
-        .collect();
+    // The structured approval needs the data key even without `runs.data` (tool and labels are
+    // metadata; the arguments are content).
+    let meta = sealer(&cp).ok();
+    let mut items: Vec<Value> = Vec::with_capacity(waiting.len());
+    for r in &waiting {
+        let step = r.awaiting.clone().unwrap_or_default();
+        let question = s.as_ref().and_then(|s| r.prompt.as_deref().and_then(|x| s.open(&r.tenant_id, &r.id, x).ok()));
+        let mut item = json!({
+            "run_id": r.id,
+            "node": r.node,
+            "version": r.version,
+            "step": step,
+            "kind": kind_of(&step),
+            "question": question,
+            "invoker": r.invoker,
+            "waiting_since": r.updated_at,
+            "expires_at": r.wake_at,
+        });
+        if kind_of(&step) == "approval"
+            && let Some(m) = &meta
+        {
+            item["approval"] = approval(&j, m, r, &step, content).await;
+        }
+        items.push(item);
+    }
     Ok(Json(json!({"object": "list", "data": items, "content_visible": content})))
+}
+
+/// What an approval step is about: `tool`, `effect`, `labels`, and `arguments` (content: only
+/// with `runs.data`). `null` for a run whose worker recorded none (an older release).
+async fn approval(j: &Arc<dyn Journal>, s: &impl Sealer, r: &RunRecord, step: &str, content: bool) -> Value {
+    let name = caliban_nodes::journal::approval_event(step);
+    let Ok(Some(ev)) = j.event(&r.id, &name).await else { return Value::Null };
+    let Some(mut v) = ev
+        .payload
+        .as_deref()
+        .and_then(|p| s.open(&r.tenant_id, &r.id, p).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    else {
+        return Value::Null;
+    };
+    if !content && let Some(o) = v.as_object_mut() {
+        o.remove("arguments");
+    }
+    v
 }
 
 /// `GET /api/v1/tenants/{t}/node-spend`: what the tenant's node runs spent on model calls today and
@@ -270,4 +302,34 @@ pub(crate) async fn answer(
     let r = j.get_run(&tenant_id, &id).await.map_err(journal_error)?.ok_or_else(|| not_found("run"))?;
     let content = p.allows(Perm::RunsData, Some(&tenant_id));
     Ok((StatusCode::ACCEPTED, Json(detail(&cp, &j, &r, content).await?)))
+}
+
+/// `POST /api/v1/tenants/{t}/runs/{id}/cancel`: cancels a run as the signed-in user (`runs.answer`;
+/// audited `node.run.cancel`, once). `200` when it ended at once (or was already cancelled), `202`
+/// when a running run was asked to stop (its worker stops at the next step boundary), `409`
+/// (`run_already_ended`) when it ended otherwise.
+pub(crate) async fn cancel(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path((tenant_id, id)): Path<(String, String)>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    use caliban_nodes::journal::Cancelled;
+    crate::ensure_tenant(&cp, &tenant_id)?;
+    let j = journal(&cp)?;
+    let out = caliban_nodes::executor::cancel(&j, &tenant_id, &id, &p.actor).await.map_err(journal_error)?;
+    let status = match out {
+        Cancelled::Ended | Cancelled::AlreadyEnded(RunStatus::Cancelled) => StatusCode::OK,
+        Cancelled::Requested => StatusCode::ACCEPTED,
+        Cancelled::AlreadyEnded(s) => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("run_already_ended: the run already ended ({})", s.as_str()),
+            ));
+        }
+        Cancelled::NotFound => return Err(not_found("run")),
+    };
+    drain_audit(&cp, &j).await?;
+    let r = j.get_run(&tenant_id, &id).await.map_err(journal_error)?.ok_or_else(|| not_found("run"))?;
+    let content = p.allows(Perm::RunsData, Some(&tenant_id));
+    Ok((status, Json(detail(&cp, &j, &r, content).await?)))
 }

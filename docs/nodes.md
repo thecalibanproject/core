@@ -385,10 +385,11 @@ standalone has no runs to show and answers `503`.
 
 | Endpoint | Permission | Does |
 |---|---|---|
-| `GET /api/v1/tenants/{t}/runs` | `runs.read` | The tenant's runs, newest first (same filters and cursor as `GET /v1/runs`) |
+| `GET /api/v1/tenants/{t}/runs` | `runs.read` | The tenant's runs, newest first (same filters and cursor as `GET /v1/runs`, plus `?version=`) |
 | `GET /api/v1/tenants/{t}/runs/{id}` | `runs.read` | The run: status, invoker, origin, budget, cost, usage, steps (vertex, kind, status, start, duration, tokens, cost, taint labels). With `runs.data` also the content: `input`, `output`, each step's `output`, the awaited `question` (`content_visible` says which) |
-| `GET /api/v1/tenants/{t}/inbox` | `runs.read` | Runs waiting for a human, oldest wait first: `kind` `question` or `approval` (a tainted write), `step`, `waiting_since`, `expires_at`; `question` with `runs.data` |
+| `GET /api/v1/tenants/{t}/inbox` | `runs.read` | Runs waiting for a human, oldest wait first: `kind` `question` or `approval` (a gated call), `step`, `waiting_since`, `expires_at`; `question` with `runs.data`; for approvals `approval` with the `tool`, its `effect` and the taint `labels`, and its `arguments` with `runs.data` (the worker records them sealed with the question) |
 | `POST /api/v1/tenants/{t}/runs/{id}/input` `{"answer": ..., "step"?: id}` | `runs.answer` | Answers the question, or approves (`{"approve": true}`) or denies a tainted write, as the signed-in user; `202` with the run, `409` when it is not waiting |
+| `POST /api/v1/tenants/{t}/runs/{id}/cancel` | `runs.answer` | Cancels the run as the signed-in user (audited once as `node.run.cancel`): `200` when it ended at once or was already cancelled, `202` when a running run was asked to stop, `409` when it ended otherwise. `runs.answer` because whoever may deny a write, which fails the run, may stop it; a separate permission would only add a grant every console admin needs |
 
 Who reads what: run **metadata** (`runs.read`) is for every role but `billing`. Run **content**
 (`runs.data`) is the tenant's data and may hold personal data, so only the roles that build and run
@@ -641,7 +642,6 @@ the person's email reaches the tool server.
 - **P3 M8:** `code` vertices (WASM), the console views themselves (the endpoints are here), A2A, an
   adaptive stage for the injection suite. When A2A comes, its data parts map to input marked
   untrusted (`caller`), never to instructions.
-- Cancelling a run from the console (cancel it with the run API).
 - MCP: the human step of a synchronous `tools/call` is answered through the run API (MCP's
   multi-round-trip input requests are not used); MCP Tasks need the `2026-07-28` protocol.
 - RAG search as a built-in tool: `caliban-rag` has no retriever yet (TODO; the `retrieved` taint

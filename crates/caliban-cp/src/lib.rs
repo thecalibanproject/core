@@ -293,6 +293,7 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/tenants/{tenant_id}/runs", get(runs::list))
         .route("/tenants/{tenant_id}/runs/{id}", get(runs::get))
         .route("/tenants/{tenant_id}/runs/{id}/input", post(runs::answer))
+        .route("/tenants/{tenant_id}/runs/{id}/cancel", post(runs::cancel))
         .route("/tenants/{tenant_id}/inbox", get(runs::inbox))
         .route("/tenants/{tenant_id}/node-spend", get(runs::spend))
         .route("/models", get(models::list_models).post(models::create_model))

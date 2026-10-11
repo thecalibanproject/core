@@ -571,6 +571,9 @@ async fn runs_are_listed_newest_first_with_filters_and_a_cursor() {
         );
         assert!(j.list_runs(&q(&|q| q.nodes = Some(vec![]))).await.unwrap().is_empty(), "{n}: an empty allowlist");
         assert_eq!(ids(j.list_runs(&q(&|q| q.statuses = vec![RunStatus::Cancelled])).await.unwrap()), ["run_6"], "{n}");
+        // A version filter (every run here is version 1).
+        assert_eq!(ids(j.list_runs(&q(&|q| q.version = Some(1))).await.unwrap()).len(), 7, "{n}");
+        assert!(j.list_runs(&q(&|q| q.version = Some(2))).await.unwrap().is_empty(), "{n}");
         // Pages of three: the cursor is the last (created_at, id) of the previous page.
         let mut pages = Vec::new();
         let mut before = None;

@@ -433,6 +433,20 @@ async fn approve_call(
             shown.truncate(shown.floor_char_boundary(2000));
             shown.push_str("...");
         }
+        // The same, structured, for the console's inbox (sealed like the question).
+        let detail = json!({"tool": reference, "effect": effect, "labels": labels, "arguments": args});
+        let sealed = cx.ex.sealer.seal(cx.tenant(), &cx.run.id, &detail.to_string()).map_err(Stop::Fail)?;
+        cx.ex
+            .journal
+            .put_event(
+                cx.tenant(),
+                &cx.run.id,
+                &crate::journal::approval_event(&id),
+                crate::journal::EventKind::Observation,
+                Some(sealed),
+            )
+            .await
+            .map_err(|e| Stop::Fail(e.to_string()))?;
         let question = format!(
             "Approve this {}? Tool {reference} (effect: {effect}) would be called with arguments derived from \
              untrusted data ({}): {shown}. Answer {{\"approve\": true}} or {{\"approve\": false}}.",

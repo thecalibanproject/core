@@ -293,7 +293,7 @@ impl EvalRunner {
                 let surface = Surface::of(&node.spec, &child_refs, &info);
                 for c in injection::cases() {
                     match injection::applicable(c, &surface, input, manifests) {
-                        Err(why) => not_applicable.push(json!({"case": c.id, "reason": why})),
+                        Err(why) => not_applicable.push((c.id, why)),
                         Ok(()) if c.goal == injection::Goal::ManifestFindings => jobs.push(Job::Manifest(c)),
                         Ok(()) => {
                             let (input, marks) = match c.goal {
@@ -349,7 +349,10 @@ impl EvalRunner {
                     "temperature": 0,
                 });
             }
-            Plan::Injection { .. } => summary["not_applicable"] = json!(not_applicable),
+            Plan::Injection { .. } => {
+                let trials = self.journal().trials(&e.id).await.map_err(|_| Abort::LeaseLost)?;
+                summary = metrics::injection_summary(injection::SUITE_VERSION, &trials, &not_applicable);
+            }
         }
         Ok(EvalFinish { status: EvalStatus::Succeeded, summary: Some(summary), error: None })
     }
