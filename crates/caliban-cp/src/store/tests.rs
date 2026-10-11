@@ -2047,9 +2047,48 @@ async fn postgres_worker_grants_are_enough() {
          GRANT SELECT, INSERT, UPDATE, DELETE ON node_run, node_step, node_event, node_run_event, node_audit TO {role};
          GRANT SELECT, INSERT, UPDATE ON node_spend TO {role};
          GRANT SELECT, UPDATE ON node_eval TO {role};
-         GRANT SELECT, INSERT, UPDATE ON node_eval_trial TO {role};"
+         GRANT SELECT, INSERT, UPDATE ON node_eval_trial TO {role};
+         GRANT SELECT, UPDATE ON rag_collection, rag_document TO {role};"
     );
     sqlx::raw_sql(AssertSqlSafe(grants)).execute(pg.pool()).await.unwrap();
+    // A document collection and documents the control plane created (the worker role cannot).
+    let (rag_c, rag_d) = {
+        use caliban_rag::store::{CollectionRecord, CollectionSettings, NewDocument, RagStore, Trust};
+        let admin = caliban_rag::pg::PgRagStore::from_pool(pg.pool().clone());
+        let c = CollectionRecord {
+            id: format!("ragc_{}", uuid::Uuid::now_v7().simple()),
+            tenant_id: "acme".into(),
+            name: "kb".into(),
+            description: None,
+            embedding_model: "emb".into(),
+            rerank_model: None,
+            settings: CollectionSettings::default(),
+            created_at: Utc::now(),
+            created_by: "user:jo".into(),
+            deleted_at: None,
+            purged_at: None,
+        };
+        let c = admin.create_collection(c, None).await.unwrap();
+        let doc = |id: &str| NewDocument {
+            tenant_id: "acme".into(),
+            collection_id: c.id.clone(),
+            doc_id: id.into(),
+            doc_key: format!("k-{id}"),
+            content_type: "text/plain".into(),
+            source: None,
+            trust: Trust::Trusted,
+            sealed_content: "sealed".into(),
+            content_hash: format!("h-{id}"),
+            bytes: 1,
+            valid_from: None,
+            valid_to: None,
+            created_by: "user:jo".into(),
+        };
+        admin.put_document(doc("a"), None).await.unwrap();
+        admin.put_document(doc("b"), None).await.unwrap();
+        let a = doc("a");
+        (c, a)
+    };
     // An eval the control plane created (the worker role cannot create one).
     {
         use caliban_nodes::journal::evals::{EvalStore, NewEval, Suite};
@@ -2179,6 +2218,34 @@ async fn postgres_worker_grants_are_enough() {
             j.trials(&e.id).await.map_err(|e| e.to_string())?;
             let f = EvalFinish { status: EvalStatus::Succeeded, summary: None, error: None };
             j.finish_eval(&e.id, "w", f, None).await.map_err(|e| e.to_string())?;
+        }
+        // What the indexing loop and retrieval do.
+        {
+            use caliban_rag::store::{IndexOutcome, RagStore};
+            let r = caliban_rag::pg::PgRagStore::from_pool(worker.pool().clone());
+            let lease = Duration::from_secs(30);
+            let (d, _) = r.claim("w", lease).await.map_err(|e| e.to_string())?.ok_or("no document")?;
+            r.heartbeat(&d.key(), "w", lease).await.map_err(|e| e.to_string())?;
+            r.collections("acme").await.map_err(|e| e.to_string())?;
+            let ready = IndexOutcome::Ready { chunks: 1, tokens: 1, pii_entities: 0, findings: vec![] };
+            if !r.finish(&d.key(), "w", ready).await.map_err(|e| e.to_string())? {
+                return Err("finishing an indexed document".to_owned());
+            }
+            let (b, _) = r.claim("w", lease).await.map_err(|e| e.to_string())?.ok_or("no second document")?;
+            let failed = IndexOutcome::Failed { error: "bad".into() };
+            r.finish(&b.key(), "w", failed).await.map_err(|e| e.to_string())?;
+            let seen = r.visible("acme", &rag_c.id, &[(rag_d.doc_key.clone(), 1)]).await.map_err(|e| e.to_string())?;
+            if seen.len() != 1 {
+                return Err("the visibility check".to_owned());
+            }
+            for p in r.purge_queue(10).await.map_err(|e| e.to_string())? {
+                r.mark_purged(&p.key()).await.map_err(|e| e.to_string())?;
+            }
+            r.collections_to_drop(10).await.map_err(|e| e.to_string())?;
+            r.mark_dropped("acme", &rag_c.id, Utc::now()).await.map_err(|e| e.to_string())?;
+            if r.create_collection(rag_c.clone(), None).await.is_ok() {
+                return Err("the worker role could create a collection".to_owned());
+            }
         }
         // No DDL.
         let ddl = sqlx::raw_sql("CREATE TABLE should_fail (x INT)").execute(worker.pool()).await;

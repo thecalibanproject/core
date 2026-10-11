@@ -39,11 +39,20 @@ pub struct Builtins {
     config: ConfigHandle,
     keyring: Arc<Keyring>,
     lane: Arc<dyn DatasourceLane>,
+    /// Retrieval (`builtin://rag_search`), when this process has a document registry and an index.
+    rag: Option<(crate::rag::RagRuntime, Arc<crate::rag::GatewayRag>)>,
 }
 
 impl Builtins {
     pub fn new(config: ConfigHandle, keyring: Arc<Keyring>, lane: Arc<dyn DatasourceLane>) -> Self {
-        Self { config, keyring, lane }
+        Self { config, keyring, lane, rag: None }
+    }
+
+    /// Enables `builtin://rag_search`.
+    #[must_use]
+    pub fn with_rag(mut self, rt: crate::rag::RagRuntime, services: Arc<crate::rag::GatewayRag>) -> Self {
+        self.rag = Some((rt, services));
+        self
     }
 }
 
@@ -55,6 +64,15 @@ impl ToolRegistry for Builtins {
                 keyring: Arc::clone(&self.keyring),
                 lane: Arc::clone(&self.lane),
             })),
+            "builtin://rag_search" => match &self.rag {
+                Some((rt, services)) => {
+                    Ok(Arc::new(crate::rag::RagSearch::new(self.config.clone(), rt.clone(), Arc::clone(services))))
+                }
+                None => Err(ToolError::Unavailable(
+                    reference.to_owned(),
+                    "retrieval is not configured on this worker (a document registry and a vector index)".into(),
+                )),
+            },
             other => Err(ToolError::UnknownKind(other.to_owned())),
         }
     }
@@ -74,7 +92,7 @@ fn parse_scope(s: &str) -> Option<(String, String, String)> {
 }
 
 /// Read scopes the run may use: the node's, narrowed to the key's when it has any.
-fn effective_scopes(t: &TenantConfig, ctx: &ToolCtx) -> Vec<(String, String)> {
+pub(crate) fn effective_scopes(t: &TenantConfig, ctx: &ToolCtx) -> Vec<(String, String)> {
     let key = ctx.invoker_key_hash.as_ref().and_then(|h| t.api_key_datasource_scopes.get(h));
     let read = |v: &[String]| -> Vec<(String, String)> {
         v.iter().filter_map(|s| parse_scope(s)).filter(|(_, _, a)| a == "read").map(|(d, o, _)| (d, o)).collect()

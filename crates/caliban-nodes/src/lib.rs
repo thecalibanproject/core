@@ -48,7 +48,7 @@ pub enum Effect {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolRef {
-    /// `mcp://server/tool#sha256:<hash>` (pinned) or `node://name@vN`.
+    /// `mcp://server/tool#sha256:<hash>` (pinned), `node://name@vN` or `builtin://<name>`.
     #[serde(rename = "ref")]
     pub reference: String,
     pub effect: Effect,
@@ -73,8 +73,14 @@ pub enum ToolTarget {
 }
 
 /// Built-in tools: `datasource_query` (read-only CQIR queries over the tenant's approved ontology,
-/// within the node's datasource scopes and the invoking key's).
-pub const BUILTIN_TOOLS: &[&str] = &["datasource_query"];
+/// within the node's datasource scopes and the invoking key's) and `rag_search` (retrieval over
+/// the tenant's document collections named by `rag.<collection>:read` scopes, narrowed the same
+/// way; results labelled `retrieved`).
+pub const BUILTIN_TOOLS: &[&str] = &["datasource_query", "rag_search"];
+
+/// The datasource name of retrieval scopes: `rag.<collection or *>:read` in `datasources.scopes`
+/// (and in API key datasource scopes) names document collections, not a datasource.
+pub const RAG_SCOPE: &str = "rag";
 
 impl ToolTarget {
     pub fn parse(reference: &str) -> Result<Self, SpecError> {
@@ -268,7 +274,9 @@ pub enum SpecError {
     BadToolRef(String),
     #[error("node reference '{0}' is malformed (expected node://name@vN)")]
     BadNodeRef(String),
-    #[error("tool '{0}' has an unknown kind (mcp://, node:// and builtin://datasource_query are supported)")]
+    #[error(
+        "tool '{0}' has an unknown kind (mcp://, node://, builtin://datasource_query and builtin://rag_search are supported)"
+    )]
     UnknownToolKind(String),
     #[error("workflow nodes need a graph")]
     MissingGraph,
@@ -310,9 +318,16 @@ impl NodeSpec {
                 if t.effect != Effect::Read {
                     return Err(SpecError::BadTool(format!("builtin://{name} is read only: declare it effect: read")));
                 }
-                if name == "datasource_query" && self.datasource_scopes().is_empty() {
+                let rag = |s: &String| s.split_once('.').is_some_and(|(d, _)| d == RAG_SCOPE);
+                if name == "datasource_query" && !self.datasource_scopes().iter().any(|s| !rag(s)) {
                     return Err(SpecError::BadTool(
                         "builtin://datasource_query needs datasources.scopes (what it may read)".into(),
+                    ));
+                }
+                if name == "rag_search" && !self.datasource_scopes().iter().any(|s| rag(s) && s.ends_with(":read")) {
+                    return Err(SpecError::BadTool(
+                        "builtin://rag_search needs rag.<collection>:read scopes in datasources.scopes (what it may search)"
+                            .into(),
                     ));
                 }
             }
@@ -598,6 +613,30 @@ mod tests {
             assert!(matches!(ToolTarget::parse(bad), Err(SpecError::BadNodeRef(_))), "{bad}");
         }
         assert!(matches!(ToolTarget::parse("http://evil/tool"), Err(SpecError::UnknownToolKind(_))));
+    }
+
+    #[test]
+    fn built_in_tools_need_their_scopes() {
+        let with = |tool: &str, scopes: serde_json::Value, effect: &str| {
+            spec(json!({
+                "kind": "agent", "prompt": {"system": "x"}, "model_policy": {},
+                "tools": [{"ref": tool, "effect": effect}], "datasources": {"scopes": scopes},
+                "budgets": {"steps": 5, "tokens": 1000, "wall_clock_s": 30}
+            }))
+            .validate()
+        };
+        assert_eq!(with("builtin://rag_search", json!(["rag.kb:read"]), "read"), Ok(()));
+        assert_eq!(with("builtin://rag_search", json!(["rag.*:read"]), "read"), Ok(()));
+        let e = with("builtin://rag_search", json!(["shop.orders:read"]), "read").unwrap_err();
+        assert!(e.to_string().contains("rag.<collection>:read"), "{e}");
+        assert!(matches!(with("builtin://rag_search", json!(["rag.kb:read"]), "write"), Err(SpecError::BadTool(_))));
+        // Retrieval scopes do not let the datasource tool read anything.
+        assert!(matches!(
+            with("builtin://datasource_query", json!(["rag.kb:read"]), "read"),
+            Err(SpecError::BadTool(_))
+        ));
+        assert_eq!(with("builtin://datasource_query", json!(["shop.orders:read", "rag.kb:read"]), "read"), Ok(()));
+        assert!(matches!(ToolTarget::parse("builtin://web_search"), Err(SpecError::UnknownToolKind(_))));
     }
 
     #[test]

@@ -16,6 +16,8 @@ mod nodes_tests;
 #[cfg(test)]
 mod purge_tests;
 #[cfg(test)]
+mod rag_tests;
+#[cfg(test)]
 mod revocation_tests;
 #[cfg(test)]
 mod ship_tests;
@@ -153,6 +155,9 @@ impl caliban_meter::UsageTransport for LocalUsageTransport {
 struct ControlPlaneNodes {
     journal: Option<Arc<dyn caliban_nodes::journal::Journal>>,
     slot: Option<Arc<std::sync::OnceLock<Arc<caliban_cp::ControlPlane>>>>,
+    /// The retrieval registry of a standalone process without a database (shared with its
+    /// indexing loop); with a database, the control plane opens its own.
+    rag: Option<Arc<dyn caliban_rag::store::RagStore>>,
 }
 
 /// Standalone: data-plane audit events go straight to this process's control plane.
@@ -392,8 +397,15 @@ async fn main() -> Result<()> {
         nodes::warn_if_local_idempotency(&gw);
         let audit =
             Arc::new(split::HttpAuditTransport::new(&args.control_plane_url, token.clone(), worker_id.clone())?);
-        let stop =
-            cli.nodes.run_locally(&gw, journal, Arc::new(keyring.clone()), nodes::lease_owner(&worker_id), audit)?;
+        let rag = nodes::postgres_rag(&url).await?;
+        let stop = cli.nodes.run_locally(
+            &gw,
+            journal,
+            Some(rag),
+            Arc::new(keyring.clone()),
+            nodes::lease_owner(&worker_id),
+            audit,
+        )?;
         let res = serve("worker", args.listen.clone(), caliban_gateway::nodes::worker_app(gw, worker_token)).await;
         stop.notify_waiters();
         flush_wal(wal.as_deref()).await;
@@ -443,8 +455,14 @@ async fn main() -> Result<()> {
                 Some(_) => Some(Arc::new(caliban_nodes::journal::memory::MemoryJournal::new())),
                 None => None,
             };
+            // Retrieval: the database's registry, else one in memory shared with the control plane.
+            let rag: Option<Arc<dyn caliban_rag::store::RagStore>> = match database_url() {
+                Some(url) => Some(nodes::postgres_rag(&url).await?),
+                None => keyring.map(|_| Arc::new(caliban_rag::store::MemoryRagStore::new()) as _),
+            };
             let local_cp = Arc::new(std::sync::OnceLock::new());
-            let cpn = ControlPlaneNodes { journal: journal.clone(), slot: Some(Arc::clone(&local_cp)) };
+            let cpn =
+                ControlPlaneNodes { journal: journal.clone(), slot: Some(Arc::clone(&local_cp)), rag: rag.clone() };
             // The control plane publishes the store's state (Postgres wins over the file) into
             // `handle` before the data plane starts serving (and migrates a database before the
             // journal is opened). Tenant purges start from that state.
@@ -459,6 +477,7 @@ async fn main() -> Result<()> {
                     Some(cli.nodes.run_locally(
                         &purge_gw,
                         journal,
+                        rag,
                         Arc::new(k.clone()),
                         nodes::lease_owner(&nodes::worker_name()),
                         Arc::new(LocalAuditTransport(local_cp.clone())),
@@ -593,9 +612,16 @@ async fn control_plane(
         Some(url) => Some(nodes::postgres_journal(&url).await?),
         None => nodes.journal,
     };
+    // The retrieval registry: the database's (shared with workers), else a standalone process's.
+    let rag = match (&nodes.rag, database_url()) {
+        (Some(r), _) => Some(Arc::clone(r)),
+        (None, Some(url)) => Some(nodes::postgres_rag(&url).await?),
+        (None, None) => None,
+    };
     let cp = Arc::new(
         caliban_cp::ControlPlane::new(store, admin_token, mode)
             .with_journal(journal)
+            .with_rag(rag)
             .with_snapshots(signer, router_token)
             .with_keyring(keyring)
             .with_oidc(oidc)

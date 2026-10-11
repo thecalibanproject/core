@@ -203,6 +203,13 @@ pub(crate) async fn publish(
     // Promoting needs the node's promotion bar met (and an injection eval for write tools), which
     // a draft cannot have yet: such a version is published with {"promote": false} first.
     let evals = if promote { crate::evals::gate(&cp, &n).await? } else { None };
+    // Document collections named in its scopes must exist (they live in the retrieval registry).
+    let spec: NodeSpec = serde_json::from_value(n.spec.clone()).map_err(|e| bad(format!("invalid spec: {e}")))?;
+    let problems = crate::rag::scope_problems(&cp, &tenant_id, &spec).await;
+    if !problems.is_empty() {
+        let e = caliban_nodes::publish::PublishError { action: "publish", name: name.clone(), version, problems };
+        return Err(crate::StoreError::Rejected(e).into());
+    }
     let dek = keys::tenant_dek(&cp.store, keyring, &tenant_id, &p.actor).await?;
     let m = Mutation::PublishNode {
         tenant_id: tenant_id.clone(),

@@ -16,6 +16,7 @@ caliban-route.workspace = true
 caliban-providers.workspace = true
 caliban-meter.workspace = true
 caliban-nodes.workspace = true
+caliban-rag.workspace = true
 caliban-mcp.workspace = true
 caliban-ontology.workspace = true
 caliban-connect.workspace = true

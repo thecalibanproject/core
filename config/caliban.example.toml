@@ -80,6 +80,15 @@ exact_ttl_secs = 3600
 #                                  # "" turns it off; see open-models.example.toml. Costs a second
 #                                  # embedding when it differs from [routing] query_prefix.
 
+# Retrieval for the built-in rag_search node tool (docs/rag.md). Collections and documents are
+# managed on the admin API; workers (or a standalone process) index them into Qdrant, one Qdrant
+# collection per document collection. Defaults shown.
+# [rag]
+# index = "qdrant"                 # or "memory" (one standalone process, lost on restart)
+# qdrant_url = "http://qdrant:6333" # unset: CALIBAN_QDRANT_URL, then [cache.semantic] qdrant_url
+# collection_prefix = "caliban_rag"
+# index_concurrency = 2            # documents one process indexes at once
+
 [pii]
 # Default for tenants that don't override it: off | mask | reversible
 default_mode = "reversible"

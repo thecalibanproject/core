@@ -35,6 +35,7 @@ pub mod pii_pool;
 mod pipeline;
 pub mod purge;
 mod quirks;
+pub mod rag;
 mod rerank;
 mod route_embed;
 mod runs;

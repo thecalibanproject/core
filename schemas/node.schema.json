@@ -35,7 +35,7 @@
         "type": "object",
         "required": ["ref", "effect"],
         "properties": {
-          "ref": { "type": "string", "pattern": "^(mcp|node|builtin)://", "description": "mcp://server/tool#sha256:<hash> (an approved manifest), node://name@vN or builtin://datasource_query" },
+          "ref": { "type": "string", "pattern": "^(mcp|node|builtin)://", "description": "mcp://server/tool#sha256:<hash> (an approved manifest), node://name@vN, builtin://datasource_query or builtin://rag_search" },
           "effect": { "enum": ["read", "write"] },
           "requires": { "type": "array", "items": { "type": "string" } },
           "allow_tainted": { "type": "array", "items": { "type": "string" }, "description": "writes, and reads that reach the network through their arguments: taint labels the arguments may carry without a human approval (tool:<server>/*, datasource, caller, *)" }
@@ -44,7 +44,7 @@
     },
     "datasources": {
       "type": "object",
-      "properties": { "scopes": { "type": "array", "items": { "type": "string", "pattern": "^[a-z0-9_]+\\.[a-z0-9_*]+:(read|write)$" } } }
+      "properties": { "scopes": { "type": "array", "description": "<datasource>.<object or *>:<read|write> for datasources; rag.<collection or *>:read for document collections (builtin://rag_search)", "items": { "type": "string", "pattern": "^[a-z0-9_]+\\.[a-z0-9_*]+:(read|write)$" } } }
     },
     "memory": {
       "type": "object",

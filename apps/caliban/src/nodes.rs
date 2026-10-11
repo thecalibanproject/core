@@ -125,6 +125,7 @@ impl NodeArgs {
         &self,
         gw: &Arc<Gateway>,
         journal: Arc<dyn Journal>,
+        rag: Option<Arc<dyn caliban_rag::store::RagStore>>,
         keyring: Arc<caliban_config::Keyring>,
         worker_id: String,
         audit: Arc<dyn AuditTransport>,
@@ -137,9 +138,29 @@ impl NodeArgs {
             max_runs = opts.max_concurrent_runs,
             "node runs execute in this process"
         );
-        let tools = tool_registry(gw, &keyring)?;
-        let executor = caliban_gateway::nodes::local_executor(gw, journal, tools, keyring, worker_id, opts);
+        // Retrieval: the built-in rag_search tool, and the loop that indexes ingested documents.
+        let rag = rag.and_then(|store| caliban_gateway::rag::RagRuntime::from_config(&gw.config.load().config, store));
+        let services = Arc::new(caliban_gateway::rag::GatewayRag::new(gw, Arc::clone(&keyring)));
+        let tools = tool_registry(gw, &keyring, rag.clone().map(|r| (r, Arc::clone(&services))))?;
+        let executor =
+            caliban_gateway::nodes::local_executor(gw, journal, tools, keyring, worker_id.clone(), opts.clone());
         let stop = Arc::new(Notify::new());
+        if let Some(rt) = &rag {
+            let index_opts = caliban_rag::runner::IndexOptions {
+                lease: opts.lease_ttl.max(Duration::from_secs(30)),
+                heartbeat: opts.heartbeat.max(Duration::from_secs(10)),
+                poll: opts.poll.max(Duration::from_millis(200)),
+                concurrency: rt.concurrency,
+                ..caliban_rag::runner::IndexOptions::default()
+            };
+            tracing::info!(registry = rt.store.name(), index = rt.index.name(), "rag: documents are indexed here");
+            let runner = caliban_rag::runner::IndexRunner::new(
+                caliban_gateway::rag::indexer(rt, services),
+                worker_id.clone(),
+                index_opts,
+            );
+            tokio::spawn(runner.run_loop(Arc::clone(&stop)));
+        }
         tokio::spawn(Arc::clone(&executor).run_loop(Arc::clone(&stop)));
         // Evals (golden sets, the injection suite) run here too: their trials are ordinary runs.
         let evals = caliban_nodes::eval::runner::EvalRunner::new(Arc::clone(&executor), self.eval_options());
@@ -162,7 +183,11 @@ impl NodeArgs {
 
 /// The tenant's approved MCP tools from the snapshot, reached through the egress guard
 /// (`CALIBAN_MCP_ALLOW_LOOPBACK` for development), with tokens signed by `CALIBAN_TOOL_TOKEN_KEY`.
-fn tool_registry(gw: &Arc<Gateway>, keyring: &Arc<caliban_config::Keyring>) -> Result<Arc<dyn ToolRegistry>> {
+fn tool_registry(
+    gw: &Arc<Gateway>,
+    keyring: &Arc<caliban_config::Keyring>,
+    rag: Option<(caliban_gateway::rag::RagRuntime, Arc<caliban_gateway::rag::GatewayRag>)>,
+) -> Result<Arc<dyn ToolRegistry>> {
     use caliban_mcp::egress::EgressPolicy;
     let allow_loopback = std::env::var("CALIBAN_MCP_ALLOW_LOOPBACK").is_ok_and(|v| matches!(v.trim(), "1" | "true"));
     if allow_loopback {
@@ -178,11 +203,14 @@ fn tool_registry(gw: &Arc<Gateway>, keyring: &Arc<caliban_config::Keyring>) -> R
         ),
     }
     let client = Arc::new(caliban_mcp::client::McpClient::system(EgressPolicy { allow_loopback }));
-    let builtins = caliban_gateway::datasource::Builtins::new(
+    let mut builtins = caliban_gateway::datasource::Builtins::new(
         gw.config.clone(),
         Arc::clone(keyring),
         Arc::new(caliban_gateway::datasource::MongoLane::default()),
     );
+    if let Some((rt, services)) = rag {
+        builtins = builtins.with_rag(rt, services);
+    }
     Ok(Arc::new(
         caliban_gateway::tools::SnapshotTools::new(
             gw.config.clone(),
@@ -336,6 +364,15 @@ pub async fn worker_journal(url: &str) -> Result<Arc<dyn Journal>> {
 }
 
 /// The Postgres journal of a standalone process (its control plane migrated the database).
+/// The retrieval document registry in the shared database.
+pub async fn postgres_rag(url: &str) -> Result<Arc<dyn caliban_rag::store::RagStore>> {
+    let s = caliban_rag::pg::PgRagStore::connect(url)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("opening the retrieval registry (CALIBAN_DATABASE_URL)")?;
+    Ok(Arc::new(s))
+}
+
 pub async fn postgres_journal(url: &str) -> Result<Arc<dyn Journal>> {
     let j = caliban_nodes::journal::postgres::PgJournal::connect(url)
         .await

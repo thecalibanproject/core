@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         record: a.record,
         reply_chars: a.reply_chars,
         responder: None,
+        embed_dim: None,
     };
     let mock = Mock::start(&a.addr, cfg).await?;
     println!("mock upstream listening on {}", mock.addr);

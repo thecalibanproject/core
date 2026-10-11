@@ -830,6 +830,17 @@ impl caliban_nodes::publish::PublishContext for TenantNodes<'_> {
             return Err(format!("access must be read or write, not '{access}'"));
         }
         let (ds, object) = target.split_once('.').ok_or("expected <datasource>.<object>:<access>")?;
+        // Document collections (`rag.<collection>:read`) live in the retrieval registry, which the
+        // control plane checks before it publishes; here only the form is checked.
+        if ds == caliban_nodes::RAG_SCOPE {
+            if access != "read" {
+                return Err("document collections are read only (rag.<collection>:read)".into());
+            }
+            if object != "*" && !caliban_rag::store::valid_collection_name(object) {
+                return Err(format!("'{object}' is not a collection name"));
+            }
+            return Ok(());
+        }
         let d = self
             .st
             .datasources

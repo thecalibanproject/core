@@ -11,6 +11,7 @@ mod evals;
 pub mod keys;
 mod models;
 mod nodes;
+pub mod rag;
 mod runs;
 pub mod store;
 pub mod tools;
@@ -59,6 +60,9 @@ pub struct ControlPlane {
     /// The node run journal (console run endpoints): the database's, shared with workers, or a
     /// standalone process's in-memory one. `None`: those endpoints answer 503.
     journal: Option<Arc<dyn caliban_nodes::journal::Journal>>,
+    /// The retrieval document registry (shared with the workers that index it). `None`: the
+    /// retrieval endpoints answer 503.
+    rag: Option<Arc<dyn caliban_rag::store::RagStore>>,
 }
 
 /// The last signed snapshot, re-served while the rendered config is unchanged.
@@ -83,7 +87,19 @@ impl ControlPlane {
             keyring: None,
             tools: None,
             journal: None,
+            rag: None,
         }
+    }
+
+    /// The retrieval document registry the admin API writes.
+    #[must_use]
+    pub fn with_rag(mut self, rag: Option<Arc<dyn caliban_rag::store::RagStore>>) -> Self {
+        self.rag = rag;
+        self
+    }
+
+    pub fn rag(&self) -> Option<Arc<dyn caliban_rag::store::RagStore>> {
+        self.rag.clone()
     }
 
     /// The node run journal the console endpoints read.
@@ -290,6 +306,22 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/tenants/{tenant_id}/tool-servers/{server}/tools", get(tools::list_tools).post(tools::import))
         .route("/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/approve", post(tools::approve))
         .route("/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/revoke", post(tools::revoke))
+        .route("/tenants/{tenant_id}/rag/collections", get(rag::list_collections).post(rag::create_collection))
+        .route(
+            "/tenants/{tenant_id}/rag/collections/{collection}",
+            get(rag::get_collection).delete(rag::delete_collection),
+        )
+        .route(
+            "/tenants/{tenant_id}/rag/collections/{collection}/documents",
+            get(rag::list_documents)
+                .post(rag::ingest)
+                .layer(axum::extract::DefaultBodyLimit::max(rag::INGEST_MAX_BYTES)),
+        )
+        .route(
+            "/tenants/{tenant_id}/rag/collections/{collection}/documents/{doc_id}",
+            get(rag::get_document).delete(rag::delete_document),
+        )
+        .route("/tenants/{tenant_id}/rag/collections/{collection}/documents/{doc_id}/release", post(rag::release))
         .route("/tenants/{tenant_id}/runs", get(runs::list))
         .route("/tenants/{tenant_id}/runs/{id}", get(runs::get))
         .route("/tenants/{tenant_id}/runs/{id}/input", post(runs::answer))
@@ -628,7 +660,14 @@ async fn delete_tenant(
     Extension(p): Extension<Principal>,
     Path(tenant_id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    cp.store.apply(&p.actor, Mutation::DeleteTenant { id: tenant_id, at: now_micros() }).await?;
+    cp.store.apply(&p.actor, Mutation::DeleteTenant { id: tenant_id.clone(), at: now_micros() }).await?;
+    // Its document collections go too (their content was sealed under the key just destroyed);
+    // workers drop the vectors.
+    if let Some(r) = cp.rag()
+        && let Err(e) = r.delete_tenant(&tenant_id, chrono::Utc::now()).await
+    {
+        tracing::error!(error = %e, tenant = %tenant_id, "deleting the tenant's document collections failed");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -919,6 +958,10 @@ async fn create_datasource(
 ) -> ApiResult<(StatusCode, Json<DatasourceRecord>)> {
     if !DATASOURCE_KINDS.contains(&body.kind.as_str()) {
         return Err(bad(format!("unsupported datasource kind '{}'", body.kind)));
+    }
+    // `rag.<collection>:read` scopes name document collections, not a datasource.
+    if body.name.eq_ignore_ascii_case(caliban_nodes::RAG_SCOPE) {
+        return Err(bad("'rag' is reserved (rag.<collection>:read scopes name document collections)"));
     }
     keys::reject_reserved(&body.connection).map_err(bad)?;
     ensure_tenant(&cp, &body.tenant_id)?;

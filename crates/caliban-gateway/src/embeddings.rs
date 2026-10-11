@@ -21,11 +21,16 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{Instrument, Span};
 
-pub async fn embeddings(State(gw): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+pub async fn embeddings(
+    State(gw): State<Arc<Gateway>>,
+    internal: Option<axum::Extension<auth::InternalCaller>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
     let request_id = RequestId::new();
     let span = telemetry::request_span("embeddings", Dialect::OpenAi, &request_id);
     telemetry::link_parent(&span, &headers);
-    run(gw, headers, body, request_id, span.clone())
+    run(gw, headers, body, request_id, span.clone(), internal.map(|e| e.0))
         .instrument(span.clone())
         .await
         .inspect_err(|e| telemetry::record_error(&span, e.error.kind()))
@@ -37,14 +42,15 @@ async fn run(
     body: Bytes,
     request_id: RequestId,
     span: Span,
+    internal: Option<auth::InternalCaller>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let snap = gw.config.load();
-    let caller = auth::caller(&snap, &headers)?;
+    let caller = auth::resolve(&snap, &headers, internal.as_ref())?;
     let tenant = caller.tenant.clone();
     span.record("caliban.tenant", tenant.id.as_str());
     let policy = limits::policy(&snap.limits_for(&tenant));
-    limits::check_rate(&gw, tenant.id.as_str(), Some(&caller.key_hash), &policy).await?;
+    limits::check_rate(&gw, tenant.id.as_str(), caller.key(), &policy).await?;
 
     let mut v: Value = serde_json::from_slice(&body).map_err(|e| CalibanError::InvalidRequest(e.to_string()))?;
     let model_id = v
@@ -110,7 +116,7 @@ async fn run(
         est_prompt_tokens: est,
         route: None,
         client_usage: true,
-        node: None,
+        node: internal.and_then(|i| i.node),
         auto_fallback: None,
     };
     finish(&gw, &outcome, usage, 0, settlement).await;

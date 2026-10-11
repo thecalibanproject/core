@@ -16,6 +16,7 @@ caliban-pii.workspace = true
 caliban-config.workspace = true
 caliban-cp.workspace = true
 caliban-gateway.workspace = true
+caliban-rag.workspace = true
 caliban-meter.workspace = true
 caliban-mcp.workspace = true
 caliban-nodes.workspace = true

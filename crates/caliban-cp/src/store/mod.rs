@@ -717,8 +717,8 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
 }
 
 /// The tenant's published node versions (sealed specs, the live flag), the node allowlists of
-/// its API keys, and its wrapped DEK (for workers) once it has released a version. Drafts and
-/// retired versions never reach the data plane.
+/// its API keys, and its wrapped DEK (for workers) once it has one. Drafts and retired versions
+/// never reach the data plane.
 fn render_nodes(st: &State, tenant: &str, obj: &mut Map<String, Value>) -> Result<(), String> {
     let mut nodes = Vec::new();
     for n in st.nodes.iter().filter(|n| n.tenant_id == tenant && n.is_live() && n.state == NodeState::Published) {
@@ -748,9 +748,10 @@ fn render_nodes(st: &State, tenant: &str, obj: &mut Map<String, Value>) -> Resul
         .filter(|k| k.tenant_id == tenant && k.is_active())
         .filter_map(|k| k.nodes.as_ref().map(|n| (&k.hash, n)))
         .collect();
-    // Workers keep opening the journals of runs of retired versions.
-    let released = st.nodes.iter().any(|n| n.tenant_id == tenant && n.is_live() && n.state != NodeState::Draft);
-    if released && let Some(d) = st.deks.get(tenant) {
+    // Workers open run journals (retired versions' runs included) and index and search the
+    // tenant's documents with it. It travels wrapped by the KEK, like the DEK inside every sealed
+    // BYOK key of the snapshot.
+    if let Some(d) = st.deks.get(tenant) {
         obj.insert("data_key".into(), serde_json::to_value(&d.wrapped).map_err(|e| e.to_string())?);
     }
     if !nodes.is_empty() {
@@ -1873,8 +1874,14 @@ impl Store {
 
 /// Audit actions recorded through the node journal's outbox: the data plane's decisions (`POST
 /// /api/v1/audit/ingest`), the end of an eval (workers), and the control plane's own writes to the
-/// journal (golden sets, promotion bars, eval starts and cancellations), which it drains at once.
+/// journal and the retrieval registry (golden sets, promotion bars, eval starts and cancellations,
+/// document collections and documents), which it drains at once.
 pub const DATA_PLANE_ACTIONS: &[&str] = &[
+    "rag.collection.create",
+    "rag.collection.delete",
+    "rag.document.ingest",
+    "rag.document.delete",
+    "rag.document.release",
     "node.run.answer",
     "node.write.approve",
     "node.write.deny",

@@ -53,6 +53,9 @@ pub struct MockConfig {
     /// Scripted Chat Completions replies (node tests): the assistant message for a request body,
     /// or `None` for the echo.
     pub responder: Option<Responder>,
+    /// Embeddings of this many dimensions that depend on the text (hashed words, normalised), so
+    /// retrieval tests can tell texts apart. `None`: every input embeds as `[0.1, 0.2, 0.3]`.
+    pub embed_dim: Option<usize>,
 }
 
 /// A scripted reply: the request body in, the assistant message (`{"role", "content",
@@ -84,6 +87,7 @@ impl Default for MockConfig {
             record: true,
             reply_chars: None,
             responder: None,
+            embed_dim: None,
         }
     }
 }
@@ -205,6 +209,7 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/messages", post(messages))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/rerank", post(rerank))
         .route("/v1/models", get(models))
         .route("/__mock/log", get(dump_log))
         .route("/healthz", get(|| async { "ok" }))
@@ -542,11 +547,82 @@ async fn embeddings(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
         });
     }
     wait(&s.cfg).await;
-    let data: Vec<Value> =
-        (0..n).map(|i| json!({"object": "embedding", "index": i, "embedding": [0.1, 0.2, 0.3]})).collect();
+    let texts: Vec<String> = match body.get("input") {
+        Some(Value::Array(a)) => a.iter().map(|x| x.as_str().unwrap_or_default().to_owned()).collect(),
+        Some(Value::String(t)) => vec![t.clone()],
+        _ => vec![String::new(); n],
+    };
+    let data: Vec<Value> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let e = match s.cfg.embed_dim {
+                Some(dim) => json!(hashed_embedding(t, dim)),
+                None => json!([0.1, 0.2, 0.3]),
+            };
+            json!({"object": "embedding", "index": i, "embedding": e})
+        })
+        .collect();
     json_resp(
         &json!({"object": "list", "model": body["model"], "data": data, "usage": {"prompt_tokens": 5, "total_tokens": 5}}),
     )
+}
+
+/// Lowercased alphanumeric words of `t`.
+fn words(t: &str) -> Vec<String> {
+    t.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(str::to_lowercase).collect()
+}
+
+/// A deterministic text-dependent vector: each word hashed into `dim` buckets, normalised.
+pub fn hashed_embedding(t: &str, dim: usize) -> Vec<f32> {
+    use sha2::Digest;
+    let dim = dim.max(2);
+    let mut v = vec![0.0f32; dim];
+    for w in words(t) {
+        let h = sha2::Sha256::digest(w.as_bytes());
+        let i = usize::from(h[0]) << 8 | usize::from(h[1]);
+        v[i % dim] += if h[2] & 1 == 0 { 1.0 } else { -1.0 };
+    }
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 0.0 {
+        v.iter_mut().for_each(|x| *x /= n);
+    } else {
+        v[0] = 1.0;
+    }
+    v
+}
+
+/// `/v1/rerank` (vLLM / Cohere shape): the share of the query's words found in each document.
+async fn rerank(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
+    let body: Value = serde_json::from_slice(&body).unwrap_or_default();
+    if s.cfg.record {
+        s.rec.lock().log.push(Entry {
+            path: "/v1/rerank".into(),
+            auth: header(&headers, "authorization"),
+            x_api_key: None,
+            body: body.clone(),
+            bill: None,
+        });
+    }
+    wait(&s.cfg).await;
+    let q = words(body["query"].as_str().unwrap_or_default());
+    let docs: Vec<String> =
+        body["documents"].as_array().into_iter().flatten().map(|d| d.as_str().unwrap_or_default().to_owned()).collect();
+    let mut results: Vec<Value> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let dw = words(d);
+            #[allow(clippy::cast_precision_loss)]
+            let score =
+                if q.is_empty() { 0.0 } else { q.iter().filter(|w| dw.contains(w)).count() as f64 / q.len() as f64 };
+            json!({"index": i, "relevance_score": score})
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        b["relevance_score"].as_f64().unwrap_or(0.0).total_cmp(&a["relevance_score"].as_f64().unwrap_or(0.0))
+    });
+    json_resp(&json!({"model": body["model"], "results": results, "usage": {"total_tokens": docs.len() * 8}}))
 }
 
 async fn models() -> Response {

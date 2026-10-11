@@ -2,15 +2,25 @@ use axum::http::HeaderMap;
 use caliban_config::{Snapshot, TenantConfig};
 use caliban_types::{CalibanError, hash_api_key};
 
-/// An authenticated caller: the tenant and the hash of the key used (for per-key limits).
+/// An authenticated caller: the tenant and the hash of the key used (for per-key limits; empty
+/// for the tenant's own background work).
 pub struct Caller<'a> {
     pub tenant: &'a TenantConfig,
     pub key_hash: String,
 }
 
+impl Caller<'_> {
+    /// The key for per-key limits (`None` for the tenant's own background work).
+    pub fn key(&self) -> Option<&str> {
+        Some(self.key_hash.as_str()).filter(|k| !k.is_empty())
+    }
+}
+
 /// A caller authenticated inside this process (a request extension; never set from the network):
 /// node workers make their model calls through the pipeline as the run's tenant and invoking API
 /// key. The key must still be active in the snapshot, so a revoked key stops its runs' calls.
+/// An empty `key_hash` is the tenant's own background work (indexing documents for retrieval):
+/// the tenant must be active, and only its tenant-wide limits apply.
 #[derive(Debug, Clone)]
 pub struct InternalCaller {
     pub tenant: String,
@@ -37,6 +47,10 @@ pub fn resolve<'a>(
     internal: Option<&InternalCaller>,
 ) -> Result<Caller<'a>, CalibanError> {
     let Some(i) = internal else { return caller(snap, headers) };
+    if i.key_hash.is_empty() {
+        let tenant = snap.tenant(&i.tenant.as_str().into()).ok_or(CalibanError::Unauthenticated)?;
+        return Ok(Caller { tenant, key_hash: String::new() });
+    }
     let tenant = snap
         .tenant_by_key_hash(&i.key_hash)
         .filter(|t| t.id.as_str() == i.tenant)

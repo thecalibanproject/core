@@ -17,6 +17,12 @@
 //! registering). Owner and admin hold all three; `tenant_admin` all three on its tenant;
 //! `developer` read and write; `viewer` and `auditor` read; `billing` none.
 //!
+//! Retrieval (`rag.*`): `rag.read` (collections, documents and their indexing state and findings;
+//! never document content), `rag.write` (create and delete collections, ingest and delete
+//! documents) and `rag.approve` (release a quarantined document: a human decision kept apart from
+//! ingesting, like approving a tool). Owner and admin hold all three; `tenant_admin` all three on
+//! its tenant; `developer` read and write; `viewer` and `auditor` read; `billing` none.
+//!
 //! Runs (P3 M5, the console): `runs.read` (run lists, the inbox, run metadata: steps, timings,
 //! tokens, cost, taint labels), `runs.data` (run content: inputs, outputs, questions) and
 //! `runs.answer` (answer a question or approve or deny a tainted write as oneself). Owner and admin
@@ -101,6 +107,7 @@ impl Role {
                 OntologyRead,
                 NodesRead,
                 ToolsRead,
+                RagRead,
                 RunsRead,
                 UsageRead,
             ],
@@ -125,6 +132,9 @@ impl Role {
                 ToolsRead,
                 ToolsWrite,
                 ToolsApprove,
+                RagRead,
+                RagWrite,
+                RagApprove,
                 RunsRead,
                 RunsData,
                 RunsAnswer,
@@ -146,6 +156,8 @@ impl Role {
                 NodesRun,
                 ToolsRead,
                 ToolsWrite,
+                RagRead,
+                RagWrite,
                 RunsRead,
                 RunsData,
                 UsageRead,
@@ -160,6 +172,7 @@ impl Role {
                 OntologyRead,
                 NodesRead,
                 ToolsRead,
+                RagRead,
                 RunsRead,
                 UsageRead,
             ],
@@ -206,6 +219,10 @@ pub enum Perm {
     ToolsRead,
     ToolsWrite,
     ToolsApprove,
+    /// Retrieval collections and documents: read, write (ingest, delete), release from quarantine.
+    RagRead,
+    RagWrite,
+    RagApprove,
     /// Node runs in the console: lists and metadata, run content, answering as oneself.
     RunsRead,
     RunsData,
@@ -214,7 +231,7 @@ pub enum Perm {
 }
 
 impl Perm {
-    pub const ALL: [Perm; 31] = [
+    pub const ALL: [Perm; 34] = [
         Perm::TenantsCreate,
         Perm::CatalogRead,
         Perm::CatalogWrite,
@@ -242,6 +259,9 @@ impl Perm {
         Perm::ToolsRead,
         Perm::ToolsWrite,
         Perm::ToolsApprove,
+        Perm::RagRead,
+        Perm::RagWrite,
+        Perm::RagApprove,
         Perm::RunsRead,
         Perm::RunsData,
         Perm::RunsAnswer,
@@ -277,6 +297,9 @@ impl Perm {
             Perm::ToolsRead => "tools.read",
             Perm::ToolsWrite => "tools.write",
             Perm::ToolsApprove => "tools.approve",
+            Perm::RagRead => "rag.read",
+            Perm::RagWrite => "rag.write",
+            Perm::RagApprove => "rag.approve",
             Perm::RunsRead => "runs.read",
             Perm::RunsData => "runs.data",
             Perm::RunsAnswer => "runs.answer",
@@ -491,6 +514,25 @@ pub const ROUTES: &[RouteRule] = &[
     r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools", Perm::ToolsWrite, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/approve", Perm::ToolsApprove, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/revoke", Perm::ToolsApprove, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/rag/collections", Perm::RagRead, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/rag/collections", Perm::RagWrite, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/rag/collections/{collection}", Perm::RagRead, TenantFrom::Path),
+    r("DELETE", "/tenants/{tenant_id}/rag/collections/{collection}", Perm::RagWrite, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/rag/collections/{collection}/documents", Perm::RagRead, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/rag/collections/{collection}/documents", Perm::RagWrite, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/rag/collections/{collection}/documents/{doc_id}", Perm::RagRead, TenantFrom::Path),
+    r(
+        "DELETE",
+        "/tenants/{tenant_id}/rag/collections/{collection}/documents/{doc_id}",
+        Perm::RagWrite,
+        TenantFrom::Path,
+    ),
+    r(
+        "POST",
+        "/tenants/{tenant_id}/rag/collections/{collection}/documents/{doc_id}/release",
+        Perm::RagApprove,
+        TenantFrom::Path,
+    ),
     r("GET", "/tenants/{tenant_id}/runs", Perm::RunsRead, TenantFrom::Path),
     r("GET", "/tenants/{tenant_id}/runs/{id}", Perm::RunsRead, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/runs/{id}/input", Perm::RunsAnswer, TenantFrom::Path),
@@ -605,6 +647,25 @@ mod tests {
         ];
         for (role, perms) in want {
             for p in [ToolsRead, ToolsWrite, ToolsApprove] {
+                assert_eq!(role.grants(p), perms.contains(&p), "{} {}", role.as_str(), p.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn rag_permissions_follow_the_roles() {
+        use Perm::{RagApprove, RagRead, RagWrite};
+        let want: &[(Role, &[Perm])] = &[
+            (Role::Owner, &[RagRead, RagWrite, RagApprove]),
+            (Role::Admin, &[RagRead, RagWrite, RagApprove]),
+            (Role::TenantAdmin, &[RagRead, RagWrite, RagApprove]),
+            (Role::Developer, &[RagRead, RagWrite]),
+            (Role::Viewer, &[RagRead]),
+            (Role::Auditor, &[RagRead]),
+            (Role::Billing, &[]),
+        ];
+        for (role, perms) in want {
+            for p in [RagRead, RagWrite, RagApprove] {
                 assert_eq!(role.grants(p), perms.contains(&p), "{} {}", role.as_str(), p.as_str());
             }
         }

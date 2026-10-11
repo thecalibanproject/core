@@ -37,6 +37,7 @@ tags:
   - name: ontology
   - name: nodes
   - name: tools
+  - name: rag
   - name: evals
   - name: usage
   - name: system
@@ -694,8 +695,9 @@ paths:
                   items: { type: string }
                   description: |
                     Datasource scopes (`<datasource>.<object>:read`) the built-in datasource query tool
-                    may read for this key's runs, intersected with each node's `datasources.scopes`.
-                    Absent: every scope of the nodes it runs.
+                    may read for this key's runs, and document collections (`rag.<collection>:read`) the
+                    built-in `rag_search` tool may search, intersected with each node's
+                    `datasources.scopes`. Absent: every scope of the nodes it runs.
       responses:
         '201':
           description: Created
@@ -1902,6 +1904,210 @@ paths:
         '204': { description: Revoked }
         '404': { $ref: '#/components/responses/Error' }
 
+  /api/v1/tenants/{tenantId}/rag/collections:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [rag]
+      summary: The tenant's document collections (rag.read)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/RagCollection' } }
+        '503': { $ref: '#/components/responses/Error' }
+    post:
+      tags: [rag]
+      summary: Create a document collection (rag.write)
+      description: |
+        A collection is what nodes search with `builtin://rag_search`, named in their scopes as
+        `rag.<name>:read`. `embedding_model` must be a catalogue embedding model the tenant can reach (its own
+        provider or a shared one); it is fixed for the collection's life. `rerank_model` (a catalogue rerank
+        model) is optional. Its vectors live in a Qdrant collection of their own. Audited
+        (`rag.collection.create`). `503` when the control plane has no document registry
+        (`CALIBAN_DATABASE_URL`, or a standalone process with a KEK).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RagCollectionCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RagCollection' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/rag/collections/{collection}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: collection, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [rag]
+      summary: A collection, with the published node versions that search it (rag.read)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/RagCollection'
+                  - type: object
+                    required: [used_by]
+                    properties:
+                      used_by: { type: array, items: { type: string }, description: 'Published versions (`name@vN`) whose scopes name it' }
+        '404': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [rag]
+      summary: Delete a collection and its documents (rag.write)
+      description: |
+        Its documents stop being served at once; workers then drop its vectors. `409` while a published node
+        version names it in its scopes (`rag.*:read` does not hold it). Audited (`rag.collection.delete`).
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/rag/collections/{collection}/documents:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: collection, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [rag]
+      summary: Documents of a collection, by id (rag.read)
+      description: The newest version of each document (deleted documents left out), with the version being served. Never the content.
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/RagDocumentStatus' }, description: 'Only documents whose newest version is in this state' }
+        - { name: cursor, in: query, schema: { type: string }, description: 'next_cursor of the previous page' }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [documents, next_cursor]
+                properties:
+                  documents:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/RagDocument'
+                        - type: object
+                          properties:
+                            live_version: { type: [integer, 'null'], description: 'The version retrieval serves (null: none is ready)' }
+                  next_cursor: { type: [string, 'null'] }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+    post:
+      tags: [rag]
+      summary: Ingest a document (rag.write)
+      description: |
+        Adds a version of `doc_id` (`version` = the previous one + 1). The content (with its title) is sealed under
+        the tenant's data key at once and never returned. The version is `pending` and **invisible** until a
+        worker has indexed it and its checks passed: chunking with heading paths, the injection scan, a
+        near-duplicate check for untrusted sources, personal data pseudonymised before embedding. Then it is
+        `ready` (and replaces the previous version in one step), or `quarantined` (invisible until released), or
+        `failed`. Markdown, HTML and plain text; PDF is refused (`422`): convert it first. At most 5 MB of text.
+        Ingesting the same content and settings as the newest version again changes nothing (`200`,
+        `unchanged: true`). Audited (`rag.document.ingest`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RagDocumentIngest' }
+      responses:
+        '202':
+          description: A new pending version
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/RagDocument'
+                  - type: object
+                    properties: { unchanged: { type: boolean, enum: [false] } }
+        '200':
+          description: The same content was already there
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/RagDocument'
+                  - type: object
+                    properties: { unchanged: { type: boolean, enum: [true] } }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: collection, in: path, required: true, schema: { type: string } }
+      - { name: docId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [rag]
+      summary: Every version of a document, newest first (rag.read)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [doc_id, live_version, versions]
+                properties:
+                  doc_id: { type: string }
+                  live_version: { type: [integer, 'null'] }
+                  versions: { type: array, items: { $ref: '#/components/schemas/RagDocument' } }
+        '404': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [rag]
+      summary: Delete every version of a document (rag.write)
+      description: It stops being served at once and its sealed content is wiped; workers then delete its vectors. Audited (`rag.document.delete`).
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}/release:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: collection, in: path, required: true, schema: { type: string } }
+      - { name: docId, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [rag]
+      summary: Release a quarantined version (rag.approve)
+      description: |
+        A decision about the findings it was quarantined for: `acknowledge_findings` must be `true` (`422`
+        otherwise). The version goes back to `pending`, is indexed again with its findings acknowledged and served
+        once ready. `409` when the version is not quarantined. Audited (`rag.document.release`, with the findings).
+        Released text is still labelled `retrieved` in node runs: a tainted write it inspires needs an allowlist
+        entry or a human approval.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version, acknowledge_findings]
+              additionalProperties: false
+              properties:
+                version: { type: integer, minimum: 1 }
+                acknowledge_findings: { type: boolean }
+      responses:
+        '200':
+          description: The version, pending again
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RagDocument' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
   /.well-known/caliban-tool-jwks.json:
     get:
       tags: [tools]
@@ -2688,7 +2894,7 @@ components:
         created_at: { type: string, format: date-time }
         revoked_at: { type: [string, 'null'], format: date-time, description: 'Set once the key is revoked.' }
         nodes: { type: [array, 'null'], items: { type: string }, description: 'Node allowlist. `null`: every published node of the tenant; `[]`: none.' }
-        datasource_scopes: { type: array, items: { type: string }, description: 'Datasource scopes the built-in query tool may read for this key (absent: every scope of the nodes it runs).' }
+        datasource_scopes: { type: array, items: { type: string }, description: 'Datasource scopes the built-in query tool may read, and document collections (rag.<collection>:read) rag_search may search, for this key (absent: every scope of the nodes it runs).' }
         purpose: { type: string, enum: [eval], description: '`eval`: the tenant''s eval key, managed by the control plane (absent on keys customers create)' }
     ApiKeyCreated:
       allOf:
@@ -3529,13 +3735,94 @@ components:
     Role:
       type: string
       enum: [owner, admin, auditor, tenant_admin, developer, viewer, billing]
+    RagCollectionSettings:
+      type: object
+      additionalProperties: false
+      properties:
+        chunk_tokens: { type: integer, minimum: 64, maximum: 2048, default: 384, description: 'Largest chunk, in estimated tokens (structure-aligned, no overlap)' }
+        default_trust: { type: string, enum: [trusted, untrusted], default: untrusted, description: 'Trust of documents ingested without one' }
+        nav_min_chunks: { type: integer, minimum: 4, default: 24, description: 'Documents with at least this many chunks get a navigation tree' }
+        vet_deadline_secs: { type: integer, minimum: 60, maximum: 604800, default: 900, description: 'An untrusted document whose checks have not passed this long after ingest fails (stays invisible)' }
+    RagCollection:
+      type: object
+      required: [id, tenant_id, name, embedding_model, settings, created_at, created_by]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        name: { type: string, description: 'What node scopes name: rag.<name>:read' }
+        description: { type: string }
+        embedding_model: { type: string }
+        rerank_model: { type: string }
+        settings: { $ref: '#/components/schemas/RagCollectionSettings' }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+    RagCollectionCreate:
+      type: object
+      required: [name, embedding_model]
+      additionalProperties: false
+      properties:
+        name: { type: string, pattern: '^[a-z0-9][a-z0-9_]{0,63}$' }
+        description: { type: string, maxLength: 1000 }
+        embedding_model: { type: string, description: 'A catalogue model of kind embedding the tenant can reach' }
+        rerank_model: { type: string, description: 'A catalogue model of kind rerank the tenant can reach' }
+        settings: { $ref: '#/components/schemas/RagCollectionSettings' }
+    RagDocumentStatus:
+      type: string
+      enum: [pending, indexing, ready, quarantined, failed, superseded, deleted]
+      description: Only `ready` versions are served.
+    RagFinding:
+      type: object
+      required: [kind, chunk]
+      properties:
+        kind: { type: string, description: 'instruction, exfiltration, hidden_unicode, url or near_duplicate' }
+        chunk: { type: integer, description: 'The chunk (0-based) it was found in' }
+    RagDocumentIngest:
+      type: object
+      required: [doc_id, content]
+      additionalProperties: false
+      properties:
+        doc_id: { type: string, minLength: 1, maxLength: 200, description: 'Visible ASCII without /. Stored in clear: no personal data' }
+        title: { type: string, maxLength: 500 }
+        content: { type: string, description: 'At most 5 MB' }
+        content_type: { type: string, default: text/markdown, description: 'text/markdown, text/html or text/plain' }
+        source: { type: string, maxLength: 2000, description: 'Where it came from (stored in clear: no personal data)' }
+        trust: { type: string, enum: [trusted, untrusted], description: 'Default: the collection''s default_trust' }
+        valid_from: { type: string, format: date-time, description: 'Not retrieved before' }
+        valid_to: { type: string, format: date-time, description: 'Not retrieved after (citations state it)' }
+    RagDocument:
+      type: object
+      required: [tenant_id, collection_id, doc_id, version, content_type, trust, bytes, status, chunks, tokens, pii_entities, findings, findings_acknowledged, attempts, created_at, created_by]
+      properties:
+        tenant_id: { type: string }
+        collection_id: { type: string }
+        doc_id: { type: string }
+        version: { type: integer }
+        content_type: { type: string }
+        source: { type: string }
+        trust: { type: string, enum: [trusted, untrusted] }
+        bytes: { type: integer }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time }
+        status: { $ref: '#/components/schemas/RagDocumentStatus' }
+        chunks: { type: integer }
+        tokens: { type: integer, description: 'Estimated tokens of its chunks' }
+        pii_entities: { type: integer, description: 'Personal-data entities pseudonymised before embedding' }
+        findings: { type: array, items: { $ref: '#/components/schemas/RagFinding' } }
+        findings_acknowledged: { type: boolean }
+        error: { type: string }
+        attempts: { type: integer }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+        indexed_at: { type: string, format: date-time }
+        released_by: { type: string }
+        released_at: { type: string, format: date-time }
     Permission:
       type: string
       enum: [tenants.create, catalog.read, catalog.write, providers.probe, audit.read, rbac.read, rbac.write,
              tenant.read, tenant.write, tenant.delete, api_keys.read, api_keys.write, provider_keys.read,
              provider_keys.write, routes.read, routes.write, datasources.read, datasources.write, ontology.read,
              ontology.review, nodes.read, nodes.write, nodes.publish, nodes.run, tools.read, tools.write,
-             tools.approve, runs.read, runs.data, runs.answer, usage.read]
+             tools.approve, rag.read, rag.write, rag.approve, runs.read, runs.data, runs.answer, usage.read]
     RoleInfo:
       type: object
       required: [role, scope, description, permissions]

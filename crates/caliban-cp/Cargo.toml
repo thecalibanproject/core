@@ -11,6 +11,7 @@ caliban-types.workspace = true
 caliban-config.workspace = true
 caliban-meter.workspace = true
 caliban-nodes.workspace = true
+caliban-rag.workspace = true
 caliban-ontology.workspace = true
 caliban-mcp.workspace = true
 async-trait.workspace = true

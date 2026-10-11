@@ -60,6 +60,95 @@ pub struct Config {
     /// Omitted from the rendered snapshot when empty, so older routers keep parsing it.
     #[serde(default, skip_serializing_if = "RoutingConfig::is_empty")]
     pub routing: RoutingConfig,
+    /// Retrieval (`caliban-rag`): where document vectors live. Omitted from the rendered snapshot
+    /// when it is the default, so older routers keep parsing it.
+    #[serde(default, skip_serializing_if = "RagConfig::is_default")]
+    pub rag: RagConfig,
+}
+
+/// Where retrieval keeps document vectors.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RagIndexKind {
+    /// Qdrant over its REST API: one collection per RAG collection. Shared by every worker.
+    #[default]
+    Qdrant,
+    /// In process, lost on restart: one standalone process without a database, development only.
+    Memory,
+}
+
+/// `[rag]`: retrieval for the built-in `rag_search` node tool (docs/rag.md). Collections and
+/// documents are managed on the admin API; workers (or a standalone process) index them.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RagConfig {
+    #[serde(default)]
+    pub index: RagIndexKind,
+    /// Qdrant REST endpoint. Unset: `CALIBAN_QDRANT_URL`, then `[cache.semantic] qdrant_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qdrant_url: Option<String>,
+    /// Unset: the semantic cache's Qdrant API key (or `CALIBAN_QDRANT_API_KEY`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qdrant_api_key: Option<SecretRef>,
+    /// Qdrant collections are named `{prefix}_{collection id}`.
+    #[serde(default = "default_rag_prefix")]
+    pub collection_prefix: String,
+    /// Documents one process indexes at once.
+    #[serde(default = "default_rag_concurrency")]
+    pub index_concurrency: usize,
+}
+
+fn default_rag_prefix() -> String {
+    "caliban_rag".into()
+}
+
+fn default_rag_concurrency() -> usize {
+    2
+}
+
+impl Default for RagConfig {
+    fn default() -> Self {
+        Self {
+            index: RagIndexKind::default(),
+            qdrant_url: None,
+            qdrant_api_key: None,
+            collection_prefix: default_rag_prefix(),
+            index_concurrency: default_rag_concurrency(),
+        }
+    }
+}
+
+impl RagConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `qdrant_url`, then `CALIBAN_QDRANT_URL`, then the semantic cache's URL.
+    pub fn resolved_qdrant_url(&self, cache: &SemanticCacheConfig) -> Option<String> {
+        self.qdrant_url.clone().filter(|u| !u.trim().is_empty()).or_else(|| cache.resolved_qdrant_url())
+    }
+
+    /// `qdrant_api_key`, then the semantic cache's key.
+    pub fn resolved_qdrant_api_key(&self, cache: &SemanticCacheConfig) -> Result<Option<String>, ConfigError> {
+        match &self.qdrant_api_key {
+            Some(r) => r
+                .resolve()
+                .map(|s| Some(s.expose().to_owned()))
+                .map_err(|e| ConfigError::Secret("rag.qdrant_api_key".into(), e.to_string())),
+            None => cache.resolved_qdrant_api_key(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let p = &self.collection_prefix;
+        if p.is_empty() || p.len() > 64 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+            return Err(ConfigError::Invalid("rag.collection_prefix must be 1 to 64 of [A-Za-z0-9_-]".into()));
+        }
+        if !(1..=64).contains(&self.index_concurrency) {
+            return Err(ConfigError::Invalid("rag.index_concurrency must be between 1 and 64".into()));
+        }
+        Ok(())
+    }
 }
 
 /// `[routing]`: how `caliban/auto` picks a model (see `caliban-route`).
@@ -1377,6 +1466,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.rag.validate()?;
         let models: HashMap<&ModelId, &ModelEntry> = self.models.iter().map(|m| (&m.id, m)).collect();
         if models.len() != self.models.len() {
             return Err(ConfigError::Invalid("duplicate model id".into()));
