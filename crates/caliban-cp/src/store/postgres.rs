@@ -60,6 +60,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (23, "auto_node_routes", include_str!("../../../../migrations/0023_auto_node_routes.sql")),
     (24, "node_evals", include_str!("../../../../migrations/0024_node_evals.sql")),
     (25, "node_run_input_labels", include_str!("../../../../migrations/0025_node_run_input_labels.sql")),
+    (26, "tool_manifest_network", include_str!("../../../../migrations/0026_tool_manifest_network.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -1473,10 +1474,11 @@ async fn upsert_tool_manifest(c: &mut PgConnection, m: &super::ToolManifestRecor
         c,
         sqlx::query(
             "INSERT INTO tool_manifest (id, tenant_id, server, name, description, input_schema, pin, findings, status,
-                                        discovered_at, approved_at, approved_by, findings_acknowledged)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                                        discovered_at, approved_at, approved_by, findings_acknowledged, network)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
              ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, approved_at = EXCLUDED.approved_at,
-                 approved_by = EXCLUDED.approved_by, findings_acknowledged = EXCLUDED.findings_acknowledged",
+                 approved_by = EXCLUDED.approved_by, findings_acknowledged = EXCLUDED.findings_acknowledged,
+                 network = EXCLUDED.network",
         )
         .bind(&m.id)
         .bind(&m.tenant_id)
@@ -1490,7 +1492,8 @@ async fn upsert_tool_manifest(c: &mut PgConnection, m: &super::ToolManifestRecor
         .bind(m.discovered_at)
         .bind(m.approved_at)
         .bind(&m.approved_by)
-        .bind(m.findings_acknowledged),
+        .bind(m.findings_acknowledged)
+        .bind(m.network),
     )
     .await
 }
@@ -1813,18 +1816,21 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     for r in rows(
         c,
         "SELECT id, tenant_id, server, name, description, input_schema, pin, findings, status, discovered_at,
-                approved_at, approved_by, findings_acknowledged
+                approved_at, approved_by, findings_acknowledged, network
          FROM tool_manifest ORDER BY ord",
     )
     .await?
     {
+        let input_schema = get::<Json<Value>>(&r, "input_schema")?.0;
         st.tool_manifests.push(super::ToolManifestRecord {
+            network_hint: caliban_nodes::executor::taint::network_hint(&input_schema),
+            network: get(&r, "network")?,
             id: get(&r, "id")?,
             tenant_id: get(&r, "tenant_id")?,
             server: get(&r, "server")?,
             name: get(&r, "name")?,
             description: get(&r, "description")?,
-            input_schema: get::<Json<Value>>(&r, "input_schema")?.0,
+            input_schema,
             pin: get(&r, "pin")?,
             findings: parse(get::<Json<Value>>(&r, "findings")?.0)?,
             status: parse_enum(get(&r, "status")?)?,

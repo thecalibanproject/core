@@ -1769,7 +1769,10 @@ paths:
       description: |
         Only approved manifests reach the data plane and can be pinned by a published node version. A manifest
         with scan findings needs `acknowledge_findings: true` (`422` otherwise). Audited (`tool.approve`, with the
-        findings and the acknowledgement).
+        findings, the acknowledgement and the network decision). `network` records whether the tool reaches the
+        network through its arguments (a URL, a host): a read through such a tool is gated like a write (tainted
+        arguments need an `allow_tainted` entry or a human approval). Absent: the input schema's hints decide
+        (`network_hint` on the manifest). To change it, revoke and approve again.
       requestBody:
         required: true
         content:
@@ -1781,6 +1784,7 @@ paths:
               properties:
                 pin: { type: string, description: 'sha256:<hex>' }
                 acknowledge_findings: { type: boolean, default: false }
+                network: { type: boolean, description: 'The tool reaches the network through its arguments (overrides the schema hints)' }
       responses:
         '200':
           description: Approved; `ref` is what node specs pin
@@ -3152,6 +3156,8 @@ components:
         approved_at: { type: [string, 'null'], format: date-time }
         approved_by: { type: [string, 'null'] }
         findings_acknowledged: { type: boolean }
+        network: { type: [boolean, 'null'], description: 'The approver''s decision: the tool reaches the network through its arguments (null: none given)' }
+        network_hint: { type: boolean, description: 'The input schema suggests it does (a URL, host or email argument, or x-caliban-network)' }
 
     UsageEvent:
       type: object

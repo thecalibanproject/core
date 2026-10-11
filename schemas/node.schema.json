@@ -38,7 +38,7 @@
           "ref": { "type": "string", "pattern": "^(mcp|node|builtin)://", "description": "mcp://server/tool#sha256:<hash> (an approved manifest), node://name@vN or builtin://datasource_query" },
           "effect": { "enum": ["read", "write"] },
           "requires": { "type": "array", "items": { "type": "string" } },
-          "allow_tainted": { "type": "array", "items": { "type": "string" }, "description": "effect=write: taint labels its arguments may carry without a human approval (tool:<server>/*, datasource, *)" }
+          "allow_tainted": { "type": "array", "items": { "type": "string" }, "description": "writes, and reads that reach the network through their arguments: taint labels the arguments may carry without a human approval (tool:<server>/*, datasource, caller, *)" }
         }
       }
     },

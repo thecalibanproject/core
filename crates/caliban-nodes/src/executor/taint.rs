@@ -167,6 +167,62 @@ pub fn caller_labels(input: &Value, schema: Option<&Value>, marks: &[String]) ->
     if present { [CALLER.to_owned()].into() } else { Taint::new() }
 }
 
+/// The schema annotation that says an argument (or the tool) reaches the network.
+pub const NETWORK_KEYWORD: &str = "x-caliban-network";
+
+/// Whether a tool's input schema suggests its arguments choose where it connects (a URL, a host),
+/// so a read through it can carry data out ("schema hints"): `x-caliban-network: true` on the
+/// schema or a property; a property `format` of `uri`, `url`, `iri`, `uri-reference`,
+/// `iri-reference`, `uri-template`, `hostname`, `idn-hostname`, `ipv4`, `ipv6` or `email`; or a
+/// property named `url`, `uri`, `href`, `link`, `endpoint`, `webhook`, `host`, `hostname`,
+/// `domain`, or ending in `_url`, `_uri`, `url` after a lowercase letter (`imageUrl`). Nested
+/// objects and array items count. An approver can override the hints either way (docs/tools.md).
+pub fn network_hint(schema: &Value) -> bool {
+    const FORMATS: &[&str] = &[
+        "uri",
+        "url",
+        "iri",
+        "uri-reference",
+        "iri-reference",
+        "uri-template",
+        "hostname",
+        "idn-hostname",
+        "ipv4",
+        "ipv6",
+        "email",
+    ];
+    const NAMES: &[&str] = &["url", "uri", "href", "link", "endpoint", "webhook", "host", "hostname", "domain"];
+    fn named(k: &str) -> bool {
+        let lower = k.to_ascii_lowercase();
+        NAMES.contains(&lower.as_str())
+            || lower.ends_with("_url")
+            || lower.ends_with("_uri")
+            || lower.ends_with("-url")
+            || k.ends_with("Url")
+            || k.ends_with("Uri")
+            || k.ends_with("URL")
+    }
+    fn walk(s: &Value) -> bool {
+        let Some(m) = s.as_object() else { return false };
+        if m.get(NETWORK_KEYWORD) == Some(&Value::Bool(true)) {
+            return true;
+        }
+        if m.get("format").and_then(Value::as_str).is_some_and(|f| FORMATS.contains(&f)) {
+            return true;
+        }
+        if let Some(props) = m.get("properties").and_then(Value::as_object)
+            && props.iter().any(|(k, sub)| named(k) || walk(sub))
+        {
+            return true;
+        }
+        ["items", "additionalProperties"].iter().any(|k| m.get(*k).is_some_and(walk))
+            || ["anyOf", "allOf", "oneOf"]
+                .iter()
+                .any(|k| m.get(*k).and_then(Value::as_array).is_some_and(|a| a.iter().any(walk)))
+    }
+    walk(schema)
+}
+
 /// What a human answered to an approval question: `{"approve": bool}`, a boolean, or a word.
 pub fn approved(answer: &Value) -> bool {
     match answer {
@@ -201,6 +257,30 @@ mod tests {
         assert!(
             approved(&json!({"approve": true})) && approved(&json!("yes")) && !approved(&json!({"approve": false}))
         );
+    }
+
+    #[test]
+    fn network_hints_in_tool_schemas() {
+        for s in [
+            json!({"type": "object", "properties": {"url": {"type": "string"}}}),
+            json!({"properties": {"q": {"type": "string", "format": "uri"}}}),
+            json!({"properties": {"callback_url": {}}}),
+            json!({"properties": {"imageUrl": {}}}),
+            json!({"properties": {"opts": {"properties": {"Host": {}}}}}),
+            json!({"properties": {"targets": {"type": "array", "items": {"format": "hostname"}}}}),
+            json!({"properties": {"q": {"x-caliban-network": true}}}),
+            json!({"x-caliban-network": true}),
+        ] {
+            assert!(network_hint(&s), "{s}");
+        }
+        for s in [
+            json!({"type": "object", "properties": {"id": {"type": "string"}, "query": {"type": "string"}}}),
+            json!({"properties": {"curl": {}, "hurl": {}, "links_count": {"type": "integer"}}}),
+            json!({"type": "object"}),
+            json!({"properties": {"q": {"x-caliban-network": false}}}),
+        ] {
+            assert!(!network_hint(&s), "{s}");
+        }
     }
 
     #[test]

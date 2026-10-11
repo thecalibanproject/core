@@ -354,13 +354,27 @@ pub(super) async fn call_tool(
     depth: u32,
 ) -> Result<StepOut, Stop> {
     let declared = node.spec.tools.iter().find(|t| t.reference == reference);
-    if let Some(t) = declared
-        && t.effect == Effect::Write
+    // Gated: writes, and reads whose arguments choose where they connect (a URL), since such a read
+    // can carry tainted data out as well as a write can (P3 decision 11).
+    let gated = declared.and_then(|t| match t.effect {
+        Effect::Write => Some((t, "write")),
+        Effect::Read
+            if !reference.starts_with("node://")
+                && cx.tools.resolve(cx.tenant(), reference).is_ok_and(|tool| tool.reaches_network()) =>
+        {
+            Some((t, "read, reaches the network through its arguments"))
+        }
+        Effect::Read => None,
+    });
+    if let Some((t, effect)) = gated
         && !taint::untrusted(&args_taint).is_empty()
         && !taint::allowed(&args_taint, &t.allow_tainted)
     {
-        super::consuming(args_taint.clone(), approve_write(cx, vertex, reference, &args, &args_taint, step_id, ledger))
-            .await?;
+        super::consuming(
+            args_taint.clone(),
+            approve_call(cx, vertex, reference, effect, &args, &args_taint, step_id, ledger),
+        )
+        .await?;
     }
     let input = json!({"tool": reference, "args": args});
     let consumed = args_taint.clone();
@@ -396,13 +410,15 @@ pub(super) async fn call_tool(
     super::consuming(consumed, call).await
 }
 
-/// A write whose arguments carry untrusted labels: waits for a human (`<step>@approve`, the run
-/// in `input_required`), then journals the decision with who made it. A refusal fails the call.
+/// A gated call (a write, or a network-reaching read) whose arguments carry untrusted labels: waits
+/// for a human (`<step>@approve`, the run in `input_required`), then journals the decision with
+/// who made it. A refusal fails the call.
 #[allow(clippy::too_many_arguments)]
-async fn approve_write(
+async fn approve_call(
     cx: &RunCx,
     vertex: &str,
     reference: &str,
+    effect: &str,
     args: &Value,
     args_taint: &Taint,
     step_id: &str,
@@ -418,8 +434,9 @@ async fn approve_write(
             shown.push_str("...");
         }
         let question = format!(
-            "Approve this write? Tool {reference} (effect: write) would be called with arguments derived from untrusted \
-             data ({}): {shown}. Answer {{\"approve\": true}} or {{\"approve\": false}}.",
+            "Approve this {}? Tool {reference} (effect: {effect}) would be called with arguments derived from \
+             untrusted data ({}): {shown}. Answer {{\"approve\": true}} or {{\"approve\": false}}.",
+            if effect == "write" { "write" } else { "call" },
             labels.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
         );
         return Err(Stop::Suspend(Suspension {
@@ -443,7 +460,8 @@ async fn approve_write(
         Ok(())
     } else {
         Err(Stop::Fail(format!(
-            "the write to '{reference}' was refused by a human (its arguments carry {})",
+            "the {} '{reference}' was refused by a human (its arguments carry {})",
+            if effect == "write" { "write to" } else { "call to" },
             labels.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
         )))
     }

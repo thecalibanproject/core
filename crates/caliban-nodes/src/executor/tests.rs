@@ -1163,6 +1163,71 @@ async fn an_agent_write_after_a_tool_result_needs_approval() {
     }
 }
 
+/// A read tool whose schema takes a URL (it reaches the network through its arguments).
+struct Fetch(Mutex<Vec<Value>>);
+
+#[async_trait::async_trait]
+impl Tool for Fetch {
+    fn info(&self) -> ToolInfo {
+        ToolInfo {
+            name: "fetch".into(),
+            description: "Fetches a page.".into(),
+            input_schema: json!({"type": "object", "properties": {"url": {"type": "string"}}}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<Value, ToolError> {
+        self.0.lock().push(args);
+        Ok(json!({"page": "ok"}))
+    }
+}
+
+/// Reads that reach the network through their arguments (P3 decision 11): tainted arguments wait
+/// for a human or an allowlist entry, like a write; untainted ones and ordinary reads do not.
+#[tokio::test]
+async fn a_read_that_reaches_the_network_is_gated_like_a_write() {
+    for j in journals().await {
+        let (crm, _, tools) = crm_and_erp();
+        let fetch = Arc::new(Fetch(Mutex::default()));
+        let net = format!("mcp://web/fetch#sha256:{}", "3".repeat(64));
+        let read = format!("mcp://crm/lookup#{PIN}");
+        let h = Harness::new(j).with_tools(tools.with(net.clone(), Arc::clone(&fetch) as Arc<dyn Tool>));
+        let spec = |allow: Option<&str>, url: &str| {
+            let mut f = json!({"ref": net, "effect": "read"});
+            if let Some(a) = allow {
+                f["allow_tainted"] = json!([a]);
+            }
+            json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(10, 1000),
+                   "tools": [{"ref": read, "effect": "read"}, f],
+                   "graph": {"vertices": [{"id": "read", "type": "tool", "config": {"tool": read}},
+                                          {"id": "get", "type": "tool", "config": {"tool": net, "args": {"url": url}}}],
+                             "edges": [{"from": "read", "to": "get"}]}})
+        };
+        h.nodes.add("tainted", 1, spec(None, "https://x.example/?c={{outputs.read.customer}}"));
+        h.nodes.add("allowed", 1, spec(Some("tool:crm/*"), "https://x.example/?c={{outputs.read.customer}}"));
+        // Untainted arguments (the run input, nothing read before): fetched at once.
+        h.nodes.add("plain", 1, json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(10, 1000),
+            "tools": [{"ref": net, "effect": "read"}],
+            "graph": {"vertices": [{"id": "get", "type": "tool", "config": {"tool": net, "args": {"url": "{{input}}"}}}], "edges": []}}));
+        let model = FakeModel::new(|_| text("unused"));
+        let ex = h.executor(&model, "w1");
+        let v = run(&ex, "tainted", json!({})).await;
+        assert_eq!(v.status, RunStatus::InputRequired, "{v:?}");
+        let a = v.awaiting.unwrap();
+        assert_eq!(a.step, "get#0@approve");
+        let q = a.question.unwrap();
+        assert!(q.contains("reaches the network") && q.contains("tool:crm/lookup"), "{q}");
+        assert!(fetch.0.lock().is_empty(), "nothing was fetched");
+        ex.deliver_input("acme", &v.id, None, &json!({"approve": false}), Some("api_key:abc")).await.unwrap();
+        ex.run_now(&v.id).await.unwrap();
+        let v = ex.view("acme", &v.id).await.unwrap().unwrap();
+        assert!(v.error.as_deref().unwrap().contains("call to"), "{v:?}");
+        assert!(fetch.0.lock().is_empty());
+        assert_eq!(run(&ex, "allowed", json!({})).await.status, RunStatus::Succeeded);
+        assert_eq!(run(&ex, "plain", json!("https://docs.example/page")).await.status, RunStatus::Succeeded);
+        assert_eq!((crm.seen.lock().len(), fetch.0.lock().len()), (2, 2));
+    }
+}
+
 /// A workflow that writes a field of its input (no tool read before it).
 fn write_input(allow: Option<&str>, schema: Option<Value>) -> Value {
     let write = format!("mcp://erp/update#{PIN_W}");

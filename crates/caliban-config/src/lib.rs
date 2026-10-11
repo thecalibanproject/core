@@ -1084,6 +1084,10 @@ pub struct ApprovedTool {
     pub input_schema: serde_json::Value,
     /// `sha256:<hex>` over the manifest (see `caliban_mcp::ToolManifest::pin`).
     pub pin: String,
+    /// The approver's decision on whether it reaches the network through its arguments (`None`:
+    /// the input schema's hints decide). Not part of the pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<bool>,
 }
 
 /// Tenant-wide caps on node spend (USD, priced like the metering), checked before every model

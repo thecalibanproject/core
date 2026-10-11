@@ -295,6 +295,18 @@ pub struct ToolManifestRecord {
     pub approved_by: Option<String>,
     /// Approved although the scan found something (an explicit decision, audited).
     pub findings_acknowledged: bool,
+    /// The approver's decision on whether the tool reaches the network through its arguments
+    /// (`None`: not given; `network_hint` decides).
+    pub network: Option<bool>,
+    /// What the input schema suggests (a URL or host argument; `taint::network_hint`).
+    pub network_hint: bool,
+}
+
+impl ToolManifestRecord {
+    /// Whether a read through this tool is gated like a write (docs/tools.md).
+    pub fn reaches_network(&self) -> bool {
+        self.network.unwrap_or(self.network_hint)
+    }
 }
 
 /// The promotion pointer of a node: its live version.
@@ -816,6 +828,7 @@ fn render_tools(st: &State, tenant: &str, obj: &mut Map<String, Value>) -> Resul
             description: m.description.clone(),
             input_schema: m.input_schema.clone(),
             pin: m.pin.clone(),
+            network: m.network,
         })
         .collect();
     if !servers.is_empty() {
@@ -986,6 +999,8 @@ pub enum Mutation {
         tool: String,
         pin: String,
         acknowledge_findings: bool,
+        /// Whether the tool reaches the network through its arguments (`None`: its schema decides).
+        network: Option<bool>,
         at: DateTime<Utc>,
         by: String,
     },
@@ -1329,7 +1344,7 @@ impl Mutation {
                 server,
                 json!({"server": server, "manifests": manifests.iter().map(|m| json!({"tool": m.name, "pin": m.pin, "findings": m.findings.len()})).collect::<Vec<_>>()}),
             ),
-            Mutation::ApproveTool { tenant_id, server, tool, pin, acknowledge_findings, .. } => {
+            Mutation::ApproveTool { tenant_id, server, tool, pin, acknowledge_findings, network, .. } => {
                 let m = before
                     .tool_manifests
                     .iter()
@@ -1339,7 +1354,8 @@ impl Mutation {
                     "tool.approve",
                     m.map_or(tool.as_str(), |m| m.id.as_str()),
                     json!({"server": server, "tool": tool, "pin": pin, "findings": m.map(|m| &m.findings),
-                           "findings_acknowledged": acknowledge_findings}),
+                           "findings_acknowledged": acknowledge_findings, "network": network,
+                           "network_hint": m.map(|m| m.network_hint)}),
                 )
             }
             Mutation::RevokeTool { tenant_id, server, tool, pin } => {

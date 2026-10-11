@@ -62,6 +62,12 @@ pub trait Tool: Send + Sync {
     fn trusted(&self) -> bool {
         false
     }
+    /// Its arguments choose where it connects (a URL, a host): a read through it can carry data
+    /// out, so tainted arguments are gated like a write's. Default: the input schema's hints
+    /// ([`super::taint::network_hint`]); a registry can override them (an approver's decision).
+    fn reaches_network(&self) -> bool {
+        super::taint::network_hint(&self.info().input_schema)
+    }
 }
 
 /// Keeps personal data where the tenant's policy allows it (the data plane implements it with

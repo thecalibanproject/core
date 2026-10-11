@@ -661,12 +661,13 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                         approved_at: None,
                         approved_by: None,
                         findings_acknowledged: false,
+                        network: None,
                         ..m.clone()
                     });
                 }
             }
         }
-        Mutation::ApproveTool { tenant_id, server, tool, pin, acknowledge_findings, at, by } => {
+        Mutation::ApproveTool { tenant_id, server, tool, pin, acknowledge_findings, network, at, by } => {
             need_tenant(st, tenant_id)?;
             st.tool_server(tenant_id, server).ok_or_else(|| StoreError::NotFound("tool server".into()))?;
             let m = st
@@ -684,6 +685,7 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             m.approved_at = Some(*at);
             m.approved_by = Some(by.clone());
             m.findings_acknowledged = !m.findings.is_empty() && *acknowledge_findings;
+            m.network = *network;
         }
         Mutation::RevokeTool { tenant_id, server, tool, pin } => {
             need_tenant(st, tenant_id)?;

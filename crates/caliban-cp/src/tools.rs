@@ -205,6 +205,7 @@ fn records(tenant: &str, server: &str, manifests: Vec<ToolManifest>) -> Vec<Tool
             id: new_id("tool"),
             tenant_id: tenant.to_owned(),
             server: server.to_owned(),
+            network_hint: caliban_nodes::executor::taint::network_hint(&m.input_schema),
             findings: caliban_mcp::scan::scan(&m),
             pin: m.pin(),
             name: m.name,
@@ -215,6 +216,7 @@ fn records(tenant: &str, server: &str, manifests: Vec<ToolManifest>) -> Vec<Tool
             approved_at: None,
             approved_by: None,
             findings_acknowledged: false,
+            network: None,
         })
         .collect()
 }
@@ -298,6 +300,10 @@ pub(crate) struct Approve {
     pin: String,
     #[serde(default)]
     acknowledge_findings: bool,
+    /// Whether the tool reaches the network through its arguments (a URL, a host): a read through
+    /// it is then gated like a write. Absent: the input schema's hints decide.
+    #[serde(default)]
+    network: Option<bool>,
 }
 
 /// Approves one manifest (by pin). The response carries the reference nodes pin it with.
@@ -313,6 +319,7 @@ pub(crate) async fn approve(
         tool: tool.clone(),
         pin: body.pin.clone(),
         acknowledge_findings: body.acknowledge_findings,
+        network: body.network,
         at: now_micros(),
         by: p.actor.clone(),
     };

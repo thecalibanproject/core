@@ -285,7 +285,7 @@ impl EvalRunner {
                 let children = self.children(&e.tenant_id, &node.spec);
                 let child_refs: Vec<&NodeSpec> = children.iter().map(Arc::as_ref).collect();
                 let tools = Arc::clone(self.ex.tools());
-                let info = |r: &str| tools.resolve(&e.tenant_id, r).ok().map(|t| t.info());
+                let info = |r: &str| tools.resolve(&e.tenant_id, r).ok().map(|t| (t.info(), t.reaches_network()));
                 let surface = Surface::of(&node.spec, &child_refs, &info);
                 for c in injection::cases() {
                     match injection::applicable(c, &surface, input, manifests) {

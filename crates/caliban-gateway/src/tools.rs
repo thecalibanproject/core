@@ -107,6 +107,12 @@ impl Tool for McpTool {
         self.server.trusted
     }
 
+    fn reaches_network(&self) -> bool {
+        self.approved
+            .network
+            .unwrap_or_else(|| caliban_nodes::executor::taint::network_hint(&self.approved.input_schema))
+    }
+
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<Value, ToolError> {
         let secret = match &self.server.credential {
             Some(r) => Some(
