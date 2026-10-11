@@ -115,6 +115,13 @@ The header carries `kid`. A server verifies the signature against the JWKS, then
 the validity window and that `scope` names the tool being called; `caliban_mcp::token::verify` is
 a reference implementation.
 
+**Tool servers should deduplicate writes on `jti`.** MCP defines no retry semantics: a mutating
+`tools/call` whose response is lost runs again when it is retried (MCP issue #3394,
+https://github.com/modelcontextprotocol/modelcontextprotocol/issues/3394). Caliban retries a call
+that failed transiently, and replays a step after a worker died, always with the same `jti` (the
+step's idempotency key). A server that records the `jti` of each write it applied and answers a
+repeat with the first result applies every write once.
+
 **The key.** `CALIBAN_TOOL_TOKEN_KEY` is a base64 Ed25519 seed (`caliban gen-tool-token-key`
 prints one and its public key). Workers and standalone processes need it to call `caliban_token`
 servers; the control plane needs it for discovery and to publish the JWKS. Without it, such calls
@@ -190,6 +197,15 @@ needs either:
 
 `pii` is handled by the personal-data rules above rather than by approvals: an untrusted tool never
 receives personal data, write or read.
+
+**Approvals are single use; allowlists are standing authority.** An approval covers one step of one
+run and the arguments it showed; it is never carried to another write or another run. An
+`allow_tainted` entry applies to every run of the version, without a human, so any injection that
+reaches a run can use it (arXiv 2609.33910). A version's view warns about `*` and about `tool:`
+patterns wider than one server (`warnings`, kind `allowlist`). They are not refused: the
+[injection suite](evals.md#the-injection-suite) runs every version with its real allowlist, so a
+version that relies on a broad entry fails it, and a version with write tools is promoted only once
+its injection eval meets the node's bar.
 
 ## Built-in tools
 

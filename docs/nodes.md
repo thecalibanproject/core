@@ -7,7 +7,8 @@ through the same request pipeline as client traffic. This page describes what P3
 (deployable versions), M2 (journal and executor), M3 (budgets and guards), M4 (tools), M5
 (exposure: the run API, event streams, the chat shortcut, the MCP server, the console endpoints)
 and M6 (`caliban/auto` picks a node) ship; the tools themselves (the MCP client, the tool registry, minted tokens, egress, taint) are in
-[`tools.md`](tools.md). The plan and its decisions are in `docs/architecture/p3-nodes-plan.md`
+[`tools.md`](tools.md), and evals (golden sets, pass^k and cost per success, the injection suite,
+promotion bars) in [`evals.md`](evals.md). The plan and its decisions are in `docs/architecture/p3-nodes-plan.md`
 (docs repository).
 
 ## The spec
@@ -99,7 +100,7 @@ run without a version runs.
 | List versions, the live one | `GET /api/v1/tenants/{t}/nodes/{name}/versions` | `nodes.read` | |
 | Get a version (spec, hash, state) | `GET /api/v1/tenants/{t}/nodes/{name}/versions/{v}` | `nodes.read` | |
 | Publish (and promote, by default) | `POST .../versions/{v}/publish` `{"promote": true}` | `nodes.publish` | `node.publish` |
-| Promote another published version (rollback) | `POST /api/v1/tenants/{t}/nodes/{name}/promote` `{"version": v}` | `nodes.publish` | `node.promote` (with the previous live version) |
+| Promote another published version (rollback) | `POST /api/v1/tenants/{t}/nodes/{name}/promote` `{"version": v}` | `nodes.publish` | `node.promote` (with the previous live version, and the evals that met the bar) |
 | Retire a published version | `POST .../versions/{v}/retire` | `nodes.publish` | `node.retire` |
 | Diff two versions | `GET /api/v1/tenants/{t}/nodes/{name}/diff?from=a&to=b` | `nodes.read` | |
 | Delete a draft or retired version | `DELETE /api/v1/tenants/{t}/nodes/{record id}` | `nodes.write` | `node.delete` |
@@ -123,6 +124,14 @@ by one as `{"kind", "message", "path"?}` with `kind` one of `spec`, `tool`, `dat
 
 Retiring a version that another published version calls is a `409`, as is deleting a published
 version (retire it first).
+
+**Promotion is gated by evals** ([evals.md](evals.md#the-promotion-bar-and-the-gate)). A version
+with write tools is promoted only once its latest injection eval meets the node's bar (default:
+every attack of the suite blocked), and a node can set a golden-set bar (pass^k, `k`, cost per
+success, p95 latency). Promoting otherwise is a `422` with problems of kind `eval_gate`; a draft
+has no evals, so such a version is published with `{"promote": false}`, evaluated, then promoted.
+Versions without write tools, on nodes without a golden bar, promote as before. A version's view
+lists `warnings` about broad `allow_tainted` entries (see [tools.md](tools.md#taint-camel-lite)).
 
 **Retiring drains.** Runs already started finish on the version they started on; only new runs
 are refused (`404`). A run carries what it needs: when it is created, the spec of its version and
@@ -153,6 +162,11 @@ last good one), so upgrade routers before publishing nodes.
 The `runs.*` permissions are for the [console endpoints](#console-endpoints): `runs.read` shows run
 metadata, `runs.data` run content, `runs.answer` lets a user answer questions and approve or deny
 tainted writes as themselves.
+
+Evals ([evals.md](evals.md#api)) use the same permissions: golden sets are written with
+`nodes.write` (their cases read with `runs.data`, like run content), the promotion bar is set with
+`nodes.publish`, evals are started and cancelled with `nodes.run` (they run the node, as an API key
+the caller names), and evals and their metrics are read with `nodes.read`.
 
 Runs are started with tenant **API keys**. A key may carry a **node allowlist** (`nodes` when it is
 created: `POST /api/v1/tenants/{t}/api-keys {"name": ..., "nodes": ["triage"]}`). Without one it may
@@ -383,6 +397,7 @@ Decisions made on the data plane go into the control plane's hash-chained audit 
 | `node.run.answer` | A human step is answered (API key, chat continuation, MCP task, console) |
 | `node.write.approve`, `node.write.deny` | A tainted write is approved or denied |
 | `node.run.cancel` | A run is cancelled |
+| `node.eval.finish` | An eval ends (its worker), with its main metric. Golden sets, promotion bars, eval starts and cancellations are written by the control plane through the same outbox ([evals.md](evals.md#api)) |
 | `tool.approve`, `tool.revoke` | A tool manifest is approved or revoked (on the control plane itself, see [tools.md](tools.md)) |
 
 The actor is who decided (`api_key:<hash prefix>`, or the console user); the target is the run;
@@ -429,6 +444,8 @@ GRANT USAGE ON SCHEMA public TO caliban_worker;  -- the schema holding Caliban's
 GRANT SELECT ON caliban_schema_migrations TO caliban_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON node_run, node_step, node_event, node_run_event, node_audit TO caliban_worker;
 GRANT SELECT, INSERT, UPDATE ON node_spend TO caliban_worker;
+GRANT SELECT, UPDATE ON node_eval TO caliban_worker;                -- evals (0024): claims, results
+GRANT SELECT, INSERT, UPDATE ON node_eval_trial TO caliban_worker;
 ALTER ROLE caliban_worker BYPASSRLS;  -- the journal tables have per-tenant row-level security; a worker serves every tenant
 ```
 
@@ -493,6 +510,7 @@ runs against both. Tables (`migrations/0013_node_journal.sql`):
 | `node_event` | Awaited events: human answers (named after the step, sealed) and timers (`<step>:deadline`, `<step>:throttled:<n>`) |
 | `node_run_event` (0021) | The run's [events](#streaming-run-events), numbered per run under the run row's lock (`node_run.event_seq`); `node_run` also has `cancel_requested_at`, `cancelled_by` and `origin`, and `node_step` the prompt and completion tokens and taint labels |
 | `node_audit` (0021) | The [audit outbox](#audit-of-run-decisions) |
+| `node_golden_set`, `node_eval_policy`, `node_eval`, `node_eval_trial` (0024) | [Evals](evals.md): golden sets (sealed), promotion bars, eval runs and their trials. `node_event` gains the kind `observation` (what a sandboxed tool of an injection run received) |
 
 - **Claims.** Workers claim the oldest runnable run with `UPDATE ... WHERE id = (SELECT ... FOR UPDATE
   SKIP LOCKED)`, so two workers never claim the same run. Runnable: `pending`; `sleeping` or
@@ -608,8 +626,8 @@ the person's email reaches the tool server.
 
 ## Not in this release
 
-- **P3 M8:** `code` vertices (WASM), the console views themselves (the endpoints are here), evals as
-  promotion gates, A2A.
+- **P3 M8:** `code` vertices (WASM), the console views themselves (the endpoints are here), A2A, an
+  adaptive stage for the injection suite.
 - Cancelling a run from the console (cancel it with the run API).
 - MCP: the human step of a synchronous `tools/call` is answered through the run API (MCP's
   multi-round-trip input requests are not used); MCP Tasks need the `2026-07-28` protocol.
