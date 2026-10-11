@@ -388,3 +388,39 @@ impl Tool for RagSearch {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use caliban_config::{Config, Snapshot};
+
+    fn gateway(scope: &str) -> Arc<Gateway> {
+        let toml = format!(
+            "[[tenants]]\nid = \"acme\"\nname = \"Acme\"\npii_mode = \"reversible\"\npii_surrogate_scope = \"{scope}\"\n"
+        );
+        let cfg = Config::from_toml_str(&toml).unwrap();
+        Arc::new(Gateway::new(
+            ConfigHandle::new(Snapshot::new(cfg, "t")),
+            Arc::new(caliban_meter::RecentUsage::default()),
+        ))
+    }
+
+    /// Documents and queries get the same surrogates (the tenant-scope key, whatever the tenant's
+    /// request scope), so a query naming a person matches the passages naming them; the address
+    /// itself is never kept.
+    #[tokio::test]
+    async fn indexed_text_is_pseudonymised_the_same_way_every_time() {
+        for scope in ["tenant", "session"] {
+            let gw = gateway(scope);
+            let rag = GatewayRag::new(&gw, Arc::new(Keyring::new([7; 32], [])));
+            let text = || vec!["Payroll questions go to jane.roe@example.com today.".to_owned()];
+            let (a, n) = rag.protect("acme", text()).await.unwrap();
+            let (b, _) = rag.protect("acme", text()).await.unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(a, b, "{scope}: the same surrogate at ingest and at query time");
+            assert!(!a[0].contains("jane.roe@example.com"), "{a:?}");
+            let (other, _) = rag.protect("acme", vec!["Ask sam.lee@example.com instead.".into()]).await.unwrap();
+            let surrogate = |s: &str| s.split_whitespace().find(|w| w.contains('@')).unwrap_or_default().to_owned();
+            assert_ne!(surrogate(&a[0]), surrogate(&other[0]), "two people, two surrogates");
+        }
+    }
+}

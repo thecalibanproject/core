@@ -159,7 +159,11 @@ async fn scenario(env: &Env) {
     assert_eq!(code.results[0].heading_path.last().map(String::as_str), Some("Error codes"));
     assert!(out.tokens <= out.budget);
 
-    // Personal data: never embedded or indexed in clear (the stand-in PII engine pseudonymises it).
+    // Personal data: never embedded or indexed in clear (the stand-in PII engine pseudonymises it),
+    // in documents or in queries; a query naming the person still finds the passage.
+    let who = env.search(&c, &format!("who is {EMAIL}")).await;
+    assert_eq!(who.results[0].heading_path.last().map(String::as_str), Some("Annual leave"), "{:?}", who.results);
+    assert!(who.context.contains(EMAIL), "the caller's own context is in clear (the run anonymizes it)");
     let embedded = env.services.embedded.lock().clone();
     assert!(embedded.iter().all(|t| !t.contains(EMAIL)), "the embedder saw the raw email");
     assert!(embedded.iter().any(|t| t.contains("@example.com")), "surrogates are indexed instead");

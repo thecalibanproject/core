@@ -352,3 +352,65 @@ async fn documents_are_ingested_indexed_and_searched_by_a_node() {
         }
     }
 }
+
+/// Personal data with the real PII engine and reversible surrogates: documents and queries are
+/// pseudonymised with the same tenant-scope key, so a question naming only a person finds the
+/// passage that names them (no reranker here: the BM25 leg matches the surrogate), while the
+/// embedder, the vector index and the model never see the address.
+#[tokio::test]
+async fn personal_data_is_pseudonymised_on_both_sides() {
+    let j = journal().await;
+    let store: Arc<dyn RagStore> = Arc::new(MemoryRagStore::new());
+    let index = Arc::new(MemoryIndex::new());
+    let e = rag_env(Some(Arc::clone(&j)), Arc::clone(&store), reader(), "").await;
+    let (s, v) =
+        send(&e.cp_app, "PATCH", "/api/v1/tenants/acme", ADMIN, Some(json!({"pii_default": "reversible"})), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let prefix = "caliban_rag_pii".to_owned();
+    let rt = RagRuntime {
+        store: Arc::clone(&store),
+        index: Arc::clone(&index) as _,
+        prefix: prefix.clone(),
+        concurrency: 1,
+    };
+    let w = rag_worker(&e, &j, &rt);
+    // No reranker: the ranking comes from the dense and BM25 legs over pseudonymised text.
+    let (s, v) =
+        send(&e.cp_app, "POST", C, ADMIN, Some(json!({"name": "people", "embedding_model": "oa/emb"})), &[]).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    // Two documents (passages of one document are cited in reading order, not by score).
+    let facilities = "# Facilities\n\nFacilities requests go to sam.lee@example.com at the front desk.";
+    let payroll = "# Payroll contacts\n\nPayroll questions go to jane.roe@example.com, who approves overtime.";
+    for (id, content) in [("facilities", facilities), ("contacts", payroll)] {
+        let (s, _) = ingest(&e, "people", json!({"doc_id": id, "content": content, "trust": "trusted"})).await;
+        assert_eq!(s, StatusCode::ACCEPTED);
+    }
+    index_all(&w).await;
+
+    // Nothing readable in the index: vectors of pseudonymised text, keyed term ids, sealed text.
+    let c = store.collection("acme", "people").await.unwrap().unwrap();
+    for p in index.points(&c.index_name(&prefix)) {
+        let raw = serde_json::to_string(&p.payload).unwrap();
+        assert!(!raw.contains("jane.roe") && !raw.contains("sam.lee") && !raw.contains("Payroll"), "{raw}");
+        assert!(!raw.contains("\"contacts\""), "{raw}");
+    }
+    let spec = json!({"kind": "agent", "prompt": {"system": "You find contacts."}, "model_policy": {},
+        "budgets": {"steps": 8, "tokens": 100000, "wall_clock_s": 60},
+        "datasources": {"scopes": ["rag.people:read"]},
+        "tools": [{"ref": "builtin://rag_search", "effect": "read"}]});
+    e.publish("contacts", spec).await;
+    let (s, v) =
+        send(&w.app, "POST", "/v1/nodes/contacts/runs", KEY, Some(json!({"input": format!("Who is {EMAIL}?")})), &[])
+            .await;
+    assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("succeeded")), "{v}");
+    // The question names only the person: the passage that names them ranks first, matched
+    // through the same surrogate on both sides.
+    let out = v["output"].to_string();
+    assert!(out.contains("[1] Payroll contacts (doc contacts v1"), "{out}");
+    for x in e.mock.log() {
+        let body = x.body.to_string();
+        assert!(!body.contains(EMAIL), "{} saw the address: {body}", x.path);
+    }
+    let embedded = e.mock.log().iter().filter(|x| x.path == "/v1/embeddings").count();
+    assert!(embedded >= 2, "{embedded}");
+}
