@@ -23,8 +23,8 @@ checked by `NodeSpec::validate` (`crates/caliban-nodes`). The parts the core enf
 | `description` | What the node does (the MCP server's tool description) |
 | `prompt.input_schema`, `prompt.output_schema` | Checked against the run input and the run output; the input schema is also the MCP tool's input schema and decides how chat messages become the input ([Chat shortcut](#the-chat-shortcut-model-nodename)) |
 | `model_policy.model` | The model the calls ask for; default: the first `candidates` entry that is a model id (not `tier:...`), else `caliban/auto` |
-| `tools` | `{"ref", "effect": "read"\|"write", "allow_tainted"?: [label patterns]}`. `ref`: `mcp://server/tool#sha256:<hash>` (an approved, pinned manifest of a registered server; see [tools.md](tools.md)), `node://name@vN` (another node of the tenant, pinned to a version) or `builtin://datasource_query` (read only) |
-| `datasources.scopes` | `<datasource>.<object>:<read\|write>` |
+| `tools` | `{"ref", "effect": "read"\|"write", "allow_tainted"?: [label patterns]}`. `ref`: `mcp://server/tool#sha256:<hash>` (an approved, pinned manifest of a registered server; see [tools.md](tools.md)), `node://name@vN` (another node of the tenant, pinned to a version), `builtin://datasource_query` or `builtin://rag_search` (both read only) |
+| `datasources.scopes` | `<datasource>.<object>:<read\|write>`; `rag.<collection or *>:read` names document collections for `builtin://rag_search` ([rag.md](rag.md)) |
 | `budgets` | `steps`, `tokens`, `wall_clock_s`, optional `usd`; `depth` (subnode nesting, default 3) and `fanout` (map concurrency, default 8). See [Budgets](#budgets) |
 | `guards` | `max_repeats` (loop guard, default 3), `tool_retries` (default 2). See [Guards](#guards) |
 | `graph` | `entry` (default: the first vertex), `vertices`, `edges` (`from`, `to`, optional `when`) |
@@ -78,8 +78,8 @@ a tool that cannot be resolved refuses the run before the first call.
 
 **Tools.** `node://name@vN` is handled by the executor. Other references go through the data
 plane's tool registry: `mcp://` resolves only to an approved manifest of a server the tenant
-registered, `builtin://datasource_query` to the built-in query tool; any other scheme is an
-unknown tool kind. A tool not trusted with personal data gets PII surrogates in its arguments; tool
+registered, `builtin://datasource_query` and `builtin://rag_search` to the built-in query and
+retrieval tools; any other scheme is an unknown tool kind. A tool not trusted with personal data gets PII surrogates in its arguments; tool
 results are anonymized as they enter the run; values carry taint labels, and a write with tainted
 arguments needs an allowlist entry or a human approval. All of this is in [tools.md](tools.md).
 
@@ -120,7 +120,8 @@ by one as `{"kind", "message", "path"?}` with `kind` one of `spec`, `tool`, `dat
   3,600, depth 5, fanout 32). Promoting a version checks the current caps again;
 - every `mcp://server/tool#sha256:...` names an approved manifest, with exactly that pin, of a
   server the tenant registered (the tool registry, [tools.md](tools.md)); `builtin://` tools are
-  read only, and `builtin://datasource_query` needs `datasources.scopes`.
+  read only, `builtin://datasource_query` needs `datasources.scopes`, and `builtin://rag_search`
+  needs `rag.<collection>:read` scopes, each naming a document collection the tenant has.
 
 Retiring a version that another published version calls is a `409`, as is deleting a published
 version (retire it first).
@@ -457,15 +458,16 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON node_run, node_step, node_event, node_ru
 GRANT SELECT, INSERT, UPDATE ON node_spend TO caliban_worker;
 GRANT SELECT, UPDATE ON node_eval TO caliban_worker;                -- evals (0024): claims, results
 GRANT SELECT, INSERT, UPDATE ON node_eval_trial TO caliban_worker;
+GRANT SELECT, UPDATE ON rag_collection, rag_document TO caliban_worker;  -- retrieval (0029): indexing, purges
 ALTER ROLE caliban_worker BYPASSRLS;  -- the journal tables have per-tenant row-level security; a worker serves every tenant
 ```
 
 (`DELETE` on `node_run` is for the retention purge, which removes a finished run's steps and
 events with it; `DELETE` on `node_audit` empties the audit outbox once the control plane has it; `node_spend` holds the tenants' spend per day, see [Budgets](#budgets). No
-sequence grants are needed: `node_step.seq` is an identity column. Workers write nothing else:
-usage goes to the control plane over HTTP, and tools reach them in the snapshot. The test
-`postgres_worker_grants_are_enough` runs a worker's journal operations as a role with exactly these
-grants.)
+sequence grants are needed: `node_step.seq` is an identity column. Workers write nothing else
+but the indexing state of retrieval documents ([rag.md](rag.md)): usage goes to the control plane
+over HTTP, and tools reach them in the snapshot. The test `postgres_worker_grants_are_enough` runs
+a worker's journal and indexing operations as a role with exactly these grants.)
 
 **More than one worker needs Valkey.** Exactly-once model calls across workers (a run taken over
 after a crash replays its in-flight call against the stored response) need the shared
@@ -644,8 +646,6 @@ the person's email reaches the tool server.
   untrusted (`caller`), never to instructions.
 - MCP: the human step of a synchronous `tools/call` is answered through the run API (MCP's
   multi-round-trip input requests are not used); MCP Tasks need the `2026-07-28` protocol.
-- RAG search as a built-in tool: `caliban-rag` has no retriever yet (TODO; the `retrieved` taint
-  label is reserved for it).
 - Journal rows of a deleted tenant stay until retention purges them (unreadable meanwhile: its data
   key is destroyed). Node specs are stored in clear in the control-plane database, as before; they
   are sealed only in snapshots and journals.

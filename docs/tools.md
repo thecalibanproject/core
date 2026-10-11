@@ -1,7 +1,7 @@
 # Node tools
 
 A node calls tools in three ways: another node (`node://name@vN`, see [nodes.md](nodes.md)), a
-built-in tool (`builtin://datasource_query`), or a tool of an MCP server the tenant registered
+built-in tool (`builtin://datasource_query`, `builtin://rag_search`), or a tool of an MCP server the tenant registered
 (`mcp://server/tool#sha256:<pin>`). Caliban is the MCP client of those servers and the single
 place where their use is enforced: which servers exist, which manifests are approved, which
 addresses can be reached, which credentials are sent, which data may leave, and which writes need
@@ -169,7 +169,7 @@ default; full CaMeL is an opt-in template later):
 |---|---|
 | `tool:<server>/<tool>` | The output of an MCP tool |
 | `datasource` | Rows from the built-in query tool |
-| `retrieved` | Retrieved documents (reserved: there is no RAG tool yet) |
+| `retrieved` | Passages from the built-in retrieval tool, `builtin://rag_search` ([rag.md](rag.md)) |
 | `caller` | A run input that holds [untrusted caller data](#untrusted-caller-data) |
 | `pii` | A run input that holds personal data |
 
@@ -292,7 +292,15 @@ principal that can write is refused), with the compiler's `maxTimeMS`, at most 2
 datasource kinds are refused until their lane exists. The datasources (credentials sealed) and the
 approved ontology reach the data plane only when a published node of the tenant uses the tool.
 
-RAG search is not built in yet: `caliban-rag` has no retriever (TODO).
+**`builtin://rag_search`** (read only; the node must declare at least one
+`rag.<collection>:read` or `rag.*:read` scope in `datasources.scopes`). It searches the tenant's
+document collections the node may read, narrowed to the invoking API key's datasource scopes when
+the key has any, and returns the best passages as `context` with citations (document id, heading
+path, chunk id) under a token budget. Its result carries the `retrieved` label. It runs in process
+and pseudonymises the query itself before anything is embedded, so it is a trusted tool (its
+arguments are not pseudonymised by the guard); its result is anonymized as it enters the run like
+any other. Collections, ingest, the poisoning controls and the search pipeline are described in
+[rag.md](rag.md).
 
 ## Settings
 

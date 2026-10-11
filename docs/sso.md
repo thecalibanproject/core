@@ -94,6 +94,7 @@ content: inputs, outputs, questions; it is the tenant's data and may hold person
 
 Tool permissions ([tools](tools.md)): `tools.read`, `tools.write`, `tools.approve`; owner, admin and
 `tenant_admin` hold all three, `developer` read and write, `viewer` and `auditor` read.
+Retrieval permissions ([rag](rag.md)): `rag.read`, `rag.write`, `rag.approve`, held the same way.
 Roles come from three places and add up:
 
 - **Group mappings in the config file** (`[[security.oidc.role_mappings]]`, or
@@ -156,6 +157,15 @@ tenants the caller may see. A refusal is `403` with `error.type = "permission_er
 | `POST /api/v1/tenants/{tenantId}/tool-servers/{server}/tools` | `tools.write` | owner, admin, tenant_admin, developer |
 | `POST /api/v1/tenants/{tenantId}/tool-servers/{server}/tools/{tool}/approve` | `tools.approve` | owner, admin, tenant_admin |
 | `POST /api/v1/tenants/{tenantId}/tool-servers/{server}/tools/{tool}/revoke` | `tools.approve` | owner, admin, tenant_admin |
+| `GET /api/v1/tenants/{tenantId}/rag/collections` | `rag.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `POST /api/v1/tenants/{tenantId}/rag/collections` | `rag.write` | owner, admin, tenant_admin, developer |
+| `GET /api/v1/tenants/{tenantId}/rag/collections/{collection}` | `rag.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `DELETE /api/v1/tenants/{tenantId}/rag/collections/{collection}` | `rag.write` | owner, admin, tenant_admin, developer |
+| `GET /api/v1/tenants/{tenantId}/rag/collections/{collection}/documents` | `rag.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `POST /api/v1/tenants/{tenantId}/rag/collections/{collection}/documents` | `rag.write` | owner, admin, tenant_admin, developer |
+| `GET /api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}` | `rag.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `DELETE /api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}` | `rag.write` | owner, admin, tenant_admin, developer |
+| `POST /api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}/release` | `rag.approve` | owner, admin, tenant_admin |
 | `GET /api/v1/tenants/{tenantId}/runs` | `runs.read` | owner, admin, auditor, tenant_admin, developer, viewer |
 | `GET /api/v1/tenants/{tenantId}/runs/{runId}` | `runs.read` (content with `runs.data`) | owner, admin, auditor, tenant_admin, developer, viewer |
 | `POST /api/v1/tenants/{tenantId}/runs/{runId}/input` | `runs.answer` | owner, admin, tenant_admin |

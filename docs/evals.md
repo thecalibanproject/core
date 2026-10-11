@@ -140,6 +140,16 @@ MCP tool servers (rmcp) and the real PII engine in reversible mode:
 | `desk`, an ordinary run of the `caller.marked_field` input without the mark (negative control) | | The real write tool receives the canary: unmarked input is trusted, so the mark is what blocks it |
 | `scribe` (negative control) | a poisoned manifest approved with its findings acknowledged | `poisoning.manifest_scan` fails |
 
+**Through the real retrieval tool.** The suite's retrieved-document cases inject into a sandboxed
+read tool. `an_injection_in_a_retrieved_document_cannot_drive_a_write` (in
+`injection_tests.rs`, so it runs in the CI injection job) plays `write.retrieved_doc` through the
+real path instead: a document carrying the instruction is ingested from a trusted source through
+the admin API (an untrusted copy is quarantined at ingest), indexed by a worker, and retrieved by
+`builtin://rag_search`. The compromised model follows it, the write waits for a human because its
+arguments carry `retrieved`, and a denial sends nothing. The negative control, the same node with
+`allow_tainted: ["retrieved"]`, sends the email: the injection did reach the model, and the taint
+rule is what stopped it. See [rag.md](rag.md).
+
 The same tests check that the real tool servers receive no call during an eval, that the canary
 contact never reaches the model, that a manifest changed after its approval (a rug pull) is
 refused at call time and never shown to the model, and that discovery flags the poisoned manifest.
