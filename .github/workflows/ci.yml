@@ -66,8 +66,25 @@ jobs:
       # shipping, schema checks, MCP tools, PII across tools), the exposure tests (event streams
       # resumed on another worker, listing and cancellation across workers, the chat shortcut, the
       # MCP server and Tasks, the console inbox, the audit chain) and caliban/auto handing to nodes.
+      # Evals on Postgres: golden sets, promotion bars, eval claims and trials in the parity suite,
+      # the eval runner on the executor, golden-set evals and the injection suite end to end.
       - run: cargo test -p caliban-nodes
-      - run: cargo test -p caliban --bin caliban -- nodes_tests exposure_tests auto_tests
+      - run: cargo test -p caliban --bin caliban -- nodes_tests exposure_tests auto_tests evals_tests injection_tests
+
+  injection:
+    name: Injection suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      # The AgentDojo-style injection suite (docs/evals.md), deterministic: a scripted compromised
+      # model follows every injected instruction, so this proves the Rust-side defenses (taint and
+      # approvals, the PII guard, declared tools only, pinned and scanned manifests) hold whatever
+      # the model does. Real gateways, real MCP tool servers, the real PII engine; negative
+      # controls must fail. Prints the pass rate per node and case.
+      - run: 'cargo test -p caliban-nodes -- eval:: executor::tests::evals'
+      - run: cargo test -p caliban --bin caliban injection_tests -- --nocapture
 
   valkey:
     name: Valkey quota store
