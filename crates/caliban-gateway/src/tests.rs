@@ -386,6 +386,68 @@ async fn anthropic_native_passthrough_keeps_cache_control_and_protects_text() {
     assert_eq!(evs.last().unwrap()["type"], "message_stop");
 }
 
+/// A conversation sent back to the model carries the arguments of its earlier tool calls,
+/// rehydrated. PII protection covers them on both paths: `tool_calls[].function.arguments` on
+/// Chat Completions, `tool_use.input` on the native Anthropic path.
+#[tokio::test]
+async fn earlier_tool_call_arguments_are_protected_on_both_paths() {
+    let (app, log, _) = setup().await;
+    let args = format!("{{\"to\":\"{EMAIL}\",\"subject\":\"plan\"}}");
+    let chat = json!({"model": "ext/mock", "messages": [
+        {"role": "user", "content": "Send the plan"},
+        {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "send", "arguments": args}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "sent"},
+        {"role": "user", "content": "thanks"}]});
+    let (status, _, out) = call(&app, "/v1/chat/completions", BEARER, chat).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let (path, _, sent) = log.last();
+    assert_eq!(path, "chat");
+    assert!(!sent.to_string().contains(EMAIL), "{sent}");
+    let sent_args: Value =
+        serde_json::from_str(sent["messages"][1]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(sent_args["subject"], "plan", "the arguments stay valid JSON: {sent_args}");
+
+    let native = json!({"model": "anth/claude", "max_tokens": 50, "messages": [
+        {"role": "user", "content": "Send the plan"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "send", "input": {"to": EMAIL, "cc": [EMAIL], "subject": "plan"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "sent"}, {"type": "text", "text": "thanks"}]}]});
+    let (status, h, out) = call(&app, "/v1/messages", ANTH, native).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let (path, _, sent) = log.last();
+    assert_eq!(path, "messages");
+    assert!(!sent.to_string().contains(EMAIL), "{sent}");
+    let input = &sent["messages"][1]["content"][0];
+    assert_eq!(
+        (input["type"].as_str(), input["id"].as_str(), input["name"].as_str()),
+        (Some("tool_use"), Some("t1"), Some("send"))
+    );
+    assert_eq!(input["input"]["subject"], "plan");
+    assert_eq!(input["input"]["to"], input["input"]["cc"][0], "one value, one surrogate");
+    assert_eq!(h["x-caliban-pii-entities"], "2");
+}
+
+/// Caliban sets prefix-cache salts itself, or none: a client's `cache_salt` never reaches an
+/// upstream, on the OpenAI-shaped path or the native Anthropic one.
+#[tokio::test]
+async fn a_client_cache_salt_is_stripped() {
+    let (app, log, _) = setup().await;
+    for model in ["ext/mock", "local/mock"] {
+        let mut body = chat_body("hello");
+        body["model"] = json!(model);
+        body["cache_salt"] = json!("another-tenants-salt");
+        let (status, _, out) = call(&app, "/v1/chat/completions", BEARER, body).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert!(log.last().2.get("cache_salt").is_none(), "{model}: {}", log.last().2);
+    }
+    let native = json!({"model": "anth/claude", "max_tokens": 50, "cache_salt": "another-tenants-salt",
+        "messages": [{"role": "user", "content": "hello"}]});
+    let (status, _, out) = call(&app, "/v1/messages", ANTH, native).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let (path, _, sent) = log.last();
+    assert_eq!(path, "messages");
+    assert!(sent.get("cache_salt").is_none(), "{sent}");
+}
+
 #[tokio::test]
 async fn openai_client_on_anthropic_provider() {
     let (app, log, _) = setup().await;

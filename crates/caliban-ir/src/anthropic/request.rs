@@ -272,10 +272,13 @@ fn tool_choice_to_openai(tc: &Value) -> Option<Value> {
     })
 }
 
-/// Visits every text segment the client wrote: `system` (string or text blocks), message text
-/// (string or `text` blocks), `tool_result` content and plain-text documents. Used to apply PII
-/// protection to a native body without disturbing `cache_control` or other block fields.
-/// (`tool_use.input` is not visited, matching tool-call arguments on the OpenAI path.)
+/// Visits every text segment the model reads: `system` (string or text blocks), message text
+/// (string or `text` blocks), `tool_result` content, plain-text documents, and every string in
+/// the `input` of the `tool_use` blocks in assistant turns (a conversation sent back to the model
+/// carries the arguments of its earlier calls, rehydrated: PII protection must see them too, as
+/// it sees tool-call arguments on the Chat Completions path). Object keys, ids and tool names are
+/// not visited. Used to apply PII protection to a native body without disturbing `cache_control`
+/// or other block fields.
 pub fn for_each_text_mut(body: &mut Value, mut f: impl FnMut(&mut String)) {
     if let Some(sys) = body.get_mut("system") {
         visit(sys, &mut f);
@@ -305,6 +308,11 @@ fn visit(v: &mut Value, f: &mut dyn FnMut(&mut String)) {
                             visit(c, f);
                         }
                     }
+                    Some("tool_use") => {
+                        if let Some(input) = b.get_mut("input") {
+                            json_strings(input, f);
+                        }
+                    }
                     Some("document") if b.pointer("/source/type").and_then(Value::as_str) == Some("text") => {
                         if let Some(Value::String(s)) = b.pointer_mut("/source/data") {
                             f(s);
@@ -314,6 +322,16 @@ fn visit(v: &mut Value, f: &mut dyn FnMut(&mut String)) {
                 }
             }
         }
+        _ => {}
+    }
+}
+
+/// Every string value in a JSON value (not object keys), in document order.
+fn json_strings(v: &mut Value, f: &mut dyn FnMut(&mut String)) {
+    match v {
+        Value::String(s) => f(s),
+        Value::Array(a) => a.iter_mut().for_each(|x| json_strings(x, f)),
+        Value::Object(o) => o.values_mut().for_each(|x| json_strings(x, f)),
         _ => {}
     }
 }
@@ -598,12 +616,12 @@ mod tests {
     }
 
     #[test]
-    fn text_visitor_covers_system_text_and_tool_results_only() {
+    fn text_visitor_covers_system_text_tool_inputs_and_tool_results() {
         let mut body = json!({
             "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
             "messages": [
                 {"role": "user", "content": "a"},
-                {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "n", "input": {"q": "x"}}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "n", "input": {"q": "x", "n": 3, "to": ["y"]}}]},
                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "r"},
                                              {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
                                              {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}}]}
@@ -614,8 +632,13 @@ mod tests {
             seen.push(s.clone());
             s.push('!');
         });
-        assert_eq!(seen, ["s", "a", "r", "b"]);
+        assert_eq!(seen, ["s", "a", "x", "y", "r", "b"]);
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        // Tool inputs: string values only; keys, ids, names and numbers are untouched.
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            json!({"type": "tool_use", "id": "t", "name": "n", "input": {"q": "x!", "n": 3, "to": ["y!"]}})
+        );
         assert_eq!(body["messages"][2]["content"][2]["text"], "b!");
     }
 

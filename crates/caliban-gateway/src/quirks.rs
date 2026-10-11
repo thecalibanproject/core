@@ -5,7 +5,8 @@
 //!   (`chat_template_kwargs.enable_thinking` for Qwen3 hybrid thinking, `reasoning_effort` for
 //!   gpt-oss/OpenAI).
 //! - Prefix-cache isolation: adds a per-tenant `cache_salt` for engines that support it, so one
-//!   tenant cannot probe another's cached prefixes through timing.
+//!   tenant cannot probe another's cached prefixes through timing. A `cache_salt` the client sent
+//!   is always removed, whether or not the provider gets one from Caliban.
 //! - `<think>` tags: when a server returns reasoning inline in `content`, it is moved to
 //!   `reasoning_content` so clients see the same shape as with a reasoning parser.
 //! - Stream usage: every stream asks for `stream_options.include_usage` (metering needs the
@@ -52,6 +53,10 @@ pub fn shape_request(
             }
         }
     }
+    // Caliban sets the salt or none: a client-supplied one is always dropped. Otherwise a caller
+    // could pick another tenant's salt (or a shared one) and probe that tenant's cached prefixes
+    // through timing, or opt itself out of isolation on a shared pool.
+    obj.remove("cache_salt");
     if provider.cache_salt {
         obj.insert("cache_salt".into(), Value::String(tenant_salt.to_owned()));
     }
@@ -274,6 +279,22 @@ mod tests {
         m.capabilities.rejects_stream_options = true;
         shape_request(&mut body, &m, &provider(false), None, "s");
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn a_client_cache_salt_never_reaches_the_upstream() {
+        // A provider without salting: the client's salt is dropped, none is sent.
+        let mut body = json!({"model": "m", "cache_salt": "another-tenants-salt"});
+        shape_request(&mut body, &model(ReasoningControl::None), &provider(false), None, "mine");
+        assert!(body.get("cache_salt").is_none(), "{body}");
+        // A salting provider: Caliban's salt replaces the client's.
+        let mut body = json!({"model": "m", "cache_salt": "another-tenants-salt"});
+        shape_request(&mut body, &model(ReasoningControl::None), &provider(true), None, "mine");
+        assert_eq!(body["cache_salt"], "mine");
+        // Not a string either: still removed.
+        let mut body = json!({"model": "m", "cache_salt": {"x": 1}});
+        shape_request(&mut body, &model(ReasoningControl::None), &provider(false), None, "mine");
+        assert!(body.get("cache_salt").is_none());
     }
 
     #[test]

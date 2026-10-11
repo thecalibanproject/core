@@ -236,6 +236,8 @@ async fn run(
                 if let Some(o) = b.as_object_mut() {
                     o.insert("model".into(), Value::String(model.upstream_model.clone()));
                     o.remove("caliban");
+                    // Caliban sets prefix-cache salts itself, or none (see `quirks::shape_request`).
+                    o.remove("cache_salt");
                 }
                 (b, entities, rh)
             }
