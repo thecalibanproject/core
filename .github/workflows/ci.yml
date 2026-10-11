@@ -70,6 +70,11 @@ jobs:
       # the eval runner on the executor, golden-set evals and the injection suite end to end.
       - run: cargo test -p caliban-nodes
       - run: cargo test -p caliban --bin caliban -- nodes_tests exposure_tests auto_tests evals_tests injection_tests
+      # Retrieval on Postgres: the document registry's parity suite (claims under a lease, quarantine
+      # and release, supersede on ready, purges, the audit outbox) and the pipeline with the
+      # registry on Postgres; then the end-to-end tests through the admin API and rag_search.
+      - run: cargo test -p caliban-rag --test store --test pipeline
+      - run: cargo test -p caliban --bin caliban -- rag_tests
 
   injection:
     name: Injection suite
@@ -82,7 +87,8 @@ jobs:
       # model follows every injected instruction, so this proves the Rust-side defenses (taint and
       # approvals, the PII guard, declared tools only, pinned and scanned manifests) hold whatever
       # the model does. Real gateways, real MCP tool servers, the real PII engine; negative
-      # controls must fail. Prints the pass rate per node and case.
+      # controls must fail. Prints the pass rate per node and case. Includes the retrieved-document
+      # case through the real rag_search tool (indexed documents, memory registry and index).
       - run: 'cargo test -p caliban-nodes -- eval:: executor::tests::evals'
       - run: cargo test -p caliban --bin caliban injection_tests -- --nocapture
 
@@ -111,7 +117,7 @@ jobs:
       - run: 'cargo test -p caliban-meter -- --nocapture quota:: idempotency::'
 
   qdrant:
-    name: Qdrant semantic cache store
+    name: Qdrant (semantic cache, retrieval)
     runs-on: ubuntu-latest
     services:
       qdrant:
@@ -131,6 +137,11 @@ jobs:
       - run: for i in $(seq 1 30); do curl -sf http://localhost:6333/readyz && exit 0; sleep 2; done; exit 1
       - run: cargo test -p caliban-cache --test qdrant -- --nocapture
       - run: cargo test -p caliban-gateway semantic_miss_latency_against_qdrant -- --nocapture
+      # Retrieval with its vectors in Qdrant: the pipeline (hybrid search with sparse BM25 vectors,
+      # readiness filters, navigation trees, purges, dropped collections), the end-to-end tests and
+      # the injection case through rag_search.
+      - run: cargo test -p caliban-rag --test pipeline
+      - run: cargo test -p caliban --bin caliban -- rag_tests an_injection_in_a_retrieved_document
 
   ner:
     name: Build with NER (ONNX Runtime)
