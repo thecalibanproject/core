@@ -966,6 +966,10 @@ pub struct TenantConfig {
     /// not listed may run every published node of the tenant.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub api_key_nodes: BTreeMap<String, Vec<String>>,
+    /// The tenant's eval key (rendered by the control plane): a key hash in `api_key_hashes` that
+    /// node runs of evals use internally and the data plane refuses on its endpoints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eval_key_hashes: Vec<String>,
     /// The tenant's data key, wrapped by a KEK: node workers seal run journals with it. Rendered
     /// when the tenant has published nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]

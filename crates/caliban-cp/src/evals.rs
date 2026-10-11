@@ -19,7 +19,8 @@ use crate::auth::Principal;
 use crate::auth::rbac::Perm;
 use crate::nodes::NodeError;
 use crate::runs::{drain_audit, journal, journal_error, sealer};
-use crate::store::{NodeRecord, NodeState, State};
+use crate::store::audit::now_micros;
+use crate::store::{ApiKeyRecord, EVAL_KEY_PURPOSE, Mutation, NodeRecord, NodeState, State, StoreError, new_id};
 use crate::{ApiError, ApiResult, Cp, bad, not_found};
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State as AxState};
@@ -36,6 +37,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 fn unprocessable(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg.into())
@@ -388,8 +390,9 @@ pub(crate) async fn get_gate(
 pub(crate) struct StartBody {
     /// `golden` or `injection`.
     suite: String,
-    /// The tenant API key the eval's runs and judge calls are made, limited and metered as.
-    api_key_id: String,
+    /// A tenant API key the eval's runs and judge calls are made, limited and metered as. Absent
+    /// (the default): the tenant's eval key, which the control plane creates on first use.
+    api_key_id: Option<String>,
     k: Option<u32>,
     concurrency: Option<u32>,
     /// Golden: only these cases.
@@ -485,14 +488,21 @@ pub(crate) async fn start(
     let spec = spec_of(&n)?;
     let suite = Suite::parse(&body.suite)
         .ok_or_else(|| unprocessable(format!("unknown suite '{}' (golden or injection)", body.suite)))?;
-    let key = st
-        .api_keys
-        .iter()
-        .find(|k| k.id == body.api_key_id && k.tenant_id == tenant_id && k.is_active())
-        .ok_or_else(|| unprocessable(format!("no active API key '{}' in tenant {tenant_id}", body.api_key_id)))?;
-    if key.nodes.as_ref().is_some_and(|allowed| !allowed.contains(&name)) {
-        return Err(unprocessable(format!("API key '{}' may not run node {name}", key.id)));
-    }
+    let key = match &body.api_key_id {
+        Some(id) => {
+            let key = st
+                .api_keys
+                .iter()
+                .find(|k| &k.id == id && k.tenant_id == tenant_id && k.is_active())
+                .cloned()
+                .ok_or_else(|| unprocessable(format!("no active API key '{id}' in tenant {tenant_id}")))?;
+            if key.nodes.as_ref().is_some_and(|allowed| !allowed.contains(&name)) {
+                return Err(unprocessable(format!("API key '{}' may not run node {name}", key.id)));
+            }
+            key
+        }
+        None => eval_key(&cp, &tenant_id, &p.actor).await?,
+    };
     let k = body.k.unwrap_or(match suite {
         Suite::Golden => 3,
         Suite::Injection => 1,
@@ -581,6 +591,74 @@ pub(crate) async fn start(
     let e = j.create_eval(new, Some(a)).await.map_err(journal_error)?;
     drain_audit(&cp, &j).await?;
     Ok((StatusCode::ACCEPTED, Json(eval_view(&e))))
+}
+
+// ───────────────────────────── the eval key ─────────────────────────────
+
+/// The tenant's eval key (P3 decision 9), created on first use: an API key the control plane
+/// manages for evals. Only its hash exists (the secret is generated and dropped at once), the
+/// data plane refuses it on its endpoints (`eval_key_hashes` in the snapshot), and it may run
+/// every node of the tenant. Created audited as `api_key.create` with `purpose: eval`.
+pub(crate) async fn eval_key(cp: &Cp, tenant: &str, actor: &str) -> ApiResult<ApiKeyRecord> {
+    for _ in 0..3 {
+        if let Some(k) =
+            cp.store.state().api_keys.iter().find(|k| k.tenant_id == tenant && k.is_active() && k.is_eval())
+        {
+            return Ok(k.clone());
+        }
+        match cp.store.apply(actor, Mutation::CreateApiKey(new_eval_key(tenant))).await {
+            // Created here, or concurrently by another replica: read it back.
+            Ok(_) | Err(StoreError::Conflict(_)) => {
+                cp.store.refresh().await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(conflict("the tenant's eval key is being created concurrently; retry"))
+}
+
+fn new_eval_key(tenant: &str) -> ApiKeyRecord {
+    // The plaintext is never stored, logged or returned: nobody can present this key.
+    let secret = Zeroizing::new(crate::generate_api_key());
+    ApiKeyRecord {
+        id: new_id("key"),
+        tenant_id: tenant.to_owned(),
+        name: "evals (managed by Caliban)".into(),
+        prefix: "cal_eval".into(),
+        hash: caliban_types::hash_api_key(&secret),
+        created_at: now_micros(),
+        revoked_at: None,
+        nodes: None,
+        datasource_scopes: None,
+        purpose: Some(EVAL_KEY_PURPOSE.into()),
+    }
+}
+
+/// `GET /tenants/{t}/eval-key` (`api_keys.read`): the tenant's eval key, if one was created.
+pub(crate) async fn get_eval_key(AxState(cp): AxState<Cp>, Path(tenant_id): Path<String>) -> ApiResult<Json<Value>> {
+    crate::ensure_tenant(&cp, &tenant_id)?;
+    let st = cp.store.state();
+    let k = st.api_keys.iter().find(|k| k.tenant_id == tenant_id && k.is_active() && k.is_eval());
+    Ok(Json(json!({"tenant_id": tenant_id, "key": k})))
+}
+
+/// `POST /tenants/{t}/eval-key/rotate` (`api_keys.write`): revokes the eval key and creates a new
+/// one (audited as `api_key.revoke` and `api_key.create`). Evals in flight lose their key: their
+/// remaining model calls fail, so rotate between evals.
+pub(crate) async fn rotate_eval_key(
+    AxState(cp): AxState<Cp>,
+    Extension(p): Extension<Principal>,
+    Path(tenant_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    crate::ensure_tenant(&cp, &tenant_id)?;
+    let old =
+        cp.store.state().api_keys.iter().find(|k| k.tenant_id == tenant_id && k.is_active() && k.is_eval()).cloned();
+    if let Some(k) = &old {
+        let m = Mutation::RevokeApiKey { tenant_id: tenant_id.clone(), id: k.id.clone(), at: now_micros() };
+        cp.store.apply(&p.actor, m).await?;
+    }
+    let key = eval_key(&cp, &tenant_id, &p.actor).await?;
+    Ok(Json(json!({"tenant_id": tenant_id, "key": key, "revoked": old.map(|k| k.id)})))
 }
 
 #[derive(Deserialize, Default)]
@@ -960,6 +1038,60 @@ mod tests {
         assert_eq!(gate["evidence"]["subnodes"]["mailer@v1"]["injection"]["eval"], id.as_str(), "{gate}");
         let (s, v) = call(&app, "POST", &format!("{N}/hub/promote"), Some(json!({"version": 1}))).await;
         assert_eq!((s, v["live"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
+    }
+
+    /// The tenant's eval key (P3 decision 9): created by the control plane on the first eval that
+    /// names no key, audited, never shown, refused by the customer key endpoints, rotated on
+    /// demand, absent from the data plane's usable keys (`eval_key_hashes`), revoked with the
+    /// tenant.
+    #[tokio::test]
+    async fn evals_use_a_managed_eval_key() {
+        let j: Arc<dyn Journal> = Arc::new(MemoryJournal::new());
+        let c = cp(Some(Arc::clone(&j)));
+        let app = app(Arc::clone(&c), None);
+        call(&app, "POST", &format!("{N}/plain/versions"), Some(json!({"spec": spec(json!([]))}))).await;
+        call(&app, "POST", &format!("{N}/plain/versions/1/publish"), None).await;
+        let (_, none) = call(&app, "GET", "/api/v1/tenants/acme/eval-key", None).await;
+        assert!(none["key"].is_null(), "{none}");
+        let body = json!({"suite": "injection", "input": {"case": "hi"}});
+        let (s, e) = call(&app, "POST", &format!("{N}/plain/versions/1/evals"), Some(body.clone())).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{e}");
+        let (_, k) = call(&app, "GET", "/api/v1/tenants/acme/eval-key", None).await;
+        let key = k["key"].clone();
+        assert_eq!((key["purpose"].as_str(), e["api_key_id"].clone()), (Some("eval"), key["id"].clone()), "{k}");
+        assert!(key.get("key").is_none() && key.get("hash").is_none(), "never shown: {key}");
+        // The same key for the next eval.
+        let (_, e2) = call(&app, "POST", &format!("{N}/plain/versions/1/evals"), Some(body.clone())).await;
+        assert_eq!(e2["api_key_id"], key["id"]);
+        // In the snapshot as a key hash workers know, and marked so the data plane refuses it.
+        let rec = c.store.state().api_keys.iter().find(|x| x.is_eval()).unwrap().clone();
+        let t = c.store.config.load().tenant(&"acme".into()).unwrap().clone();
+        assert!(t.api_key_hashes.contains(&rec.hash) && t.eval_key_hashes == [rec.hash.clone()]);
+        // The customer key endpoints leave it alone.
+        let kid = key["id"].as_str().unwrap();
+        let uri = format!("/api/v1/tenants/acme/api-keys/{kid}");
+        assert_eq!(call(&app, "DELETE", &uri, None).await.0, StatusCode::CONFLICT);
+        assert_eq!(call(&app, "PATCH", &uri, Some(json!({"nodes": []}))).await.0, StatusCode::CONFLICT);
+        // Rotation: a new key, the old one revoked; both audited.
+        let (s, r) = call(&app, "POST", "/api/v1/tenants/acme/eval-key/rotate", None).await;
+        assert_eq!((s, r["revoked"].as_str()), (StatusCode::OK, Some(kid)), "{r}");
+        assert_ne!(r["key"]["id"], key["id"]);
+        let a = actions(&app).await;
+        assert!(a.iter().filter(|x| *x == "api_key.create").count() >= 2 && a.contains(&"api_key.revoke".to_owned()));
+        let (_, audit) = call(&app, "GET", "/api/v1/audit?limit=100", None).await;
+        assert!(
+            audit["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["action"] == "api_key.create" && e["detail"]["purpose"] == "eval"),
+            "{audit}"
+        );
+        // An explicitly named customer key still works (kept: it is cheap).
+        let (_, ck) = call(&app, "POST", "/api/v1/tenants/acme/api-keys", Some(json!({"name": "mine"}))).await;
+        let named = json!({"suite": "injection", "input": {"case": "hi"}, "api_key_id": ck["id"]});
+        let (s, e3) = call(&app, "POST", &format!("{N}/plain/versions/1/evals"), Some(named)).await;
+        assert_eq!((s, e3["api_key_id"].clone()), (StatusCode::ACCEPTED, ck["id"].clone()), "{e3}");
     }
 
     #[tokio::test]

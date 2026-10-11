@@ -61,6 +61,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (24, "node_evals", include_str!("../../../../migrations/0024_node_evals.sql")),
     (25, "node_run_input_labels", include_str!("../../../../migrations/0025_node_run_input_labels.sql")),
     (26, "tool_manifest_network", include_str!("../../../../migrations/0026_tool_manifest_network.sql")),
+    (27, "api_key_purpose", include_str!("../../../../migrations/0027_api_key_purpose.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -1340,7 +1341,7 @@ async fn set_promotion(
 async fn insert_api_key(c: &mut PgConnection, k: &ApiKeyRecord) -> Result<(), StoreError> {
     exec(
         c,
-        sqlx::query("INSERT INTO api_key (id, tenant_id, name, prefix, sha256, created_at, revoked_at, nodes, datasource_scopes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
+        sqlx::query("INSERT INTO api_key (id, tenant_id, name, prefix, sha256, created_at, revoked_at, nodes, datasource_scopes, purpose) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
             .bind(&k.id)
             .bind(&k.tenant_id)
             .bind(&k.name)
@@ -1349,7 +1350,8 @@ async fn insert_api_key(c: &mut PgConnection, k: &ApiKeyRecord) -> Result<(), St
             .bind(k.created_at)
             .bind(k.revoked_at)
             .bind(&k.nodes)
-            .bind(&k.datasource_scopes),
+            .bind(&k.datasource_scopes)
+            .bind(&k.purpose),
     )
     .await
 }
@@ -1687,7 +1689,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
 
     // Revoked keys are loaded too (listed with `include_revoked`); `render` leaves them out.
     for r in
-        rows(c, "SELECT id, tenant_id, name, prefix, sha256, created_at, revoked_at, nodes, datasource_scopes FROM api_key ORDER BY ord")
+        rows(c, "SELECT id, tenant_id, name, prefix, sha256, created_at, revoked_at, nodes, datasource_scopes, purpose FROM api_key ORDER BY ord")
             .await?
     {
         st.api_keys.push(ApiKeyRecord {
@@ -1700,6 +1702,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             revoked_at: get(&r, "revoked_at")?,
             nodes: get(&r, "nodes")?,
             datasource_scopes: get(&r, "datasource_scopes")?,
+            purpose: get(&r, "purpose")?,
         });
     }
 

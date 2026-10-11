@@ -10,7 +10,7 @@ themselves are in [nodes.md](nodes.md), their tools and the defenses the suite e
 
 **Every eval run uses the normal path.** An eval of a published node version starts its trials
 as ordinary node runs: the worker's executor creates them (`origin: eval:<eval id>`, invoker
-`eval:<eval id>`) with the API key the eval names, so the input is checked against the input
+`eval:<eval id>`) with the tenant's [eval key](#the-eval-key) (or the API key the eval names), so the input is checked against the input
 schema, budgets and tenant spend caps apply, and every model call goes through the gateway
 pipeline (PII, caches, routing, quotas, metering, tracing). Usage events carry `node`,
 `node_version` and `run_id` as for any run. The LLM judge's calls go through the same pipeline,
@@ -219,18 +219,42 @@ which is audited.
 | `DELETE .../nodes/{name}/versions/{v}/golden-set` | `nodes.write` | `node.golden_set.delete` |
 | `GET .../nodes/{name}/eval-policy` | `nodes.read` | |
 | `PUT .../nodes/{name}/eval-policy` | `nodes.publish` | `node.eval_policy.update` (old and new bar) |
-| `POST .../nodes/{name}/versions/{v}/evals` `{"suite", "api_key_id", "k"?, "concurrency"?, "cases"?, "judge_model"?, "input"?, "input_case"?}` | `nodes.run` | `node.eval.start` |
+| `POST .../nodes/{name}/versions/{v}/evals` `{"suite", "api_key_id"?, "k"?, "concurrency"?, "cases"?, "judge_model"?, "input"?, "input_case"?}` | `nodes.run` | `node.eval.start` |
 | `GET .../nodes/{name}/versions/{v}/gate` | `nodes.read` | |
 | `GET /api/v1/tenants/{t}/evals` (`node`, `version`, `suite`, `status`, `limit`, `cursor`) | `nodes.read` | |
 | `GET /api/v1/tenants/{t}/evals/{id}` (trials; their `detail` with `runs.data`) | `nodes.read` | |
 | `POST /api/v1/tenants/{t}/evals/{id}/cancel` | `nodes.run` | `node.eval.cancel` |
+| `GET /api/v1/tenants/{t}/eval-key` | `api_keys.read` | |
+| `POST /api/v1/tenants/{t}/eval-key/rotate` | `api_keys.write` | `api_key.revoke`, `api_key.create` (`purpose: eval`) |
 
 `...` is `/api/v1/tenants/{t}`. The end of an eval is audited by its worker (`node.eval.finish`,
-with its main metric). Starting an eval needs an active API key of the tenant that may run the
-node: its quotas apply to the eval, and its usage is the eval's. `k` defaults to 3 (golden) and 1
+with its main metric). An eval runs as the tenant's [eval key](#the-eval-key) unless it names an
+active customer key (`api_key_id`) that may run the node: the key's quotas apply to the eval, and
+its usage is the eval's. `k` defaults to 3 (golden) and 1
 (injection), at most 10; at most 200 cases; `concurrency` (trials in flight) defaults to 4, at
 most 16. Everything lives next to the node journal, so a control plane without one answers `503`
 (and a version with write tools cannot be promoted there).
+
+## The eval key
+
+Evals need an API key: their runs and judge calls go through the pipeline as a key, which is
+limited and metered. Naming a customer key mixed eval traffic into that key's quotas and usage, and
+needed a key that could also serve production traffic. So the control plane creates and manages a
+dedicated key per tenant (P3 decision 9):
+
+- created on the first eval that names no key (`api_key.create`, `purpose: eval`), one active per
+  tenant (migration 0027);
+- its secret is generated and dropped at once: only its hash exists, like every key, and nobody
+  ever sees the plaintext;
+- the data plane refuses it on every endpoint (`401`; the snapshot lists it in `eval_key_hashes`):
+  it only serves eval runs and judge calls inside workers, which use the key hash directly. A worker
+  waits (like for the version) until the key reaches its snapshot;
+- it may run every node of the tenant; its usage, quotas and metering are the evals';
+- the customer key endpoints refuse to change or revoke it (`409`); rotate it with
+  `POST .../eval-key/rotate` (audited) between evals, since evals in flight lose it; it is revoked
+  with the tenant like every key.
+
+Naming a customer key (`api_key_id`) still works.
 
 ## Where evals run
 

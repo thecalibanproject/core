@@ -279,6 +279,8 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/tenants/{tenant_id}/nodes/{id}/versions/{version}/evals", post(evals::start))
         .route("/tenants/{tenant_id}/nodes/{id}/versions/{version}/gate", get(evals::get_gate))
         .route("/tenants/{tenant_id}/nodes/{id}/eval-policy", get(evals::get_policy).put(evals::put_policy))
+        .route("/tenants/{tenant_id}/eval-key", get(evals::get_eval_key))
+        .route("/tenants/{tenant_id}/eval-key/rotate", post(evals::rotate_eval_key))
         .route("/tenants/{tenant_id}/evals", get(evals::list))
         .route("/tenants/{tenant_id}/evals/{id}", get(evals::get))
         .route("/tenants/{tenant_id}/evals/{id}/cancel", post(evals::cancel))
@@ -663,8 +665,23 @@ async fn revoke_api_key(
     Extension(p): Extension<Principal>,
     Path((tenant_id, key_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    refuse_eval_key(&cp, &tenant_id, &key_id)?;
     cp.store.apply(&p.actor, Mutation::RevokeApiKey { tenant_id, id: key_id, at: now_micros() }).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The eval key is managed by the control plane: `409` on the customer key endpoints.
+fn refuse_eval_key(cp: &Cp, tenant_id: &str, key_id: &str) -> ApiResult<()> {
+    let st = cp.store.state();
+    if st.api_keys.iter().any(|k| k.tenant_id == tenant_id && k.id == key_id && k.is_eval()) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "this is the tenant's eval key, managed by the control plane: rotate it with \
+             POST /api/v1/tenants/{tenant_id}/eval-key/rotate (it is revoked with the tenant)"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -690,6 +707,7 @@ async fn update_api_key(
     if body.nodes.is_some() && !p.allows(Perm::NodesRun, Some(&tenant_id)) {
         return Err(auth::forbidden("changing an API key's node access needs the nodes.run permission"));
     }
+    refuse_eval_key(&cp, &tenant_id, &key_id)?;
     let m = Mutation::UpdateApiKey {
         tenant_id: tenant_id.clone(),
         id: key_id.clone(),
@@ -738,6 +756,7 @@ async fn create_api_key(
         revoked_at: None,
         nodes,
         datasource_scopes: body.datasource_scopes,
+        purpose: None,
     };
     cp.store.apply(&p.actor, Mutation::CreateApiKey(rec.clone())).await?;
     let mut v = serde_json::to_value(&rec).unwrap_or_default();

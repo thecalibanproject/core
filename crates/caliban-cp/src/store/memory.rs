@@ -311,6 +311,9 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             if st.api_keys.iter().any(|x| x.hash == k.hash || x.id == k.id) {
                 return Err(StoreError::Conflict("api key already exists".into()));
             }
+            if k.is_eval() && st.api_keys.iter().any(|x| x.tenant_id == k.tenant_id && x.is_active() && x.is_eval()) {
+                return Err(StoreError::Conflict("the tenant already has an active eval key".into()));
+            }
             st.api_keys.push(k.clone());
         }
         Mutation::UpdateApiKey { tenant_id, id, nodes, datasource_scopes } => {

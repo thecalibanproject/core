@@ -721,6 +721,7 @@ paths:
       responses:
         '204': { description: Revoked }
         '404': { $ref: '#/components/responses/Error' }
+        '409': { description: 'The tenant''s eval key: managed by the control plane (rotate it with `POST .../eval-key/rotate`)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     patch:
       tags: [tenants]
       summary: Change an API key's node allowlist and datasource scopes
@@ -1230,8 +1231,10 @@ paths:
       summary: Start an eval of a published version
       description: |
         `golden`: every case of the version's golden set (or `cases`) runs `k` times (default 3) as
-        ordinary node runs on workers, through the request pipeline, as the API key `api_key_id`
-        (it must be active and allowed to run the node; its quotas apply and its usage is metered).
+        ordinary node runs on workers, through the request pipeline, as the tenant's eval key (created
+        and managed by the control plane, see `GET .../eval-key`), or as the API key `api_key_id`
+        when one is named (it must be active and allowed to run the node). The key's quotas apply and
+        its usage is metered.
         `injection`: the built-in injection suite against sandboxed tools (`k` default 1); the run
         input is `input`, else the input of `input_case` (or the golden set's first case), whose
         checks then measure utility under attack. Needs `nodes.run`; audited as `node.eval.start`.
@@ -1242,10 +1245,10 @@ paths:
           application/json:
             schema:
               type: object
-              required: [suite, api_key_id]
+              required: [suite]
               properties:
                 suite: { type: string, enum: [golden, injection] }
-                api_key_id: { type: string }
+                api_key_id: { type: string, description: 'Optional: a customer API key to run the eval as. Absent: the tenant''s eval key' }
                 k: { type: integer, minimum: 1, maximum: 10 }
                 concurrency: { type: integer, minimum: 1, maximum: 16, default: 4 }
                 cases: { type: array, items: { type: string }, description: 'Golden: only these cases' }
@@ -1282,6 +1285,52 @@ paths:
                   allowed: { type: boolean }
                   evidence: { description: 'The evals that meet the bar (`golden`, `injection`), null when no gate applies' }
                   problems: { type: array, items: { type: object } }
+
+  /api/v1/tenants/{tenantId}/eval-key:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [evals]
+      summary: The tenant's eval key
+      description: |
+        `api_keys.read`. The API key the control plane creates and manages for the tenant's evals
+        (on the first eval that names no key). Its plaintext never exists outside the moment it is
+        generated; the data plane refuses it on its endpoints (`401`); workers use it for eval runs
+        and judge calls, which are metered and limited as this key. `key` is null before the first
+        eval. Revoked with the tenant.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenant_id, key]
+                properties:
+                  tenant_id: { type: string }
+                  key: { oneOf: [ { $ref: '#/components/schemas/ApiKeyInfo' }, { type: 'null' } ] }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/eval-key/rotate:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    post:
+      tags: [evals]
+      summary: Rotate the tenant's eval key
+      description: |
+        `api_keys.write`. Revokes the eval key (`api_key.revoke`) and creates a new one
+        (`api_key.create`, `purpose: eval`). Evals in flight lose their key: rotate between evals.
+      responses:
+        '200':
+          description: Rotated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenant_id, key, revoked]
+                properties:
+                  tenant_id: { type: string }
+                  key: { $ref: '#/components/schemas/ApiKeyInfo' }
+                  revoked: { type: [string, 'null'], description: 'The id of the key it replaced' }
+        '404': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/evals:
     parameters: [ { $ref: '#/components/parameters/TenantId' } ]
@@ -2596,6 +2645,7 @@ components:
         revoked_at: { type: [string, 'null'], format: date-time, description: 'Set once the key is revoked.' }
         nodes: { type: [array, 'null'], items: { type: string }, description: 'Node allowlist. `null`: every published node of the tenant; `[]`: none.' }
         datasource_scopes: { type: array, items: { type: string }, description: 'Datasource scopes the built-in query tool may read for this key (absent: every scope of the nodes it runs).' }
+        purpose: { type: string, enum: [eval], description: '`eval`: the tenant''s eval key, managed by the control plane (absent on keys customers create)' }
     ApiKeyCreated:
       allOf:
         - $ref: '#/components/schemas/ApiKeyInfo'

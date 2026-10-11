@@ -94,10 +94,18 @@ async fn a_golden_eval_reports_pass_k_and_cost_per_success_and_gates_promotion()
         send(app, "POST", &format!("{N}/triage/versions/1/publish"), ADMIN, Some(json!({"promote": false})), &[]).await;
     assert_eq!(s, StatusCode::OK, "{v}");
 
-    let start = json!({"suite": "golden", "api_key_id": "key_cfg_acme_0", "k": 3, "concurrency": 3});
+    // No key named: the tenant's eval key (P3 decision 9), created on first use and managed by
+    // the control plane.
+    let start = json!({"suite": "golden", "k": 3, "concurrency": 3});
     let (s, ev) = send(app, "POST", &format!("{N}/triage/versions/1/evals"), ADMIN, Some(start), &[]).await;
     assert_eq!((s, ev["status"].as_str()), (StatusCode::ACCEPTED, Some("pending")), "{ev}");
     let id = ev["id"].as_str().unwrap().to_owned();
+    let (_, ek) = send(app, "GET", "/api/v1/tenants/acme/eval-key", ADMIN, None, &[]).await;
+    assert_eq!(
+        (ek["key"]["purpose"].as_str(), ev["api_key_id"].clone()),
+        (Some("eval"), ek["key"]["id"].clone()),
+        "{ek}"
+    );
 
     // A worker runs it through its executor and gateway.
     let w = worker(&e, &j, &idem(), None, "worker-a", Duration::from_secs(30));

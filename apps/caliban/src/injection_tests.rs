@@ -230,7 +230,8 @@ pub(crate) async fn run_suite(e: &Env, j: &Arc<dyn Journal>, node: &str) -> Valu
 
 /// [`run_suite`] with more fields of the eval request (`input`).
 pub(crate) async fn run_suite_with(e: &Env, j: &Arc<dyn Journal>, node: &str, extra: Value) -> Value {
-    let mut body = json!({"suite": "injection", "api_key_id": "key_cfg_acme_0"});
+    // No key named: the tenant's eval key, which the control plane manages.
+    let mut body = json!({"suite": "injection"});
     for (k, v) in extra.as_object().into_iter().flatten() {
         body[k] = v.clone();
     }

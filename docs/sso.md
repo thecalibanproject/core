@@ -131,6 +131,8 @@ tenants the caller may see. A refusal is `403` with `error.type = "permission_er
 | `POST /api/v1/tenants/{tenantId}/api-keys` | `api_keys.write` | owner, admin, tenant_admin, developer |
 | `DELETE /api/v1/tenants/{tenantId}/api-keys/{keyId}` | `api_keys.write` | owner, admin, tenant_admin, developer |
 | `PATCH /api/v1/tenants/{tenantId}/api-keys/{keyId}` | `api_keys.write` (`nodes.run` too to change node access) | owner, admin, tenant_admin, developer |
+| `GET /api/v1/tenants/{tenantId}/eval-key` | `api_keys.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `POST /api/v1/tenants/{tenantId}/eval-key/rotate` | `api_keys.write` | owner, admin, tenant_admin, developer |
 | `GET /api/v1/tenants/{tenantId}/provider-keys` | `provider_keys.read` | owner, admin, auditor, tenant_admin, developer, viewer |
 | `POST /api/v1/tenants/{tenantId}/provider-keys` | `provider_keys.write` | owner, admin, tenant_admin |
 | `DELETE /api/v1/tenants/{tenantId}/provider-keys/{keyId}` | `provider_keys.write` | owner, admin, tenant_admin |

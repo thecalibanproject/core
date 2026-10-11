@@ -254,10 +254,14 @@ impl EvalRunner {
         let deadline = Instant::now() + self.opts.snapshot_wait;
         let node = loop {
             watch.check()?;
+            let known = self.ex.nodes().knows_key(&e.tenant_id, &e.invoker_key_hash);
             match self.ex.nodes().resolve(&e.tenant_id, &e.node, Some(e.version)) {
-                Ok(n) => break n,
+                Ok(n) if known => break n,
+                Ok(_) if Instant::now() >= deadline => {
+                    return Ok(Self::fail("the eval's API key has not reached this worker (revoked?)"));
+                }
                 Err(err) if Instant::now() >= deadline => return Ok(Self::fail(err)),
-                Err(_) => tokio::time::sleep(self.opts.poll).await,
+                _ => tokio::time::sleep(self.opts.poll).await,
             }
         };
         if node.hash != e.spec_hash {

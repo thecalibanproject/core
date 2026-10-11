@@ -456,6 +456,8 @@ pub const ROUTES: &[RouteRule] = &[
     r("POST", "/tenants/{tenant_id}/api-keys", Perm::ApiKeysWrite, TenantFrom::Path),
     r("DELETE", "/tenants/{tenant_id}/api-keys/{key_id}", Perm::ApiKeysWrite, TenantFrom::Path),
     r("PATCH", "/tenants/{tenant_id}/api-keys/{key_id}", Perm::ApiKeysWrite, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/eval-key", Perm::ApiKeysRead, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/eval-key/rotate", Perm::ApiKeysWrite, TenantFrom::Path),
     r("GET", "/tenants/{tenant_id}/provider-keys", Perm::ProviderKeysRead, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/provider-keys", Perm::ProviderKeysWrite, TenantFrom::Path),
     r("DELETE", "/tenants/{tenant_id}/provider-keys/{key_id}", Perm::ProviderKeysWrite, TenantFrom::Path),

@@ -137,6 +137,12 @@ pub trait NodeSource: Send + Sync {
     fn tenant_policy(&self, _tenant: &str) -> TenantPolicy {
         TenantPolicy::default()
     }
+
+    /// Whether this process knows the tenant API key (by hash) yet: an eval waits for its key (the
+    /// tenant's eval key may have just been created) as it waits for its version.
+    fn knows_key(&self, _tenant: &str, _key_hash: &str) -> bool {
+        true
+    }
 }
 
 /// Tenant settings the executor enforces on every run.

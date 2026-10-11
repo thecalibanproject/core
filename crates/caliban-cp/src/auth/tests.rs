@@ -761,6 +761,15 @@ fn cases() -> Vec<Case> {
             true,
             "owner admin tenant_admin developer",
         ),
+        c("GET", "/tenants/{tenant_id}/eval-key", "/api/v1/tenants/{t}/eval-key", None, true, READERS),
+        c(
+            "POST",
+            "/tenants/{tenant_id}/eval-key/rotate",
+            "/api/v1/tenants/{t}/eval-key/rotate",
+            None,
+            true,
+            "owner admin tenant_admin developer",
+        ),
         c("GET", "/tenants/{tenant_id}/provider-keys", "/api/v1/tenants/{t}/provider-keys", None, true, READERS),
         c(
             "POST",

@@ -192,6 +192,10 @@ impl NodeSource for SnapshotNodes {
         let Some(t) = snap.tenant(&tenant.into()) else { return TenantPolicy::default() };
         TenantPolicy { spend: t.node_spend_caps.unwrap_or_default() }
     }
+
+    fn knows_key(&self, tenant: &str, key_hash: &str) -> bool {
+        self.config.load().tenant_by_key_hash(key_hash).is_some_and(|t| t.id.as_str() == tenant)
+    }
 }
 
 /// Seals run data with the tenant's data key from the snapshot (`data_key`), opened with the

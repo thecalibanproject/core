@@ -126,6 +126,11 @@ pub struct ApiKeyRecord {
     /// the node's). `None`: every scope of the nodes it runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datasource_scopes: Option<Vec<String>>,
+    /// `Some("eval")`: the tenant's eval key, created and managed by the control plane (its
+    /// plaintext never exists outside the moment of creation; the data plane refuses it on its
+    /// endpoints). `None`: a key a customer created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -465,6 +470,7 @@ impl State {
                     revoked_at: None,
                     nodes: None,
                     datasource_scopes: None,
+                    purpose: None,
                 });
             }
             for p in &t.providers {
@@ -570,7 +576,15 @@ impl ApiKeyRecord {
     pub fn is_active(&self) -> bool {
         self.revoked_at.is_none()
     }
+
+    /// The tenant's eval key (see [`EVAL_KEY_PURPOSE`]).
+    pub fn is_eval(&self) -> bool {
+        self.purpose.as_deref() == Some(EVAL_KEY_PURPOSE)
+    }
 }
+
+/// `ApiKeyRecord::purpose` of the per-tenant eval key.
+pub const EVAL_KEY_PURPOSE: &str = "eval";
 
 impl DatasourceRecord {
     pub fn is_live(&self) -> bool {
@@ -597,6 +611,7 @@ const TENANT_FIELDS: &[&str] = &[
     "routes",
     "nodes",
     "api_key_nodes",
+    "eval_key_hashes",
     "data_key",
     "node_spend_caps",
     "node_routes",
@@ -743,6 +758,11 @@ fn render_nodes(st: &State, tenant: &str, obj: &mut Map<String, Value>) -> Resul
     }
     if !allowlists.is_empty() {
         obj.insert("api_key_nodes".into(), serde_json::to_value(allowlists).map_err(|e| e.to_string())?);
+    }
+    let eval_keys: Vec<&String> =
+        st.api_keys.iter().filter(|k| k.tenant_id == tenant && k.is_active() && k.is_eval()).map(|k| &k.hash).collect();
+    if !eval_keys.is_empty() {
+        obj.insert("eval_key_hashes".into(), json!(eval_keys));
     }
     let scopes: BTreeMap<&String, &Vec<String>> = st
         .api_keys
@@ -1172,6 +1192,9 @@ impl Mutation {
             }
             Mutation::CreateApiKey(k) => {
                 let mut detail = json!({"name": k.name, "prefix": k.prefix});
+                if let Some(purpose) = &k.purpose {
+                    detail["purpose"] = json!(purpose);
+                }
                 if let Some(n) = &k.nodes {
                     detail["nodes"] = json!(n);
                 }

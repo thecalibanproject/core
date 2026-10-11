@@ -2426,3 +2426,42 @@ api_key_hashes = ["{globex}"]
         crate::embedder::lru_key_covers_tenant_and_model();
     }
 }
+
+/// The tenant's eval key (rendered by the control plane in `eval_key_hashes`) is refused on the
+/// data plane's endpoints; it only serves evals inside workers.
+#[tokio::test]
+async fn the_eval_key_is_refused_on_the_data_plane() {
+    let (base, _log) = mock_upstream().await;
+    let toml = format!(
+        r#"
+[[models]]
+id = "local/mock"
+provider = "mocklocal"
+upstream_model = "mock-local"
+trust_tier = "t0_sovereign"
+
+[[tenants]]
+id = "acme"
+name = "Acme"
+api_key_hashes = ["{acme}", "{eval}"]
+eval_key_hashes = ["{eval}"]
+  [[tenants.providers]]
+  id = "mocklocal"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t0_sovereign"
+"#,
+        acme = hash("cal_acme"),
+        eval = hash("cal_evalkey"),
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    let gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(RecentUsage::default()));
+    let app = app(Arc::new(gw));
+    let body = json!({"model": "local/mock", "messages": [{"role": "user", "content": "hi"}]});
+    let (s, _, _) = call(&app, "/v1/chat/completions", BEARER, body.clone()).await;
+    assert_eq!(s, StatusCode::OK);
+    for path in ["/v1/chat/completions", "/v1/messages", "/v1/nodes/x/runs", "/mcp"] {
+        let (s, _, out) = call(&app, path, ("authorization", "Bearer cal_evalkey"), body.clone()).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{path}: {out}");
+    }
+}

@@ -58,6 +58,10 @@ pub fn caller<'a>(snap: &'a Snapshot, headers: &HeaderMap) -> Result<Caller<'a>,
         .ok_or(CalibanError::Unauthenticated)?;
     let key_hash = hash_api_key(key);
     let tenant = snap.tenant_by_key_hash(&key_hash).ok_or(CalibanError::Unauthenticated)?;
+    // The tenant's eval key only serves evals, inside the worker (P3 decision 9): never a client.
+    if tenant.eval_key_hashes.iter().any(|h| h.eq_ignore_ascii_case(&key_hash)) {
+        return Err(CalibanError::Unauthenticated);
+    }
     Ok(Caller { tenant, key_hash })
 }
 
