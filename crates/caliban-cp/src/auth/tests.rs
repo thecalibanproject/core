@@ -1441,6 +1441,7 @@ async fn run_content_and_answers_follow_the_roles() {
             idempotency: None,
             specs: None,
             origin: None,
+            input_labels: vec![],
         })
         .await
         .unwrap();
@@ -1512,6 +1513,7 @@ async fn run_content_and_answers_follow_the_roles() {
             idempotency: None,
             specs: None,
             origin: None,
+            input_labels: vec![],
         })
         .await
         .unwrap();

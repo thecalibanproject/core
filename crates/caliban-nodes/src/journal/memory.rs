@@ -155,6 +155,7 @@ impl Journal for MemoryJournal {
             cancel_requested_at: None,
             cancelled_by: None,
             origin: run.origin,
+            input_labels: run.input_labels,
             last_event: 0,
         };
         let data = serde_json::json!({"node": rec.node, "version": rec.version});

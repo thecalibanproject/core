@@ -216,6 +216,10 @@ pub struct StartRun {
     /// first model call: the tenant's node spend caps are reached, or what is left of them is less
     /// than the version's `budgets.usd` (`caliban/auto` falls back to a model call then).
     pub check_spend: bool,
+    /// JSON pointers into the input (`""`: all of it) the caller marks as untrusted data: present
+    /// values make the run input carry the `caller` taint label, like the fields the input schema
+    /// declares `x-caliban-untrusted` (see [`taint::caller_labels`]). Unmarked input is trusted.
+    pub untrusted: Vec<String>,
 }
 
 /// Run-level budget (`"budget"` on `POST /v1/nodes/{name}/runs`).
@@ -276,6 +280,9 @@ pub struct RunView {
     /// What started the run when it was not a run request (`auto:<intent>`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Taint labels the run input carries from the start (`caller`: it holds untrusted caller
+    /// data). `pii` is found when the run executes and shows on its steps.
+    pub input_labels: Vec<String>,
     /// A cancellation was asked for and the run has not stopped yet.
     pub cancel_requested: bool,
     /// The number of the run's last event (`GET /v1/runs/{id}/events?after=` resumes there).
@@ -502,6 +509,12 @@ impl Executor {
         if let Some(s) = node.spec.input_schema() {
             crate::schema::validate(s, &req.input).map_err(|e| ExecError::Invalid(format!("input: {e}")))?;
         }
+        if req.untrusted.len() > taint::MAX_MARKS || req.untrusted.iter().any(|p| !p.is_empty() && !p.starts_with('/'))
+        {
+            return Err(ExecError::Invalid("untrusted: a list of JSON pointers into the input".into()));
+        }
+        let input_labels: Vec<String> =
+            taint::caller_labels(&req.input, node.spec.input_schema(), &req.untrusted).into_iter().collect();
         let id = format!("run_{}", uuid::Uuid::now_v7().simple());
         let input = self.sealer.seal(&req.tenant, &id, &req.input.to_string()).map_err(ExecError::Internal)?;
         // The run keeps the versions it starts on: retiring one later drains it instead of
@@ -525,6 +538,7 @@ impl Executor {
             idempotency: req.idempotency,
             specs: Some(specs),
             origin: req.origin,
+            input_labels,
         };
         let out = match self.journal.create_run(run).await? {
             Created::New(r) => (r, true),
@@ -639,6 +653,7 @@ impl Executor {
             steps: steps.iter().map(StepView::of).collect(),
             claims: r.claims,
             origin: r.origin.clone(),
+            input_labels: r.input_labels.clone(),
             cancel_requested: r.cancel_requested_at.is_some() && !r.status.is_terminal(),
             last_event: r.last_event,
             created_at: r.created_at,
@@ -771,8 +786,9 @@ impl Executor {
                 return;
             }
         };
-        // The run input is labelled `pii` when it holds personal data.
-        let mut input_taint = taint::Taint::new();
+        // The run input is labelled `pii` when it holds personal data, and carries the labels it
+        // was created with (`caller`: untrusted caller data).
+        let mut input_taint: taint::Taint = cx.run.input_labels.iter().cloned().collect();
         if self.data.has_pii(&cx.run.tenant_id, &cx.input).await {
             input_taint.insert(taint::PII.to_owned());
         }

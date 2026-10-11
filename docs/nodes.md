@@ -185,9 +185,9 @@ Data plane, tenant API key as bearer token, the key allowed to run the node:
 
 | Endpoint | Does |
 |---|---|
-| `POST /v1/nodes/{name}/runs` `{"input": ..., "version"?: v, "async"?: false, "stream"?: false, "wait_s"?: s, "budget"?: {...}}` | Starts a run of the live version (or `version`). Sync by default: waits until the run ends or waits for a human, at most `CALIBAN_NODE_SYNC_WAIT_SECS` (default 60) or `wait_s`; `200` when it ended, else `202` with the run so far. `"async": true` answers `202` at once. `"stream": true` answers with the run's [events](#streaming-run-events) (SSE) until it ends or waits for a human. Instead of `input`, `"chat": {"messages": [...]}` gives chat messages that are mapped to the node's input as the [chat shortcut](#the-chat-shortcut-model-nodename) does. `Idempotency-Key` returns the run the first request created (`Idempotent-Replayed: true`); the same key with another body is a `422`. The input is checked against `prompt.input_schema` (`400`) |
+| `POST /v1/nodes/{name}/runs` `{"input": ..., "version"?: v, "async"?: false, "stream"?: false, "wait_s"?: s, "budget"?: {...}, "untrusted"?: true \| ["/field", ...]}` | Starts a run of the live version (or `version`). Sync by default: waits until the run ends or waits for a human, at most `CALIBAN_NODE_SYNC_WAIT_SECS` (default 60) or `wait_s`; `200` when it ended, else `202` with the run so far. `"async": true` answers `202` at once. `"stream": true` answers with the run's [events](#streaming-run-events) (SSE) until it ends or waits for a human. Instead of `input`, `"chat": {"messages": [...]}` gives chat messages that are mapped to the node's input as the [chat shortcut](#the-chat-shortcut-model-nodename) does. `Idempotency-Key` returns the run the first request created (`Idempotent-Replayed: true`); the same key with another body is a `422`. The input is checked against `prompt.input_schema` (`400`). `untrusted` marks [untrusted caller data](tools.md#untrusted-caller-data) |
 | `GET /v1/runs` | The tenant's runs the key may see (its node allowlist), newest first: `?node=`, `?status=` (comma separated), `?created_after=`, `?created_before=` (RFC 3339), `?limit=` (default 50, at most 200), `?cursor=` (`next_cursor` of the previous page). Summaries only (no content, no steps) |
-| `GET /v1/runs/{id}` | The run: `status`, `output`, `partial`, `error`, `stop_reason`, `awaiting` (`step`, `question`), `budget` (limits and spend), `cost_usd`, `usage` (prompt and completion tokens of its model calls), `steps` (id, vertex, kind, status, tokens, usd, taint labels, start, duration), `origin`, `cancel_requested`, `last_event` |
+| `GET /v1/runs/{id}` | The run: `status`, `output`, `partial`, `error`, `stop_reason`, `awaiting` (`step`, `question`), `budget` (limits and spend), `cost_usd`, `usage` (prompt and completion tokens of its model calls), `steps` (id, vertex, kind, status, tokens, usd, taint labels, start, duration), `origin`, `input_labels` (`caller` when the input holds untrusted caller data), `cancel_requested`, `last_event` |
 | `GET /v1/runs/{id}/events` | The run's [events](#streaming-run-events) (SSE), resumable with `Last-Event-ID` (or `?after=`) |
 | `POST /v1/runs/{id}/input` `{"answer": ..., "step"?: id}` | Answers the human step the run waits for; `202`, the run resumes. `409` when it is not waiting |
 | `POST /v1/runs/{id}/cancel` | Cancels the run (see [Cancellation](#cancellation)): `200` when it ended at once (or was already cancelled), `202` when a running run was asked to stop, `409` (`run_already_ended`) when it ended otherwise |
@@ -259,9 +259,15 @@ Anthropic SDK users need no new client. Same API key and allowlist as the run AP
   `string` schema, or the one string property of an object schema that has exactly one (its only
   required property, or its only property). The reference triage node gets `{"case": "<text>"}`.
   Any other schema refuses the request (`400 invalid_input`), saying what it expects;
+  A schema without a `type` (one that only annotates, such as `{"x-caliban-untrusted": true}`)
+  takes the text as is;
 - no input schema: `exposure.chat_input` decides: `"text"` (default) is the last user message's
   text; `"messages"` is `{"messages": [{"role", "content"}, ...]}` with the text of every message,
   system messages included.
+
+`caliban.untrusted` in the request body (`true`, or JSON pointers into the node's input) marks the
+input as [untrusted caller data](tools.md#untrusted-caller-data), like `untrusted` on the run API;
+it also applies when `caliban/auto` hands the request to a node.
 
 **Answer.** The node's output is the assistant message (a string as is, other JSON compact).
 `finish_reason` (OpenAI) / `stop_reason` (Anthropic) is `stop` / `end_turn` when the run succeeded
@@ -316,6 +322,9 @@ affinity. Routers forward the runs to workers like the run API.
   node's output as text, plus `structuredContent` when it is an object. A failed or cancelled run is
   an error result. A run that waits for a human, or is still going, returns its state
   (`structuredContent.run` with the run id, and the question): answer it through the run API.
+  `_meta["caliban/untrusted"]` on the request (`true`, or JSON pointers into the arguments; for a
+  wrapped tool, `/input/...` points into the node's input) marks
+  [untrusted caller data](tools.md#untrusted-caller-data).
 - **Tasks** (`CALIBAN_MCP_TASKS=true`, off by default: the spec marks Tasks experimental): a client
   that declares the tasks extension gets a task for every `tools/call` instead of waiting. The task
   id is the run id, so tasks are as durable as runs and any router answers for any task. `tasks/get`
@@ -510,6 +519,7 @@ runs against both. Tables (`migrations/0013_node_journal.sql`):
 | `node_event` | Awaited events: human answers (named after the step, sealed) and timers (`<step>:deadline`, `<step>:throttled:<n>`) |
 | `node_run_event` (0021) | The run's [events](#streaming-run-events), numbered per run under the run row's lock (`node_run.event_seq`); `node_run` also has `cancel_requested_at`, `cancelled_by` and `origin`, and `node_step` the prompt and completion tokens and taint labels |
 | `node_audit` (0021) | The [audit outbox](#audit-of-run-decisions) |
+| `node_run.input_labels` (0025) | Taint labels the run input carries from the start (`caller`), fixed when the run is created |
 | `node_golden_set`, `node_eval_policy`, `node_eval`, `node_eval_trial` (0024) | [Evals](evals.md): golden sets (sealed), promotion bars, eval runs and their trials. `node_event` gains the kind `observation` (what a sandboxed tool of an injection run received) |
 
 - **Claims.** Workers claim the oldest runnable run with `UPDATE ... WHERE id = (SELECT ... FOR UPDATE
@@ -627,7 +637,8 @@ the person's email reaches the tool server.
 ## Not in this release
 
 - **P3 M8:** `code` vertices (WASM), the console views themselves (the endpoints are here), A2A, an
-  adaptive stage for the injection suite.
+  adaptive stage for the injection suite. When A2A comes, its data parts map to input marked
+  untrusted (`caller`), never to instructions.
 - Cancelling a run from the console (cancel it with the run API).
 - MCP: the human step of a synchronous `tools/call` is answered through the run API (MCP's
   multi-round-trip input requests are not used); MCP Tasks need the `2026-07-28` protocol.

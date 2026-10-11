@@ -103,7 +103,8 @@ impl Watch {
 /// One trial to run.
 enum Job {
     Golden(Arc<GoldenCase>, u32),
-    Injection(&'static injection::Case, u32, Value),
+    /// The case, the trial, the run input and the pointers the caller marks untrusted.
+    Injection(&'static injection::Case, u32, Value, Vec<String>),
     Manifest(&'static injection::Case),
 }
 
@@ -291,13 +292,15 @@ impl EvalRunner {
                         Err(why) => not_applicable.push(json!({"case": c.id, "reason": why})),
                         Ok(()) if c.goal == injection::Goal::ManifestFindings => jobs.push(Job::Manifest(c)),
                         Ok(()) => {
-                            let input = match c.goal {
+                            let (input, marks) = match c.goal {
+                                _ if c.carrier.in_input() => injection::caller_input(c, &surface, input)
+                                    .unwrap_or_else(|| (input.clone(), vec![])),
                                 injection::Goal::PiiToRead | injection::Goal::PiiToWrite => {
-                                    injection::with_pii(input).unwrap_or_else(|| input.clone())
+                                    (injection::with_pii(input).unwrap_or_else(|| input.clone()), vec![])
                                 }
-                                _ => input.clone(),
+                                _ => (input.clone(), vec![]),
                             };
-                            jobs.extend((0..e.k).map(|n| Job::Injection(c, n, input.clone())));
+                            jobs.extend((0..e.k).map(|n| Job::Injection(c, n, input.clone(), marks.clone())));
                         }
                     }
                 }
@@ -306,7 +309,7 @@ impl EvalRunner {
         jobs.retain(|j| {
             let key = match j {
                 Job::Golden(c, n) => (c.id.clone(), *n),
-                Job::Injection(c, n, _) => (c.id.to_owned(), *n),
+                Job::Injection(c, n, ..) => (c.id.to_owned(), *n),
                 Job::Manifest(c) => (c.id.to_owned(), 0),
             };
             !done.contains(&key)
@@ -412,7 +415,7 @@ impl EvalRunner {
     async fn trial(&self, cx: &Ctx<'_>, job: Job) -> Result<(), Abort> {
         cx.watch.check()?;
         let e = cx.e;
-        let (case_id, n, input, origin) = match &job {
+        let (case_id, n, input, origin, untrusted) = match &job {
             Job::Manifest(c) => {
                 let Plan::Injection { manifests, .. } = cx.plan else { return Ok(()) };
                 let v = injection::manifest_verdict(c, manifests);
@@ -426,8 +429,10 @@ impl EvalRunner {
                 t.verdict = serde_json::to_value(&v).unwrap_or_default();
                 return self.put(t).await;
             }
-            Job::Golden(c, n) => (c.id.clone(), *n, c.input.clone(), format!("eval:{}", e.id)),
-            Job::Injection(c, n, input) => (c.id.to_owned(), *n, input.clone(), injection::origin(&e.id, c.id)),
+            Job::Golden(c, n) => (c.id.clone(), *n, c.input.clone(), format!("eval:{}", e.id), vec![]),
+            Job::Injection(c, n, input, marks) => {
+                (c.id.to_owned(), *n, input.clone(), injection::origin(&e.id, c.id), marks.clone())
+            }
         };
         let start = StartRun {
             tenant: e.tenant_id.clone(),
@@ -441,6 +446,7 @@ impl EvalRunner {
             budget: None,
             origin: Some(origin),
             check_spend: false,
+            untrusted,
         };
         let run = match self.ex.create(start).await {
             Ok((run, _)) => run,
@@ -461,7 +467,7 @@ impl EvalRunner {
         cx.watch.inflight.lock().remove(&run.id);
         let t = match &job {
             Job::Golden(c, _) => self.score_golden(cx, c, n, &ended).await,
-            Job::Injection(c, _, _) => self.score_injection(cx, c, n, &ended).await,
+            Job::Injection(c, ..) => self.score_injection(cx, c, n, &ended).await,
             Job::Manifest(_) => return Ok(()),
         };
         self.put(t).await
@@ -498,7 +504,7 @@ impl EvalRunner {
                     None if approval => Some(json!({"approve": false})),
                     None => None,
                 },
-                Job::Injection(c, _, _) if approval => Some(json!({"approve": c.approves(&question)})),
+                Job::Injection(c, ..) if approval => Some(json!({"approve": c.approves(&question)})),
                 Job::Injection(..) => Some(json!("No further details.")),
                 Job::Manifest(_) => None,
             };

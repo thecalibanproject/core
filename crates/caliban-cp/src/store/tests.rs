@@ -2068,6 +2068,7 @@ async fn postgres_worker_grants_are_enough() {
             idempotency: Some(("k".into(), "fp".into())),
             specs: None,
             origin: Some("auto:triage".into()),
+            input_labels: vec![],
         };
         j.create_run(NewRun { id: "run_h".into(), idempotency: None, ..run.clone() })
             .await

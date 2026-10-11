@@ -11,7 +11,9 @@
 //!   (Specs are sealed: a router opens them with `CALIBAN_KEK`; without it, tools are listed with
 //!   the generic `{"input"}` schema.)
 //! - **`tools/call`**: runs the node through the same path as the run API (a router forwards it to
-//!   a worker) and waits for it, at most `CALIBAN_NODE_SYNC_WAIT_SECS`. The result is the node's
+//!   a worker) and waits for it, at most `CALIBAN_NODE_SYNC_WAIT_SECS`. `_meta["caliban/untrusted"]`
+//!   (`true`, or JSON pointers into the arguments) marks arguments as untrusted caller data, labelled
+//!   `caller` in the run, like `untrusted` on the run API. The result is the node's
 //!   output (text, and `structuredContent` when it is an object). A run that fails is an error
 //!   result; a run still going at the cap, or waiting for a human, returns its state and run id
 //!   (follow it with the run API).
@@ -129,14 +131,38 @@ impl NodeTool {
         s.as_object().cloned().unwrap_or_default()
     }
 
+    /// The tool's arguments are `{"input": <the node's input>}`.
+    fn wrapped(&self) -> bool {
+        !self.schema.as_ref().is_some_and(|s| s.get("type").and_then(Value::as_str) == Some("object"))
+    }
+
     fn run_input(&self, args: Map<String, Value>) -> Value {
-        let wrapped = !self.schema.as_ref().is_some_and(|s| s.get("type").and_then(Value::as_str) == Some("object"));
-        if wrapped && args.len() == 1 && args.contains_key("input") {
+        if self.wrapped() && args.len() == 1 && args.contains_key("input") {
             return args.get("input").cloned().unwrap_or(Value::Null);
         }
         Value::Object(args)
     }
+
+    /// The caller's marks (pointers into the tool's arguments) as pointers into the run input:
+    /// for a wrapped tool, `/input/x` is `/x` of the run input.
+    fn run_marks(&self, marks: Vec<String>, args: &Map<String, Value>) -> Vec<String> {
+        if !(self.wrapped() && args.len() == 1 && args.contains_key("input")) {
+            return marks;
+        }
+        marks
+            .into_iter()
+            .map(|p| match p.strip_prefix("/input") {
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => rest.to_owned(),
+                // The whole arguments object, or a field outside `input`: all of the input.
+                _ => String::new(),
+            })
+            .collect()
+    }
 }
+
+/// The `_meta` key of `tools/call` that marks arguments as untrusted caller data: `true` (all of
+/// them) or a list of JSON pointers into the arguments.
+pub const UNTRUSTED_META: &str = "caliban/untrusted";
 
 impl NodesServer {
     fn caller(&self, ctx: &RequestContext<RoleServer>) -> Result<(Caller, axum::http::HeaderMap), ErrorData> {
@@ -303,10 +329,22 @@ impl ServerHandler for NodesServer {
             .find(|(n, _)| *n == name)
             .map(|(_, t)| t)
             .ok_or_else(|| ErrorData::invalid_params(format!("no tool named '{name}'"), None))?;
-        let input = tool.run_input(request.arguments.unwrap_or_default());
+        let marks = context
+            .meta
+            .get(UNTRUSTED_META)
+            .or_else(|| request.meta.as_ref().and_then(|m| m.get(UNTRUSTED_META)))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let marks = caliban_nodes::executor::taint::parse_marks(&marks)
+            .map_err(|e| ErrorData::invalid_params(format!("_meta[\"{UNTRUSTED_META}\"]: {e}"), None))?;
+        let args = request.arguments.unwrap_or_default();
+        let untrusted = tool.run_marks(marks, &args);
+        let input = tool.run_input(args);
         let runs = self.runs()?;
-        let (run_id, _, events) =
-            runs.start(&caller, &headers, Start { node: name, input, ..Start::default() }).await.map_err(rpc)?;
+        let (run_id, _, events) = runs
+            .start(&caller, &headers, Start { node: name, input, untrusted, ..Start::default() })
+            .await
+            .map_err(rpc)?;
         let as_task = self.tasks && context.client_capabilities().is_some_and(|c| c.supports_tasks());
         if as_task {
             let now = chrono::Utc::now().to_rfc3339();

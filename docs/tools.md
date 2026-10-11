@@ -170,6 +170,7 @@ default; full CaMeL is an opt-in template later):
 | `tool:<server>/<tool>` | The output of an MCP tool |
 | `datasource` | Rows from the built-in query tool |
 | `retrieved` | Retrieved documents (reserved: there is no RAG tool yet) |
+| `caller` | A run input that holds [untrusted caller data](#untrusted-caller-data) |
 | `pii` | A run input that holds personal data |
 
 Labels flow with the value on each edge, and a vertex also consumes the labels of every earlier
@@ -197,6 +198,40 @@ needs either:
 
 `pii` is handled by the personal-data rules above rather than by approvals: an untrusted tool never
 receives personal data, write or read.
+
+### Untrusted caller data
+
+An external agent that calls a node often forwards content it did not write: a web page, an email,
+another agent's output. Without a label, that content would enter the run as trusted input and
+could drive a write: the laundering path of "Can CaMeLs Talk?" (arXiv 2610.05640, preprint), where
+labels that do not cross an agent boundary let untrusted data be reread as instructions (research
+note 04, P3 decision 8). So callers can mark input as data:
+
+| Where | How |
+|---|---|
+| `POST /v1/nodes/{name}/runs` | `"untrusted": true` (the whole input) or `["/email/body", "/attachments"]` (JSON pointers, RFC 6901; `""` is the whole input) |
+| `model: "node/<name>"` (chat completions, messages), `caliban/auto` handing a request to a node | `"caliban": {"untrusted": ...}`, same values, pointers into the node's input |
+| MCP `tools/call` | `params._meta["caliban/untrusted"]`, same values, pointers into the tool's arguments (`/input/...` for a tool wrapped as `{"input"}`) |
+| The node's input schema | `"x-caliban-untrusted": true` on a property (or on the schema itself, or on an array's `items`): marked whoever calls, and a caller cannot unmark it |
+| A2A (not built) | Data parts will map to marked input, never to instructions |
+
+When a marked value is present in the input (not `null`), the run input carries the `caller` label
+from the start: the rule above applies to every write its data reaches, exactly as for a tool's
+output (an `allow_tainted` entry such as `"caller"`, or a human approval), and `caller` data is
+also screened by the personal-data rules like the rest of the input. The label is fixed when the run
+is created (`node_run.input_labels`, migration 0025), shown as `input_labels` on the run, and kept by
+every replay. Malformed marks are a `400` (`invalid_input`).
+
+**Granularity.** Labels belong to values, and the run input is one value: a marked field labels the
+whole input and everything derived from it, not only the vertices that read that field. Keep
+untrusted content and instructions in separate runs, or approve the writes, when that is too coarse.
+
+**Unmarked input is trusted (the default).** The API key that runs the node is an authenticated
+principal the tenant allowed to run it, and its input is the task it asks for. Labelling all caller
+input by default would make every write of every node wait for a human or an `allow_tainted:
+["caller"]` entry, which is standing authority over all input and so no protection; it would also
+break existing nodes (`caliban/auto` hands a user's own message to a node). Mark what you forward,
+and have node authors mark fields that are meant to carry outside content in the input schema.
 
 **Approvals are single use; allowlists are standing authority.** An approval covers one step of one
 run and the arguments it showed; it is never carried to another write or another run. An

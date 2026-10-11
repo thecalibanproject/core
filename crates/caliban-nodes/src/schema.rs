@@ -4,7 +4,8 @@
 //! `required`, `additionalProperties` (boolean or schema), `items` (one schema), `minItems`,
 //! `maxItems`, `minLength`, `maxLength`, `pattern`, `minimum`, `maximum`, `anyOf`, `allOf`.
 //! Annotations (`title`, `description`, `default`, `examples`, `$schema`, `$id`, `$comment`,
-//! `format`) are accepted and not checked. Any other keyword (`$ref`, `oneOf`, `if`, ...) is
+//! `format`) are accepted and not checked, and so is `x-caliban-untrusted` (a boolean: the value is
+//! untrusted caller data, labelled `caller` in a run; see `executor::taint`). Any other keyword (`$ref`, `oneOf`, `if`, ...) is
 //! refused when the node version is published ([`check_supported`]), so a schema is never
 //! silently weaker than it reads.
 
@@ -45,6 +46,12 @@ fn check_at(schema: &Value, at: &str) -> Result<(), String> {
     };
     for (k, v) in m {
         if ANNOTATIONS.contains(&k.as_str()) {
+            continue;
+        }
+        if k == crate::executor::taint::UNTRUSTED_KEYWORD {
+            if !v.is_boolean() {
+                return Err(format!("{k} at {} must be a boolean", here()));
+            }
             continue;
         }
         if !CHECKED.contains(&k.as_str()) {

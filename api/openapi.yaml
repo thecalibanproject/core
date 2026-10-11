@@ -319,6 +319,13 @@ paths:
         Instead of `input`, `chat.messages` gives chat messages, mapped to the node's input as the
         `node/<name>` chat shortcut does.
 
+        **Untrusted caller data** (`untrusted`): `true` marks the whole input, a list of JSON
+        pointers marks fields (`["/email/body"]`). Marked values that are present (and the fields
+        the node's input schema declares `x-caliban-untrusted: true`, whoever calls) make the run
+        input carry the `caller` taint label: a write tool their data reaches needs an
+        `allow_tainted` entry or a human approval, as with tool outputs. Unmarked input is trusted
+        (the API key that may run the node is the principal). See core/docs/tools.md.
+
         Every model call the run makes goes through the gateway pipeline as the invoking key (PII,
         caches, routing, quotas, metering), with an Idempotency-Key per step. Split-mode routers
         forward this request to a worker.
@@ -356,6 +363,13 @@ paths:
                     tokens: { type: integer, minimum: 1 }
                     usd: { type: number, exclusiveMinimum: 0 }
                     wall_clock_s: { type: integer, minimum: 1 }
+                untrusted:
+                  description: 'Input the caller marks as untrusted data (taint label `caller`): `true` (all of it), `false`, or JSON pointers into the input (`""` is the whole input)'
+                  oneOf:
+                    - type: boolean
+                    - type: array
+                      maxItems: 64
+                      items: { type: string, pattern: '^(/.*)?$' }
       responses:
         '200':
           description: The run ended (succeeded, failed, budget_exhausted or cancelled), or its event stream
@@ -468,7 +482,9 @@ paths:
         otherwise). `tools/list`: the published nodes the key may run (input schema: the node's).
         `tools/call`: runs the node, waits at most `CALIBAN_NODE_SYNC_WAIT_SECS`. With
         `CALIBAN_MCP_TASKS=true`, clients declaring the tasks extension get a task (its id is the run
-        id) and use `tasks/get`, `tasks/update`, `tasks/cancel`. See core/docs/nodes.md.
+        id) and use `tasks/get`, `tasks/update`, `tasks/cancel`. `params._meta["caliban/untrusted"]`
+        on `tools/call` (`true`, or JSON pointers into the arguments) marks arguments as untrusted
+        caller data, like `untrusted` on `POST /v1/nodes/{name}/runs`. See core/docs/nodes.md.
       requestBody:
         required: true
         content:
@@ -2364,6 +2380,13 @@ components:
         reasoning: { type: string, enum: [off, low, medium, high], description: 'Mapped per model family (Qwen3 enable_thinking, reasoning_effort). OpenAI reasoning_effort is also accepted.' }
         zdr: { type: boolean, default: false }
         trace_id: { type: string }
+        untrusted:
+          description: '`model: "node/<name>"` (and caliban/auto handing the request to a node): the node input the caller marks as untrusted data (taint label `caller`), `true` or JSON pointers into the node''s input. See `POST /v1/nodes/{name}/runs`.'
+          oneOf:
+            - type: boolean
+            - type: array
+              maxItems: 64
+              items: { type: string, pattern: '^(/.*)?$' }
 
     ChatMessage:
       type: object
@@ -2934,6 +2957,7 @@ components:
           items: { $ref: '#/components/schemas/RunStep' }
         claims: { type: integer, description: 'How many times a worker claimed the run (more than 1 after a takeover or a resume)' }
         origin: { type: string, description: 'What started the run when not a run request: `auto:<intent>` (caliban/auto)' }
+        input_labels: { type: array, items: { type: string }, description: 'Taint labels the run input carries from the start: `caller` when it holds untrusted caller data' }
         cancel_requested: { type: boolean, description: 'A cancellation was asked for and the run has not stopped yet' }
         last_event: { type: integer, description: 'Number of the run''s last event (resume its event stream after it)' }
         created_at: { type: string, format: date-time }
@@ -3037,6 +3061,7 @@ components:
         status: { $ref: '#/components/schemas/RunStatus' }
         invoker: { type: string }
         origin: { type: [string, 'null'] }
+        input_labels: { type: array, items: { type: string }, description: 'Taint labels the run input carries from the start (`caller`)' }
         error: { type: [string, 'null'] }
         stop_reason: { type: [string, 'null'] }
         partial: { type: boolean }

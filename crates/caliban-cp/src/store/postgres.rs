@@ -59,6 +59,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (22, "audit_ingest", include_str!("../../../../migrations/0022_audit_ingest.sql")),
     (23, "auto_node_routes", include_str!("../../../../migrations/0023_auto_node_routes.sql")),
     (24, "node_evals", include_str!("../../../../migrations/0024_node_evals.sql")),
+    (25, "node_run_input_labels", include_str!("../../../../migrations/0025_node_run_input_labels.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.

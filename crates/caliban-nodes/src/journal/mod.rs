@@ -131,6 +131,9 @@ pub struct NewRun {
     /// What started the run when it was not a direct run request (e.g. `auto:<intent>` when
     /// `caliban/auto` handed a chat request to the node). Its model calls' usage events say so.
     pub origin: Option<String>,
+    /// Taint labels the run input carries from the start (`caller`), fixed when the run is created
+    /// so a replay on another worker sees the same.
+    pub input_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +175,8 @@ pub struct RunRecord {
     pub cancelled_by: Option<String>,
     /// See [`NewRun::origin`].
     pub origin: Option<String>,
+    /// See [`NewRun::input_labels`].
+    pub input_labels: Vec<String>,
     /// The number of the run's last event (0: none yet).
     pub last_event: u64,
 }

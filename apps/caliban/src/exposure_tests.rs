@@ -763,3 +763,99 @@ async fn the_console_inbox_approves_a_tainted_write() {
     let (_, inbox) = send(&e.cp_app, "GET", "/api/v1/tenants/acme/inbox", ADMIN, None, &[]).await;
     assert_eq!(inbox["data"], json!([]));
 }
+
+/// Untrusted caller data (P3 decision 8) can be marked on every run API: `untrusted` on
+/// `POST /v1/nodes/{name}/runs` (direct and through a router), `caliban.untrusted` on the chat
+/// shortcut, `_meta["caliban/untrusted"]` on MCP `tools/call`. The run input then carries the
+/// `caller` label; unmarked input carries none.
+#[tokio::test]
+async fn every_run_api_marks_untrusted_caller_data() {
+    use rmcp::model::{CallToolRequestParams, CallToolResponse, RequestMetaObject};
+    let e = env(Duration::ZERO).await;
+    let echo = json!({"kind": "workflow", "model_policy": {}, "budgets": {"steps": 3, "tokens": 10000, "wall_clock_s": 60},
+                      "graph": {"vertices": [{"id": "answer", "type": "llm", "config": {"prompt": "hello {{input}}"}}], "edges": []}});
+    e.publish("echo", echo).await;
+    let j = journal().await;
+    let w = worker(&e, &j, &idem(), None, "worker-1", LONG);
+    let (_router, r, server) = split(&e, &w).await;
+    let labels = async |id: &str| {
+        let (s, v) = send(&w.app, "GET", &format!("/v1/runs/{id}"), KEY, None, &[]).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        v["input_labels"].clone()
+    };
+
+    for app in [&w.app, &r] {
+        for (marks, want) in [
+            (json!(null), json!([])),
+            (json!(true), json!(["caller"])),
+            (json!(["/mail"]), json!(["caller"])),
+            (json!(["/absent"]), json!([])),
+        ] {
+            let mut body = json!({"input": {"mail": "forwarded text"}});
+            if !marks.is_null() {
+                body["untrusted"] = marks.clone();
+            }
+            let (s, v) = send(app, "POST", "/v1/nodes/echo/runs", KEY, Some(body), &[]).await;
+            assert_eq!((s, v["input_labels"].clone()), (StatusCode::OK, want), "{marks}: {v}");
+        }
+        let body = json!({"input": "x", "untrusted": ["mail"]});
+        let (s, v) = send(app, "POST", "/v1/nodes/echo/runs", KEY, Some(body), &[]).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_input")), "{v}");
+    }
+
+    // The chat shortcut, on both dialects.
+    let mut body = chat("node/echo", "forwarded text", false);
+    body["caliban"] = json!({"untrusted": true});
+    let (s, h, text) = request(&w.app, "POST", "/v1/chat/completions", KEY, Some(body), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{text}");
+    assert_eq!(labels(h["caliban-run-id"].to_str().unwrap()).await, json!(["caller"]));
+    let mut body = messages("node/echo", "forwarded text", false);
+    body["caliban"] = json!({"untrusted": [""]});
+    let (s, h, text) = request(&r, "POST", "/v1/messages", KEY, Some(body), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{text}");
+    assert_eq!(labels(h["caliban-run-id"].to_str().unwrap()).await, json!(["caller"]));
+    let (s, h, text) =
+        request(&w.app, "POST", "/v1/chat/completions", KEY, Some(chat("node/echo", "plain", false)), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{text}");
+    assert_eq!(labels(h["caliban-run-id"].to_str().unwrap()).await, json!([]));
+
+    // MCP: `_meta` marks pointers into the tool's arguments (`/input` is the node's input).
+    let (url, task) = serve(w.app.clone()).await;
+    let cfg =
+        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(format!("{url}/mcp"))
+            .auth_header(KEY.to_owned());
+    let u = reqwest::Url::parse(&url).unwrap();
+    let http = caliban_mcp::egress::pinned_client(&u, u.socket_addrs(|| None).unwrap()[0], LONG).unwrap();
+    let transport = rmcp::transport::StreamableHttpClientTransport::with_client(http, cfg);
+    let lifecycle =
+        rmcp::service::ClientLifecycleMode::Discover { preferred_versions: vec![rmcp::model::ProtocolVersion::LATEST] };
+    let client =
+        rmcp::service::ClientServiceExt::serve_with_lifecycle(TasksClient, transport, lifecycle).await.unwrap();
+    let newest = async || {
+        let (_, l) = send(&w.app, "GET", "/v1/runs?node=echo&limit=1", KEY, None, &[]).await;
+        l["data"][0]["id"].as_str().unwrap().to_owned()
+    };
+    for (marks, want) in
+        [(None, json!([])), (Some(json!(["/input"])), json!(["caller"])), (Some(json!(true)), json!(["caller"]))]
+    {
+        let mut params = CallToolRequestParams::new("echo");
+        params.arguments = json!({"input": "forwarded text"}).as_object().cloned();
+        if let Some(m) = &marks {
+            let mut meta = RequestMetaObject::new();
+            meta.insert("caliban/untrusted".into(), m.clone());
+            params.meta = Some(meta);
+        }
+        let CallToolResponse::Complete(out) = client.call_tool_once(params).await.unwrap() else { panic!("a result") };
+        assert_ne!(out.is_error, Some(true), "{out:?}");
+        assert_eq!(labels(&newest().await).await, want, "{marks:?}");
+    }
+    let mut params = CallToolRequestParams::new("echo");
+    params.arguments = json!({"input": "x"}).as_object().cloned();
+    let mut meta = RequestMetaObject::new();
+    meta.insert("caliban/untrusted".into(), json!("all"));
+    params.meta = Some(meta);
+    assert!(client.call_tool_once(params).await.is_err(), "malformed marks are refused");
+    let _ = client.cancel().await;
+    task.abort();
+    server.abort();
+}

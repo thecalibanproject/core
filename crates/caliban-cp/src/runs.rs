@@ -108,6 +108,7 @@ async fn detail(cp: &Cp, j: &Arc<dyn Journal>, r: &RunRecord, content: bool) -> 
         "status": r.status,
         "invoker": r.invoker,
         "origin": r.origin,
+        "input_labels": r.input_labels,
         "error": r.error,
         "stop_reason": r.stop_reason,
         "partial": r.status == RunStatus::BudgetExhausted,

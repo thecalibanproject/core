@@ -21,6 +21,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../../../migrations/0017_node_run_retention.sql"),
     include_str!("../../../../migrations/0021_node_exposure.sql"),
     include_str!("../../../../migrations/0024_node_evals.sql"),
+    include_str!("../../../../migrations/0025_node_run_input_labels.sql"),
 ];
 
 /// Columns of `node_step` rows ([`step_row`]).
@@ -36,7 +37,7 @@ macro_rules! run_columns {
         "id, tenant_id, node, version, spec_hash, invoker, invoker_key_hash, input, specs, output, status, wake_at, awaiting, \
          prompt, budget, lease_owner, lease_expires_at, claims, error, stop_reason, idempotency_key, \
          idempotency_fingerprint, created_at, updated_at, started_at, finished_at, cancel_requested_at, \
-         cancelled_by, origin, event_seq"
+         cancelled_by, origin, event_seq, input_labels"
     };
 }
 
@@ -114,6 +115,8 @@ fn run_row(r: &PgRow) -> JResult<RunRecord> {
         cancel_requested_at: get(r, "cancel_requested_at")?,
         cancelled_by: get(r, "cancelled_by")?,
         origin: get(r, "origin")?,
+        input_labels: serde_json::from_value(get::<Json<serde_json::Value>>(r, "input_labels")?.0)
+            .map_err(|e| JournalError(format!("input_labels: {e}")))?,
         last_event: u64::try_from(get::<i64>(r, "event_seq")?).unwrap_or_default(),
     })
 }
@@ -250,8 +253,9 @@ impl Journal for PgJournal {
         let mut tx = self.pool.begin().await.map_err(db)?;
         let inserted = sqlx::query(concat!(
             "INSERT INTO node_run (id, tenant_id, node, version, spec_hash, invoker, invoker_key_hash, input, status,
-                                   budget, idempotency_key, idempotency_fingerprint, specs, origin, event_seq)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12, $13, 1)
+                                   budget, idempotency_key, idempotency_fingerprint, specs, origin, event_seq,
+                                   input_labels)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12, $13, 1, $14)
              ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
              RETURNING ",
             run_columns!()
@@ -269,6 +273,7 @@ impl Journal for PgJournal {
         .bind(&fp)
         .bind(&run.specs)
         .bind(&run.origin)
+        .bind(Json(serde_json::json!(run.input_labels)))
         .fetch_optional(&mut *tx)
         .await
         .map_err(db)?;

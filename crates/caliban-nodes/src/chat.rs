@@ -45,7 +45,9 @@ pub fn input_from_messages(spec: &NodeSpec, messages: &[Value]) -> Result<Value,
             {
                 return Ok(v);
             }
-            if schema.get("type").and_then(Value::as_str) == Some("string") {
+            // A schema without a type (it only annotates, e.g. `{"x-caliban-untrusted": true}`) or a
+            // string schema: the text is the input.
+            if schema.get("type").is_none_or(|t| t == "string") {
                 return Ok(Value::String(text));
             }
             match text_property(schema) {

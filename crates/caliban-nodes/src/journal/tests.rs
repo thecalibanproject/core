@@ -36,6 +36,7 @@ pub(crate) fn new_run(id: &str, tenant: &str, key: Option<(&str, &str)>) -> NewR
         idempotency: key.map(|(k, f)| (k.to_owned(), f.to_owned())),
         specs: Some("sealed-specs".into()),
         origin: None,
+        input_labels: vec!["caller".into()],
     }
 }
 
@@ -86,6 +87,7 @@ async fn idempotency_keys_return_the_first_run() {
         };
         assert_eq!((a.status, a.claims, a.output.is_none()), (RunStatus::Pending, 0, true), "{n}");
         assert_eq!(a.specs.as_deref(), Some("sealed-specs"), "{n}: the pinned versions are stored");
+        assert_eq!(a.input_labels, ["caller"], "{n}: the input's labels are stored");
         assert_eq!(
             j.create_run(new_run("run_b", "acme", Some(("k1", "fp1")))).await.unwrap(),
             Created::Existing(a.clone()),
@@ -100,7 +102,8 @@ async fn idempotency_keys_return_the_first_run() {
         assert!(matches!(j.create_run(new_run("run_e", "acme", None)).await.unwrap(), Created::New(_)));
         assert!(j.get_run("acme", "run_b").await.unwrap().is_none(), "{n}: the duplicate created nothing");
         assert!(j.get_run("globex", "run_a").await.unwrap().is_none(), "{n}: runs are tenant-scoped");
-        assert_eq!(j.get_run("acme", "run_a").await.unwrap().unwrap().id, "run_a");
+        let got = j.get_run("acme", "run_a").await.unwrap().unwrap();
+        assert_eq!((got.id.as_str(), got.input_labels.clone()), ("run_a", vec!["caller".to_owned()]), "{n}");
     }
 }
 

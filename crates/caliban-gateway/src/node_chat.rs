@@ -227,7 +227,11 @@ pub(crate) async fn respond(
         None => {
             let messages: Vec<Value> =
                 req.messages.iter().map(|m| json!({"role": m.role, "content": m.content})).collect();
+            let marks = req.caliban.as_ref().and_then(|c| c.untrusted.as_ref()).unwrap_or(&Value::Null);
+            let untrusted = caliban_nodes::executor::taint::parse_marks(marks)
+                .map_err(|e| NotStarted(bad(format!("caliban.{e}"))))?;
             let start = Start {
+                untrusted,
                 node: nc.target.name.clone(),
                 version: nc.target.version,
                 chat: Some(messages),

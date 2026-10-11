@@ -26,6 +26,11 @@ pub struct CalibanExt {
     #[serde(default)]
     pub zdr: bool,
     pub trace_id: Option<String>,
+    /// `model: "node/<name>"` (and `caliban/auto` handing the request to a node): the node input
+    /// the caller marks as untrusted data, `true` or a list of JSON pointers into the node's input
+    /// (P3 decision 8; checked by the node executor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untrusted: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

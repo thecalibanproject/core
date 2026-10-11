@@ -4,11 +4,12 @@
 //! **Run API** (tenant API keys; the key must be allowed to run the node, see
 //! `TenantConfig::key_may_run`):
 //! - `POST /v1/nodes/{name}/runs` `{"input": ..., "version"?: N, "async"?: bool, "stream"?: bool,
-//!   "wait_s"?: s, "budget"?: {...}}`: sync by default (waits until the run ends or waits for a
+//!   "wait_s"?: s, "budget"?: {...}, "untrusted"?: true | ["/field", ...]}`: sync by default (waits until the run ends or waits for a
 //!   human, at most `CALIBAN_NODE_SYNC_WAIT_SECS`, then answers `202` with the run so far);
 //!   `"async": true` answers `202` at once; `"stream": true` answers with the run's events (SSE)
 //!   until it ends or waits for a human. `Idempotency-Key` returns the run the first request
-//!   created.
+//!   created. `untrusted` marks input as untrusted caller data (the `caller` taint label: writes
+//!   it reaches need an allowlist entry or a human approval); unmarked input is trusted.
 //! - `GET /v1/runs`: the tenant's runs the key may see (its node allowlist), newest first, with
 //!   filters and a cursor.
 //! - `GET /v1/runs/{id}`: status, output, awaited question, budget, usage, steps.
@@ -313,6 +314,9 @@ pub(crate) struct Start {
     pub budget: Option<RunBudget>,
     pub origin: Option<String>,
     pub check_spend: bool,
+    /// JSON pointers into the input the caller marks as untrusted data (see
+    /// `caliban_nodes::executor::taint::parse_marks`).
+    pub untrusted: Vec<String>,
 }
 
 impl<'a> Runs<'a> {
@@ -353,6 +357,7 @@ impl<'a> Runs<'a> {
                     budget: s.budget,
                     origin: s.origin,
                     check_spend: s.check_spend,
+                    untrusted: s.untrusted,
                 };
                 let (run, _) = l.executor.create(start).await.map_err(exec_error)?;
                 if run.status == RunStatus::Pending {
@@ -369,6 +374,9 @@ impl<'a> Runs<'a> {
                 }
                 if let Some(v) = s.version {
                     body["version"] = json!(v);
+                }
+                if !s.untrusted.is_empty() {
+                    body["untrusted"] = json!(s.untrusted);
                 }
                 if let Some(b) = s.budget {
                     body["budget"] =
@@ -547,6 +555,10 @@ struct RunCreate {
     wait_s: Option<f64>,
     /// Lowers the version's budget for this run (`steps`, `tokens`, `usd`, `wall_clock_s`).
     budget: Option<RunBudget>,
+    /// Input the caller marks as untrusted data: `true` (all of it) or JSON pointers into it. Such
+    /// values are labelled `caller` and gated like tool outputs.
+    #[serde(default)]
+    untrusted: Value,
 }
 
 #[derive(Deserialize)]
@@ -627,6 +639,10 @@ async fn create_run(State(gw): State<Arc<Gateway>>, Path(name): Path<String>, re
             }
         },
     };
+    let untrusted = match caliban_nodes::executor::taint::parse_marks(&rc.untrusted) {
+        Ok(m) => m,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", Some("invalid_input"), e),
+    };
     let header = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let start = StartRun {
         tenant: caller.tenant.clone(),
@@ -640,6 +656,7 @@ async fn create_run(State(gw): State<Arc<Gateway>>, Path(name): Path<String>, re
         budget: rc.budget,
         origin: if internal { header(ORIGIN_HEADER) } else { None },
         check_spend: internal && header(CHECK_SPEND_HEADER).as_deref() == Some("true"),
+        untrusted,
     };
     let (run, new) = match runs.executor.create(start).await {
         Ok(x) => x,
