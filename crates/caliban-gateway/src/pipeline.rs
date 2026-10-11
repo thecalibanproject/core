@@ -207,7 +207,6 @@ async fn run(
     let mut settlement =
         limits::reserve(&gw, tenant.id.as_str(), &policy, Amount { tokens: est_prompt + est_out, usd }).await?;
 
-    let salt = quirks::tenant_salt(&gw.salt_key, tenant.id.as_str());
     let mut native_protected: Option<NativeProtected> = None;
     let mut last_err = None;
     for (attempt, model_id) in decision.candidates.iter().enumerate() {
@@ -244,6 +243,8 @@ async fn run(
             None => {
                 let outgoing = if use_protected { &protected_req } else { &req };
                 let mut b = outgoing.to_openai_upstream(&model.upstream_model);
+                let salt =
+                    quirks::tenant_salt(&gw.salt_key, tenant.id.as_str(), provider.id.as_str(), &model.upstream_model);
                 quirks::shape_request(&mut b, &model, &provider, req.reasoning_pref(), &salt);
                 (b, if use_protected { protected.entities } else { 0 }, use_protected.then(|| Arc::clone(&rehydrator)))
             }
@@ -502,6 +503,11 @@ pub(crate) fn resolve(
     let model = snap.model(id)?.clone();
     let provider = snap.provider_for(tenant, &model.provider)?.clone();
     Some((model, provider))
+}
+
+#[cfg(test)]
+pub(crate) fn body_hash_for_tests(body: &Value, model: &str) -> blake3::Hash {
+    body_hash(body, model)
 }
 
 /// Cache key input: the exact body sent upstream, minus transport-only fields.

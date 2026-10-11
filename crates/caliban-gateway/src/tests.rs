@@ -2241,3 +2241,188 @@ api_key_hashes = ["{acme}"]
         assert_eq!((upstream_calls(&log), events(&usage)), (calls, charged));
     }
 }
+
+/// Cache-key isolation (research notes 01 and 02, deltas 2026-10-11; KV provenance, arXiv
+/// 2609.38706; KeyPooling, arXiv 2608.17485): every cache key Caliban computes, and the prefix-cache
+/// salt it sends, includes the tenant and the model identity (a LoRA adapter is its own upstream
+/// model), so identical tokens under two tenants or two adapters of one base model never share an
+/// entry. Runs in the default CI job (no services).
+mod cache_isolation {
+    use super::semantic::{FakeEmbedder, wait_entries};
+    use super::*;
+    use caliban_cache::semantic::{KeyParts, MemoryStore, ResponseShape, SemanticKey, VectorStore};
+    use caliban_cache::{CacheKeyParts, cache_key};
+    use caliban_types::TenantId;
+
+    /// Two tenants on one shared, salting pool that serves a base model and a LoRA adapter of it.
+    async fn setup() -> (Router, Log, Arc<MemoryStore>) {
+        let (base, log) = mock_upstream().await;
+        let toml = format!(
+            r#"
+[cache.semantic]
+enabled = true
+store = "memory"
+embedding_model = "local/embed"
+verify_rate = 0.0
+query_prefix = ""
+
+[[providers]]
+id = "pool"
+kind = "openai_compatible"
+base_url = "{base}"
+trust_tier = "t0_sovereign"
+cache_salt = true
+
+[[models]]
+id = "pool/qwen"
+provider = "pool"
+upstream_model = "qwen"
+trust_tier = "t0_sovereign"
+
+[[models]]
+id = "pool/qwen-legal"
+provider = "pool"
+upstream_model = "qwen-lora-legal"
+trust_tier = "t0_sovereign"
+
+[[models]]
+id = "local/embed"
+provider = "pool"
+upstream_model = "embed"
+kind = "embedding"
+trust_tier = "t0_sovereign"
+
+[[tenants]]
+id = "acme"
+name = "Acme"
+semantic_cache = "on"
+api_key_hashes = ["{acme}"]
+
+[[tenants]]
+id = "globex"
+name = "Globex"
+semantic_cache = "on"
+api_key_hashes = ["{globex}"]
+"#,
+            acme = hash("cal_acme"),
+            globex = hash("cal_globex"),
+        );
+        let cfg = Config::from_toml_str(&toml).unwrap();
+        let store = Arc::new(MemoryStore::default());
+        let mut gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(RecentUsage::default()))
+            .with_semantic_store(store.clone() as Arc<dyn VectorStore>);
+        gw.embedder = Arc::new(FakeEmbedder::default());
+        (app(Arc::new(gw)), log, store)
+    }
+
+    const GLOBEX: (&str, &str) = ("authorization", "Bearer cal_globex");
+
+    fn ask(model: &str, text: &str, cache: &str) -> Value {
+        json!({"model": model, "temperature": 0, "caliban": {"cache": cache},
+               "messages": [{"role": "user", "content": text}]})
+    }
+
+    /// The pipeline end to end: the exact cache, the semantic cache and the salt sent upstream.
+    #[tokio::test]
+    async fn identical_tokens_under_two_tenants_or_two_adapters_share_nothing() {
+        let (app, log, store) = setup().await;
+        let calls = |log: &Log| log.0.lock().unwrap().len();
+        let mut salts = std::collections::HashMap::new();
+        // Exact cache (T1): seeded by acme on the base model.
+        let prompt = "What is the notice period in the standard contract?";
+        for (who, auth, model, hit) in [
+            ("acme/base", BEARER, "pool/qwen", false),
+            ("acme/base again", BEARER, "pool/qwen", true),
+            ("globex/base", GLOBEX, "pool/qwen", false),
+            ("acme/adapter", BEARER, "pool/qwen-legal", false),
+            ("globex/adapter", GLOBEX, "pool/qwen-legal", false),
+        ] {
+            let before = calls(&log);
+            let (s, h, out) = call(&app, "/v1/chat/completions", auth, ask(model, prompt, "exact")).await;
+            assert_eq!(s, StatusCode::OK, "{who}: {out}");
+            assert_eq!(h["x-caliban-cache"] == "hit", hit, "{who}: {h:?}");
+            assert_eq!(calls(&log) == before, hit, "{who}");
+            if !hit {
+                let salt = log.last().2["cache_salt"].as_str().unwrap().to_owned();
+                salts.insert(who.split_once('/').map(|(t, m)| (t.to_owned(), m.to_owned())).unwrap(), salt);
+            }
+        }
+        // The salt: one per (tenant, model), stable, never shared.
+        let distinct: std::collections::HashSet<&String> = salts.values().collect();
+        assert_eq!((salts.len(), distinct.len()), (4, 4), "{salts:?}");
+        let before = calls(&log);
+        call(&app, "/v1/chat/completions", BEARER, ask("pool/qwen", "Another question entirely", "off")).await;
+        assert_eq!(calls(&log), before + 1);
+        assert_eq!(log.last().2["cache_salt"].as_str(), salts.get(&("acme".into(), "base".into())).map(String::as_str));
+
+        // Semantic cache (T2): acme seeds the base model; a paraphrase hits only there.
+        let seed = "How long is the notice period in the standard contract?";
+        let (s, _, out) = call(&app, "/v1/chat/completions", BEARER, ask("pool/qwen", seed, "semantic")).await;
+        assert_eq!(s, StatusCode::OK, "{out}");
+        wait_entries(&store, 1).await;
+        let para = "how long is the notice period in the standard contract";
+        for (who, auth, model, hit) in [
+            ("globex/base", GLOBEX, "pool/qwen", false),
+            ("acme/adapter", BEARER, "pool/qwen-legal", false),
+            ("acme/base", BEARER, "pool/qwen", true),
+        ] {
+            let before = calls(&log);
+            let (s, h, out) = call(&app, "/v1/chat/completions", auth, ask(model, para, "semantic")).await;
+            assert_eq!(s, StatusCode::OK, "{who}: {out}");
+            assert_eq!(
+                (h["x-caliban-cache"] == "hit", calls(&log) == before),
+                (hit, hit),
+                "{who}: {:?} {:?}",
+                h.get("x-caliban-cache"),
+                h.get("x-caliban-cache-tier")
+            );
+        }
+    }
+
+    /// The key functions themselves: changing only the tenant or only the model changes the key.
+    #[test]
+    fn every_key_covers_tenant_and_model() {
+        let (a, b): (TenantId, TenantId) = ("acme".into(), "globex".into());
+        // T1: the tenant is hashed in; the model is part of the request hash (`body_hash`).
+        let t1 = |t: &TenantId, model: &str| {
+            let body = json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
+            cache_key(&CacheKeyParts {
+                tenant: t,
+                request_hash: crate::pipeline::body_hash_for_tests(&body, model),
+                acl_fingerprint: &[],
+                datasource_epochs: &[],
+                pii_mode: caliban_types::PiiMode::Mask,
+            })
+        };
+        assert_ne!(t1(&a, "pool/qwen"), t1(&b, "pool/qwen"));
+        assert_ne!(t1(&a, "pool/qwen"), t1(&a, "pool/qwen-legal"));
+        assert_eq!(t1(&a, "pool/qwen"), t1(&a, "pool/qwen"));
+        // T2: the tenant is the store's filter and is in the partition; the model is the route.
+        let t2 = |t: &TenantId, model: &str| {
+            SemanticKey::new(&KeyParts {
+                tenant: t,
+                model,
+                shape: ResponseShape::Openai,
+                context_hash: blake3::hash(b"ctx"),
+                prompt: "hi",
+                surrogates: &[],
+                pii_mode: caliban_types::PiiMode::Mask,
+                embed_prefix: "",
+            })
+        };
+        let (x, y, z) = (t2(&a, "pool/qwen"), t2(&b, "pool/qwen"), t2(&a, "pool/qwen-legal"));
+        assert!(x.tenant != y.tenant && x.partition != y.partition, "{x:?} {y:?}");
+        assert!(x.route != z.route && x.partition != z.partition, "{x:?} {z:?}");
+        // The prefix-cache salt.
+        let k = [9u8; 32];
+        let s = |t: &str, p: &str, m: &str| crate::quirks::tenant_salt(&k, t, p, m);
+        assert_ne!(s("acme", "pool", "qwen"), s("globex", "pool", "qwen"));
+        assert_ne!(s("acme", "pool", "qwen"), s("acme", "pool", "qwen-lora-legal"));
+        assert_ne!(s("acme", "pool", "qwen"), s("acme", "pool-b", "qwen"));
+        assert_ne!(s("ab", "c", "m"), s("a", "bc", "m"), "parts are length-prefixed");
+        assert_eq!(s("acme", "pool", "qwen"), s("acme", "pool", "qwen"));
+        assert_eq!(s("acme", "pool", "qwen").len(), 32);
+        // The embedding LRU: scoped by tenant and by the embedding model.
+        crate::embedder::lru_key_covers_tenant_and_model();
+    }
+}

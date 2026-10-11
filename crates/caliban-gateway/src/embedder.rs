@@ -132,6 +132,41 @@ fn lru_key(scope: Option<&TenantId>, entry: &ModelEntry, provider: &ProviderConf
     *h.finalize().as_bytes()
 }
 
+/// For the cache-isolation test (`tests::cache_isolation`): the LRU key changes with the tenant and
+/// with the embedding model.
+#[cfg(test)]
+pub(crate) fn lru_key_covers_tenant_and_model() {
+    let entry = |id: &str, up: &str| ModelEntry {
+        id: id.into(),
+        provider: "pool".into(),
+        upstream_model: up.into(),
+        kind: Default::default(),
+        family: None,
+        capabilities: Default::default(),
+        trust_tier: caliban_types::TrustTier::T0Sovereign,
+        licence: None,
+        context_window: None,
+        price_in_per_mtok: None,
+        price_out_per_mtok: None,
+        price_cache_read_per_mtok: None,
+        price_cache_write_per_mtok: None,
+        price_cache_write_1h_per_mtok: None,
+    };
+    let p = ProviderConfig {
+        id: "pool".into(),
+        kind: caliban_types::ProviderKind::OpenaiCompatible,
+        base_url: "http://pool".into(),
+        trust_tier: caliban_types::TrustTier::T0Sovereign,
+        api_key: None,
+        cache_salt: true,
+    };
+    let (a, b): (TenantId, TenantId) = ("acme".into(), "globex".into());
+    let (e1, e2) = (entry("local/embed", "embed"), entry("local/embed-2", "embed-2"));
+    assert_ne!(lru_key(Some(&a), &e1, &p, "x"), lru_key(Some(&b), &e1, &p, "x"));
+    assert_ne!(lru_key(Some(&a), &e1, &p, "x"), lru_key(None, &e1, &p, "x"));
+    assert_ne!(lru_key(Some(&a), &e1, &p, "x"), lru_key(Some(&a), &e2, &p, "x"));
+}
+
 /// `data[].embedding` ordered by `data[].index`; exactly `n` vectors of one dimension.
 fn parse_vectors(v: &Value, n: usize) -> Result<Vec<Vec<f32>>, EmbedError> {
     let data = v.get("data").and_then(Value::as_array).ok_or_else(|| EmbedError::Invalid("no data array".into()))?;

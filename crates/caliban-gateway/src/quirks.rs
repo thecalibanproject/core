@@ -181,9 +181,18 @@ impl ThinkSplitter {
     }
 }
 
-/// Hex salt for a tenant, stable for a given key.
-pub fn tenant_salt(key: &[u8; 32], tenant: &str) -> String {
-    blake3::keyed_hash(key, tenant.as_bytes()).to_hex()[..32].to_owned()
+/// Hex prefix-cache salt for a tenant on one served model, stable for a given key. It covers the
+/// tenant and the model identity (provider and upstream model, which names a LoRA adapter on
+/// vLLM), so two tenants, or two adapters of one base model, never share a cache entry even in a
+/// KV tier that keys on tokens and the salt only (research note 01, KV provenance, arXiv
+/// 2609.38706).
+pub fn tenant_salt(key: &[u8; 32], tenant: &str, provider: &str, upstream_model: &str) -> String {
+    let mut h = blake3::Hasher::new_keyed(key);
+    for part in [tenant, provider, upstream_model] {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part.as_bytes());
+    }
+    h.finalize().to_hex()[..32].to_owned()
 }
 
 /// Field name the upstream used for reasoning deltas (vLLM: `reasoning_content`; newer: `reasoning`).
