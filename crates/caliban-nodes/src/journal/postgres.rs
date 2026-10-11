@@ -20,6 +20,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../../../migrations/0015_node_spend.sql"),
     include_str!("../../../../migrations/0017_node_run_retention.sql"),
     include_str!("../../../../migrations/0021_node_exposure.sql"),
+    include_str!("../../../../migrations/0024_node_evals.sql"),
 ];
 
 /// Columns of `node_step` rows ([`step_row`]).
@@ -548,7 +549,7 @@ impl Journal for PgJournal {
             Ok(EventRecord {
                 run_id: get(&r, "run_id")?,
                 name: get(&r, "name")?,
-                kind: if get::<String>(&r, "kind")? == "timer" { EventKind::Timer } else { EventKind::Input },
+                kind: EventKind::parse(&get::<String>(&r, "kind")?),
                 payload: get(&r, "payload")?,
                 created_at: get(&r, "created_at")?,
             })
@@ -807,5 +808,452 @@ impl Journal for PgJournal {
     async fn ack_audit(&self, ids: &[String]) -> JResult<()> {
         sqlx::query("DELETE FROM node_audit WHERE id = ANY($1)").bind(ids).execute(&self.pool).await.map_err(db)?;
         Ok(())
+    }
+}
+
+// ───────────────────────────── evals ─────────────────────────────
+
+use super::evals::*;
+
+macro_rules! eval_columns {
+    () => {
+        "id, tenant_id, node, version, spec_hash, suite, k, concurrency, created_by, api_key_id, invoker_key_hash, plan, \
+         case_count, status, lease_owner, lease_expires_at, claims, summary, error, cancel_requested_at, cancelled_by, \
+         created_at, updated_at, started_at, finished_at"
+    };
+}
+
+macro_rules! trial_columns {
+    () => {
+        "eval_id, tenant_id, case_id, trial, run_id, status, cost_usd, latency_ms, tokens, verdict, detail, created_at, \
+         finished_at"
+    };
+}
+
+fn u32_of(r: &PgRow, col: &str) -> JResult<u32> {
+    Ok(u32::try_from(get::<i32>(r, col)?).unwrap_or_default())
+}
+
+fn eval_row(r: &PgRow) -> JResult<EvalRecord> {
+    let status: String = get(r, "status")?;
+    let suite: String = get(r, "suite")?;
+    Ok(EvalRecord {
+        id: get(r, "id")?,
+        tenant_id: get(r, "tenant_id")?,
+        node: get(r, "node")?,
+        version: u32_of(r, "version")?,
+        spec_hash: get(r, "spec_hash")?,
+        suite: Suite::parse(&suite).ok_or_else(|| JournalError(format!("unknown eval suite {suite}")))?,
+        k: u32_of(r, "k")?,
+        concurrency: u32_of(r, "concurrency")?,
+        created_by: get(r, "created_by")?,
+        api_key_id: get(r, "api_key_id")?,
+        invoker_key_hash: get(r, "invoker_key_hash")?,
+        plan: get(r, "plan")?,
+        case_count: u32_of(r, "case_count")?,
+        status: EvalStatus::parse(&status).ok_or_else(|| JournalError(format!("unknown eval status {status}")))?,
+        lease_owner: get(r, "lease_owner")?,
+        lease_expires_at: get(r, "lease_expires_at")?,
+        claims: u32_of(r, "claims")?,
+        summary: get::<Option<Json<serde_json::Value>>>(r, "summary")?.map(|j| j.0),
+        error: get(r, "error")?,
+        cancel_requested_at: get(r, "cancel_requested_at")?,
+        cancelled_by: get(r, "cancelled_by")?,
+        created_at: get(r, "created_at")?,
+        updated_at: get(r, "updated_at")?,
+        started_at: get(r, "started_at")?,
+        finished_at: get(r, "finished_at")?,
+    })
+}
+
+fn trial_row(r: &PgRow) -> JResult<TrialRecord> {
+    let status: String = get(r, "status")?;
+    Ok(TrialRecord {
+        eval_id: get(r, "eval_id")?,
+        tenant_id: get(r, "tenant_id")?,
+        case_id: get(r, "case_id")?,
+        trial: u32_of(r, "trial")?,
+        run_id: get(r, "run_id")?,
+        status: TrialStatus::parse(&status).ok_or_else(|| JournalError(format!("unknown trial status {status}")))?,
+        cost_usd: get(r, "cost_usd")?,
+        latency_ms: u64_of(r, "latency_ms")?,
+        tokens: u64_of(r, "tokens")?,
+        verdict: get::<Json<serde_json::Value>>(r, "verdict")?.0,
+        detail: get(r, "detail")?,
+        created_at: get(r, "created_at")?,
+        finished_at: get(r, "finished_at")?,
+    })
+}
+
+fn golden_row(r: &PgRow) -> JResult<GoldenSetRecord> {
+    Ok(GoldenSetRecord {
+        tenant_id: get(r, "tenant_id")?,
+        node: get(r, "node")?,
+        version: u32_of(r, "version")?,
+        cases: get(r, "cases")?,
+        case_count: u32_of(r, "case_count")?,
+        hash: get(r, "hash")?,
+        updated_at: get(r, "updated_at")?,
+        updated_by: get(r, "updated_by")?,
+    })
+}
+
+const GOLDEN_COLUMNS: &str = "tenant_id, node, version, cases, case_count, hash, updated_at, updated_by";
+
+#[async_trait::async_trait]
+impl EvalStore for PgJournal {
+    async fn put_golden_set(&self, g: GoldenSetRecord, audit: Option<AuditEvent>) -> JResult<()> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        sqlx::query(
+            "INSERT INTO node_golden_set (tenant_id, node, version, cases, case_count, hash, updated_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (tenant_id, node, version) DO UPDATE
+             SET cases = EXCLUDED.cases, case_count = EXCLUDED.case_count, hash = EXCLUDED.hash,
+                 updated_by = EXCLUDED.updated_by, updated_at = clock_timestamp()",
+        )
+        .bind(&g.tenant_id)
+        .bind(&g.node)
+        .bind(i32_of(g.version))
+        .bind(&g.cases)
+        .bind(i32_of(g.case_count))
+        .bind(&g.hash)
+        .bind(&g.updated_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        push_audit(&mut tx, audit.as_ref()).await?;
+        tx.commit().await.map_err(db)
+    }
+
+    async fn golden_set(&self, tenant: &str, node: &str, version: u32) -> JResult<Option<GoldenSetRecord>> {
+        let q =
+            format!("SELECT {GOLDEN_COLUMNS} FROM node_golden_set WHERE tenant_id = $1 AND node = $2 AND version = $3");
+        sqlx::query(sqlx::AssertSqlSafe(q))
+            .bind(tenant)
+            .bind(node)
+            .bind(i32_of(version))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?
+            .as_ref()
+            .map(golden_row)
+            .transpose()
+    }
+
+    async fn golden_sets(&self, tenant: &str, node: &str) -> JResult<Vec<GoldenSetRecord>> {
+        let q =
+            format!("SELECT {GOLDEN_COLUMNS} FROM node_golden_set WHERE tenant_id = $1 AND node = $2 ORDER BY version");
+        let rows =
+            sqlx::query(sqlx::AssertSqlSafe(q)).bind(tenant).bind(node).fetch_all(&self.pool).await.map_err(db)?;
+        rows.iter().map(golden_row).collect()
+    }
+
+    async fn delete_golden_set(
+        &self,
+        tenant: &str,
+        node: &str,
+        version: u32,
+        audit: Option<AuditEvent>,
+    ) -> JResult<bool> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let r = sqlx::query("DELETE FROM node_golden_set WHERE tenant_id = $1 AND node = $2 AND version = $3")
+            .bind(tenant)
+            .bind(node)
+            .bind(i32_of(version))
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        let gone = r.rows_affected() == 1;
+        if gone {
+            push_audit(&mut tx, audit.as_ref()).await?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(gone)
+    }
+
+    async fn put_eval_policy(&self, p: EvalPolicyRecord, audit: Option<AuditEvent>) -> JResult<()> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        sqlx::query(
+            "INSERT INTO node_eval_policy (tenant_id, node, policy, updated_by) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (tenant_id, node) DO UPDATE
+             SET policy = EXCLUDED.policy, updated_by = EXCLUDED.updated_by, updated_at = clock_timestamp()",
+        )
+        .bind(&p.tenant_id)
+        .bind(&p.node)
+        .bind(Json(&p.policy))
+        .bind(&p.updated_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        push_audit(&mut tx, audit.as_ref()).await?;
+        tx.commit().await.map_err(db)
+    }
+
+    async fn eval_policy(&self, tenant: &str, node: &str) -> JResult<Option<EvalPolicyRecord>> {
+        let r = sqlx::query(
+            "SELECT tenant_id, node, policy, updated_at, updated_by FROM node_eval_policy
+             WHERE tenant_id = $1 AND node = $2",
+        )
+        .bind(tenant)
+        .bind(node)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        r.map(|r| {
+            Ok(EvalPolicyRecord {
+                tenant_id: get(&r, "tenant_id")?,
+                node: get(&r, "node")?,
+                policy: get::<Json<serde_json::Value>>(&r, "policy")?.0,
+                updated_at: get(&r, "updated_at")?,
+                updated_by: get(&r, "updated_by")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn create_eval(&self, e: NewEval, audit: Option<AuditEvent>) -> JResult<EvalRecord> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let r = sqlx::query(concat!(
+            "INSERT INTO node_eval (id, tenant_id, node, version, spec_hash, suite, k, concurrency, created_by,
+                                    api_key_id, invoker_key_hash, plan, case_count, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pending') RETURNING ",
+            eval_columns!()
+        ))
+        .bind(&e.id)
+        .bind(&e.tenant_id)
+        .bind(&e.node)
+        .bind(i32_of(e.version))
+        .bind(&e.spec_hash)
+        .bind(e.suite.as_str())
+        .bind(i32_of(e.k))
+        .bind(i32_of(e.concurrency))
+        .bind(&e.created_by)
+        .bind(&e.api_key_id)
+        .bind(&e.invoker_key_hash)
+        .bind(&e.plan)
+        .bind(i32_of(e.case_count))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        let rec = eval_row(&r)?;
+        push_audit(&mut tx, audit.as_ref()).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(rec)
+    }
+
+    async fn get_eval(&self, tenant: &str, id: &str) -> JResult<Option<EvalRecord>> {
+        sqlx::query(concat!("SELECT ", eval_columns!(), " FROM node_eval WHERE id = $1 AND tenant_id = $2"))
+            .bind(id)
+            .bind(tenant)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?
+            .as_ref()
+            .map(eval_row)
+            .transpose()
+    }
+
+    async fn list_evals(&self, q: &EvalQuery) -> JResult<Vec<EvalRecord>> {
+        let statuses: Vec<&str> = q.statuses.iter().map(|s| s.as_str()).collect();
+        let (before_at, before_id) = q.before.clone().map_or((None, None), |(t, id)| (Some(t), Some(id)));
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            eval_columns!(),
+            " FROM node_eval
+             WHERE tenant_id = $1
+               AND ($2::TEXT IS NULL OR node = $2)
+               AND ($3::INTEGER IS NULL OR version = $3)
+               AND ($4::TEXT IS NULL OR suite = $4)
+               AND (cardinality($5::TEXT[]) = 0 OR status = ANY($5))
+               AND ($6::TIMESTAMPTZ IS NULL OR (created_at, id) < ($6, $7))
+             ORDER BY created_at DESC, id DESC LIMIT $8"
+        ))
+        .bind(&q.tenant)
+        .bind(&q.node)
+        .bind(q.version.map(i32_of))
+        .bind(q.suite.map(Suite::as_str))
+        .bind(&statuses)
+        .bind(before_at)
+        .bind(before_id)
+        .bind(i64_of(q.limit as u64))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter().map(eval_row).collect()
+    }
+
+    async fn claim_eval(&self, worker: &str, ttl: Duration) -> JResult<Option<EvalRecord>> {
+        sqlx::query(concat!(
+            "UPDATE node_eval SET status = 'running', lease_owner = $1,
+                                  lease_expires_at = now() + make_interval(secs => $2), claims = claims + 1,
+                                  started_at = COALESCE(started_at, now()), updated_at = now()
+             WHERE id = (SELECT id FROM node_eval
+                         WHERE status = 'pending' OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < now()))
+                         ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED)
+             RETURNING ",
+            eval_columns!()
+        ))
+        .bind(worker)
+        .bind(secs(ttl))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?
+        .as_ref()
+        .map(eval_row)
+        .transpose()
+    }
+
+    async fn heartbeat_eval(&self, id: &str, worker: &str, ttl: Duration) -> JResult<bool> {
+        let r = sqlx::query(
+            "UPDATE node_eval SET lease_expires_at = now() + make_interval(secs => $3)
+             WHERE id = $1 AND lease_owner = $2 AND status = 'running'",
+        )
+        .bind(id)
+        .bind(worker)
+        .bind(secs(ttl))
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    async fn cancel_eval(&self, tenant: &str, id: &str, by: &str, audit: Option<AuditEvent>) -> JResult<EvalCancel> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let row: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT status, cancel_requested_at FROM node_eval WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(id)
+        .bind(tenant)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let Some((status, requested)) = row else { return Ok(EvalCancel::NotFound) };
+        let status = EvalStatus::parse(&status).ok_or_else(|| JournalError(format!("unknown eval status {status}")))?;
+        let out = match status {
+            s if s.is_terminal() => return Ok(EvalCancel::AlreadyEnded(s)),
+            EvalStatus::Running if requested.is_some() => return Ok(EvalCancel::Requested),
+            EvalStatus::Running => {
+                sqlx::query(
+                    "UPDATE node_eval SET cancel_requested_at = now(), cancelled_by = $2, updated_at = now() WHERE id = $1",
+                )
+                .bind(id)
+                .bind(by)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+                EvalCancel::Requested
+            }
+            _ => {
+                sqlx::query(
+                    "UPDATE node_eval SET status = 'cancelled', cancel_requested_at = now(), cancelled_by = $2,
+                                          updated_at = now(), finished_at = now()
+                     WHERE id = $1",
+                )
+                .bind(id)
+                .bind(by)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+                EvalCancel::Ended
+            }
+        };
+        push_audit(&mut tx, audit.as_ref()).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(out)
+    }
+
+    async fn finish_eval(&self, id: &str, worker: &str, f: EvalFinish, audit: Option<AuditEvent>) -> JResult<bool> {
+        bad_finish(&f)?;
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let r = sqlx::query(
+            "UPDATE node_eval SET status = $3, summary = $4, error = $5, lease_owner = NULL, lease_expires_at = NULL,
+                                  updated_at = now(), finished_at = now()
+             WHERE id = $1 AND lease_owner = $2 AND status = 'running'",
+        )
+        .bind(id)
+        .bind(worker)
+        .bind(f.status.as_str())
+        .bind(f.summary.as_ref().map(Json))
+        .bind(&f.error)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        if r.rows_affected() != 1 {
+            return Ok(false);
+        }
+        push_audit(&mut tx, audit.as_ref()).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
+    async fn put_trial(&self, worker: &str, t: TrialRecord) -> JResult<TrialWrite> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        // Fence: lock the eval row while we hold its lease.
+        let held: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM node_eval WHERE id = $1 AND lease_owner = $2 AND status = 'running' FOR UPDATE",
+        )
+        .bind(&t.eval_id)
+        .bind(worker)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if held.is_none() {
+            return Ok(TrialWrite::LeaseLost);
+        }
+        let written = sqlx::query(
+            "INSERT INTO node_eval_trial (eval_id, case_id, trial, tenant_id, run_id, status, cost_usd, latency_ms, tokens,
+                                          verdict, detail, finished_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CASE WHEN $6 = 'running' THEN NULL ELSE now() END)
+             ON CONFLICT (eval_id, case_id, trial) DO UPDATE
+             SET run_id = EXCLUDED.run_id, status = EXCLUDED.status, cost_usd = EXCLUDED.cost_usd,
+                 latency_ms = EXCLUDED.latency_ms, tokens = EXCLUDED.tokens, verdict = EXCLUDED.verdict,
+                 detail = EXCLUDED.detail, finished_at = EXCLUDED.finished_at
+             WHERE node_eval_trial.status = 'running'",
+        )
+        .bind(&t.eval_id)
+        .bind(&t.case_id)
+        .bind(i32_of(t.trial))
+        .bind(&t.tenant_id)
+        .bind(&t.run_id)
+        .bind(t.status.as_str())
+        .bind(t.cost_usd)
+        .bind(i64_of(t.latency_ms))
+        .bind(i64_of(t.tokens))
+        .bind(Json(&t.verdict))
+        .bind(&t.detail)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        let out = if written.rows_affected() == 1 {
+            TrialWrite::Written
+        } else {
+            let r = sqlx::query(concat!(
+                "SELECT ",
+                trial_columns!(),
+                " FROM node_eval_trial WHERE eval_id = $1 AND case_id = $2 AND trial = $3"
+            ))
+            .bind(&t.eval_id)
+            .bind(&t.case_id)
+            .bind(i32_of(t.trial))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+            TrialWrite::Existing(Box::new(trial_row(&r)?))
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(out)
+    }
+
+    async fn trials(&self, eval_id: &str) -> JResult<Vec<TrialRecord>> {
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            trial_columns!(),
+            " FROM node_eval_trial WHERE eval_id = $1 ORDER BY case_id COLLATE \"C\", trial"
+        ))
+        .bind(eval_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter().map(trial_row).collect()
     }
 }

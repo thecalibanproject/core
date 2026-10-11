@@ -2,6 +2,7 @@
 //! [`super::postgres::PgJournal`] (the parity suite runs against both); everything is lost when
 //! the process stops.
 
+use super::evals::*;
 use super::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -18,6 +19,14 @@ struct Tables {
     run_events: HashMap<String, Vec<RunEvent>>,
     /// The audit outbox, in creation order, with who holds each entry and until when.
     audit: Vec<(AuditEvent, Option<Hold>)>,
+    /// (tenant, node, version) to its golden set.
+    golden: HashMap<(String, String, u32), GoldenSetRecord>,
+    /// (tenant, node) to its promotion bar.
+    policies: HashMap<(String, String), EvalPolicyRecord>,
+    /// In creation order.
+    evals: Vec<EvalRecord>,
+    /// Eval id to its trials.
+    trials: HashMap<String, Vec<TrialRecord>>,
 }
 
 /// Who holds an outbox entry, and until when.
@@ -462,5 +471,212 @@ impl Journal for MemoryJournal {
     async fn ack_audit(&self, ids: &[String]) -> JResult<()> {
         self.t.lock().audit.retain(|(a, _)| !ids.contains(&a.id));
         Ok(())
+    }
+}
+
+fn holds_eval(e: &EvalRecord, worker: &str) -> bool {
+    e.status == EvalStatus::Running && e.lease_owner.as_deref() == Some(worker)
+}
+
+#[async_trait::async_trait]
+impl EvalStore for MemoryJournal {
+    async fn put_golden_set(&self, g: GoldenSetRecord, audit: Option<AuditEvent>) -> JResult<()> {
+        let mut t = self.t.lock();
+        let key = (g.tenant_id.clone(), g.node.clone(), g.version);
+        t.golden.insert(key, GoldenSetRecord { updated_at: Utc::now(), ..g });
+        t.push_audit(audit);
+        Ok(())
+    }
+
+    async fn golden_set(&self, tenant: &str, node: &str, version: u32) -> JResult<Option<GoldenSetRecord>> {
+        Ok(self.t.lock().golden.get(&(tenant.to_owned(), node.to_owned(), version)).cloned())
+    }
+
+    async fn golden_sets(&self, tenant: &str, node: &str) -> JResult<Vec<GoldenSetRecord>> {
+        let t = self.t.lock();
+        let mut v: Vec<GoldenSetRecord> =
+            t.golden.values().filter(|g| g.tenant_id == tenant && g.node == node).cloned().collect();
+        v.sort_by_key(|g| g.version);
+        Ok(v)
+    }
+
+    async fn delete_golden_set(
+        &self,
+        tenant: &str,
+        node: &str,
+        version: u32,
+        audit: Option<AuditEvent>,
+    ) -> JResult<bool> {
+        let mut t = self.t.lock();
+        let gone = t.golden.remove(&(tenant.to_owned(), node.to_owned(), version)).is_some();
+        if gone {
+            t.push_audit(audit);
+        }
+        Ok(gone)
+    }
+
+    async fn put_eval_policy(&self, p: EvalPolicyRecord, audit: Option<AuditEvent>) -> JResult<()> {
+        let mut t = self.t.lock();
+        t.policies.insert((p.tenant_id.clone(), p.node.clone()), EvalPolicyRecord { updated_at: Utc::now(), ..p });
+        t.push_audit(audit);
+        Ok(())
+    }
+
+    async fn eval_policy(&self, tenant: &str, node: &str) -> JResult<Option<EvalPolicyRecord>> {
+        Ok(self.t.lock().policies.get(&(tenant.to_owned(), node.to_owned())).cloned())
+    }
+
+    async fn create_eval(&self, e: NewEval, audit: Option<AuditEvent>) -> JResult<EvalRecord> {
+        let mut t = self.t.lock();
+        if t.evals.iter().any(|x| x.id == e.id) {
+            return Err(JournalError(format!("eval {} already exists", e.id)));
+        }
+        let now = Utc::now();
+        let rec = EvalRecord {
+            id: e.id,
+            tenant_id: e.tenant_id,
+            node: e.node,
+            version: e.version,
+            spec_hash: e.spec_hash,
+            suite: e.suite,
+            k: e.k,
+            concurrency: e.concurrency,
+            created_by: e.created_by,
+            api_key_id: e.api_key_id,
+            invoker_key_hash: e.invoker_key_hash,
+            plan: e.plan,
+            case_count: e.case_count,
+            status: EvalStatus::Pending,
+            lease_owner: None,
+            lease_expires_at: None,
+            claims: 0,
+            summary: None,
+            error: None,
+            cancel_requested_at: None,
+            cancelled_by: None,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+        t.evals.push(rec.clone());
+        t.push_audit(audit);
+        Ok(rec)
+    }
+
+    async fn get_eval(&self, tenant: &str, id: &str) -> JResult<Option<EvalRecord>> {
+        Ok(self.t.lock().evals.iter().find(|e| e.id == id && e.tenant_id == tenant).cloned())
+    }
+
+    async fn list_evals(&self, q: &EvalQuery) -> JResult<Vec<EvalRecord>> {
+        let t = self.t.lock();
+        let mut v: Vec<EvalRecord> = t.evals.iter().filter(|e| q.matches(e)).cloned().collect();
+        v.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
+        v.truncate(q.limit);
+        Ok(v)
+    }
+
+    async fn claim_eval(&self, worker: &str, ttl: Duration) -> JResult<Option<EvalRecord>> {
+        let now = Utc::now();
+        let mut t = self.t.lock();
+        Ok(t.evals.iter_mut().find(|e| claimable(e, now)).map(|e| {
+            e.status = EvalStatus::Running;
+            e.lease_owner = Some(worker.to_owned());
+            e.lease_expires_at = Some(lease_until(now, ttl));
+            e.claims += 1;
+            e.started_at.get_or_insert(now);
+            e.updated_at = now;
+            e.clone()
+        }))
+    }
+
+    async fn heartbeat_eval(&self, id: &str, worker: &str, ttl: Duration) -> JResult<bool> {
+        let now = Utc::now();
+        let mut t = self.t.lock();
+        Ok(match t.evals.iter_mut().find(|e| e.id == id && holds_eval(e, worker)) {
+            Some(e) => {
+                e.lease_expires_at = Some(lease_until(now, ttl));
+                true
+            }
+            None => false,
+        })
+    }
+
+    async fn cancel_eval(&self, tenant: &str, id: &str, by: &str, audit: Option<AuditEvent>) -> JResult<EvalCancel> {
+        let mut t = self.t.lock();
+        let now = Utc::now();
+        let Some(e) = t.evals.iter_mut().find(|e| e.id == id && e.tenant_id == tenant) else {
+            return Ok(EvalCancel::NotFound);
+        };
+        let out = match e.status {
+            s if s.is_terminal() => return Ok(EvalCancel::AlreadyEnded(s)),
+            EvalStatus::Running if e.cancel_requested_at.is_some() => return Ok(EvalCancel::Requested),
+            EvalStatus::Running => {
+                e.cancel_requested_at = Some(now);
+                e.cancelled_by = Some(by.to_owned());
+                e.updated_at = now;
+                EvalCancel::Requested
+            }
+            _ => {
+                e.status = EvalStatus::Cancelled;
+                e.cancel_requested_at = Some(now);
+                e.cancelled_by = Some(by.to_owned());
+                e.updated_at = now;
+                e.finished_at = Some(now);
+                EvalCancel::Ended
+            }
+        };
+        t.push_audit(audit);
+        Ok(out)
+    }
+
+    async fn finish_eval(&self, id: &str, worker: &str, f: EvalFinish, audit: Option<AuditEvent>) -> JResult<bool> {
+        bad_finish(&f)?;
+        let mut t = self.t.lock();
+        let ok = match t.evals.iter_mut().find(|e| e.id == id && holds_eval(e, worker)) {
+            Some(e) => {
+                let now = Utc::now();
+                e.status = f.status;
+                e.summary = f.summary;
+                e.error = f.error;
+                e.lease_owner = None;
+                e.lease_expires_at = None;
+                e.updated_at = now;
+                e.finished_at = Some(now);
+                true
+            }
+            None => false,
+        };
+        if ok {
+            t.push_audit(audit);
+        }
+        Ok(ok)
+    }
+
+    async fn put_trial(&self, worker: &str, tr: TrialRecord) -> JResult<TrialWrite> {
+        let mut t = self.t.lock();
+        if !t.evals.iter().any(|e| e.id == tr.eval_id && holds_eval(e, worker)) {
+            return Ok(TrialWrite::LeaseLost);
+        }
+        let list = t.trials.entry(tr.eval_id.clone()).or_default();
+        match list.iter_mut().find(|x| x.case_id == tr.case_id && x.trial == tr.trial) {
+            Some(x) if x.status.is_final() => Ok(TrialWrite::Existing(Box::new(x.clone()))),
+            Some(x) => {
+                let created_at = x.created_at;
+                *x = TrialRecord { created_at, finished_at: tr.status.is_final().then(Utc::now), ..tr };
+                Ok(TrialWrite::Written)
+            }
+            None => {
+                let now = Utc::now();
+                list.push(TrialRecord { created_at: now, finished_at: tr.status.is_final().then_some(now), ..tr });
+                Ok(TrialWrite::Written)
+            }
+        }
+    }
+
+    async fn trials(&self, eval_id: &str) -> JResult<Vec<TrialRecord>> {
+        let mut v = self.t.lock().trials.get(eval_id).cloned().unwrap_or_default();
+        v.sort_by(|a, b| (&a.case_id, a.trial).cmp(&(&b.case_id, b.trial)));
+        Ok(v)
     }
 }

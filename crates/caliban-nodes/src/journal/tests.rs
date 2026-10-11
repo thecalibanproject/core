@@ -599,3 +599,244 @@ async fn runs_are_listed_newest_first_with_filters_and_a_cursor() {
         );
     }
 }
+
+// ───────────────────────────── evals ─────────────────────────────
+
+use super::evals::*;
+
+fn audit_event(id: &str, action: &str) -> AuditEvent {
+    AuditEvent {
+        id: id.into(),
+        tenant_id: "acme".into(),
+        actor: "user:jo".into(),
+        action: action.into(),
+        target: Some("triage".into()),
+        detail: serde_json::json!({"node": "triage"}),
+        at: Utc::now(),
+    }
+}
+
+pub(crate) fn new_eval(id: &str, tenant: &str, suite: Suite) -> NewEval {
+    NewEval {
+        id: id.into(),
+        tenant_id: tenant.into(),
+        node: "triage".into(),
+        version: 2,
+        spec_hash: "sha256:01".into(),
+        suite,
+        k: 3,
+        concurrency: 2,
+        created_by: "user:jo".into(),
+        api_key_id: Some("key_1".into()),
+        invoker_key_hash: "ab".repeat(32),
+        plan: "sealed-plan".into(),
+        case_count: 2,
+    }
+}
+
+fn trial(eval: &str, case: &str, n: u32, status: TrialStatus) -> TrialRecord {
+    TrialRecord {
+        eval_id: eval.into(),
+        tenant_id: "acme".into(),
+        case_id: case.into(),
+        trial: n,
+        run_id: Some(format!("run_{case}_{n}")),
+        status,
+        cost_usd: 0.25,
+        latency_ms: 120,
+        tokens: 40,
+        verdict: serde_json::json!({"checks": [{"type": "exact", "passed": status == TrialStatus::Passed}]}),
+        detail: Some("sealed-detail".into()),
+        created_at: Utc::now(),
+        finished_at: None,
+    }
+}
+
+#[tokio::test]
+async fn golden_sets_and_promotion_bars_are_stored_per_version_with_their_audit() {
+    for j in journals().await {
+        let n = j.name();
+        let g = |v: u32, cases: &str, count: u32| GoldenSetRecord {
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: v,
+            cases: cases.into(),
+            case_count: count,
+            hash: format!("sha256:{cases}"),
+            updated_at: Utc::now(),
+            updated_by: "user:jo".into(),
+        };
+        j.put_golden_set(g(2, "sealed-a", 2), Some(audit_event("g1", "node.golden_set.update"))).await.unwrap();
+        j.put_golden_set(g(1, "sealed-b", 1), None).await.unwrap();
+        // Replaced in place.
+        j.put_golden_set(g(2, "sealed-c", 3), Some(audit_event("g2", "node.golden_set.update"))).await.unwrap();
+        let got = j.golden_set("acme", "triage", 2).await.unwrap().expect(n);
+        assert_eq!((got.cases.as_str(), got.case_count, got.updated_by.as_str()), ("sealed-c", 3, "user:jo"), "{n}");
+        assert!(j.golden_set("globex", "triage", 2).await.unwrap().is_none(), "{n}: tenant-scoped");
+        let all: Vec<u32> = j.golden_sets("acme", "triage").await.unwrap().iter().map(|g| g.version).collect();
+        assert_eq!(all, [1, 2], "{n}");
+        assert!(
+            j.delete_golden_set("acme", "triage", 1, Some(audit_event("g3", "node.golden_set.delete"))).await.unwrap()
+        );
+        assert!(!j.delete_golden_set("acme", "triage", 1, Some(audit_event("g4", "x"))).await.unwrap(), "{n}");
+
+        assert!(j.eval_policy("acme", "triage").await.unwrap().is_none());
+        let p = |bar: f64| EvalPolicyRecord {
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            policy: serde_json::json!({"golden": {"min_pass_k": bar}}),
+            updated_at: Utc::now(),
+            updated_by: "user:jo".into(),
+        };
+        j.put_eval_policy(p(0.8), Some(audit_event("p1", "node.eval_policy.update"))).await.unwrap();
+        j.put_eval_policy(p(0.9), None).await.unwrap();
+        let got = j.eval_policy("acme", "triage").await.unwrap().expect(n);
+        assert_eq!(got.policy["golden"]["min_pass_k"], 0.9, "{n}");
+
+        // Every write recorded its audit event in the outbox (a no-op delete recorded nothing).
+        let mut ids: Vec<String> =
+            j.claim_audit("cp", TTL, 100).await.unwrap().into_iter().map(|a| a.id).collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, ["g1", "g2", "g3", "p1"], "{n}");
+    }
+}
+
+#[tokio::test]
+async fn evals_are_claimed_once_fenced_by_their_lease_and_finished_with_metrics() {
+    for j in journals().await {
+        let n = j.name();
+        let e = j.create_eval(new_eval("eval_1", "acme", Suite::Golden), Some(audit_event("e1", "node.eval.start")));
+        let e = e.await.unwrap();
+        assert_eq!((e.status, e.claims, e.k, e.suite), (EvalStatus::Pending, 0, 3, Suite::Golden), "{n}");
+        assert!(j.get_eval("globex", "eval_1").await.unwrap().is_none(), "{n}: tenant-scoped");
+
+        let c = j.claim_eval("w1", TTL).await.unwrap().expect(n);
+        assert_eq!((c.status, c.lease_owner.as_deref(), c.claims), (EvalStatus::Running, Some("w1"), 1), "{n}");
+        assert!(j.claim_eval("w2", TTL).await.unwrap().is_none(), "{n}: held");
+        assert!(j.heartbeat_eval("eval_1", "w1", TTL).await.unwrap());
+        assert!(!j.heartbeat_eval("eval_1", "w2", TTL).await.unwrap());
+
+        // Trials: written while running, final once.
+        let running =
+            TrialRecord { status: TrialStatus::Running, detail: None, ..trial("eval_1", "a", 0, TrialStatus::Running) };
+        assert_eq!(j.put_trial("w1", running).await.unwrap(), TrialWrite::Written, "{n}");
+        assert_eq!(
+            j.put_trial("w2", trial("eval_1", "a", 0, TrialStatus::Passed)).await.unwrap(),
+            TrialWrite::LeaseLost
+        );
+        assert_eq!(j.put_trial("w1", trial("eval_1", "a", 0, TrialStatus::Passed)).await.unwrap(), TrialWrite::Written);
+        match j.put_trial("w1", trial("eval_1", "a", 0, TrialStatus::Failed)).await.unwrap() {
+            TrialWrite::Existing(t) => assert_eq!(t.status, TrialStatus::Passed, "{n}: the first final write wins"),
+            other => panic!("{n}: {other:?}"),
+        }
+        j.put_trial("w1", trial("eval_1", "b", 1, TrialStatus::Failed)).await.unwrap();
+        j.put_trial("w1", trial("eval_1", "b", 0, TrialStatus::Error)).await.unwrap();
+        let ts = j.trials("eval_1").await.unwrap();
+        let keys: Vec<(&str, u32, TrialStatus)> = ts.iter().map(|t| (t.case_id.as_str(), t.trial, t.status)).collect();
+        assert_eq!(
+            keys,
+            [("a", 0, TrialStatus::Passed), ("b", 0, TrialStatus::Error), ("b", 1, TrialStatus::Failed)],
+            "{n}"
+        );
+        assert!(ts.iter().all(|t| t.finished_at.is_some()), "{n}");
+        assert_eq!((ts[0].run_id.as_deref(), ts[0].latency_ms, ts[0].cost_usd), (Some("run_a_0"), 120, 0.25), "{n}");
+        assert_eq!(ts[0].verdict["checks"][0]["passed"], true, "{n}");
+
+        // w1 stops heartbeating: w2 takes it over and w1 is fenced off.
+        j.create_eval(new_eval("eval_2", "acme", Suite::Injection), None).await.unwrap();
+        let c2 = j.claim_eval("w3", Duration::ZERO).await.unwrap().expect(n);
+        assert_eq!(c2.id, "eval_2", "{n}");
+        let mut taken = None;
+        until("the eval lease to expire", async || {
+            taken = j.claim_eval("w4", TTL).await.unwrap();
+            taken.is_some()
+        })
+        .await;
+        assert_eq!(taken.map(|e| (e.id, e.claims)), Some(("eval_2".to_owned(), 2)), "{n}");
+        let done =
+            |s: EvalStatus| EvalFinish { status: s, summary: Some(serde_json::json!({"pass_rate": 1.0})), error: None };
+        assert!(!j.finish_eval("eval_2", "w3", done(EvalStatus::Succeeded), None).await.unwrap(), "{n}: fenced");
+        assert!(j.finish_eval("eval_2", "w4", done(EvalStatus::Succeeded), None).await.unwrap(), "{n}");
+        assert!(j.finish_eval("eval_1", "w1", done(EvalStatus::Running), None).await.is_err(), "{n}");
+        let f = j.finish_eval("eval_1", "w1", done(EvalStatus::Succeeded), Some(audit_event("e2", "node.eval.finish")));
+        assert!(f.await.unwrap(), "{n}");
+        let e = j.get_eval("acme", "eval_1").await.unwrap().unwrap();
+        assert_eq!(
+            (e.status, e.lease_owner, e.summary.unwrap()["pass_rate"].as_f64()),
+            (EvalStatus::Succeeded, None, Some(1.0))
+        );
+        assert!(e.finished_at.is_some() && e.started_at.is_some(), "{n}");
+        assert_eq!(
+            j.put_trial("w1", trial("eval_1", "c", 0, TrialStatus::Passed)).await.unwrap(),
+            TrialWrite::LeaseLost
+        );
+
+        // Listing: newest first, filtered.
+        j.create_eval(new_eval("eval_3", "acme", Suite::Golden), None).await.unwrap();
+        let q = |suite: Option<Suite>, statuses: Vec<EvalStatus>| EvalQuery {
+            tenant: "acme".into(),
+            node: Some("triage".into()),
+            version: Some(2),
+            suite,
+            statuses,
+            before: None,
+            limit: 10,
+        };
+        let ids = |v: Vec<EvalRecord>| v.into_iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(j.list_evals(&q(None, vec![])).await.unwrap()), ["eval_3", "eval_2", "eval_1"], "{n}");
+        assert_eq!(ids(j.list_evals(&q(Some(Suite::Golden), vec![EvalStatus::Succeeded])).await.unwrap()), ["eval_1"]);
+        let mut page = q(None, vec![]);
+        page.limit = 1;
+        let first = j.list_evals(&page).await.unwrap();
+        page.before = Some((first[0].created_at, first[0].id.clone()));
+        assert_eq!(ids(j.list_evals(&page).await.unwrap()), ["eval_2"], "{n}");
+        let mut other = q(None, vec![]);
+        other.tenant = "globex".into();
+        assert!(j.list_evals(&other).await.unwrap().is_empty(), "{n}");
+    }
+}
+
+#[tokio::test]
+async fn cancelling_an_eval_ends_a_pending_one_and_asks_a_running_one_to_stop() {
+    for j in journals().await {
+        let n = j.name();
+        j.create_eval(new_eval("eval_p", "acme", Suite::Golden), None).await.unwrap();
+        let c = j.cancel_eval("acme", "eval_p", "user:jo", Some(audit_event("eval_p/cancel", "node.eval.cancel")));
+        assert_eq!(c.await.unwrap(), EvalCancel::Ended, "{n}");
+        let e = j.get_eval("acme", "eval_p").await.unwrap().unwrap();
+        assert_eq!((e.status, e.cancelled_by.as_deref()), (EvalStatus::Cancelled, Some("user:jo")), "{n}");
+        assert!(j.claim_eval("w1", TTL).await.unwrap().is_none(), "{n}: nothing to claim");
+        assert_eq!(
+            j.cancel_eval("acme", "eval_p", "x", None).await.unwrap(),
+            EvalCancel::AlreadyEnded(EvalStatus::Cancelled)
+        );
+        assert_eq!(j.cancel_eval("globex", "eval_p", "x", None).await.unwrap(), EvalCancel::NotFound, "{n}");
+
+        j.create_eval(new_eval("eval_r", "acme", Suite::Injection), None).await.unwrap();
+        j.claim_eval("w1", TTL).await.unwrap().expect(n);
+        assert_eq!(j.cancel_eval("acme", "eval_r", "user:jo", None).await.unwrap(), EvalCancel::Requested, "{n}");
+        assert_eq!(j.cancel_eval("acme", "eval_r", "user:jo", None).await.unwrap(), EvalCancel::Requested, "{n}");
+        let e = j.get_eval("acme", "eval_r").await.unwrap().unwrap();
+        assert!(e.cancel_requested_at.is_some() && e.status == EvalStatus::Running, "{n}");
+        let f = EvalFinish { status: EvalStatus::Cancelled, summary: None, error: None };
+        assert!(j.finish_eval("eval_r", "w1", f, None).await.unwrap(), "{n}");
+        let ids: Vec<String> = j.claim_audit("cp", TTL, 10).await.unwrap().into_iter().map(|a| a.id).collect();
+        assert_eq!(ids, ["eval_p/cancel"], "{n}");
+    }
+}
+
+#[tokio::test]
+async fn sandbox_observations_are_events_written_once() {
+    for j in journals().await {
+        let n = j.name();
+        j.create_run(new_run("run_1", "acme", None)).await.unwrap();
+        assert!(
+            j.put_event("acme", "run_1", "sandbox:agent#1.0", EventKind::Observation, Some("a".into())).await.unwrap()
+        );
+        assert!(
+            !j.put_event("acme", "run_1", "sandbox:agent#1.0", EventKind::Observation, Some("b".into())).await.unwrap()
+        );
+        let ev = j.event("run_1", "sandbox:agent#1.0").await.unwrap().expect(n);
+        assert_eq!((ev.kind, ev.payload.as_deref()), (EventKind::Observation, Some("a")), "{n}");
+    }
+}

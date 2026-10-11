@@ -33,6 +33,7 @@
 //! Payloads are opaque strings here: the executor seals them with the tenant's data key before
 //! they reach the journal ([`crate::seal`]).
 
+pub mod evals;
 pub mod memory;
 pub mod postgres;
 #[cfg(test)]
@@ -208,6 +209,8 @@ pub struct StepRecord {
 pub enum EventKind {
     Input,
     Timer,
+    /// What a sandboxed tool of an injection-suite run received (`sandbox:<step>`, sealed).
+    Observation,
 }
 
 impl EventKind {
@@ -215,6 +218,15 @@ impl EventKind {
         match self {
             Self::Input => "input",
             Self::Timer => "timer",
+            Self::Observation => "observation",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "timer" => Self::Timer,
+            "observation" => Self::Observation,
+            _ => Self::Input,
         }
     }
 }
@@ -459,8 +471,9 @@ pub struct JournalError(pub String);
 
 pub type JResult<T> = Result<T, JournalError>;
 
+/// The run journal. Every journal also stores evals ([`evals::EvalStore`]).
 #[async_trait::async_trait]
-pub trait Journal: Send + Sync {
+pub trait Journal: evals::EvalStore + Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Creates a run in `pending`, or returns the run an earlier request with the same
