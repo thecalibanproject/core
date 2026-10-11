@@ -1384,22 +1384,44 @@ async fn usage_ingest(s: &Store) -> usage::UsageReport {
     close(t.routed_model_cost_usd, 0.0005 * 3.0);
     close(t.margin_usd, 0.0032 - 0.0015);
     close(t.cost_usd, 0.0005 * 4.0);
-    assert_eq!(
-        all.events[3],
-        usage_event(
-            "r2",
-            "acme",
-            2,
-            json!({"cache": "hit", "cache_tier": "semantic",
+    let mut r2 = usage_event(
+        "r2",
+        "acme",
+        2,
+        json!({"cache": "hit", "cache_tier": "semantic",
         "usage_source": null, "prompt_tokens": 0, "completion_tokens": 0, "cached_prompt_tokens": 0,
-        "tokens_saved": 120, "cost_usd": 0.0, "routed_model_cost_usd": 0.0, "billed_usd": 0.0002, "saved_usd": 0.0008})
-        ),
-        "events round-trip"
+        "tokens_saved": 120, "cost_usd": 0.0, "routed_model_cost_usd": 0.0, "billed_usd": 0.0002, "saved_usd": 0.0008}),
     );
+    usage::strip_routing(&mut r2);
+    assert_eq!(all.events[3], r2, "events round-trip, without their routing facts");
+    // Routing decisions are content-class: no event keeps them, the store counts them per day.
+    for e in &all.events {
+        assert!(
+            e.intent.is_empty()
+                && e.intent_confidence.is_none()
+                && e.route_stage.is_none()
+                && e.route.is_none()
+                && e.route_fallback.is_none(),
+            "{e:?}"
+        );
+    }
+    let day = usage_base().date_naive();
+    let by: Vec<(&str, &str, &str, &str, u64)> = all
+        .by_route
+        .iter()
+        .inspect(|r| assert_eq!(r.day, day))
+        .map(|r| {
+            (r.tenant_id.as_str(), r.intent.as_str(), r.route_stage.as_str(), r.route_fallback.as_str(), r.requests)
+        })
+        .collect();
     assert_eq!(
-        (all.events[1].route.as_deref(), all.events[1].route_fallback.as_deref()),
-        (Some("model:ext/gpt"), Some("low_confidence")),
-        "the caliban/auto path round-trips"
+        by,
+        [
+            ("acme", "chat", "knn", "", 3),
+            ("globex", "chat", "knn", "", 1),
+            ("globex", "chat", "knn", "low_confidence", 1)
+        ],
+        "counts only, duplicates not counted twice"
     );
 
     let acme = s.usage_report(Some(&["acme".to_owned()]), 2).await.unwrap();

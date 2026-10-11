@@ -139,7 +139,6 @@ async fn run(
         d
     };
     let route_meta = RouteMeta::new(&decision, &snap, &tenant, &req);
-    span.record("caliban.route.intent", decision.intent.as_str());
     span.record("caliban.route.stage", decision.stage);
 
     // caliban/auto may hand the request to one of the tenant's nodes, with this classification
@@ -159,7 +158,9 @@ async fn run(
                 };
                 let nc = crate::node_chat::NodeChat {
                     target,
-                    origin: Some(format!("auto:{}", decision.intent)),
+                    // Not `auto:<intent>`: a per-request intent record is content-class data
+                    // (arXiv 2610.09981); the client sees it in `x-caliban-intent`.
+                    origin: Some("auto".into()),
                     check_spend: true,
                     headers: vec![(HeaderName::from_static("x-caliban-intent"), route_meta.header.clone())],
                 };

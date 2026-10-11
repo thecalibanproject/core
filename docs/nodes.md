@@ -352,8 +352,8 @@ by intent; audited as `tenant.update`). The intents are the tenant's `caliban/au
 exemplars in `[routing.tenants.<id>.exemplars]`, and the deployment's).
 
 When a `caliban/auto` request classifies into an intent that maps to a node, the node runs instead of
-a model call, through the same path as `model: "node/<name>"` (the run's `origin` is
-`auto:<intent>`). The request is classified once: the node path and the fallback both use the
+a model call, through the same path as `model: "node/<name>"` (the run's `origin` is `auto`: the
+intent is not recorded with the run, since routing decisions are content-class). The request is classified once: the node path and the fallback both use the
 routing decision the request already has, and a node's own model calls never hand off to a node.
 Otherwise a model answers, and the response says why in `x-caliban-route-fallback`:
 
@@ -368,9 +368,10 @@ Otherwise a model answers, and the response says why in `x-caliban-route-fallbac
 | `node_input_invalid` | The conversation does not fit the node's input schema |
 
 `x-caliban-route` names the path taken: `node/<name>@v<N>`, or `model:<id>` (set on every
-`caliban/auto` answer of a tenant that maps intents to nodes). Usage events record it: the node's
-model calls carry `route: node/<name>@v<N>` (next to `node`, `node_version`, `run_id`), a model
-answer carries `route: model:<id>` and `route_fallback`. A run that started is never replaced by a
+`caliban/auto` answer of a tenant that maps intents to nodes). Usage events carry it from the data
+plane (`route: node/<name>@v<N>` on the node's model calls, `route: model:<id>` and
+`route_fallback` on a model answer), but the usage store keeps only daily counts of the fallback
+reasons (`by_route`), not per-request routing facts (README, "Routing records are content-class"). A run that started is never replaced by a
 model call: its failure is the answer. Streams work on both paths. To continue a run that
 `caliban/auto` started, send `model: "caliban/auto"` with `Caliban-Run-Id`: it goes on with the
 run's node, without classifying again.

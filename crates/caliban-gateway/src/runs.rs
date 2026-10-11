@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 
 /// The run a response is about (chat shortcut, streams): readable by SDKs from the headers.
 pub const RUN_ID_HEADER: &str = "caliban-run-id";
-/// Internal (router to worker, never from clients): what started the run (`auto:<intent>`).
+/// Internal (router to worker, never from clients): what started the run (`auto`).
 pub(crate) const ORIGIN_HEADER: &str = "x-caliban-run-origin";
 /// Internal (router to worker): refuse the run with `429 node_over_budget` when the tenant's
 /// spend caps leave no room for it, instead of creating it.

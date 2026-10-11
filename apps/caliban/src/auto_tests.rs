@@ -193,7 +193,7 @@ async fn auto_hands_a_classified_request_to_the_node_and_classifies_once() {
     assert_eq!(a.embedded("two days"), 0, "continuing a run classifies nothing");
     // The run says what started it; its model calls' usage events say which path ran.
     let (_, r) = send(&a.w.app, "GET", &format!("/v1/runs/{run}"), KEY, None, &[]).await;
-    assert_eq!(r["origin"], "auto:triage");
+    assert_eq!(r["origin"], "auto", "no intent in the run record (content-class)");
     let evs = a.w.usage.snapshot(Some("acme"), 10);
     assert_eq!(evs.len(), 2, "the classifier and the answer");
     for e in &evs {
@@ -260,11 +260,7 @@ async fn auto_on_a_router_runs_the_node_on_a_worker() {
     assert_eq!(h["x-caliban-route"], "node/flow@v1");
     let v: Value = serde_json::from_str(&body).unwrap();
     let run = v["caliban"]["run_id"].as_str().unwrap().to_owned();
-    assert_eq!(
-        a.w.ex.view("acme", &run).await.unwrap().unwrap().origin.as_deref(),
-        Some("auto:triage"),
-        "the worker ran it"
-    );
+    assert_eq!(a.w.ex.view("acme", &run).await.unwrap().unwrap().origin.as_deref(), Some("auto"), "the worker ran it");
     // The worker refuses the run (spend caps); the router answers with a model, saying why.
     let caps = json!({"node_spend_caps": {"daily_usd": 0.5}});
     assert_eq!(send(&a.e.cp_app, "PATCH", "/api/v1/tenants/acme", ADMIN, Some(caps), &[]).await.0, StatusCode::OK);

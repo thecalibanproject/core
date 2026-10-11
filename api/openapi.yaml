@@ -1906,6 +1906,11 @@ paths:
         totals each node version (cost per node); a `run_id` covers raw events only. `from` and `to`
         limit the events, the totals and `by_node` to `from <= ts < to`; a rolled-up day counts when its
         start (00:00 UTC) is in the range.
+
+        **Routing decisions are content-class** (which intent requests go to reveals topics, arXiv
+        2610.09981): events come without `intent`, `intent_confidence`, `route_stage`, `route` and
+        `route_fallback` (empty or absent), and `by_route` counts requests per tenant, UTC day, intent,
+        deciding stage and fallback reason instead (not with `node` or `run_id`).
       parameters:
         - { $ref: '#/components/parameters/TenantQuery' }
         - { name: node, in: query, schema: { type: string } }
@@ -3225,7 +3230,7 @@ components:
         cache_write_1h_tokens: { type: integer, description: 'Part of cache_write_tokens written with the Anthropic 1-hour TTL. Omitted when 0.' }
         usage_source: { type: string, enum: [provider, estimated], description: '`provider`: the token counts are the provider''s usage report. `estimated`: no complete report arrived (the client disconnected mid-stream, the upstream stream failed or ended without usage, or the model has `rejects_stream_options`), so the gateway estimated them: prompt tokens from the provider''s partial report when one arrived (Anthropic `message_start`), else from the request; completion tokens from the output streamed so far, about 4 bytes per token. After a disconnect the provider may bill more than the estimate. Absent on cache hits (nothing consumed) and on events written before this field existed.' }
         tokens_saved: { type: integer, description: 'Tokens not sent upstream thanks to Caliban: on a cache hit of either tier, the cached answer''s prompt plus completion tokens' }
-        intent: { type: string }
+        intent: { type: string, description: 'Always empty in reports (routing decisions are content-class; see `by_route`). Set only in transit, from a data plane.' }
         cache: { type: string, enum: [hit, miss, bypass] }
         cache_tier: { type: string, enum: [exact, semantic], description: 'Only on hits: which cache tier answered.' }
         pii_entities: { type: integer }
@@ -3233,8 +3238,8 @@ components:
         latency_ms: { type: integer }
         ts: { type: string, format: date-time }
         requested_model: { type: string, description: 'Model the client asked for (`caliban/auto` or a pinned id). Chat requests only; absent otherwise.' }
-        intent_confidence: { type: number, description: 'Confidence of the intent decision, 0..1. Chat requests only.' }
-        route_stage: { type: string, enum: [rules, knn, keyword], description: 'Stage that decided the intent. Chat requests only.' }
+        intent_confidence: { type: number, description: 'In transit only (never in reports): confidence of the intent decision, 0..1.' }
+        route_stage: { type: string, enum: [rules, knn, keyword], description: 'In transit only (never in reports): the stage that decided the intent; counted in `by_route`.' }
         routed_model_cost_usd: { type: number, description: '`caliban/auto` only: real cost of the routed model for this request (the same number and cost function as `cost_usd`, prompt-cache prices included). Absent when the model has no price.' }
         flat_price_usd: { type: number, description: '`caliban/auto` only: flat auto price for the same tokens (`[routing] auto_price_*`), through the same cost function as `cost_usd`; the flat price has no cache prices, so cache reads and writes count at its input price. On a cache hit of either tier: the full flat price of the cached answer''s tokens (what a miss would have billed), recorded next to `billed_usd`. Events written before cache-hit billing record 0 on hits.' }
         billed_usd: { type: number, description: '`caliban/auto` only: what the customer is billed. `flat_price_usd` on a miss; on a cache hit of either tier, `flat_price_usd` x the tenant''s cache-hit fraction (`auto_cache_hit_fraction`, default 0.2). Margin = billed_usd - routed_model_cost_usd. Absent on events written before cache-hit billing (they billed `flat_price_usd`).' }
@@ -3242,11 +3247,26 @@ components:
         node: { type: string, description: 'Node model calls only: the node of the run (its root node: a subnode''s calls are the run''s).' }
         node_version: { type: integer }
         run_id: { type: string }
+        route: { type: string, description: 'In transit only (never in reports): the path a caliban/auto request took' }
+        route_fallback: { type: string, description: 'In transit only (never in reports): why a model answered rather than a node; counted in `by_route`' }
     UsageReport:
       type: object
       required: [events, totals]
       properties:
         events: { type: array, items: { $ref: '#/components/schemas/UsageEvent' } }
+        by_route:
+          type: array
+          description: 'Requests per tenant, UTC day, intent, deciding stage and fallback reason (empty strings: not set). The only routing record kept; not computed with `node` or `run_id`.'
+          items:
+            type: object
+            required: [tenant_id, day, intent, route_stage, route_fallback, requests]
+            properties:
+              tenant_id: { type: string }
+              day: { type: string, format: date }
+              intent: { type: string }
+              route_stage: { type: string }
+              route_fallback: { type: string }
+              requests: { type: integer }
         by_node:
           type: array
           description: The same totals per node version (node calls only), raw and rolled-up days.

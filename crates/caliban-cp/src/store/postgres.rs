@@ -62,6 +62,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (25, "node_run_input_labels", include_str!("../../../../migrations/0025_node_run_input_labels.sql")),
     (26, "tool_manifest_network", include_str!("../../../../migrations/0026_tool_manifest_network.sql")),
     (27, "api_key_purpose", include_str!("../../../../migrations/0027_api_key_purpose.sql")),
+    (28, "usage_routing_content_class", include_str!("../../../../migrations/0028_usage_routing_content_class.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -323,7 +324,10 @@ impl PgBackend {
         let int =
             |f: &dyn Fn(&caliban_meter::UsageEvent) -> u64| events.iter().map(|e| i64_of(f(e))).collect::<Vec<_>>();
         let usd = |f: &dyn Fn(&caliban_meter::UsageEvent) -> Option<f64>| events.iter().map(f).collect::<Vec<_>>();
-        let r = sqlx::query(
+        // Routing facts are content-class: not stored per request, counted per day below.
+        let none_text = vec![None::<String>; events.len()];
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let inserted: Vec<String> = sqlx::query_scalar(
             "INSERT INTO usage_event (request_id, tenant_id, model, intent, prompt_tokens, completion_tokens,
                                       cached_prompt_tokens, tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts,
                                       requested_model, intent_confidence, route_stage, routed_model_cost_usd, flat_price_usd,
@@ -334,12 +338,12 @@ impl PgBackend {
                                   $13::TIMESTAMPTZ[], $14::TEXT[], $15::REAL[], $16::TEXT[], $17::FLOAT8[], $18::FLOAT8[],
                                   $19::TEXT[], $20::TEXT[], $21::BIGINT[], $22::BIGINT[], $23::FLOAT8[], $24::FLOAT8[],
                                   $25::TEXT[], $26::INTEGER[], $27::TEXT[], $28::TEXT[], $29::TEXT[])
-             ON CONFLICT (request_id) DO NOTHING",
+             ON CONFLICT (request_id) DO NOTHING RETURNING request_id",
         )
         .bind(col(&|e| e.request_id.clone()))
         .bind(col(&|e| e.tenant_id.clone()))
         .bind(col(&|e| e.model.clone()))
-        .bind(col(&|e| e.intent.clone()))
+        .bind(&none_text)
         .bind(int(&|e| e.prompt_tokens))
         .bind(int(&|e| e.completion_tokens))
         .bind(int(&|e| e.cached_prompt_tokens))
@@ -350,8 +354,8 @@ impl PgBackend {
         .bind(int(&|e| e.latency_ms))
         .bind(events.iter().map(|e| e.ts).collect::<Vec<_>>())
         .bind(opt(&|e| e.requested_model.clone()))
-        .bind(events.iter().map(|e| e.intent_confidence).collect::<Vec<_>>())
-        .bind(opt(&|e| e.route_stage.clone()))
+        .bind(vec![None::<f32>; events.len()])
+        .bind(&none_text)
         .bind(usd(&|e| e.routed_model_cost_usd))
         .bind(usd(&|e| e.flat_price_usd))
         .bind(opt(&|e| e.cache_tier.map(|t| t.as_str().to_owned())))
@@ -363,12 +367,33 @@ impl PgBackend {
         .bind(opt(&|e| e.node.clone()))
         .bind(events.iter().map(|e| e.node_version.map(|v| i32::try_from(v).unwrap_or(i32::MAX))).collect::<Vec<_>>())
         .bind(opt(&|e| e.run_id.clone()))
-        .bind(opt(&|e| e.route.clone()))
-        .bind(opt(&|e| e.route_fallback.clone()))
-        .execute(&self.pool)
+        .bind(&none_text)
+        .bind(&none_text)
+        .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
-        Ok(r.rows_affected())
+        let new: std::collections::HashSet<&str> = inserted.iter().map(String::as_str).collect();
+        let counts = super::usage::route_counts(events.iter().filter(|e| new.contains(e.request_id.as_str())));
+        if !counts.is_empty() {
+            let c = |f: &dyn Fn(&super::usage::RouteCount) -> String| counts.iter().map(f).collect::<Vec<_>>();
+            sqlx::query(
+                "INSERT INTO usage_route_daily (tenant_id, day, intent, route_stage, route_fallback, requests)
+                 SELECT * FROM UNNEST($1::TEXT[], $2::DATE[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::BIGINT[])
+                 ON CONFLICT (tenant_id, day, intent, route_stage, route_fallback)
+                 DO UPDATE SET requests = usage_route_daily.requests + EXCLUDED.requests",
+            )
+            .bind(c(&|r| r.tenant_id.clone()))
+            .bind(counts.iter().map(|r| r.day).collect::<Vec<_>>())
+            .bind(c(&|r| r.intent.clone()))
+            .bind(c(&|r| r.route_stage.clone()))
+            .bind(c(&|r| r.route_fallback.clone()))
+            .bind(counts.iter().map(|r| i64_of(r.requests)).collect::<Vec<_>>())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(inserted.len() as u64)
     }
 
     /// Applies pending migrations; refuses to start if an applied migration was edited.
@@ -729,7 +754,37 @@ impl Backend for PgBackend {
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
-        Ok(Some(super::usage::UsageReport { events, totals, by_node }))
+        // Routing counts (per day; none when filtering by node or run: they carry neither).
+        let by_route = if f.node.is_some() || f.run_id.is_some() {
+            vec![]
+        } else {
+            sqlx::query(
+                "SELECT tenant_id, day, intent, route_stage, route_fallback, requests FROM usage_route_daily
+                 WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1))
+                       AND ($2::TIMESTAMPTZ IS NULL OR (day::TIMESTAMP AT TIME ZONE 'UTC') >= $2)
+                       AND ($3::TIMESTAMPTZ IS NULL OR (day::TIMESTAMP AT TIME ZONE 'UTC') < $3)
+                 ORDER BY tenant_id, day, intent, route_stage, route_fallback",
+            )
+            .bind(&tenants)
+            .bind(f.from)
+            .bind(f.to)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?
+            .iter()
+            .map(|r| {
+                Ok(super::usage::RouteCount {
+                    tenant_id: get(r, "tenant_id")?,
+                    day: get(r, "day")?,
+                    intent: get(r, "intent")?,
+                    route_stage: get(r, "route_stage")?,
+                    route_fallback: get(r, "route_fallback")?,
+                    requests: u64::try_from(get::<i64>(r, "requests")?).unwrap_or(0),
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?
+        };
+        Ok(Some(super::usage::UsageReport { events, totals, by_node, by_route }))
     }
 
     async fn usage_boundary(&self, days: u32) -> Result<Option<DateTime<Utc>>, StoreError> {

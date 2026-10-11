@@ -77,7 +77,7 @@ pub struct CallCtx {
     pub step_id: String,
     /// Derived from (run id, step id): the same for every attempt of the step.
     pub idempotency_key: String,
-    /// What started the run (`auto:<intent>`), if not a run request.
+    /// What started the run (`auto`), if not a run request.
     pub origin: Option<String>,
 }
 
@@ -216,7 +216,7 @@ pub struct StartRun {
     pub idempotency: Option<(String, String)>,
     /// Run-level limits: each one lowers the version's budget for this run (never raises it).
     pub budget: Option<RunBudget>,
-    /// What started the run, when not a run request (`auto:<intent>`).
+    /// What started the run, when not a run request (`auto`).
     pub origin: Option<String>,
     /// Refuse the run ([`ExecError::OverBudget`]) instead of creating one that would stop at its
     /// first model call: the tenant's node spend caps are reached, or what is left of them is less
@@ -283,7 +283,7 @@ pub struct RunView {
     pub usage: RunUsage,
     pub steps: Vec<StepView>,
     pub claims: u32,
-    /// What started the run when it was not a run request (`auto:<intent>`).
+    /// What started the run when it was not a run request (`auto`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     /// Taint labels the run input carries from the start (`caller`: it holds untrusted caller

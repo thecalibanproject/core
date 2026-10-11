@@ -10,6 +10,14 @@
 //!   standalone data plane's own events always did; ingested events are deduplicated against the
 //!   last [`MEMORY_DEDUP`] request ids. For development and demos only.
 //!
+//! **Routing facts are content-class** (research note 02; arXiv 2610.09981: which intent requests
+//! are classified into, and how often, reveals sensitive topics per user even without the
+//! prompts). Stored and reported events carry no `intent`, `intent_confidence`, `route_stage`,
+//! `route` or `route_fallback` ([`strip_routing`]); the store keeps counts per (tenant, UTC day,
+//! intent, stage, fallback) instead ([`RouteCount`], `usage_route_daily`), reported as `by_route`.
+//! The events travel with them (router WAL and process ring, both transient) so the counts can be
+//! made. Billing needs none of them.
+//!
 //! Billing fields (`billed_usd`, `saved_usd`, `flat_price_usd`, `routed_model_cost_usd`) are
 //! computed by the data plane that served the request, with the prices and cache-hit fraction of
 //! the snapshot it served it under, and stored as received: the same code computes them in
@@ -148,13 +156,65 @@ pub struct NodeUsage {
     pub totals: UsageTotals,
 }
 
-/// Newest events (up to the requested limit), the totals over all matching events (raw and rolled
-/// up), and the same totals per node version (node calls only).
+/// Requests per (tenant, UTC day, intent, deciding stage, fallback reason): the only record of
+/// routing decisions the store keeps. Empty strings: not set.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct RouteCount {
+    pub tenant_id: String,
+    pub day: chrono::NaiveDate,
+    pub intent: String,
+    pub route_stage: String,
+    pub route_fallback: String,
+    pub requests: u64,
+}
+
+/// Removes the per-request routing facts from an event (see the module docs).
+pub fn strip_routing(e: &mut UsageEvent) {
+    e.intent.clear();
+    e.intent_confidence = None;
+    e.route_stage = None;
+    e.route = None;
+    e.route_fallback = None;
+}
+
+/// The routing counts of `events` (events with no routing fact count nothing).
+pub fn route_counts<'a>(events: impl Iterator<Item = &'a UsageEvent>) -> Vec<RouteCount> {
+    let mut m: std::collections::BTreeMap<(String, chrono::NaiveDate, String, String, String), u64> =
+        Default::default();
+    for e in events {
+        if e.intent.is_empty() && e.route_stage.is_none() && e.route_fallback.is_none() {
+            continue;
+        }
+        let k = (
+            e.tenant_id.clone(),
+            e.ts.date_naive(),
+            e.intent.clone(),
+            e.route_stage.clone().unwrap_or_default(),
+            e.route_fallback.clone().unwrap_or_default(),
+        );
+        *m.entry(k).or_default() += 1;
+    }
+    m.into_iter()
+        .map(|((tenant_id, day, intent, route_stage, route_fallback), requests)| RouteCount {
+            tenant_id,
+            day,
+            intent,
+            route_stage,
+            route_fallback,
+            requests,
+        })
+        .collect()
+}
+
+/// Newest events (up to the requested limit; no routing facts), the totals over all matching
+/// events (raw and rolled up), the same totals per node version (node calls only), and the routing
+/// counts per day (not with a node or run filter).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct UsageReport {
     pub events: Vec<UsageEvent>,
     pub totals: UsageTotals,
     pub by_node: Vec<NodeUsage>,
+    pub by_route: Vec<RouteCount>,
 }
 
 /// The memory store's usage: the process ring plus a bounded set of ingested request ids.
@@ -209,8 +269,10 @@ impl MemoryUsage {
             .into_iter()
             .map(|((node, node_version), ev)| NodeUsage { node, node_version, totals: UsageTotals::from_events(&ev) })
             .collect();
+        let by_route = if f.node.is_some() || f.run_id.is_some() { vec![] } else { route_counts(all.iter()) };
         all.truncate(f.limit);
-        UsageReport { events: all, totals, by_node }
+        all.iter_mut().for_each(strip_routing);
+        UsageReport { events: all, totals, by_node, by_route }
     }
 }
 

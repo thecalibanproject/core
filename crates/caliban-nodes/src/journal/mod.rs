@@ -128,7 +128,7 @@ pub struct NewRun {
     /// Sealed: the specs of the run's version and of every version it can reach (`node://`), so a
     /// run finishes on what it started on even if a version is retired meanwhile.
     pub specs: Option<String>,
-    /// What started the run when it was not a direct run request (e.g. `auto:<intent>` when
+    /// What started the run when it was not a direct run request (e.g. `auto` when
     /// `caliban/auto` handed a chat request to the node). Its model calls' usage events say so.
     pub origin: Option<String>,
     /// Taint labels the run input carries from the start (`caller`), fixed when the run is created

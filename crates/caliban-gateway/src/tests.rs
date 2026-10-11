@@ -670,7 +670,7 @@ async fn genai_spans_carry_attributes_but_never_content() {
     assert!(has(root, "caliban.tenant", "acme"));
     assert!(has(root, "caliban.cache", "bypass"));
     assert!(has(root, "caliban.pii.entities", "1"));
-    assert!(has(root, "caliban.route.intent", "pinned"));
+    assert!(!seen.iter().any(|(_, f, _)| f == "caliban.route.intent"), "intents are content-class: never on a span");
     assert!(has(root, "caliban.route.stage", "rules"));
     assert!(has(root, "otel.name", "chat anth/claude"));
     assert!(has(root, "gen_ai.provider.name", "anthropic"));

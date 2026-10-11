@@ -10,12 +10,16 @@
 //! chat {model}            gen_ai.operation.name, gen_ai.provider.name, gen_ai.request.model,
 //!  │                      gen_ai.response.model, gen_ai.usage.input_tokens/output_tokens,
 //!  │                      caliban.tenant, caliban.cache, caliban.pii.entities,
-//!  │                      caliban.route.intent, caliban.route.stage, error.type
+//!  │                      caliban.route.stage, error.type
 //!  ├─ route
 //!  ├─ pii
 //!  ├─ cache
 //!  └─ chat {upstream_model}   (client span, one per attempt incl. fallbacks)
 //! ```
+//! **Routing decisions are content-class**: the intent a request was classified into is never put
+//! on a span (it reveals topics even without the prompt, arXiv 2610.09981); stage, confidence and
+//! policy are.
+//!
 //! **Prompt and response content are never recorded**: only spans and events with the
 //! [`TARGET`] target are exported, and those carry ids, counts and labels only. (Ordinary log
 //! events, which may include truncated upstream error bodies, never reach the exporter.)
@@ -141,7 +145,6 @@ pub(crate) fn request_span(op: &'static str, dialect: Dialect, request_id: &Requ
         caliban.tenant = Empty,
         caliban.cache = Empty,
         caliban.pii.entities = Empty,
-        caliban.route.intent = Empty,
         caliban.route.stage = Empty,
         caliban.route.fallback = Empty,
         caliban.fallbacks = Empty,
@@ -181,7 +184,6 @@ pub(crate) fn child(name: &'static str) -> Span {
         "route" => tracing::info_span!(
             target: TARGET,
             "route",
-            caliban.route.intent = Empty,
             caliban.route.confidence = Empty,
             caliban.route.stage = Empty,
             caliban.route.policy = Empty,
@@ -201,7 +203,6 @@ pub(crate) fn child(name: &'static str) -> Span {
 
 /// Routing decision on the `route` span (no prompt content).
 pub(crate) fn record_route(s: &Span, d: &caliban_route::RouteDecision) {
-    s.record("caliban.route.intent", d.intent.as_str());
     s.record("caliban.route.confidence", f64::from(d.confidence));
     s.record("caliban.route.stage", d.stage);
     s.record("caliban.route.policy", d.policy);
