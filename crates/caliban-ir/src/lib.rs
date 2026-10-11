@@ -112,10 +112,20 @@ impl ChatRequest {
         serde_json::to_value(req).unwrap_or(Value::Null)
     }
 
-    /// Calls `f` on every user-visible text segment (string content and `{"type":"text"}` parts).
+    /// Calls `f` on every text segment the model reads: string content, `{"type":"text"}` parts,
+    /// and the arguments of the tool calls in assistant messages (a conversation sent back to the
+    /// model carries the arguments of its earlier calls, rehydrated: PII protection must see them
+    /// too).
     pub fn for_each_text_mut(&mut self, mut f: impl FnMut(&str, &mut String)) {
         for m in &mut self.messages {
             let role = m.role.clone();
+            if let Some(Value::Array(calls)) = m.extra.get_mut("tool_calls") {
+                for c in calls {
+                    if let Some(Value::String(args)) = c.pointer_mut("/function/arguments") {
+                        f(&role, args);
+                    }
+                }
+            }
             match &mut m.content {
                 Value::String(s) => f(&role, s),
                 Value::Array(parts) => {
@@ -330,6 +340,19 @@ mod tests {
         });
         assert_eq!(seen, vec!["a"]);
         assert_eq!(r.last_user_text().unwrap(), "a!");
+    }
+
+    /// Tool-call arguments in the history are text the model reads (PII protection sees them).
+    #[test]
+    fn tool_call_arguments_are_visited() {
+        let mut r = req(r#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":null,
+                "tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{\"q\":\"x\"}"}}]}]}"#);
+        let mut seen = vec![];
+        r.for_each_text_mut(|role, s| seen.push((role.to_owned(), s.clone())));
+        assert_eq!(
+            seen,
+            vec![("user".to_owned(), "hi".to_owned()), ("assistant".to_owned(), "{\"q\":\"x\"}".to_owned())]
+        );
     }
 
     #[test]
