@@ -7,6 +7,7 @@
 //! token) for an Ed25519-signed config snapshot.
 
 pub mod auth;
+mod evals;
 pub mod keys;
 mod models;
 mod nodes;
@@ -271,6 +272,16 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/tenants/{tenant_id}/nodes/{id}/versions/{version}/retire", post(nodes::retire))
         .route("/tenants/{tenant_id}/nodes/{id}/promote", post(nodes::promote))
         .route("/tenants/{tenant_id}/nodes/{id}/diff", get(nodes::diff))
+        .route(
+            "/tenants/{tenant_id}/nodes/{id}/versions/{version}/golden-set",
+            get(evals::get_golden).put(evals::put_golden).delete(evals::delete_golden),
+        )
+        .route("/tenants/{tenant_id}/nodes/{id}/versions/{version}/evals", post(evals::start))
+        .route("/tenants/{tenant_id}/nodes/{id}/versions/{version}/gate", get(evals::get_gate))
+        .route("/tenants/{tenant_id}/nodes/{id}/eval-policy", get(evals::get_policy).put(evals::put_policy))
+        .route("/tenants/{tenant_id}/evals", get(evals::list))
+        .route("/tenants/{tenant_id}/evals/{id}", get(evals::get))
+        .route("/tenants/{tenant_id}/evals/{id}/cancel", post(evals::cancel))
         .route("/tenants/{tenant_id}/tool-servers", get(tools::list_servers).post(tools::create_server))
         .route("/tenants/{tenant_id}/tool-servers/{server}", delete(tools::delete_server).patch(tools::update_server))
         .route("/tenants/{tenant_id}/tool-servers/{server}/discover", post(tools::discover))

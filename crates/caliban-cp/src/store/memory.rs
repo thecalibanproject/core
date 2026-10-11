@@ -461,7 +461,7 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             }
             n.deleted_at = Some(*at);
         }
-        Mutation::PublishNode { tenant_id, name, version, sealed_spec, promote, at, by } => {
+        Mutation::PublishNode { tenant_id, name, version, sealed_spec, promote, at, by, .. } => {
             need_tenant(st, tenant_id)?;
             let n = st
                 .node_version(tenant_id, name, *version)
@@ -495,7 +495,7 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 promote_to(st, tenant_id, name, *version, *at, by);
             }
         }
-        Mutation::PromoteNode { tenant_id, name, version, at, by } => {
+        Mutation::PromoteNode { tenant_id, name, version, at, by, .. } => {
             need_tenant(st, tenant_id)?;
             let n = st
                 .node_version(tenant_id, name, *version)

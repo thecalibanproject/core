@@ -103,7 +103,7 @@ pub trait PublishContext {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Problem {
     /// `spec` (the static checks), `tool`, `datasource_scope`, `budget` (a tenant cap), `node_ref`,
-    /// `cycle`.
+    /// `cycle`, `eval_gate` (the node's promotion bar); `allowlist` for warnings.
     pub kind: &'static str,
     pub message: String,
     /// Where in the spec, when it is one place: `tools[0]`, `datasources.scopes[1]`,
@@ -143,6 +143,46 @@ pub struct PublishError {
     pub name: String,
     pub version: u32,
     pub problems: Vec<Problem>,
+}
+
+/// Warnings (never refusals) on the `allow_tainted` entries of a spec's write tools. An entry is
+/// standing authority: it lets tainted data drive the write in every run of the version, without
+/// a human, so an injection that reaches the run can use it ("When Consent Outlives Context",
+/// arXiv 2609.33910). `*` allows every label; a `tool:` pattern that does not name one server
+/// (`tool:*`, `tool:c*`) allows tools of many. Entries are warned about rather than refused: the
+/// injection suite runs every version with its real allowlist (`replay.allowlisted_write` and the
+/// other write cases fail when the allowlist lets them through), so a version that relies on a
+/// broad entry cannot be promoted under the default bar unless the node's promotion bar is lowered
+/// on purpose, and that decision is audited.
+pub fn allowlist_warnings(spec: &NodeSpec) -> Vec<Problem> {
+    let mut out = Vec::new();
+    for (i, t) in spec.tools.iter().enumerate() {
+        for (n, p) in t.allow_tainted.iter().enumerate() {
+            let path = Some(format!("tools[{i}].allow_tainted[{n}]"));
+            if p == "*" {
+                out.push(Problem::new(
+                    "allowlist",
+                    format!(
+                        "{}: \"*\" lets data from any tool or datasource drive this write without a human approval",
+                        t.reference
+                    ),
+                    path,
+                ));
+            } else if let Some(prefix) = p.strip_suffix('*')
+                && !prefix.strip_prefix("tool:").is_some_and(|server| server.ends_with('/') && server.len() > 1)
+            {
+                out.push(Problem::new(
+                    "allowlist",
+                    format!(
+                        "{}: \"{p}\" covers more than one tool server; name the server (tool:<server>/*)",
+                        t.reference
+                    ),
+                    path,
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Every reason `spec` (version `version` of node `name`) cannot be published; `Ok` when none.
@@ -325,5 +365,20 @@ mod tests {
         assert!(usd.violations(&s)[0].contains("budgets.usd = 0.75 exceeds"));
         s.budgets.usd = Some(0.25);
         assert!(usd.violations(&s).is_empty());
+    }
+
+    #[test]
+    fn broad_allowlists_are_warned_about() {
+        let pin = "0".repeat(64);
+        let spec: NodeSpec = serde_json::from_value(serde_json::json!({
+            "kind": "agent", "model_policy": {}, "budgets": {"steps": 1, "tokens": 1, "wall_clock_s": 1},
+            "tools": [{"ref": format!("mcp://erp/a#sha256:{pin}"), "effect": "write",
+                       "allow_tainted": ["*", "tool:*", "tool:crm/*", "datasource", "tool:c*"]}]
+        }))
+        .unwrap();
+        let w = allowlist_warnings(&spec);
+        let paths: Vec<&str> = w.iter().filter_map(|p| p.path.as_deref()).collect();
+        assert_eq!(paths, ["tools[0].allow_tainted[0]", "tools[0].allow_tainted[1]", "tools[0].allow_tainted[4]"]);
+        assert!(w.iter().all(|p| p.kind == "allowlist"));
     }
 }

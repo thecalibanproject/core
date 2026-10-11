@@ -19,9 +19,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 /// A version as the API shows it: the record plus whether it is the live one.
+/// `warnings`: broad `allow_tainted` entries (standing authority for tainted writes, see
+/// [`caliban_nodes::publish::allowlist_warnings`]).
 pub(crate) fn view(st: &State, n: &NodeRecord) -> Value {
     let mut v = serde_json::to_value(n).unwrap_or_default();
     v["live"] = json!(st.promotion(&n.tenant_id, &n.name).is_some_and(|p| p.version == n.version));
+    let warnings = serde_json::from_value::<NodeSpec>(n.spec.clone())
+        .map(|s| caliban_nodes::publish::allowlist_warnings(&s))
+        .unwrap_or_default();
+    v["warnings"] = json!(warnings);
     v
 }
 
@@ -193,15 +199,20 @@ pub(crate) async fn publish(
     }
     // Sealed like BYOK keys: routers and workers open it with their keyring.
     let keyring = cp.keyring("node versions").map_err(|_| bad("cannot publish nodes: CALIBAN_KEK is not set"))?;
+    let promote = body.promote.unwrap_or(true);
+    // Promoting needs the node's promotion bar met (and an injection eval for write tools), which
+    // a draft cannot have yet: such a version is published with {"promote": false} first.
+    let evals = if promote { crate::evals::gate(&cp, &n).await? } else { None };
     let dek = keys::tenant_dek(&cp.store, keyring, &tenant_id, &p.actor).await?;
     let m = Mutation::PublishNode {
         tenant_id: tenant_id.clone(),
         name: name.clone(),
         version,
         sealed_spec: dek.seal(&tenant_id, &n.spec.to_string()),
-        promote: body.promote.unwrap_or(true),
+        promote,
         at: now_micros(),
         by: p.actor.clone(),
+        evals,
     };
     let st = cp.store.apply(&p.actor, m).await?;
     Ok(Json(view(&st, &version_of(&st, &tenant_id, &name, version)?)))
@@ -219,12 +230,17 @@ pub(crate) async fn promote(
     Path((tenant_id, name)): Path<(String, String)>,
     Json(body): Json<PromoteBody>,
 ) -> NodeResult<Json<Value>> {
+    crate::ensure_tenant(&cp, &tenant_id)?;
+    let n = version_of(&cp.store.state(), &tenant_id, &name, body.version)?;
+    // Only a published version has evals; the store refuses the others with its own message.
+    let evals = if n.state == NodeState::Published { crate::evals::gate(&cp, &n).await? } else { None };
     let m = Mutation::PromoteNode {
         tenant_id: tenant_id.clone(),
         name: name.clone(),
         version: body.version,
         at: now_micros(),
         by: p.actor.clone(),
+        evals,
     };
     let st = cp.store.apply(&p.actor, m).await?;
     Ok(Json(view(&st, &version_of(&st, &tenant_id, &name, body.version)?)))

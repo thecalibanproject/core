@@ -4,9 +4,10 @@
 //! audit log included). Tenant roles apply to one tenant: `tenant_admin`, `developer`, `viewer` and
 //! `billing`. A principal holds any number of both; what it may do is the union.
 //!
-//! Nodes (P3): `nodes.read` (versions, diffs), `nodes.write` (create drafts, delete drafts and
-//! retired versions), `nodes.publish` (publish, promote, retire) and `nodes.run` (run nodes; on the
-//! admin API, granting node access to an API key needs it). Owner and admin hold all four;
+//! Nodes (P3): `nodes.read` (versions, diffs, evals and their metrics, the promotion bar),
+//! `nodes.write` (create drafts, delete drafts and retired versions, golden sets), `nodes.publish`
+//! (publish, promote, retire, set the promotion bar) and `nodes.run` (run nodes; on the admin API,
+//! granting node access to an API key, and starting or cancelling evals, need it). Owner and admin hold all four;
 //! `tenant_admin` all four on its tenant; `developer` read, write and run (not publish); `viewer`
 //! and `auditor` read; `billing` none.
 //!
@@ -469,6 +470,16 @@ pub const ROUTES: &[RouteRule] = &[
     r("POST", "/tenants/{tenant_id}/nodes/{id}/versions/{version}/retire", Perm::NodesPublish, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/nodes/{id}/promote", Perm::NodesPublish, TenantFrom::Path),
     r("GET", "/tenants/{tenant_id}/nodes/{id}/diff", Perm::NodesRead, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/nodes/{id}/versions/{version}/golden-set", Perm::NodesRead, TenantFrom::Path),
+    r("PUT", "/tenants/{tenant_id}/nodes/{id}/versions/{version}/golden-set", Perm::NodesWrite, TenantFrom::Path),
+    r("DELETE", "/tenants/{tenant_id}/nodes/{id}/versions/{version}/golden-set", Perm::NodesWrite, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/nodes/{id}/versions/{version}/evals", Perm::NodesRun, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/nodes/{id}/versions/{version}/gate", Perm::NodesRead, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/nodes/{id}/eval-policy", Perm::NodesRead, TenantFrom::Path),
+    r("PUT", "/tenants/{tenant_id}/nodes/{id}/eval-policy", Perm::NodesPublish, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/evals", Perm::NodesRead, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/evals/{id}", Perm::NodesRead, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/evals/{id}/cancel", Perm::NodesRun, TenantFrom::Path),
     r("GET", "/tenants/{tenant_id}/tool-servers", Perm::ToolsRead, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/tool-servers", Perm::ToolsWrite, TenantFrom::Path),
     r("DELETE", "/tenants/{tenant_id}/tool-servers/{server}", Perm::ToolsWrite, TenantFrom::Path),

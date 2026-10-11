@@ -1074,6 +1074,7 @@ async fn node_lifecycle(s: &Store) {
         promote,
         at: ts(),
         by: A.into(),
+        evals: None,
     };
     let promote = |name: &str, v: u32| Mutation::PromoteNode {
         tenant_id: "globex".into(),
@@ -1081,6 +1082,7 @@ async fn node_lifecycle(s: &Store) {
         version: v,
         at: ts(),
         by: A.into(),
+        evals: None,
     };
     let retire = |name: &str, v: u32| Mutation::RetireNode {
         tenant_id: "globex".into(),
@@ -2017,9 +2019,32 @@ async fn postgres_worker_grants_are_enough() {
          GRANT USAGE ON SCHEMA {schema} TO {role};
          GRANT SELECT ON caliban_schema_migrations TO {role};
          GRANT SELECT, INSERT, UPDATE, DELETE ON node_run, node_step, node_event, node_run_event, node_audit TO {role};
-         GRANT SELECT, INSERT, UPDATE ON node_spend TO {role};"
+         GRANT SELECT, INSERT, UPDATE ON node_spend TO {role};
+         GRANT SELECT, UPDATE ON node_eval TO {role};
+         GRANT SELECT, INSERT, UPDATE ON node_eval_trial TO {role};"
     );
     sqlx::raw_sql(AssertSqlSafe(grants)).execute(pg.pool()).await.unwrap();
+    // An eval the control plane created (the worker role cannot create one).
+    {
+        use caliban_nodes::journal::evals::{EvalStore, NewEval, Suite};
+        let admin = PgJournal::from_pool(pg.pool().clone());
+        let e = NewEval {
+            id: "eval_g".into(),
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: 1,
+            spec_hash: "sha256:00".into(),
+            suite: Suite::Injection,
+            k: 1,
+            concurrency: 1,
+            created_by: "user:jo".into(),
+            api_key_id: None,
+            invoker_key_hash: "ab".into(),
+            plan: "sealed".into(),
+            case_count: 1,
+        };
+        admin.create_eval(e, None).await.unwrap();
+    }
     let opts: PgConnectOptions = url
         .parse::<PgConnectOptions>()
         .unwrap()
@@ -2090,6 +2115,9 @@ async fn postgres_worker_grants_are_enough() {
         j.ack_audit(&shipped.into_iter().map(|a| a.id).collect::<Vec<_>>()).await.map_err(|e| e.to_string())?;
         j.tenant_spend("acme").await.map_err(|e| e.to_string())?;
         j.put_event("acme", "run_g", "t", EventKind::Timer, None).await.map_err(|e| e.to_string())?;
+        j.put_event("acme", "run_g", "sandbox:a#0", EventKind::Observation, Some("sealed".into()))
+            .await
+            .map_err(|e| e.to_string())?;
         let f = Finish {
             status: RunStatus::Succeeded,
             output: None,
@@ -2099,6 +2127,32 @@ async fn postgres_worker_grants_are_enough() {
         };
         j.finish("run_g", "w", f).await.map_err(|e| e.to_string())?;
         j.purge_finished(Duration::ZERO, 10).await.map_err(|e| e.to_string())?;
+        // What the eval runner does.
+        {
+            use caliban_nodes::journal::evals::{EvalFinish, EvalStatus, EvalStore, TrialRecord, TrialStatus};
+            let e = j.claim_eval("w", Duration::from_secs(30)).await.map_err(|e| e.to_string())?.ok_or("no eval")?;
+            j.heartbeat_eval(&e.id, "w", Duration::from_secs(30)).await.map_err(|e| e.to_string())?;
+            j.get_eval("acme", &e.id).await.map_err(|e| e.to_string())?;
+            let t = TrialRecord {
+                eval_id: e.id.clone(),
+                tenant_id: "acme".into(),
+                case_id: "write.ignore_previous".into(),
+                trial: 0,
+                run_id: None,
+                status: TrialStatus::Passed,
+                cost_usd: 0.0,
+                latency_ms: 0,
+                tokens: 0,
+                verdict: serde_json::json!({}),
+                detail: None,
+                created_at: now,
+                finished_at: None,
+            };
+            j.put_trial("w", t).await.map_err(|e| e.to_string())?;
+            j.trials(&e.id).await.map_err(|e| e.to_string())?;
+            let f = EvalFinish { status: EvalStatus::Succeeded, summary: None, error: None };
+            j.finish_eval(&e.id, "w", f, None).await.map_err(|e| e.to_string())?;
+        }
         // No DDL.
         let ddl = sqlx::raw_sql("CREATE TABLE should_fail (x INT)").execute(worker.pool()).await;
         if ddl.is_ok() {

@@ -205,12 +205,19 @@ pub(crate) async fn send(
 impl Env {
     /// Creates, publishes and promotes a version of `name`.
     pub(crate) async fn publish(&self, name: &str, spec: Value) {
+        self.publish_with(name, spec, true).await;
+    }
+
+    /// Creates and publishes a version of `name` (promoted when `promote`; a version with write
+    /// tools is promoted only after its evals). Returns its number.
+    pub(crate) async fn publish_with(&self, name: &str, spec: Value, promote: bool) -> u64 {
         let uri = format!("/api/v1/tenants/acme/nodes/{name}/versions");
         let (s, v) = send(&self.cp_app, "POST", &uri, ADMIN, Some(json!({"spec": spec})), &[]).await;
         assert_eq!(s, StatusCode::CREATED, "{v}");
         let uri = format!("/api/v1/tenants/acme/nodes/{name}/versions/{}/publish", v["version"]);
-        let (s, p) = send(&self.cp_app, "POST", &uri, ADMIN, None, &[]).await;
+        let (s, p) = send(&self.cp_app, "POST", &uri, ADMIN, Some(json!({"promote": promote})), &[]).await;
         assert_eq!(s, StatusCode::OK, "{p}");
+        v["version"].as_u64().unwrap()
     }
 }
 

@@ -34,7 +34,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-fn journal(cp: &Cp) -> ApiResult<Arc<dyn Journal>> {
+pub(crate) fn journal(cp: &Cp) -> ApiResult<Arc<dyn Journal>> {
     cp.journal().ok_or_else(|| {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -46,7 +46,7 @@ fn journal(cp: &Cp) -> ApiResult<Arc<dyn Journal>> {
 }
 
 /// Opens run content with the tenant's data key (unwrapped with the control plane's keyring).
-fn sealer(cp: &Cp) -> ApiResult<impl Sealer> {
+pub(crate) fn sealer(cp: &Cp) -> ApiResult<impl Sealer + use<>> {
     let keyring = cp.keyring.clone().ok_or_else(|| bad("run content cannot be opened: CALIBAN_KEK is not set"))?;
     let state = cp.store.state();
     Ok(DekSealer::new(move |tenant: &str| -> Result<Arc<Dek>, String> {
@@ -55,7 +55,7 @@ fn sealer(cp: &Cp) -> ApiResult<impl Sealer> {
     }))
 }
 
-fn journal_error(e: impl std::fmt::Display) -> ApiError {
+pub(crate) fn journal_error(e: impl std::fmt::Display) -> ApiError {
     tracing::error!(error = %e, "node journal error");
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, "node journal error".into())
 }
@@ -220,6 +220,18 @@ pub(crate) async fn spend(State(cp): State<Cp>, Path(tenant_id): Path<String>) -
     })))
 }
 
+/// Records the journal's audit outbox in the audit chain now, as a worker's shipper would (it would
+/// record nothing more: event ids are stable), with any other entry waiting there. Called after a
+/// journal write the control plane made with an audit event.
+pub(crate) async fn drain_audit(cp: &Cp, j: &Arc<dyn Journal>) -> ApiResult<()> {
+    let pending =
+        j.claim_audit("control-plane", std::time::Duration::from_secs(60), 1000).await.map_err(journal_error)?;
+    let ids: Vec<String> = pending.iter().map(|e| e.id.clone()).collect();
+    cp.store.ingest_audit(pending).await?;
+    j.ack_audit(&ids).await.map_err(journal_error)?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AnswerBody {
@@ -253,13 +265,7 @@ pub(crate) async fn answer(
         }
         Delivered::NotFound => return Err(not_found("run")),
     }
-    // Recorded in the audit chain now, as a worker's shipper would (it would record nothing more:
-    // the event id is the same), with any other entry waiting in the outbox.
-    let pending =
-        j.claim_audit("control-plane", std::time::Duration::from_secs(60), 1000).await.map_err(journal_error)?;
-    let ids: Vec<String> = pending.iter().map(|e| e.id.clone()).collect();
-    cp.store.ingest_audit(pending).await?;
-    j.ack_audit(&ids).await.map_err(journal_error)?;
+    drain_audit(&cp, &j).await?;
     let r = j.get_run(&tenant_id, &id).await.map_err(journal_error)?.ok_or_else(|| not_found("run"))?;
     let content = p.allows(Perm::RunsData, Some(&tenant_id));
     Ok((StatusCode::ACCEPTED, Json(detail(&cp, &j, &r, content).await?)))

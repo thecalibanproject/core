@@ -702,11 +702,13 @@ async fn the_console_inbox_approves_a_tainted_write() {
         "graph": {"vertices": [{"id": "read", "type": "tool", "config": {"tool": read}},
                                {"id": "write", "type": "tool", "config": {"tool": write, "args": {"customer": "{{outputs.read.customer}}"}}}],
                   "edges": [{"from": "read", "to": "write"}]}});
-    e.publish("sync", spec).await;
+    // Published, not promoted: a version with write tools is promoted only after its injection
+    // eval (evals_tests.rs); runs name the version.
+    e.publish_with("sync", spec, false).await;
     let w = worker(&e, &j, &idem(), None, "worker-a", LONG);
     let stop = Arc::new(tokio::sync::Notify::new());
     tokio::spawn(Arc::clone(&w.ex).run_loop(Arc::clone(&stop)));
-    let (s, v) = send(&w.app, "POST", "/v1/nodes/sync/runs", KEY, Some(json!({"input": {}})), &[]).await;
+    let (s, v) = send(&w.app, "POST", "/v1/nodes/sync/runs", KEY, Some(json!({"input": {}, "version": 1})), &[]).await;
     assert_eq!((s, v["status"].as_str()), (StatusCode::ACCEPTED, Some("input_required")), "{v}");
     let id = v["id"].as_str().unwrap().to_owned();
     assert!(erp.calls().is_empty());

@@ -931,15 +931,19 @@ pub enum Mutation {
         promote: bool,
         at: DateTime<Utc>,
         by: String,
+        /// When it promotes: the evals that met the node's promotion bar (audited).
+        evals: Option<Value>,
     },
     /// Moves the promotion pointer to a published version (rollback included); its budgets are
-    /// checked against the tenant's caps again.
+    /// checked against the tenant's caps again. `evals`: the evals that met the node's promotion
+    /// bar (audited).
     PromoteNode {
         tenant_id: String,
         name: String,
         version: u32,
         at: DateTime<Utc>,
         by: String,
+        evals: Option<Value>,
     },
     /// Retires a published version: it leaves the data plane (and the pointer, if live).
     RetireNode {
@@ -1244,25 +1248,23 @@ impl Mutation {
             Mutation::CreateNode(n) => {
                 d(Some(&n.tenant_id), "node.create", &n.id, json!({"name": n.name, "hash": n.hash}))
             }
-            Mutation::PublishNode { tenant_id, name, version, promote, .. } => {
+            Mutation::PublishNode { tenant_id, name, version, promote, evals, .. } => {
                 let n = before.node_version(tenant_id, name, *version);
-                d(
-                    Some(tenant_id),
-                    "node.publish",
-                    n.map_or(name.as_str(), |n| n.id.as_str()),
-                    json!({"name": name, "version": version, "hash": n.map(|n| &n.hash), "promoted": promote,
-                           "previous_live": before.promotion(tenant_id, name).map(|p| p.version)}),
-                )
+                let mut detail = json!({"name": name, "version": version, "hash": n.map(|n| &n.hash), "promoted": promote,
+                                        "previous_live": before.promotion(tenant_id, name).map(|p| p.version)});
+                if let Some(e) = evals.as_ref().filter(|e| !e.is_null()) {
+                    detail["evals"] = e.clone();
+                }
+                d(Some(tenant_id), "node.publish", n.map_or(name.as_str(), |n| n.id.as_str()), detail)
             }
-            Mutation::PromoteNode { tenant_id, name, version, .. } => {
+            Mutation::PromoteNode { tenant_id, name, version, evals, .. } => {
                 let n = before.node_version(tenant_id, name, *version);
-                d(
-                    Some(tenant_id),
-                    "node.promote",
-                    n.map_or(name.as_str(), |n| n.id.as_str()),
-                    json!({"name": name, "version": version, "hash": n.map(|n| &n.hash),
-                           "previous_live": before.promotion(tenant_id, name).map(|p| p.version)}),
-                )
+                let mut detail = json!({"name": name, "version": version, "hash": n.map(|n| &n.hash),
+                                        "previous_live": before.promotion(tenant_id, name).map(|p| p.version)});
+                if let Some(e) = evals.as_ref().filter(|e| !e.is_null()) {
+                    detail["evals"] = e.clone();
+                }
+                d(Some(tenant_id), "node.promote", n.map_or(name.as_str(), |n| n.id.as_str()), detail)
             }
             Mutation::RetireNode { tenant_id, name, version, .. } => {
                 let n = before.node_version(tenant_id, name, *version);
@@ -1830,9 +1832,21 @@ impl Store {
     }
 }
 
-/// Audit actions the data plane may record (`POST /api/v1/audit/ingest`).
-pub const DATA_PLANE_ACTIONS: &[&str] =
-    &["node.run.answer", "node.write.approve", "node.write.deny", "node.run.cancel"];
+/// Audit actions recorded through the node journal's outbox: the data plane's decisions (`POST
+/// /api/v1/audit/ingest`), the end of an eval (workers), and the control plane's own writes to the
+/// journal (golden sets, promotion bars, eval starts and cancellations), which it drains at once.
+pub const DATA_PLANE_ACTIONS: &[&str] = &[
+    "node.run.answer",
+    "node.write.approve",
+    "node.write.deny",
+    "node.run.cancel",
+    "node.eval.start",
+    "node.eval.cancel",
+    "node.eval.finish",
+    "node.golden_set.update",
+    "node.golden_set.delete",
+    "node.eval_policy.update",
+];
 
 pub fn default_base_url(kind: ProviderKind) -> Option<String> {
     match kind {
