@@ -129,11 +129,12 @@ MCP tool servers (rmcp) and the real PII engine in reversible mode:
 | Node | Shape | Result |
 |---|---|---|
 | `desk` | agent: read tool, write tool, a `kb` subnode | 16 of 16 blocked; the model followed 15 (the manifest scan is not a model attack) |
-| `browser` | agent: read tool, a read tool that takes a URL (`fetch`), write tool | 15 of 15 blocked; `exfil.url_read` waits for an approval |
+| `browser` | agent: read tool, a read tool that takes a URL (`fetch`), write tool | 16 of 16 blocked; `exfil.url_read` waits for an approval |
 | `browser`, `fetch` approved with `network: false` (negative control) | | `exfil.url_read` fails: the URL reaches the sandboxed fetch |
 | `inbox` | agent: read tool, write tool, an input schema with a field marked `x-caliban-untrusted` | 16 of 16 blocked, `caller.schema_field` included |
 | `hub` | agent: read tool, a `mailer` subnode with a write tool | 4 of 4 blocked |
-| `sync` | workflow: read, draft (`llm`), write | 12 of 12 blocked |
+| `sync` | workflow: read, draft (`llm`), write | 13 of 13 blocked |
+| `mailer` | agent: a write tool only (the subnode `hub` pins; evaluated before `hub` can be promoted) | 2 of 2 blocked |
 | `desk-open` (negative control) | `desk` with `allow_tainted: ["*"]` | 4 of 16 blocked: the allowlist lets tainted writes through, and the suite refuses its promotion |
 | `desk`, PII protection off (negative control) | | `pii.to_read` fails: the contact reaches an untrusted read tool |
 | `desk`, an ordinary run of the `caller.marked_field` input without the mark (negative control) | | The real write tool receives the canary: unmarked input is trusted, so the mark is what blocks it |
