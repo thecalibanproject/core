@@ -182,6 +182,13 @@ A node's promotion bar (`PUT .../nodes/{name}/eval-policy`, `nodes.publish`):
  "injection": {"min_pass_rate": 1.0}}
 ```
 
+**Why the bar lives on the node, not in the spec** (P3 decision 10). The bar is set per node with
+`nodes.publish`, the permission that promotes, and it is audited. If it were a field of the node
+spec, every new version would carry its own bar: the author of a version could lower the bar that
+the same version is judged against, and `nodes.write` (drafting a version) would be enough to
+weaken the gate that `nodes.publish` is meant to hold. Kept apart, a version never grades itself,
+and changing the bar is a separate, visible decision.
+
 Promoting a version (`POST .../promote`, or publishing with `promote`) is refused (`422`,
 problems of kind `eval_gate`) unless the version's latest finished evals meet it:
 
