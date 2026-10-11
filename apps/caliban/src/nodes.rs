@@ -270,6 +270,26 @@ async fn purge_runs(journal: Arc<dyn Journal>, keep: Duration, stop: Arc<Notify>
         if total > 0 {
             tracing::info!(runs = total, days = keep.as_secs() / 86_400, "purged finished node runs past retention");
         }
+        // Evals: the summaries stay, their sealed content (trial detail, the plan) goes with the
+        // runs it came from.
+        let mut cleared = 0;
+        loop {
+            match journal.purge_eval_content(keep, BATCH).await {
+                Ok(n) => {
+                    cleared += n;
+                    if (n as usize) < BATCH {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "purging eval content failed; retrying next hour");
+                    break;
+                }
+            }
+        }
+        if cleared > 0 {
+            tracing::info!(rows = cleared, "cleared the content of evals past retention");
+        }
         tokio::select! {
             () = stop.notified() => return,
             () = tokio::time::sleep(Duration::from_secs(3600)) => {}

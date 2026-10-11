@@ -609,7 +609,8 @@ model's cost otherwise): over a run's events it equals the run's `cost_usd`.
 more than `CALIBAN_NODE_RUN_RETENTION_DAYS` ago (default 30; 0 keeps them), with their steps and
 events, hourly and in batches of 500 (`FOR UPDATE SKIP LOCKED`, so workers purging at once take
 different rows). Runs not finished are never purged. The tenants' daily spend (`node_spend`) is
-not purged with them.
+not purged with them. The same purge clears the sealed content of evals that finished before the
+cutoff (trial detail and the plan) and keeps their summaries ([evals.md](evals.md#retention)).
 
 **Retention of usage events.** The control plane (Postgres store) moves raw usage events older
 than `CALIBAN_USAGE_RETENTION_DAYS` (default 90 whole UTC days; 0 keeps them) into `usage_daily`,

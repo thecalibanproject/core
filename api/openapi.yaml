@@ -2951,6 +2951,7 @@ components:
         cancel_requested: { type: boolean }
         cancelled_by: { type: [string, 'null'] }
         claims: { type: integer }
+        content_purged: { type: boolean, description: 'Run retention cleared the eval''s sealed content (trial `detail`, the plan); the summary and verdicts stay' }
         created_at: { type: string, format: date-time }
         started_at: { type: [string, 'null'], format: date-time }
         finished_at: { type: [string, 'null'], format: date-time }

@@ -680,4 +680,30 @@ impl EvalStore for MemoryJournal {
         v.sort_by(|a, b| (&a.case_id, a.trial).cmp(&(&b.case_id, b.trial)));
         Ok(v)
     }
+
+    async fn purge_eval_content(&self, older_than: Duration, batch: usize) -> JResult<u64> {
+        let cutoff = Utc::now() - lease(older_than);
+        let mut t = self.t.lock();
+        let mut n = 0u64;
+        for tr in t.trials.values_mut().flatten() {
+            if n as usize >= batch {
+                break;
+            }
+            if tr.detail.is_some() && tr.finished_at.is_some_and(|f| f < cutoff) {
+                tr.detail = None;
+                n += 1;
+            }
+        }
+        let mut m = 0usize;
+        for e in t.evals.iter_mut() {
+            if m >= batch {
+                break;
+            }
+            if e.status.is_terminal() && !e.plan.is_empty() && e.finished_at.is_some_and(|f| f < cutoff) {
+                e.plan.clear();
+                m += 1;
+            }
+        }
+        Ok(n + m as u64)
+    }
 }

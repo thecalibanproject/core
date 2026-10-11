@@ -461,6 +461,8 @@ fn eval_view(e: &EvalRecord) -> Value {
         "cancel_requested": e.cancel_requested_at.is_some() && !e.status.is_terminal(),
         "cancelled_by": e.cancelled_by,
         "claims": e.claims,
+        // Retention cleared its sealed content (trial detail, the plan); the summary stays.
+        "content_purged": e.plan.is_empty(),
         "created_at": e.created_at,
         "started_at": e.started_at,
         "finished_at": e.finished_at,

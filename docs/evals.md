@@ -256,6 +256,16 @@ dedicated key per tenant (P3 decision 9):
 
 Naming a customer key (`api_key_id`) still works.
 
+## Retention
+
+Eval summaries are kept: the metrics, the verdicts (metadata) and the trial rows outlive the runs,
+so a node's history and the promotion gate's evidence stay readable (P3 decision 13). The sealed
+content goes with the run retention (`CALIBAN_NODE_RUN_RETENTION_DAYS`, default 30): the same hourly
+purge on the workers clears each trial's `detail` (what the scorers said, the output that failed a
+check) and the eval's sealed plan (its golden cases or injection input) once the eval finished
+longer ago than that, in batches with `FOR UPDATE SKIP LOCKED`. The eval then shows
+`content_purged: true`. Golden sets themselves belong to a version and are not purged.
+
 ## Where evals run
 
 Workers and standalone processes run an eval runner next to their claim loop. A runner claims an

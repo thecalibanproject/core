@@ -800,6 +800,18 @@ async fn evals_are_claimed_once_fenced_by_their_lease_and_finished_with_metrics(
         let mut other = q(None, vec![]);
         other.tenant = "globex".into();
         assert!(j.list_evals(&other).await.unwrap().is_empty(), "{n}");
+
+        // Retention: the summary stays; the sealed content of finished evals goes.
+        assert_eq!(j.purge_eval_content(Duration::from_secs(3600), 100).await.unwrap(), 0, "{n}: too recent");
+        let cleared = j.purge_eval_content(Duration::ZERO, 100).await.unwrap();
+        assert_eq!(cleared, 5, "{n}: three trials, two finished evals");
+        let ts = j.trials("eval_1").await.unwrap();
+        assert!(ts.iter().all(|t| t.detail.is_none()) && ts[0].verdict["checks"][0]["passed"] == true, "{n}");
+        let e = j.get_eval("acme", "eval_1").await.unwrap().unwrap();
+        assert_eq!((e.plan.as_str(), e.summary.unwrap()["pass_rate"].as_f64()), ("", Some(1.0)), "{n}");
+        let pending = j.get_eval("acme", "eval_3").await.unwrap().unwrap();
+        assert_eq!(pending.plan, "sealed-plan", "{n}: an eval not finished keeps its plan");
+        assert_eq!(j.purge_eval_content(Duration::ZERO, 100).await.unwrap(), 0, "{n}: done");
     }
 }
 

@@ -347,4 +347,12 @@ pub trait EvalStore: Send + Sync {
     async fn put_trial(&self, worker: &str, t: TrialRecord) -> JResult<TrialWrite>;
     /// The eval's trials, by case then trial.
     async fn trials(&self, eval_id: &str) -> JResult<Vec<TrialRecord>>;
+
+    /// Retention (P3 decision 13; with the runs' retention): clears the sealed content of evals
+    /// that finished more than `older_than` ago, at most `batch` rows of each kind per call: each
+    /// trial's `detail`, and the eval's sealed `plan` (its golden cases or injection input), which
+    /// becomes empty. Summaries, verdicts (metadata) and the rows themselves are kept, so metrics
+    /// and the promotion gate's evidence outlive the content. Safe on several workers at once.
+    /// Returns how many rows it cleared.
+    async fn purge_eval_content(&self, older_than: Duration, batch: usize) -> JResult<u64>;
 }

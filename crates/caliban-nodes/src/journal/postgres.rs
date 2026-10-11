@@ -1261,4 +1261,34 @@ impl EvalStore for PgJournal {
         .map_err(db)?;
         rows.iter().map(trial_row).collect()
     }
+
+    async fn purge_eval_content(&self, older_than: Duration, batch: usize) -> JResult<u64> {
+        let limit = i64::try_from(batch).unwrap_or(i64::MAX);
+        // SKIP LOCKED: several workers purging at once take different rows.
+        let trials = sqlx::query(
+            "UPDATE node_eval_trial SET detail = NULL WHERE (eval_id, case_id, trial) IN (
+                 SELECT eval_id, case_id, trial FROM node_eval_trial
+                 WHERE detail IS NOT NULL AND finished_at IS NOT NULL
+                       AND finished_at < now() - make_interval(secs => $1)
+                 ORDER BY finished_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        )
+        .bind(secs(older_than))
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        let evals = sqlx::query(
+            "UPDATE node_eval SET plan = '' WHERE id IN (
+                 SELECT id FROM node_eval
+                 WHERE status IN ('succeeded', 'failed', 'cancelled') AND plan <> '' AND finished_at IS NOT NULL
+                       AND finished_at < now() - make_interval(secs => $1)
+                 ORDER BY finished_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        )
+        .bind(secs(older_than))
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(trials.rows_affected() + evals.rows_affected())
+    }
 }
