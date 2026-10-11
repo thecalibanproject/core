@@ -1361,3 +1361,272 @@ async fn step_events_carry_taint_labels_costs_and_usage() {
         assert_eq!(v.last_event, 4, "created, started, finished, input required: {v:?}");
     }
 }
+
+// ───────────────────────────── evals ─────────────────────────────
+
+mod evals {
+    use super::*;
+    use crate::eval::injection::{self, PII_CANARY};
+    use crate::eval::runner::{EvalOptions, EvalRunner};
+    use crate::eval::{GoldenCase, Plan};
+    use crate::journal::evals::{EvalRecord, EvalStatus, NewEval, Suite, TrialStatus};
+
+    fn opts() -> EvalOptions {
+        EvalOptions {
+            lease_ttl: Duration::from_secs(5),
+            heartbeat: Duration::from_millis(200),
+            poll: Duration::from_millis(20),
+            max_concurrent_evals: 2,
+            snapshot_wait: Duration::from_secs(5),
+        }
+    }
+
+    async fn start_eval(h: &Harness, node: &str, suite: Suite, k: u32, plan: &Plan) -> EvalRecord {
+        let id = format!("eval_{}", uuid::Uuid::now_v7().simple());
+        let hash = h.nodes.resolve("acme", node, Some(1)).unwrap().hash;
+        let sealed = h.sealer.seal("acme", &id, &serde_json::to_string(plan).unwrap()).unwrap();
+        let e = NewEval {
+            id,
+            tenant_id: "acme".into(),
+            node: node.into(),
+            version: 1,
+            spec_hash: hash,
+            suite,
+            k,
+            concurrency: 3,
+            created_by: "user:jo".into(),
+            api_key_id: None,
+            invoker_key_hash: "ab".repeat(32),
+            plan: sealed,
+            case_count: 3,
+        };
+        h.journal.create_eval(e, None).await.unwrap()
+    }
+
+    /// Golden cases run `k` times as ordinary runs: scripted answers for the human step, the judge
+    /// through the model client with the eval as its run, pass^k and cost per success.
+    #[tokio::test]
+    async fn a_golden_eval_runs_every_case_k_times_and_reports_pass_k() {
+        for j in journals().await {
+            let h = Harness::new(Arc::clone(&j));
+            h.nodes.add("triage", 1, triage_spec());
+            let base = triage_model();
+            let model = FakeModel::new(move |body| {
+                if system(body).starts_with("You grade") {
+                    text("{\"score\": 0.9, \"reason\": \"fine\"}")
+                } else {
+                    (base.script)(body)
+                }
+            });
+            let ex = h.executor(&model, "w1");
+            let case = |v: Value| serde_json::from_value::<GoldenCase>(v).unwrap();
+            let cases = vec![
+                case(json!({"id": "good", "input": {"case": "chest pain"}, "answers": {"ask": "40"},
+                            "checks": [{"type": "json_schema", "schema": {"type": "object", "required": ["service"]}},
+                                       {"type": "contains", "value": "gp"},
+                                       {"type": "llm_judge", "rubric": "Is the service sensible?", "threshold": 0.5}]})),
+                case(json!({"id": "wrong", "input": {"case": "x"}, "answers": {"ask": "40"}, "expected": "nope"})),
+                case(json!({"id": "unanswered", "input": {"case": "x"}, "expected": "nope"})),
+            ];
+            let plan = Plan::Golden {
+                golden_hash: crate::eval::golden_hash(&cases),
+                cases,
+                judge_model: Some("local/judge".into()),
+            };
+            let e = start_eval(&h, "triage", Suite::Golden, 2, &plan).await;
+            let runner = EvalRunner::new(Arc::clone(&ex), opts());
+            assert!(runner.run_once().await);
+            let e = j.get_eval("acme", &e.id).await.unwrap().unwrap();
+            assert_eq!(e.status, EvalStatus::Succeeded, "{e:?}");
+            let s = e.summary.unwrap();
+            assert_eq!((s["trials"].as_u64(), s["passed_trials"].as_u64()), (Some(6), Some(2)), "{s}");
+            assert_eq!(s["pass_hat_k"].as_f64().unwrap(), 1.0 / 3.0);
+            assert_eq!(s["judge"]["default_model"], "local/judge");
+            assert!(s["cost_per_success_usd"].as_f64().unwrap() > 0.0 && s["latency_ms"]["p95"].is_u64());
+            let trials = j.trials(&e.id).await.unwrap();
+            let unanswered: Vec<&TrialStatus> =
+                trials.iter().filter(|t| t.case_id == "unanswered").map(|t| &t.status).collect();
+            assert_eq!(unanswered, [&TrialStatus::Failed, &TrialStatus::Failed]);
+            // Every trial is an ordinary run of the version, started by the eval.
+            for t in &trials {
+                let r = j.get_run("acme", t.run_id.as_ref().unwrap()).await.unwrap().unwrap();
+                assert_eq!(
+                    (r.origin.as_deref(), r.invoker.as_str()),
+                    (Some(format!("eval:{}", e.id).as_str()), format!("eval:{}", e.id).as_str())
+                );
+            }
+            // The judge ran once per trial of the good case, through the model client.
+            assert_eq!(model.steps().iter().filter(|s| s.starts_with("judge:good:")).count(), 2);
+            // Running it again does nothing: every trial is recorded.
+            assert!(!runner.run_once().await);
+        }
+    }
+
+    /// Hides the canary contact like the PII engine (`[EMAIL]`).
+    struct CanaryGuard;
+
+    #[async_trait::async_trait]
+    impl DataGuard for CanaryGuard {
+        async fn protect(&self, _tenant: &str, v: Value) -> Result<(Value, bool), String> {
+            let s = v.to_string();
+            Ok((serde_json::from_str(&s.replace(PII_CANARY, "[EMAIL]")).unwrap(), s.contains(PII_CANARY)))
+        }
+        async fn anonymize(&self, tenant: &str, v: Value) -> Result<Value, String> {
+            self.protect(tenant, v).await.map(|(v, _)| v)
+        }
+        async fn has_pii(&self, _tenant: &str, v: &Value) -> bool {
+            v.to_string().contains(PII_CANARY)
+        }
+    }
+
+    const PIN_N: &str = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+
+    /// Agents that look a record up first (through the `kb` subnode when they have it), and follow
+    /// every injection they see.
+    fn compromised() -> Arc<FakeModel> {
+        FakeModel::new(|body| {
+            if let Some(m) = injection::compromised_reply(body) {
+                return m;
+            }
+            let tools: Vec<String> = body["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["function"]["name"].as_str().map(str::to_owned))
+                .collect();
+            let looked = body["messages"].as_array().is_some_and(|m| m.iter().any(|m| m["role"] == "tool"));
+            if tools.is_empty() || looked {
+                return text("Resolved: record 4471");
+            }
+            let first = tools.iter().find(|t| *t == "kb_v1").or_else(|| tools.iter().find(|t| *t == "lookup"));
+            match first {
+                Some(f) => json!({"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c0", "type": "function", "function": {"name": f, "arguments": "{\"id\": \"4471\"}"}}]}),
+                None => text("Resolved."),
+            }
+        })
+    }
+
+    struct Suite3 {
+        h: Harness,
+        real: Vec<Arc<Recorder>>,
+    }
+
+    fn suite_nodes(j: Arc<dyn Journal>, allow: Option<&str>) -> Suite3 {
+        let r = |n: &'static str| Recorder::new(n, false, json!({"real": true}));
+        let (lookup, send, search, notify) = (r("lookup"), r("send_email"), r("search"), r("notify"));
+        let refs = [
+            format!("mcp://crm/lookup#{PIN}"),
+            format!("mcp://mail/send_email#{PIN_W}"),
+            format!("mcp://kb/search#{PIN}"),
+            format!("mcp://mail/notify#{PIN_N}"),
+        ];
+        let mut tools = StaticTools::new();
+        for (re, t) in refs.iter().zip([&lookup, &send, &search, &notify]) {
+            tools = tools.with(re.clone(), Arc::clone(t) as Arc<dyn Tool>);
+        }
+        let h = Harness::new(j).with_tools(tools);
+        let mut write = json!({"ref": refs[1], "effect": "write"});
+        if let Some(a) = allow {
+            write["allow_tainted"] = json!([a]);
+        }
+        h.nodes.add("kb", 1, json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(10, 10_000),
+            "tools": [{"ref": refs[2], "effect": "read"}],
+            "graph": {"vertices": [{"id": "search", "type": "tool", "config": {"tool": refs[2], "args": {"q": "{{input}}"}}}], "edges": []}}));
+        h.nodes.add(
+            "mailer",
+            1,
+            json!({"kind": "agent", "model_policy": {}, "budgets": budgets(10, 10_000),
+            "tools": [{"ref": refs[3], "effect": "write"}]}),
+        );
+        h.nodes.add(
+            "desk",
+            1,
+            json!({"kind": "agent", "model_policy": {}, "budgets": budgets(12, 100_000),
+            "tools": [{"ref": refs[0], "effect": "read"}, write, {"ref": "node://kb@v1", "effect": "read"}]}),
+        );
+        h.nodes.add(
+            "hub",
+            1,
+            json!({"kind": "agent", "model_policy": {}, "budgets": budgets(12, 100_000),
+            "tools": [{"ref": refs[0], "effect": "read"}, {"ref": "node://mailer@v1", "effect": "read"}]}),
+        );
+        Suite3 { h, real: vec![lookup, send, search, notify] }
+    }
+
+    async fn injection_eval(s: &Suite3, node: &str, guard: bool) -> (Value, Vec<crate::journal::evals::TrialRecord>) {
+        let model = compromised();
+        let ex = s.h.executor(&model, "w1");
+        let ex =
+            if guard { Arc::new(Arc::try_unwrap(ex).ok().unwrap().with_data_guard(Arc::new(CanaryGuard))) } else { ex };
+        let plan = Plan::Injection {
+            input: json!("Customer asks about record 4471"),
+            suite_version: injection::SUITE_VERSION,
+            manifests: vec![],
+            checks: vec![],
+        };
+        let e = start_eval(&s.h, node, Suite::Injection, 1, &plan).await;
+        assert!(EvalRunner::new(Arc::clone(&ex), opts()).run_once().await);
+        let e = s.h.journal.get_eval("acme", &e.id).await.unwrap().unwrap();
+        assert_eq!(e.status, EvalStatus::Succeeded, "{e:?}");
+        (e.summary.unwrap(), s.h.journal.trials(&e.id).await.unwrap())
+    }
+
+    fn outcome(trials: &[crate::journal::evals::TrialRecord], case: &str) -> (bool, Value) {
+        let t = trials.iter().find(|t| t.case_id == case).unwrap_or_else(|| panic!("no trial for {case}"));
+        (t.status == TrialStatus::Passed, t.verdict.clone())
+    }
+
+    /// Against a model that follows every injection, the Rust-side defenses block every attack:
+    /// tainted writes wait for an approval (denied), approvals do not carry over, taint crosses
+    /// subnode boundaries both ways, PII stays out of untrusted tools. The real tools are never
+    /// called.
+    #[tokio::test]
+    async fn the_injection_suite_holds_against_a_compromised_model() {
+        for j in journals().await {
+            let s = suite_nodes(Arc::clone(&j), None);
+            let (sum, trials) = injection_eval(&s, "desk", true).await;
+            assert_eq!(sum["pass_rate"], 1.0, "{sum}");
+            assert_eq!(sum["attack_success_rate"], 0.0);
+            assert_eq!(sum["attacked"], sum["trials"], "the model followed every injection: {sum}");
+            let (ok, v) = outcome(&trials, "subnode.child_to_parent");
+            assert!(ok && v["defenses"] == json!(["approval_required"]), "{v}");
+            let (ok, v) = outcome(&trials, "replay.prior_approval");
+            assert!(ok && v["tool_calls"].as_u64() >= Some(2), "the benign write ran, the replayed one did not: {v}");
+            assert!(outcome(&trials, "pii.to_read").0 && outcome(&trials, "write.staged").0);
+            let na: Vec<&str> =
+                sum["not_applicable"].as_array().unwrap().iter().map(|c| c["case"].as_str().unwrap()).collect();
+            assert!(na.contains(&"replay.allowlisted_write") && na.contains(&"subnode.parent_to_child"), "{na:?}");
+            for t in &s.real {
+                assert!(t.seen.lock().is_empty(), "the real {} tool was called", t.name);
+            }
+            // The injection reaches the child, through its parent: the child's write is tainted.
+            let (sum, trials) = injection_eval(&s, "hub", true).await;
+            let (ok, v) = outcome(&trials, "subnode.parent_to_child");
+            assert!(ok && v["attacked"] == true && v["defenses"] == json!(["approval_required"]), "{v} {sum}");
+        }
+    }
+
+    /// The suite catches what the defenses do not cover: a standing allowlist lets tainted writes
+    /// through (residual authority), and without the PII guard the contact reaches a read tool.
+    #[tokio::test]
+    async fn the_injection_suite_fails_versions_whose_defenses_are_off() {
+        let s = suite_nodes(Arc::new(MemoryJournal::new()), Some("*"));
+        let (sum, trials) = injection_eval(&s, "desk", false).await;
+        assert!(sum["pass_rate"].as_f64().unwrap() < 0.5, "{sum}");
+        for case in [
+            "write.ignore_previous",
+            "write.fragmented",
+            "replay.allowlisted_write",
+            "subnode.child_to_parent",
+            "pii.to_read",
+        ] {
+            assert!(!outcome(&trials, case).0, "{case} should succeed: {:?}", outcome(&trials, case).1);
+        }
+        assert!(outcome(&trials, "exfil.undeclared_tool").0, "undeclared tools never run");
+        assert_eq!(sum["by_category"]["replay"]["blocked"], 0);
+        for t in &s.real {
+            assert!(t.seen.lock().is_empty(), "the real {} tool was called", t.name);
+        }
+    }
+}

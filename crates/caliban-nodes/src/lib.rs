@@ -5,7 +5,9 @@
 //! - content hashes and publish-time validation against the tenant ([`hash`], [`publish`]);
 //! - the hierarchical budget ledger ([`budget`]);
 //! - the durable run journal, in memory and on Postgres, following the Absurd model ([`journal`]);
-//! - the executor on tokio: graph vertices, a bounded agent loop, replay ([`executor`]).
+//! - the executor on tokio: graph vertices, a bounded agent loop, replay ([`executor`]);
+//! - evals: golden sets scored `k` times per case, the injection suite against sandboxed tools,
+//!   promotion bars, and the runner that executes them on workers ([`eval`]).
 //!
 //! Every model call the executor makes goes through a [`executor::ModelClient`], which the data
 //! plane implements with its own request pipeline (PII, cache, routing, quotas, metering, tracing).
@@ -17,6 +19,7 @@
 pub mod budget;
 pub mod chat;
 pub mod diff;
+pub mod eval;
 pub mod executor;
 pub mod hash;
 pub mod journal;

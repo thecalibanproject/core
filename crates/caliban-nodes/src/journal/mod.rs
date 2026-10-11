@@ -30,6 +30,9 @@
 //!   transaction; every worker ships them to the control plane's hash-chained audit log
 //!   ([`Journal::claim_audit`], [`Journal::ack_audit`]), which deduplicates by the event's id.
 //!
+//! - **Evals.** Golden sets, promotion bars, eval runs and their trials ([`evals::EvalStore`],
+//!   which every journal implements): eval runs are claimed and fenced like runs.
+//!
 //! Payloads are opaque strings here: the executor seals them with the tenant's data key before
 //! they reach the journal ([`crate::seal`]).
 

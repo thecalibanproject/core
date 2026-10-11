@@ -25,6 +25,7 @@ pub mod taint;
 pub mod template;
 pub mod tools;
 
+pub(crate) use agent::function_name;
 pub use tools::{DataGuard, FnTool, NoGuard, NoTools, StaticTools, Tool, ToolCtx, ToolError, ToolInfo, ToolRegistry};
 
 use crate::budget::{BudgetError, BudgetState, Ledger};
@@ -478,6 +479,16 @@ impl Executor {
 
     pub fn nodes(&self) -> &Arc<dyn NodeSource> {
         &self.nodes
+    }
+
+    /// The model client (the eval runner's judge calls go through it, like node calls).
+    pub fn models(&self) -> &Arc<dyn ModelClient> {
+        &self.models
+    }
+
+    /// The tool registry of ordinary runs.
+    pub fn tools(&self) -> &Arc<dyn ToolRegistry> {
+        &self.tools
     }
 
     /// Creates a run (`pending`) after validating its input. Returns the run and whether it is new
@@ -949,6 +960,11 @@ pub(crate) struct RunCx {
     pinned: HashMap<(String, u32), ResolvedNode>,
     pub input: Value,
     pub ledger: Ledger,
+    /// The run's tools: the executor's registry, or the injection suite's sandbox for a run whose
+    /// origin is an injection case (`eval::injection`).
+    pub tools: Arc<dyn ToolRegistry>,
+    /// The tools are sandboxed (circuit breakers are then kept apart from the real tools').
+    pub sandboxed: bool,
     recorded: HashMap<String, StepRecord>,
     usd: Mutex<f64>,
     /// Deepest nesting level and widest `map` the run reached (reported in its budget).
@@ -1006,10 +1022,35 @@ impl RunCx {
             .into_iter()
             .map(|s| (s.step_id.clone(), s))
             .collect();
+        // An injection-suite run gets sandboxed tools, never the real ones (an unknown case fails).
+        let (tools, sandboxed): (Arc<dyn ToolRegistry>, bool) =
+            match crate::eval::injection::case_of_origin(run.origin.as_deref()) {
+                None => (Arc::clone(&ex.tools), false),
+                Some(Err(e)) => return Err(Stop::Fail(e)),
+                Some(Ok(case)) => {
+                    let children: Vec<&NodeSpec> = pinned
+                        .iter()
+                        .filter(|((n, v), _)| !(*n == root.name && *v == root.version))
+                        .map(|(_, r)| r.spec.as_ref())
+                        .collect();
+                    let sandbox = crate::eval::injection::SandboxTools::new(
+                        case,
+                        &run.tenant_id,
+                        &root.spec,
+                        &children,
+                        Arc::clone(&ex.tools),
+                        Arc::clone(&ex.journal),
+                        Arc::clone(&ex.sealer),
+                    );
+                    (Arc::new(sandbox), true)
+                }
+            };
         let b = run.budget;
         let ledger = Ledger::root(b.ledger_limits());
         let guards = root.spec.guards();
         Ok(Self {
+            tools,
+            sandboxed,
             elapsed_base_ms: b.wall_clock_ms_used,
             depth_used: std::sync::atomic::AtomicU32::new(0),
             fanout_used: std::sync::atomic::AtomicU32::new(0),

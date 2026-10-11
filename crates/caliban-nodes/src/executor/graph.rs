@@ -375,7 +375,7 @@ pub(super) async fn call_tool(
                 out
             }
             _ => {
-                let tool = cx.ex.tools.resolve(cx.tenant(), reference).map_err(|e| Stop::Fail(e.to_string()))?;
+                let tool = cx.tools.resolve(cx.tenant(), reference).map_err(|e| Stop::Fail(e.to_string()))?;
                 let ctx = ToolCtx {
                     tenant: cx.tenant().to_owned(),
                     node: cx.run.node.clone(),
@@ -459,7 +459,8 @@ async fn guarded_call(
     args: Value,
 ) -> Result<Value, Stop> {
     let ex = &cx.ex;
-    let key = (cx.tenant().to_owned(), super::breaker::tool_key(reference));
+    let breaker = super::breaker::tool_key(reference);
+    let key = (cx.tenant().to_owned(), if cx.sandboxed { format!("sandbox:{breaker}") } else { breaker });
     let admitted = ex.breakers.lock().entry(key.clone()).or_default().admit(Instant::now(), ex.opts.breaker_cooldown);
     if let Err(wait) = admitted {
         return Err(Stop::Fail(format!(

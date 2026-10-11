@@ -32,7 +32,7 @@ struct Bound {
 }
 
 /// Function names: `[a-zA-Z0-9_-]`, at most 64 characters.
-fn function_name(s: &str) -> String {
+pub(crate) fn function_name(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).take(64).collect()
 }
 
@@ -49,7 +49,7 @@ fn bind_tools(cx: &RunCx, node: &ResolvedNode) -> Result<Vec<Bound>, Stop> {
                 _tool: None,
             },
             ToolTarget::Mcp { .. } | ToolTarget::Builtin { .. } => {
-                let tool = cx.ex.tools.resolve(cx.tenant(), &t.reference).map_err(|e| Stop::Fail(e.to_string()))?;
+                let tool = cx.tools.resolve(cx.tenant(), &t.reference).map_err(|e| Stop::Fail(e.to_string()))?;
                 let info = tool.info();
                 Bound {
                     function: function_name(&info.name),
