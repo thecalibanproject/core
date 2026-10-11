@@ -3,7 +3,11 @@
 #[cfg(test)]
 mod auto_tests;
 #[cfg(test)]
+mod evals_tests;
+#[cfg(test)]
 mod exposure_tests;
+#[cfg(test)]
+mod injection_tests;
 #[cfg(test)]
 mod kek_checkin_tests;
 mod nodes;

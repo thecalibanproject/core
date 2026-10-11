@@ -164,9 +164,25 @@ pub(crate) async fn env_full(
     extra: &str,
     upstream: Option<&str>,
 ) -> Env {
-    let cfg = MockConfig { latency, responder: Some(responder()), ..MockConfig::default() };
-    let mock = Mock::start("127.0.0.1:0", cfg).await.unwrap();
-    let cfg = config_with(upstream.unwrap_or(&mock.base_url()), extra);
+    let upstream = upstream.map(str::to_owned);
+    let extra = extra.to_owned();
+    env_from(latency, journal, responder(), move |mock_url| {
+        config_with(upstream.as_deref().unwrap_or(mock_url), &extra)
+    })
+    .await
+}
+
+/// An environment whose mock model server answers with `responder`, and whose config `cfg` builds
+/// from the mock server's base URL.
+pub(crate) async fn env_from(
+    latency: Duration,
+    journal: Option<Arc<dyn Journal>>,
+    responder: Responder,
+    cfg: impl FnOnce(&str) -> Config,
+) -> Env {
+    let mock_cfg = MockConfig { latency, responder: Some(responder), ..MockConfig::default() };
+    let mock = Mock::start("127.0.0.1:0", mock_cfg).await.unwrap();
+    let cfg = cfg(&mock.base_url());
     let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "boot"));
     let cp = Arc::new(
         ControlPlane::new(Store::new(cfg, handle.clone(), RecentUsage::default()), ADMIN.into(), "standalone")

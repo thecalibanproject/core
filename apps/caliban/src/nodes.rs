@@ -83,6 +83,16 @@ impl NodeArgs {
         }
     }
 
+    pub fn eval_options(&self) -> caliban_nodes::eval::runner::EvalOptions {
+        let opts = self.options();
+        caliban_nodes::eval::runner::EvalOptions {
+            lease_ttl: opts.lease_ttl,
+            heartbeat: opts.heartbeat,
+            poll: opts.poll,
+            ..caliban_nodes::eval::runner::EvalOptions::default()
+        }
+    }
+
     fn sync_wait(&self) -> Duration {
         Duration::from_secs(self.node_sync_wait_secs.max(1))
     }
@@ -131,6 +141,9 @@ impl NodeArgs {
         let executor = caliban_gateway::nodes::local_executor(gw, journal, tools, keyring, worker_id, opts);
         let stop = Arc::new(Notify::new());
         tokio::spawn(Arc::clone(&executor).run_loop(Arc::clone(&stop)));
+        // Evals (golden sets, the injection suite) run here too: their trials are ordinary runs.
+        let evals = caliban_nodes::eval::runner::EvalRunner::new(Arc::clone(&executor), self.eval_options());
+        tokio::spawn(evals.run_loop(Arc::clone(&stop)));
         tokio::spawn(ship_audit(
             Arc::clone(executor.journal()),
             audit,
