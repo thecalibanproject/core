@@ -256,6 +256,7 @@ pub fn indexer(rt: &RagRuntime, services: Arc<GatewayRag>) -> Arc<Indexer> {
         index: Arc::clone(&rt.index),
         services: services as Arc<dyn RagServices>,
         prefix: rt.prefix.clone(),
+        plain_chunks: false,
     })
 }
 
@@ -370,6 +371,7 @@ impl Tool for RagSearch {
             index: Arc::clone(&self.rt.index),
             services: Arc::clone(&self.services) as Arc<dyn RagServices>,
             prefix: self.rt.prefix.clone(),
+            options: caliban_rag::retrieve::RetrieveOptions::default(),
         };
         let scope = CallScope {
             tenant: ctx.tenant.clone(),
@@ -385,3 +387,4 @@ impl Tool for RagSearch {
         serde_json::to_value(out).map_err(|e| ToolError::Failed(e.to_string()))
     }
 }
+

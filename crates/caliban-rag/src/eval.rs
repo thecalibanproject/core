@@ -15,19 +15,21 @@ use caliban_config::Dek;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Graded relevance of results to a query: `(document id, heading path prefix) -> grade`.
+/// Graded relevance of results to a query: `(document id, evidence, grade)`. A result is
+/// `(document id, what it shows)`, where what it shows is its heading path and text; it matches a
+/// label of its document when it contains the label's evidence (a phrase of the passage that
+/// answers). Matching on evidence rather than on chunk ids lets chunkers be compared.
 #[derive(Debug, Clone, Default)]
 pub struct Labels {
     pub relevant: Vec<(String, String, u32)>,
 }
 
 impl Labels {
-    /// The grade of a result (0: not relevant). A label's heading path matches a result whose path
-    /// starts with it (a label on a section covers its subsections).
-    pub fn grade(&self, doc_id: &str, heading_path: &str) -> u32 {
+    /// The grade of a result (0: not relevant).
+    pub fn grade(&self, doc_id: &str, shown: &str) -> u32 {
         self.relevant
             .iter()
-            .filter(|(d, h, _)| d == doc_id && heading_path.starts_with(h.as_str()))
+            .filter(|(d, h, _)| d == doc_id && shown.contains(h.as_str()))
             .map(|(_, _, g)| *g)
             .max()
             .unwrap_or(0)
@@ -42,7 +44,7 @@ pub fn recall_at(results: &[(String, String)], labels: &Labels, k: usize) -> f64
     }
     let found = wanted
         .iter()
-        .filter(|(d, h, _)| results.iter().take(k).any(|(rd, rh)| rd == d && rh.starts_with(h.as_str())))
+        .filter(|(d, h, _)| results.iter().take(k).any(|(rd, rh)| rd == d && rh.contains(h.as_str())))
         .count();
     #[allow(clippy::cast_precision_loss)]
     let r = found as f64 / wanted.len() as f64;
@@ -58,7 +60,7 @@ pub fn ndcg_at(results: &[(String, String)], labels: &Labels, k: usize) -> f64 {
             .relevant
             .iter()
             .enumerate()
-            .filter(|(j, (ld, lh, _))| !used.contains(j) && ld == d && h.starts_with(lh.as_str()))
+            .filter(|(j, (ld, lh, _))| !used.contains(j) && ld == d && h.contains(lh.as_str()))
             .max_by_key(|(_, (_, _, g))| *g);
         if let Some((j, (_, _, g))) = best {
             used.insert(j);
@@ -99,6 +101,10 @@ const CONCEPTS: &[&[&str]] = &[
     &["cancel", "terminate", "end", "stop"],
     &["install", "setup", "configure", "deploy"],
     &["phone", "mobile", "smartphone", "cellphone"],
+    &["sick", "ill", "illness", "sickness", "unwell"],
+    &["visitor", "guest"],
+    &["meal", "dinner", "lunch", "food"],
+    &["submit", "file", "send"],
 ];
 
 fn slot(feature: &str, dim: usize) -> (usize, f32) {
@@ -184,8 +190,12 @@ impl TestServices {
         }
     }
 
+    /// The tenant's data key: derived from the tenant id, so runs are reproducible (point ids and
+    /// term ids, hence tie-breaks, depend on it).
     pub fn dek(&self, tenant: &str) -> Arc<Dek> {
-        Arc::clone(self.keys.lock().entry(tenant.to_owned()).or_insert_with(|| Arc::new(Dek::generate())))
+        Arc::clone(self.keys.lock().entry(tenant.to_owned()).or_insert_with(|| {
+            Arc::new(Dek::from_test_bytes(blake3::derive_key("caliban rag test data key", tenant.as_bytes())))
+        }))
     }
 }
 

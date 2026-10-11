@@ -327,6 +327,12 @@ impl Dek {
         Self(key)
     }
 
+    /// A DEK from known bytes: deterministic tests and evals only (real DEKs are generated).
+    #[doc(hidden)]
+    pub fn from_test_bytes(key: [u8; 32]) -> Self {
+        Self(Zeroizing::new(key))
+    }
+
     /// Seals a secret of `tenant`: base64(nonce ‖ ciphertext), the tenant id as associated data.
     pub fn seal(&self, tenant: &str, plaintext: &str) -> String {
         encrypt(&self.0, &secret_aad(tenant), plaintext.as_bytes())

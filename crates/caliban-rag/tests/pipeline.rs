@@ -40,6 +40,7 @@ impl Env {
             index: Arc::clone(&index),
             services: Arc::clone(&services) as _,
             prefix: prefix.clone(),
+            plain_chunks: false,
         });
         let runner = IndexRunner::new(indexer, "w1", IndexOptions::default());
         let retriever = Retriever {
@@ -47,6 +48,7 @@ impl Env {
             index: Arc::clone(&index),
             services: Arc::clone(&services) as _,
             prefix: prefix.clone(),
+            options: caliban_rag::retrieve::RetrieveOptions::default(),
         };
         Self { store, index, services, runner, retriever, prefix, memory: None }
     }

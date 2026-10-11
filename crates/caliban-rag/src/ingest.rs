@@ -118,6 +118,9 @@ pub struct Indexer {
     pub services: Arc<dyn RagServices>,
     /// Qdrant collection prefix.
     pub prefix: String,
+    /// Chunk without structure (fixed windows, no heading paths): the baseline the retrieval eval
+    /// compares structure-aware chunking with. Never set in production.
+    pub plain_chunks: bool,
 }
 
 /// Whether a finding quarantines a document from a source of this trust.
@@ -169,8 +172,12 @@ impl Indexer {
         let env: DocumentEnvelope =
             serde_json::from_str(&plain).map_err(|e| RagError::Invalid(format!("the document is malformed: {e}")))?;
         let kind = ContentType::parse(&doc.content_type).map_err(RagError::Invalid)?;
-        let parsed = parse(kind, &env.content);
-        let title = env.title.clone().or_else(|| parsed.title.clone());
+        let parsed = if self.plain_chunks {
+            parse(ContentType::Text, &env.content.replace('\n', " "))
+        } else {
+            parse(kind, &env.content)
+        };
+        let title = if self.plain_chunks { None } else { env.title.clone().or_else(|| parsed.title.clone()) };
         let chunks = chunk(&parsed, collection.settings.chunk_tokens);
         if chunks.is_empty() {
             return Ok(IndexOutcome::Failed { error: "the document has no text".into() });

@@ -11,7 +11,7 @@
 //! 3. **Navigation.** For a query that needs several pieces of evidence (`evidence: "multi"`), or
 //!    one aimed at a single document (`doc_id`), the long documents among the best candidates are
 //!    walked through their navigation trees ([`crate::navtree`]); the chunks reached join the
-//!    fusion as one more ranked list.
+//!    candidates the reranker sees, without reordering the flat ranking.
 //! 4. **Rerank** through the gateway's rerank path when the collection names a rerank model (top
 //!    [`RERANK_DEPTH`] candidates); scores then also drive the cliff below. Without a reranker the
 //!    fused rank decides.
@@ -20,9 +20,10 @@
 //!    several pieces of evidence **and** the candidate pool is redundant: on clean pools
 //!    diversification lowered relevance, evidence coverage and answer quality, and it helped only
 //!    for multi-evidence queries over redundant pools (arXiv 2610.09412, preprint).
-//! 6. **Budget.** Chunks are added in rank order until `max_tokens` or `k`, stopping early at a
-//!    rerank score cliff: more context is not better (Lost in the Middle, arXiv 2307.03172; the
-//!    inverted U of arXiv 2410.05983). Nothing is cut mid-chunk.
+//! 6. **Budget.** After a rerank, passages more than [`RERANK_CLIFF`] below the best one are dropped
+//!    (before the diversity step), then chunks are added in rank order until `max_tokens` or `k`:
+//!    more context is not better (Lost in the Middle, arXiv 2307.03172; the inverted U of
+//!    arXiv 2410.05983). Nothing is cut mid-chunk.
 //! 7. **Order and citations.** Documents ordered best first and second best last, the rest in
 //!    between (against "lost in the middle"); chunks of one document in reading order (OP-RAG,
 //!    arXiv 2409.01666). Each chunk is cited `[n]` with its document id, version, heading path and
@@ -134,6 +135,42 @@ pub struct Retriever {
     pub index: Arc<dyn VectorIndex>,
     pub services: Arc<dyn RagServices>,
     pub prefix: String,
+    /// Which stages run (all of them by default; the eval turns them off one by one).
+    pub options: RetrieveOptions,
+}
+
+/// When the near-duplicate penalty applies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Diversity {
+    Off,
+    /// Multi-evidence queries over a redundant pool only (the default; arXiv 2610.09412).
+    #[default]
+    Conditional,
+    /// Every query (what the paper found harmful on clean pools; for comparison only).
+    Always,
+}
+
+/// The stages of [`Retriever::search`]. Production uses the default (everything on); the
+/// retrieval eval compares configurations, which is also how a tenant-level change (for example
+/// LLM-written chunk context for unstructured documents) should be gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrieveOptions {
+    /// The BM25 leg next to the dense one.
+    pub lexical: bool,
+    /// The collection's rerank model, when it has one.
+    pub rerank: bool,
+    /// Navigation trees for multi-evidence queries and `doc_id` searches.
+    pub navigate: bool,
+    pub diversity: Diversity,
+    /// Candidates per leg and collection ([`LEG_DEPTH`]). The eval lowers it to stand for a
+    /// corpus much larger than the candidate pool.
+    pub depth: usize,
+}
+
+impl Default for RetrieveOptions {
+    fn default() -> Self {
+        Self { lexical: true, rerank: true, navigate: true, diversity: Diversity::Conditional, depth: LEG_DEPTH }
+    }
 }
 
 /// One candidate chunk.
@@ -191,9 +228,9 @@ impl Retriever {
         for (ci, c) in collections.iter().enumerate() {
             let req = SearchRequest {
                 dense: vectors.get(c.embedding_model.as_str()).cloned(),
-                sparse: Some(sparse.clone()),
+                sparse: self.options.lexical.then(|| sparse.clone()),
                 filter: Filter { doc_keys: doc_filter[ci].clone(), now: Some(args.now), ..Filter::default() },
-                limit: LEG_DEPTH,
+                limit: self.options.depth.max(1),
                 with_vectors: true,
             };
             let r = self.index.search(&names[ci], &req).await?;
@@ -210,31 +247,9 @@ impl Retriever {
                 }
             }
         }
-        out.strategy.hybrid = !sparse.is_empty();
+        out.strategy.hybrid = self.options.lexical && !sparse.is_empty();
 
-        // 3. Navigation (needs the first fusion to pick documents).
-        let first = fuse(&lists, &pool);
-        if args.evidence == Evidence::Multi || args.doc_id.is_some() {
-            let mut walked: HashSet<(usize, String)> = HashSet::new();
-            for id in first.iter().take(CANDIDATES) {
-                let Some(c) = pool.get(id) else { continue };
-                let key = (c.collection, c.hit.payload.doc_key.clone());
-                if c.hit.payload.parent.is_none() || walked.contains(&key) || walked.len() >= NAVIGATED_DOCS {
-                    continue;
-                }
-                walked.insert(key.clone());
-                let ci = c.collection;
-                let dense = vectors.get(collections[ci].embedding_model.as_str()).cloned();
-                let leaves = self.walk(&names[ci], &key.1, c.hit.payload.doc_version, dense, &sparse, args.now).await?;
-                if !leaves.is_empty() {
-                    out.strategy.navigated.push(key.1.clone());
-                    lists.push(leaves.iter().map(|h| h.id.clone()).collect());
-                    for h in leaves {
-                        pool.entry(h.id.clone()).or_insert(Cand { hit: h, collection: ci, score: 0.0, chunk: None });
-                    }
-                }
-            }
-        }
+        // The flat ranking.
         let fused = rrf(&lists, RRF_K);
         let mut ranked: Vec<Cand> = Vec::new();
         for (id, score) in fused {
@@ -247,6 +262,48 @@ impl Retriever {
             if ranked.len() >= CANDIDATES {
                 break;
             }
+        }
+
+        // 3. Navigation: the long documents among the best candidates are walked, and the chunks
+        // reached join the candidates the reranker sees. They never reorder the flat ranking: fused
+        // in as one more ranked list, the walk's leaves displaced better flat results on the
+        // synthetic eval (inner nodes average over unrelated sections), so they are candidates, not
+        // votes. Without a reranker they come after the flat ranking.
+        if self.options.navigate && (args.evidence == Evidence::Multi || args.doc_id.is_some()) {
+            let mut walked: HashSet<(usize, String)> = HashSet::new();
+            let mut extra: Vec<Cand> = Vec::new();
+            let seen: HashSet<String> = ranked.iter().map(|c| c.hit.id.clone()).collect();
+            let docs: Vec<(usize, String, u32)> = ranked
+                .iter()
+                .filter(|c| c.hit.payload.parent.is_some())
+                .map(|c| (c.collection, c.hit.payload.doc_key.clone(), c.hit.payload.doc_version))
+                .collect();
+            for (ci, doc_key, version) in docs {
+                if walked.len() >= NAVIGATED_DOCS || !walked.insert((ci, doc_key.clone())) {
+                    continue;
+                }
+                let dense = vectors.get(collections[ci].embedding_model.as_str()).cloned();
+                let leaves = self.walk(&names[ci], &doc_key, version, dense, &sparse, args.now).await?;
+                if !leaves.is_empty() {
+                    out.strategy.navigated.push(doc_key.clone());
+                }
+                for h in leaves {
+                    if !seen.contains(&h.id) && !extra.iter().any(|e| e.hit.id == h.id) {
+                        extra.push(Cand { hit: h, collection: ci, score: 0.0, chunk: None });
+                    }
+                }
+            }
+            // As strong as the weakest flat candidate: they neither lead nor skew score scales.
+            let floor = ranked.iter().map(|c| c.score).fold(f32::MAX, f32::min);
+            let floor = if floor == f32::MAX { 0.0 } else { floor };
+            for e in &mut extra {
+                e.score = floor;
+            }
+            let reranks = self.options.rerank && collections.iter().any(|c| c.rerank_model.is_some());
+            let at = if reranks { ranked.len().min(RERANK_DEPTH.saturating_sub(extra.len())) } else { ranked.len() };
+            let tail = ranked.split_off(at);
+            ranked.extend(extra);
+            ranked.extend(tail);
         }
         out.strategy.candidates = ranked.len();
 
@@ -285,7 +342,7 @@ impl Retriever {
         }
 
         // 4. Rerank.
-        let rerank_model = collections.iter().find_map(|c| c.rerank_model.clone());
+        let rerank_model = collections.iter().find_map(|c| c.rerank_model.clone()).filter(|_| self.options.rerank);
         if let Some(model) = &rerank_model
             && !opened.is_empty()
         {
@@ -302,21 +359,30 @@ impl Retriever {
             }
         }
 
+        // The cliff: after a rerank, what falls far below the best passage is not evidence. It is
+        // applied before diversity, which only reorders what is left (otherwise a novel but
+        // irrelevant passage moved up by the penalty would end the context early).
+        if out.strategy.reranked {
+            let best = opened.iter().map(|c| c.score).fold(f32::MIN, f32::max);
+            opened.retain(|c| best - c.score <= RERANK_CLIFF);
+        }
+
         // 5. Diversity, only for a multi-evidence query over a redundant pool.
-        if args.evidence == Evidence::Multi && redundant(&opened) {
+        let diversify = match self.options.diversity {
+            Diversity::Off => false,
+            Diversity::Conditional => args.evidence == Evidence::Multi && redundant(&opened),
+            Diversity::Always => true,
+        };
+        if diversify {
             opened = mmr(opened);
             out.strategy.diversified = true;
         }
 
-        // 6. Budget and cliff.
-        let best = opened.first().map_or(0.0, |c| c.score);
+        // 6. Budget.
         let mut used = 0u32;
         let mut picked: Vec<Cand> = Vec::new();
         for c in opened {
             if picked.len() >= k {
-                break;
-            }
-            if out.strategy.reranked && best - c.score > RERANK_CLIFF {
                 break;
             }
             let t = c.hit.payload.tokens;
@@ -434,7 +500,7 @@ impl Retriever {
                             ..Filter::default()
                         },
                         limit: frontier.len() * crate::navtree::FANOUT * 2,
-                        with_vectors: false,
+                        with_vectors: true,
                     },
                 )
                 .await?;
@@ -475,10 +541,6 @@ fn chunk_text(c: Option<&SealedChunk>) -> String {
     }
 }
 
-fn fuse(lists: &[Vec<String>], pool: &HashMap<String, Cand>) -> Vec<String> {
-    rrf(lists, RRF_K).into_iter().map(|(id, _)| id).filter(|id| pool.contains_key(id)).collect()
-}
-
 /// The redundancy test: the share of near-duplicate pairs among the top candidates.
 fn redundant(c: &[Cand]) -> bool {
     let top: Vec<&Vec<f32>> = c.iter().take(10).filter_map(|c| c.hit.dense.as_ref()).collect();
@@ -499,10 +561,12 @@ fn redundant(c: &[Cand]) -> bool {
     share >= REDUNDANT_SHARE
 }
 
-/// Maximal marginal relevance over the candidates (scores min-max normalised).
+/// Maximal marginal relevance over the candidates, with scores divided by the best one (min-max
+/// normalisation would give the weakest candidate, often the second piece of evidence a
+/// multi-evidence query needs, no relevance at all).
 fn mmr(mut c: Vec<Cand>) -> Vec<Cand> {
-    let (lo, hi) = c.iter().fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x.score), hi.max(x.score)));
-    let norm = |s: f32| if hi > lo { (s - lo) / (hi - lo) } else { 1.0 };
+    let hi = c.iter().map(|x| x.score).fold(f32::MIN, f32::max);
+    let norm = |s: f32| if hi > 0.0 { (s / hi).max(0.0) } else { 1.0 };
     let mut out: Vec<Cand> = Vec::with_capacity(c.len());
     while !c.is_empty() {
         let mut best = (0, f32::MIN);
