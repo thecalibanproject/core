@@ -117,6 +117,9 @@ pub(crate) struct RouteMeta {
     /// Fraction of the flat price billed when a cache tier answers (tenant override, else
     /// `[routing] auto_cache_hit_fraction`, else 0.20).
     pub cache_hit_fraction: f64,
+    /// `x-caliban-escalation`: `admitted` or `denied` when the request was an escalation to the
+    /// expensive tier (`[routing.escalation]`).
+    pub escalation: Option<&'static str>,
 }
 
 impl RouteMeta {
@@ -129,6 +132,7 @@ impl RouteMeta {
             requested_model: req.model.clone(),
             flat_price: snap.config.routing.auto_price_for(&tenant.id),
             cache_hit_fraction: snap.auto_cache_hit_fraction_for(tenant),
+            escalation: None,
         }
     }
 }

@@ -18,6 +18,7 @@ pub mod datasource;
 pub mod embedder;
 mod embeddings;
 mod error;
+pub mod escalation;
 mod idempotency;
 mod limits;
 mod mcp_server;
@@ -111,6 +112,8 @@ pub struct Gateway {
     keyring: std::sync::OnceLock<Arc<caliban_config::Keyring>>,
     /// MCP server settings ([`Gateway::set_mcp`]); default: no Tasks, any `Host`.
     mcp: std::sync::OnceLock<McpSettings>,
+    /// Escalation admissions and denials (`[routing.escalation]`), for `/metrics`.
+    pub escalations: escalation::EscalationStats,
 }
 
 impl Gateway {
@@ -143,6 +146,7 @@ impl Gateway {
             nodes: std::sync::OnceLock::new(),
             keyring: std::sync::OnceLock::new(),
             mcp: std::sync::OnceLock::new(),
+            escalations: escalation::EscalationStats::default(),
         }
     }
 
@@ -369,5 +373,6 @@ pub(crate) async fn metrics(
         label(&snap.kek_ids.join(","))
     );
     gw.usage.metrics(&mut out);
+    gw.escalations.metrics(&mut out);
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)
 }

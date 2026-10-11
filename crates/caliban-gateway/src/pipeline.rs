@@ -129,16 +129,23 @@ async fn run(
     let ext = req.ext();
     let pii_mode = ext.pii.unwrap_or_else(|| snap.pii_mode_for(&tenant));
 
-    let decision = {
+    let (decision, escalation) = {
         let s = telemetry::child("route");
-        let d = route_embed::route(&gw, &snap, &tenant, &req).instrument(s.clone()).await.map_err(|e| match e {
+        let mut d = route_embed::route(&gw, &snap, &tenant, &req).instrument(s.clone()).await.map_err(|e| match e {
             RouteError::UnknownModel(_) => CalibanError::InvalidRequest(e.to_string()),
             _ => CalibanError::PolicyViolation(e.to_string()),
         })?;
+        // The per-key escalation budget for the expensive tier (GateDrain, arXiv 2609.33992).
+        let esc =
+            crate::escalation::admit(gw.quota.as_ref(), &gw.escalations, &snap, &tenant, &caller.key_hash, &mut d)
+                .await;
         telemetry::record_route(&s, &d);
-        d
+        if let Some(h) = esc.header() {
+            s.record("caliban.route.escalation", h);
+        }
+        (d, esc)
     };
-    let route_meta = RouteMeta::new(&decision, &snap, &tenant, &req);
+    let route_meta = RouteMeta { escalation: escalation.header(), ..RouteMeta::new(&decision, &snap, &tenant, &req) };
     span.record("caliban.route.stage", decision.stage);
 
     // caliban/auto may hand the request to one of the tenant's nodes, with this classification
@@ -595,6 +602,9 @@ pub(crate) fn caliban_headers(h: &mut HeaderMap, o: &Outcome) {
     set("x-caliban-routed-model", o.model.id.to_string());
     if let Some(r) = &o.route {
         set("x-caliban-intent", r.header.clone());
+        if let Some(e) = r.escalation {
+            set("x-caliban-escalation", e.to_owned());
+        }
     }
     set("x-caliban-cache", o.cache.as_str().to_owned());
     if let Some(t) = o.cache_tier {

@@ -259,7 +259,14 @@ code = 0.86
 [routing.tenants.acme]                      # floors, prices, `knn = false`, and the tenant's own exemplars
 floors = { code = 0.9 }
 exemplars = { "legal.review" = ["review this NDA clause for risky terms", "check the liability cap in this MSA"] }
+
+[routing.escalation]                        # admission budget per API key for the expensive tier
+expensive_models = ["openai/gpt-5"]         # and/or every model at or above an output price:
+min_price_out_per_mtok = 10.0
+per_key_per_minute = 30                     # unset: escalations are only counted
 ```
+
+**Escalation budgets** (research note 02; GateDrain, arXiv 2609.33992, preprint): a `caliban/auto` request whose chosen model is in the expensive tier is an escalation. Each API key may make `per_key_per_minute` of them (a burst of that many, refilled evenly), counted in the quota store, so with `[limits] store = "valkey"` the budget is shared by every router. Over budget the request is neither queued nor refused: it takes the cheaper models of its route, else the cheaper models of the tenant's `default` route (keep a cheap model there), and the answer says `x-caliban-escalation: denied` (`admitted` otherwise). Bounded perturbations that lower routing confidence can push traffic into a shared strong tier without raising the request rate; the budget caps what one key can drain whatever the classifier says. Pinned models are never escalations. `/metrics` counts `caliban_escalations_total{outcome="admitted"|"denied"}`; the route span carries `caliban.route.escalation`. Stage 3 (an LLM fallback) and cascades are not built; when they are, their escalations take the same budget.
 
 - The routing embedder must be served by a shared (deployment) provider, typically an on-prem TEI or vLLM embedding server: exemplars are embedded once for the deployment, never with a tenant's BYOK key, even when a tenant has its own provider under the same id. A tenant that the shared provider does not serve routes by the keyword rules. If that provider is outside the trust boundary, prompts are PII-masked before embedding, which adds latency; prefer a `t0_sovereign` embedder.
 - Embedding calls go through the same `ProviderEmbedder` as the semantic cache (its shared-provider path), with its batching (32 inputs per upstream request, the TEI default) and LRU. The vector space id (model id, upstream model, provider `base_url`) keys the exemplar cache. Pointing `[cache.semantic] embedding_model` at the same model lets one embedding serve both (see [Cache](#request-pipeline)).

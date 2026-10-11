@@ -132,9 +132,44 @@ pub struct RoutingConfig {
     /// [`DEFAULT_AUTO_CACHE_HIT_FRACTION`]. A tenant's `auto_cache_hit_fraction` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cache_hit_fraction: Option<f64>,
+    /// Escalation admission budgets for the expensive tier (`[routing.escalation]`).
+    #[serde(default, skip_serializing_if = "EscalationConfig::is_off")]
+    pub escalation: EscalationConfig,
     /// Per-tenant overrides and exemplars.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tenants: BTreeMap<TenantId, TenantRouting>,
+}
+
+/// `[routing.escalation]`: an admission budget per API key for `caliban/auto` requests that route
+/// to the expensive tier (GateDrain, arXiv 2609.33992, preprint; research note 02). Bounded
+/// perturbations that lower routing confidence can push traffic into a shared strong tier without
+/// raising the request rate; a per-key budget caps what one key can drain, and an over-budget
+/// request takes the cheaper models of its route (or the tenant default route) instead of queuing.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EscalationConfig {
+    /// Catalogue models that form the expensive tier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expensive_models: Vec<ModelId>,
+    /// Also every model whose output price (USD per million tokens) is at least this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_price_out_per_mtok: Option<f64>,
+    /// Escalations each API key may make per minute (a burst of that many, refilled evenly).
+    /// Unset: no budget (escalations are only counted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_key_per_minute: Option<u32>,
+}
+
+impl EscalationConfig {
+    pub fn is_off(&self) -> bool {
+        self == &EscalationConfig::default()
+    }
+
+    /// Whether `m` is in the expensive tier.
+    pub fn is_expensive(&self, m: &ModelEntry) -> bool {
+        self.expensive_models.contains(&m.id)
+            || self.min_price_out_per_mtok.is_some_and(|min| m.price_out_per_mtok.is_some_and(|p| p >= min))
+    }
 }
 
 /// `[routing.tenants.<tenant_id>]`.
@@ -237,6 +272,12 @@ impl RoutingConfig {
         price("auto_price_out_per_mtok", self.auto_price_out_per_mtok)?;
         if let Some(f) = self.auto_cache_hit_fraction {
             unit("auto_cache_hit_fraction".into(), f)?;
+        }
+        price("escalation.min_price_out_per_mtok", self.escalation.min_price_out_per_mtok)?;
+        if self.escalation.per_key_per_minute == Some(0) {
+            return Err(ConfigError::Invalid(
+                "routing: escalation.per_key_per_minute must be >= 1 (leave it unset for no budget)".into(),
+            ));
         }
         for (tenant, t) in &self.tenants {
             for (intent, f) in &t.floors {

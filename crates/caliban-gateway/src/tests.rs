@@ -2465,3 +2465,88 @@ eval_key_hashes = ["{eval}"]
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{path}: {out}");
     }
 }
+
+/// Escalation admission budgets per API key (GateDrain, arXiv 2609.33992): a key's
+/// `caliban/auto` requests reach the expensive tier at most `per_key_per_minute` times; over that
+/// they take the cheaper models of the route, not a queue or an error. Other keys keep their own
+/// budget; pinned models are not escalations.
+#[tokio::test]
+async fn escalations_to_the_expensive_tier_have_a_budget_per_key() {
+    let (base, log) = mock_upstream().await;
+    let toml = format!(
+        r#"
+[routing.escalation]
+expensive_models = ["pool/strong"]
+per_key_per_minute = 2
+
+[[models]]
+id = "pool/strong"
+provider = "pool"
+upstream_model = "strong"
+trust_tier = "t0_sovereign"
+price_in_per_mtok = 3.0
+price_out_per_mtok = 15.0
+
+[[models]]
+id = "pool/cheap"
+provider = "pool"
+upstream_model = "cheap"
+trust_tier = "t0_sovereign"
+price_in_per_mtok = 0.1
+price_out_per_mtok = 0.4
+
+[[tenants]]
+id = "acme"
+name = "Acme"
+api_key_hashes = ["{a}", "{b}"]
+  [[tenants.providers]]
+  id = "pool"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t0_sovereign"
+  [[tenants.routes]]
+  intent = "default"
+  models = ["pool/strong", "pool/cheap"]
+"#,
+        a = hash("cal_a"),
+        b = hash("cal_b"),
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    let gw = Arc::new(Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(RecentUsage::default())));
+    let app = app(Arc::clone(&gw));
+    let ask = |model: &str| json!({"model": model, "messages": [{"role": "user", "content": "hello there"}]});
+    let a = ("authorization", "Bearer cal_a");
+    let mut seen = vec![];
+    for _ in 0..3 {
+        let (s, h, out) = call(&app, "/v1/chat/completions", a, ask("caliban/auto")).await;
+        assert_eq!(s, StatusCode::OK, "{out}");
+        seen.push((
+            h["x-caliban-routed-model"].to_str().unwrap().to_owned(),
+            h.get("x-caliban-escalation").map(|v| v.to_str().unwrap().to_owned()),
+            log.last().2["model"].as_str().unwrap().to_owned(),
+        ));
+    }
+    let row = |m: &str, e: &str, up: &str| (m.to_owned(), Some(e.to_owned()), up.to_owned());
+    assert_eq!(
+        seen,
+        [
+            row("pool/strong", "admitted", "strong"),
+            row("pool/strong", "admitted", "strong"),
+            row("pool/cheap", "denied", "cheap"),
+        ]
+    );
+    // Another key of the tenant has its own budget.
+    let (_, h, _) = call(&app, "/v1/chat/completions", ("authorization", "Bearer cal_b"), ask("caliban/auto")).await;
+    assert_eq!(
+        (h["x-caliban-routed-model"].to_str().unwrap(), h["x-caliban-escalation"].to_str().unwrap()),
+        ("pool/strong", "admitted")
+    );
+    // Pinning the expensive model is not an escalation (the client chose it, and pays its price).
+    let (s, h, _) = call(&app, "/v1/chat/completions", a, ask("pool/strong")).await;
+    assert_eq!((s, h.get("x-caliban-escalation")), (StatusCode::OK, None));
+    assert_eq!((gw.escalations.admitted(), gw.escalations.denied()), (3, 1));
+    let resp = app.clone().oneshot(Request::get("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+    let text = String::from_utf8(axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    assert!(text.contains("caliban_escalations_total{outcome=\"admitted\"} 3"), "{text}");
+    assert!(text.contains("caliban_escalations_total{outcome=\"denied\"} 1"), "{text}");
+}

@@ -189,7 +189,8 @@ pub(crate) fn child(name: &'static str) -> Span {
             caliban.route.policy = Empty,
             caliban.route.knn_fallback = Empty,
             caliban.route.knn_us = Empty,
-            caliban.route.candidates = Empty
+            caliban.route.candidates = Empty,
+            caliban.route.escalation = Empty
         ),
         "pii" => {
             tracing::info_span!(target: TARGET, "pii", caliban.pii.mode = Empty, caliban.pii.surrogate_scope = Empty, caliban.pii.entities = Empty, caliban.pii.degraded = Empty)
