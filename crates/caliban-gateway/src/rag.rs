@@ -373,9 +373,12 @@ impl Tool for RagSearch {
             prefix: self.rt.prefix.clone(),
             options: caliban_rag::retrieve::RetrieveOptions::default(),
         };
+        // Searches are made as the run's invoking key, like its model calls: never as the tenant's
+        // own background work.
+        let key = ctx.invoker_key_hash.clone().ok_or_else(|| arg_err("the run has no invoking API key"))?;
         let scope = CallScope {
             tenant: ctx.tenant.clone(),
-            key_hash: ctx.invoker_key_hash.clone(),
+            key_hash: Some(key),
             node: Some(NodeCall { node: ctx.node.clone(), version: ctx.node_version, run_id: ctx.run_id.clone() }),
             idempotency_key: Some(ctx.idempotency_key.clone()),
         };
@@ -402,6 +405,39 @@ mod tests {
             ConfigHandle::new(Snapshot::new(cfg, "t")),
             Arc::new(caliban_meter::RecentUsage::default()),
         ))
+    }
+
+    /// A search is made as the run's invoking key, never as the tenant's own background work, and
+    /// only over the collections the node's scopes name.
+    #[tokio::test]
+    async fn searches_need_an_invoking_key_and_a_scope() {
+        let gw = gateway("tenant");
+        let rt = RagRuntime {
+            store: Arc::new(caliban_rag::store::MemoryRagStore::new()),
+            index: Arc::new(MemoryIndex::new()),
+            prefix: "t".into(),
+            concurrency: 1,
+        };
+        let services = Arc::new(GatewayRag::new(&gw, Arc::new(Keyring::new([7; 32], []))));
+        let tool = RagSearch::new(gw.config.clone(), rt, services);
+        let ctx = |key: Option<&str>, scopes: &[&str]| ToolCtx {
+            tenant: "acme".into(),
+            node: "n".into(),
+            node_version: 1,
+            run_id: "run_1".into(),
+            datasource_scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+            invoker_key_hash: key.map(str::to_owned),
+            step_id: "s#0".into(),
+            idempotency_key: "k".into(),
+        };
+        let args = json!({"query": "leave"});
+        let e = tool.call(&ctx(None, &["rag.kb:read"]), args.clone()).await.unwrap_err();
+        assert!(e.to_string().contains("no invoking API key"), "{e}");
+        let e = tool.call(&ctx(Some("ab"), &["shop.orders:read"]), args.clone()).await.unwrap_err();
+        assert!(e.to_string().contains("may not search any document collection"), "{e}");
+        let e = tool.call(&ctx(Some("ab"), &["rag.kb:read"]), json!({"query": "x", "collections": ["hr"]})).await;
+        assert!(e.unwrap_err().to_string().contains("outside the datasource scopes"));
+        assert!(tool.trusted() && !tool.reaches_network());
     }
 
     /// Documents and queries get the same surrogates (the tenant-scope key, whatever the tenant's

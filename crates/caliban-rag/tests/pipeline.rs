@@ -377,3 +377,62 @@ async fn untrusted_documents_have_a_vetting_deadline() {
         Utc::now()
     ));
 }
+
+/// Services that delete the document being indexed during its embedding call, as an administrator
+/// deleting it at that moment would.
+struct DeletingServices {
+    inner: Arc<TestServices>,
+    store: Arc<dyn RagStore>,
+    target: parking_lot::Mutex<Option<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl caliban_rag::RagServices for DeletingServices {
+    fn data_key(&self, tenant: &str) -> Result<Arc<caliban_config::Dek>, RagError> {
+        self.inner.data_key(tenant)
+    }
+
+    async fn protect(&self, tenant: &str, texts: Vec<String>) -> Result<(Vec<String>, usize), RagError> {
+        self.inner.protect(tenant, texts).await
+    }
+
+    async fn embed(&self, scope: &CallScope, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, RagError> {
+        let target = self.target.lock().take();
+        if let Some((collection, doc)) = target {
+            self.store.delete_document(&scope.tenant, &collection, &doc, Utc::now(), None).await.unwrap();
+        }
+        self.inner.embed(scope, model, texts).await
+    }
+
+    async fn rerank(&self, scope: &CallScope, model: &str, q: &str, docs: &[String]) -> Result<Vec<f32>, RagError> {
+        self.inner.rerank(scope, model, q, docs).await
+    }
+}
+
+/// A document deleted while a worker indexes it: the worker's outcome is dropped and the points it
+/// wrote are removed (they were never served).
+#[tokio::test]
+async fn a_document_deleted_during_indexing_leaves_nothing_behind() {
+    let store: Arc<dyn RagStore> = Arc::new(MemoryRagStore::new());
+    let index = Arc::new(MemoryIndex::new());
+    let base = Env::new(Arc::clone(&store), Arc::clone(&index) as _, prefix());
+    let c = base.collection("acme", "kb", CollectionSettings::default()).await;
+    let v = base.ingest(&c, "leave", LEAVE, Trust::Trusted).await;
+    let services = Arc::new(DeletingServices {
+        inner: Arc::clone(&base.services),
+        store: Arc::clone(&store),
+        target: parking_lot::Mutex::new(Some((c.id.clone(), "leave".into()))),
+    });
+    let indexer = Arc::new(Indexer {
+        store: Arc::clone(&store),
+        index: Arc::clone(&index) as _,
+        services: services as _,
+        prefix: base.prefix.clone(),
+        plain_chunks: false,
+    });
+    let runner = IndexRunner::new(indexer, "w1", IndexOptions::default());
+    assert!(runner.step().await);
+    assert_eq!(base.status(&c, "leave", v).await, DocStatus::Deleted);
+    assert!(index.points(&c.index_name(&base.prefix)).is_empty(), "the late points were removed");
+    assert!(base.search(&c, "annual leave").await.results.is_empty());
+}

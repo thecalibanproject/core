@@ -111,11 +111,34 @@ impl IndexRunner {
                 outcome = what, "rag: document indexed"
             ),
             Ok(false) => {
-                tracing::info!(doc = %key.doc_id, "rag: the document changed while it was indexed; outcome dropped")
+                tracing::info!(doc = %key.doc_id, "rag: the document changed while it was indexed; outcome dropped");
+                self.clean_up_after(&doc).await;
             }
             Err(e) => tracing::warn!(error = %e, doc = %key.doc_id, "rag: recording the outcome failed"),
         }
         true
+    }
+
+    /// A version deleted while it was being indexed: points written after the purge looked would
+    /// stay behind (never served: the registry says deleted). Another worker that took over an
+    /// expired lease is left alone.
+    async fn clean_up_after(&self, doc: &DocumentRecord) {
+        let Ok(versions) = self.store().document(&doc.tenant_id, &doc.collection_id, &doc.doc_id).await else {
+            return;
+        };
+        let gone = versions
+            .iter()
+            .find(|d| d.version == doc.version)
+            .is_none_or(|d| matches!(d.status, crate::store::DocStatus::Deleted));
+        if !gone {
+            return;
+        }
+        if let Some(c) = self.collection_of(doc).await {
+            let name = c.index_name(&self.indexer.prefix);
+            if let Err(e) = self.indexer.index.delete_doc(&name, &doc.doc_key, Some(doc.version)).await {
+                tracing::warn!(error = %e, doc = %doc.doc_id, "rag: cleaning up a deleted document failed");
+            }
+        }
     }
 
     /// Deletes vectors that are no longer served. Returns how many versions and collections it
