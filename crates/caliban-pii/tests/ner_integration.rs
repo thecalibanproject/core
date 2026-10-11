@@ -54,7 +54,7 @@ fn has(v: &[(EntityType, String)], ty: EntityType, s: &str) -> bool {
     v.iter().any(|(t, x)| *t == ty && x.contains(s))
 }
 
-/// The labelled mini-corpus: (text, expected (type, substring)) — used for a rough P/R print.
+/// The labelled mini-corpus: (text, expected (type, substring)), used for a rough P/R print.
 fn corpus() -> Vec<(&'static str, Vec<(EntityType, &'static str)>)> {
     use EntityType::*;
     vec![

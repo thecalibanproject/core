@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn byte_offsets_with_multibyte_text() {
-        // "Ünal Çelik ✈ visited São Paulo, 東京." — offsets are bytes.
+        // "Ünal Çelik ✈ visited São Paulo, 東京." (offsets are bytes).
         let text = "Ünal Çelik ✈ visited São Paulo, 東京.";
         let ent = |s: &str| {
             let start = text.find(s).unwrap();
