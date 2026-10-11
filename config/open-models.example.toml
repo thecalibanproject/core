@@ -136,7 +136,19 @@ cache_salt = false
 # sites, either restrict this pool to one tenant or start the server with --no-cache-prompt.
 # tenants = ["acme"]
 
+# 1×12 GB tier: llama.cpp (CUDA) with the Qwen3.5-9B Q4_K_M GGUF. compose profile: gpu-12gb
+# No tenant cache_salt in llama.cpp, so compose starts it with its prompt cache off
+# (--no-cache-prompt) and no host RAM cache tier (--cache-ram=0). Turn the prompt cache on
+# (GPU12_CHAT_CACHE_PROMPT=--cache-prompt) only for one trust group (docs research note 09, section 5).
+[[providers]]
+id = "llamacpp-gpu12"
+kind = "openai_compatible"
+base_url = "http://qwen3-gpu12:8000/v1"
+trust_tier = "t0_sovereign"
+cache_salt = false
+
 # Embeddings: TEI serving Qwen3-Embedding-0.6B (GPU: profile embeddings, CPU: profile cpu).
+# Profile gpu-12gb: llama.cpp with the Q8_0 GGUF under the same name.
 [[providers]]
 id = "tei-embed"
 kind = "openai_compatible"
@@ -145,6 +157,8 @@ trust_tier = "t0_sovereign"
 cache_salt = false
 
 # Reranker on GPU: vLLM pooling runner serving Qwen3-Reranker-0.6B. compose profile: reranker
+# Profile gpu-12gb: llama.cpp --reranking with the Q8_0 GGUF under the same name (it ignores
+# cache_salt and has no prefix cache for rerank requests).
 [[providers]]
 id = "vllm-rerank"
 kind = "openai_compatible"
@@ -252,6 +266,24 @@ price_in_per_mtok = 0.0
 price_out_per_mtok = 0.0
 [models.capabilities]
 tools = true                          # needs --jinja (default on)
+vision = false                        # no --mmproj loaded
+reasoning = "hybrid"
+reasoning_control = "enable_thinking" # llama-server accepts chat_template_kwargs per request
+inline_think_tags = false             # --reasoning-format auto -> message.reasoning_content
+
+[[models]]
+id = "local/qwen3.5-9b-q4"
+provider = "llamacpp-gpu12"
+upstream_model = "unsloth/Qwen3.5-9B-GGUF"   # llama-server --alias (GPU12_CHAT_ALIAS)
+kind = "chat"
+family = "qwen3.5"
+trust_tier = "t0_sovereign"
+licence = "apache-2.0"
+context_window = 32768                # llama.cpp --ctx-size (GPU12_CHAT_CTX); native 262144
+price_in_per_mtok = 0.0
+price_out_per_mtok = 0.0
+[models.capabilities]
+tools = true                          # --jinja
 vision = false                        # no --mmproj loaded
 reasoning = "hybrid"
 reasoning_control = "enable_thinking" # llama-server accepts chat_template_kwargs per request
@@ -370,24 +402,24 @@ api_key_hashes = []
   # large GPU → small GPU → CPU.
   [[tenants.routes]]
   intent = "default"
-  models = ["local/qwen3.8-27b", "local/qwen3.6-35b-a3b", "local/qwen3.5-9b", "local/qwen3.6-35b-a3b-q4", "local/gpt-oss-20b"]
+  models = ["local/qwen3.8-27b", "local/qwen3.6-35b-a3b", "local/qwen3.5-9b", "local/qwen3.5-9b-q4", "local/qwen3.6-35b-a3b-q4", "local/gpt-oss-20b"]
 
   [[tenants.routes]]
   intent = "chat"
-  models = ["local/qwen3.6-35b-a3b", "local/qwen3.5-9b", "local/qwen3.6-35b-a3b-q4", "ollama/qwen3.6-35b"]
+  models = ["local/qwen3.6-35b-a3b", "local/qwen3.5-9b", "local/qwen3.5-9b-q4", "local/qwen3.6-35b-a3b-q4", "ollama/qwen3.6-35b"]
 
   [[tenants.routes]]
   intent = "code"
-  models = ["local/qwen3.8-27b", "local/qwen3.6-35b-a3b", "local/gpt-oss-20b", "local/qwen3.5-9b"]
+  models = ["local/qwen3.8-27b", "local/qwen3.6-35b-a3b", "local/gpt-oss-20b", "local/qwen3.5-9b", "local/qwen3.5-9b-q4"]
 
   [[tenants.routes]]
   intent = "analytics"
-  models = ["local/qwen3.8-27b", "local/gpt-oss-20b", "local/qwen3.6-35b-a3b", "local/qwen3.5-9b"]
+  models = ["local/qwen3.8-27b", "local/gpt-oss-20b", "local/qwen3.6-35b-a3b", "local/qwen3.5-9b", "local/qwen3.5-9b-q4"]
 
   [[tenants.routes]]
   intent = "summarize"
-  models = ["local/qwen3.6-35b-a3b", "local/qwen3.5-9b", "local/qwen3.6-35b-a3b-q4", "ollama/qwen3.6-35b"]
+  models = ["local/qwen3.6-35b-a3b", "local/qwen3.5-9b", "local/qwen3.5-9b-q4", "local/qwen3.6-35b-a3b-q4", "ollama/qwen3.6-35b"]
 
   [[tenants.routes]]
   intent = "extraction"
-  models = ["local/qwen3.5-9b", "local/qwen3.6-35b-a3b", "local/gpt-oss-20b", "local/qwen3.6-35b-a3b-q4"]
+  models = ["local/qwen3.5-9b", "local/qwen3.5-9b-q4", "local/qwen3.6-35b-a3b", "local/gpt-oss-20b", "local/qwen3.6-35b-a3b-q4"]

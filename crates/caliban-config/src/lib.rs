@@ -1681,6 +1681,11 @@ mod tests {
         let c = snap.config.semantic_cache_settings();
         assert_eq!(c.query_prefix.as_deref(), Some(DEFAULT_SEM_QUERY_PREFIX), "Qwen3-Embedding: prefix on");
         assert_eq!((c.threshold, c.min_threshold), (0.91, 0.91));
+        // The 12 GB GPU tier (deploy's gpu-12gb compose profile): llama.cpp, no salt.
+        let q4 = snap.model(&"local/qwen3.5-9b-q4".into()).expect("the gpu-12gb model");
+        let p = snap.provider_for(t, &q4.provider).expect("its provider");
+        assert_eq!((p.id.as_str(), p.cache_salt), ("llamacpp-gpu12", false));
+        assert!(t.routes.iter().all(|r| r.models.iter().any(|m| m.as_str() == "local/qwen3.5-9b-q4")));
     }
 
     /// The opt-in blocks of the open-models example (`[routing]` and the cache `query_prefix`)
