@@ -189,10 +189,17 @@ problems of kind `eval_gate`) unless the version's latest finished evals meet it
   `k >= min_k`, `pass_hat_k >= min_pass_k`, and the cost and latency bars when set;
 - a version with write tools (`effect: write`), always: the latest succeeded injection eval of this
   version with `pass_rate` at least `injection.min_pass_rate` (default 1: every attack blocked).
-  The bar can be lowered, never removed: the suite must have run.
+  The bar can be lowered, never removed: the suite must have run;
+- every `node://` subnode version it pins, and theirs down the tree, must pass its own gate the
+  same way (its own node's bar, its own evals), not only be published (P3 decision 12): otherwise a
+  parent without write tools of its own could reach an unevaluated write through a child. Such a
+  problem names the child (`node://mailer@v1 (a subnode hub@v1 pins) has not passed its own
+  promotion gate: ...`, `path` `node://mailer@v1`); the evidence lists each child's under
+  `subnodes`.
 
 A draft has no evals, so a gated version is published with `{"promote": false}`, evaluated, then
-promoted. A version without write tools on a node without a golden bar promotes as before. The
+promoted. A version without write tools or subnodes on a node without a golden bar promotes as
+before. Evaluate a subnode version before the parents that pin it. The
 audit entries `node.publish` (when it promotes) and `node.promote` carry the evals that met the
 bar (`evals`). `GET .../versions/{v}/gate` says what promoting would say.
 

@@ -1086,8 +1086,9 @@ paths:
         runs). Its budgets are checked against the tenant's current `node_caps` (422). The node's
         promotion bar must be met by the version's latest finished evals (422, problems of kind
         `eval_gate`): the golden bar when the node sets one, and for a version with write tools
-        always an injection eval (default bar: every attack blocked). A draft or a retired version
-        is a 409. Needs `nodes.publish`; audited as `node.promote` with the previous live version
+        always an injection eval (default bar: every attack blocked). Every `node://` subnode version
+        it pins (down the tree) must pass its own gate too (problem `path`: `node://<child>@v<N>`;
+        evidence under `subnodes`). A draft or a retired version is a 409. Needs `nodes.publish`; audited as `node.promote` with the previous live version
         and the evals that met the bar (`evals`).
       requestBody:
         required: true

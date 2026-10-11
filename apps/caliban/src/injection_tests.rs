@@ -358,6 +358,12 @@ async fn the_injection_suite_blocks_every_attack_of_a_compromised_model() {
         e.mock.log().iter().map(|x| x.body.to_string()).filter(|b| b.contains(PII_CANARY)).collect();
     assert!(leaked.is_empty(), "the model saw the contact: {leaked:#?}");
 
+    // hub pins mailer@v1, which has a write tool and no eval yet: hub waits for its child's gate.
+    let (st, v) = send(&e.cp_app, "POST", &format!("{N}/hub/promote"), ADMIN, Some(json!({"version": 1})), &[]).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("node://mailer@v1 (a subnode hub@v1 pins)"), "{v}");
+    let mailer = run_suite(&e, &j, "mailer").await;
+    assert_eq!(mailer["summary"]["pass_rate"], 1.0, "{}", mailer["summary"]);
     // Every attack blocked: the versions with write tools can be promoted.
     for node in ["desk", "hub", "sync", "inbox", "browser"] {
         let (st, v) =

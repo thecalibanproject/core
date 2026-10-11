@@ -278,8 +278,61 @@ async fn latest(
 }
 
 /// Whether promoting `n` is allowed: `Ok` with the evidence for the audit log (`None` when no gate
-/// applies), else every reason, as `eval_gate` problems.
+/// applies), else every reason, as `eval_gate` problems. Every `node://` subnode version it pins
+/// (and theirs, down the tree) must pass its own gate too (P3 decision 12): being published is not
+/// enough, or a version could reach an unevaluated write through a child.
 pub(crate) async fn gate(cp: &Cp, n: &NodeRecord) -> Result<Option<Value>, NodeError> {
+    let mut problems = Vec::new();
+    let mut subnodes = serde_json::Map::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut todo: Vec<(String, u32, String)> =
+        spec_of(n)?.node_refs().into_iter().map(|(c, v)| (c, v, format!("{}@v{}", n.name, n.version))).collect();
+    while let Some((child, v, via)) = todo.pop() {
+        if !seen.insert((child.clone(), v)) || (child == n.name && v == n.version) {
+            continue;
+        }
+        let c = version_of(&cp.store.state(), &n.tenant_id, &child, v)?;
+        todo.extend(spec_of(&c)?.node_refs().into_iter().map(|(cc, cv)| (cc, cv, format!("{child}@v{v}"))));
+        match own_gate(cp, &c).await {
+            Ok(e) => {
+                subnodes.insert(format!("{child}@v{v}"), e.unwrap_or(Value::Null));
+            }
+            Err(NodeError::Problems(_, ps)) => problems.extend(ps.into_iter().map(|p| {
+                let m = format!(
+                    "node://{child}@v{v} (a subnode {via} pins) has not passed its own promotion gate: {}",
+                    p.message
+                );
+                (m, Some(format!("node://{child}@v{v}")))
+            })),
+            Err(e) => return Err(e),
+        }
+    }
+    let own = own_gate(cp, n).await;
+    let (own_evidence, own_problems) = match own {
+        Ok(e) => (e, vec![]),
+        Err(NodeError::Problems(_, ps)) => (None, ps.into_iter().map(|p| p.message).collect()),
+        Err(e) => return Err(e),
+    };
+    let problems: Vec<(String, Option<String>)> = own_problems.into_iter().map(|m| (m, None)).chain(problems).collect();
+    if !problems.is_empty() {
+        let text: Vec<&str> = problems.iter().map(|(m, _)| m.as_str()).collect();
+        let mut msg = format!("{}@v{} cannot be promoted: {}", n.name, n.version, text.join("; "));
+        if n.state == NodeState::Draft {
+            msg.push_str(". Publish it with {\"promote\": false}, run its evals, then promote it");
+        }
+        let list = problems.into_iter().map(|(m, path)| Problem::new("eval_gate", m, path)).collect();
+        return Err(NodeError::Problems(msg, list));
+    }
+    if subnodes.is_empty() {
+        return Ok(own_evidence);
+    }
+    let mut e = own_evidence.unwrap_or_else(|| json!({}));
+    e["subnodes"] = Value::Object(subnodes);
+    Ok(Some(e))
+}
+
+/// The gate of one version on its own evals (not its subnodes').
+async fn own_gate(cp: &Cp, n: &NodeRecord) -> Result<Option<Value>, NodeError> {
     let spec = spec_of(n)?;
     let Some(j) = cp.journal() else {
         if eval::has_write_tools(&spec) {
@@ -861,6 +914,52 @@ mod tests {
             call(&app, "POST", &format!("/api/v1/tenants/acme/evals/{gid}/cancel"), None).await.0,
             StatusCode::CONFLICT
         );
+    }
+
+    /// A pinned subnode version must have passed its own gate (P3 decision 12): a parent without
+    /// write tools of its own is refused while a child it pins has none of its evals.
+    #[tokio::test]
+    async fn a_pinned_subnode_must_pass_its_own_gate() {
+        let j: Arc<dyn Journal> = Arc::new(MemoryJournal::new());
+        let app = app(cp(Some(Arc::clone(&j))), None);
+        let write = write_tool(&app).await;
+        let mut child = spec(json!([{"ref": write, "effect": "write"}]));
+        child["prompt"]["input_schema"] = json!({"type": "string"});
+        call(&app, "POST", &format!("{N}/mailer/versions"), Some(json!({"spec": child}))).await;
+        let (s, v) =
+            call(&app, "POST", &format!("{N}/mailer/versions/1/publish"), Some(json!({"promote": false}))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        // The parent has no write tool, no bar: before, it promoted at once.
+        let parent = spec(json!([{"ref": "node://mailer@v1", "effect": "read"}]));
+        call(&app, "POST", &format!("{N}/hub/versions"), Some(json!({"spec": parent}))).await;
+        let (s, e) = call(&app, "POST", &format!("{N}/hub/versions/1/publish"), None).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
+        let msg = e["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("node://mailer@v1 (a subnode hub@v1 pins) has not passed its own promotion gate")
+                && msg.contains("injection"),
+            "{msg}"
+        );
+        assert_eq!(e["error"]["problems"][0]["path"], "node://mailer@v1", "{e}");
+        let (s, v) = call(&app, "POST", &format!("{N}/hub/versions/1/publish"), Some(json!({"promote": false}))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, gate) = call(&app, "GET", &format!("{N}/hub/versions/1/gate"), None).await;
+        assert_eq!(gate["allowed"], false, "{gate}");
+
+        // The child's injection eval meets its bar: the parent promotes, and the audit names it.
+        let (_, key) = call(&app, "POST", "/api/v1/tenants/acme/api-keys", Some(json!({"name": "evals"}))).await;
+        let body = json!({"suite": "injection", "api_key_id": key["id"], "input": "hi"});
+        let (s, e) = call(&app, "POST", &format!("{N}/mailer/versions/1/evals"), Some(body)).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{e}");
+        let id = e["id"].as_str().unwrap().to_owned();
+        j.claim_eval("w", Duration::from_secs(30)).await.unwrap().unwrap();
+        let f = EvalFinish { status: EvalStatus::Succeeded, summary: Some(json!({"pass_rate": 1.0})), error: None };
+        assert!(j.finish_eval(&id, "w", f, None).await.unwrap());
+        let (_, gate) = call(&app, "GET", &format!("{N}/hub/versions/1/gate"), None).await;
+        assert_eq!(gate["allowed"], true, "{gate}");
+        assert_eq!(gate["evidence"]["subnodes"]["mailer@v1"]["injection"]["eval"], id.as_str(), "{gate}");
+        let (s, v) = call(&app, "POST", &format!("{N}/hub/promote"), Some(json!({"version": 1}))).await;
+        assert_eq!((s, v["live"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
     }
 
     #[tokio::test]
