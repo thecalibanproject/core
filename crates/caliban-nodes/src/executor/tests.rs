@@ -1462,6 +1462,50 @@ mod evals {
         }
     }
 
+    /// Cancelling a running eval stops it: its run in flight is cancelled and it ends `cancelled`.
+    #[tokio::test]
+    async fn a_cancelled_eval_cancels_its_runs() {
+        for j in journals().await {
+            let h = Harness::new(Arc::clone(&j));
+            h.nodes.add("chain", 1, json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(10, 10_000),
+                "graph": {"vertices": [{"id": "a", "type": "llm"}, {"id": "b", "type": "llm"}], "edges": [{"from": "a", "to": "b"}]}}));
+            let model = FakeModel::new(|body| text(&format!("<{}>", last_user(body))));
+            *model.hold.lock() = Some("b#0".into());
+            let ex = h.executor(&model, "w1");
+            let cases =
+                vec![serde_json::from_value::<GoldenCase>(json!({"id": "x", "input": "go", "expected": "y"})).unwrap()];
+            let plan = Plan::Golden { golden_hash: crate::eval::golden_hash(&cases), cases, judge_model: None };
+            let e = start_eval(&h, "chain", Suite::Golden, 1, &plan).await;
+            let runner = EvalRunner::new(Arc::clone(&ex), opts());
+            let task = tokio::spawn({
+                let r = Arc::clone(&runner);
+                async move { r.run_once().await }
+            });
+            model.held.notified().await;
+            assert_eq!(
+                j.cancel_eval("acme", &e.id, "user:jo", None).await.unwrap(),
+                crate::journal::evals::EvalCancel::Requested
+            );
+            // The runner sees it and cancels the run in flight; then the held call completes.
+            let mut run = None;
+            crate::journal::tests::until_pub("the run to be cancelled", async || {
+                run = j.trials(&e.id).await.unwrap().first().and_then(|t| t.run_id.clone());
+                match &run {
+                    Some(r) => j.get_run("acme", r).await.unwrap().is_some_and(|r| r.cancel_requested_at.is_some()),
+                    None => false,
+                }
+            })
+            .await;
+            model.release.notify_one();
+            assert!(task.await.unwrap());
+            let e = j.get_eval("acme", &e.id).await.unwrap().unwrap();
+            assert_eq!(e.status, EvalStatus::Cancelled, "{e:?}");
+            let r = j.get_run("acme", &run.unwrap()).await.unwrap().unwrap();
+            assert!(r.cancel_requested_at.is_some(), "{r:?}");
+            assert_eq!(model.calls_for("b#0"), 1, "the call in flight completed; nothing ran after it");
+        }
+    }
+
     /// Hides the canary contact like the PII engine (`[EMAIL]`).
     struct CanaryGuard;
 

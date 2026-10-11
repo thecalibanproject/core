@@ -320,6 +320,17 @@ impl EvalRunner {
         if let Some(abort) = results.iter().find_map(|r| r.err()) {
             return Err(abort);
         }
+        // A cancellation that came in while the last trials ended still wins.
+        if self
+            .journal()
+            .get_eval(&e.tenant_id, &e.id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|x| x.cancel_requested_at.is_some())
+        {
+            return Err(Abort::Cancelled);
+        }
         let mut summary = self.summary(e).await.map_err(|_| Abort::LeaseLost)?;
         match &plan {
             Plan::Golden { golden_hash, judge_model, .. } => {
@@ -445,9 +456,9 @@ impl EvalRunner {
         if run.status == RunStatus::Pending {
             self.ex.spawn_run(run.id.clone());
         }
-        let ended = self.follow(cx, &run.id, &job).await;
+        // Kept in flight when the eval stops (cancelled), so its run is cancelled with it.
+        let ended = self.follow(cx, &run.id, &job).await?;
         cx.watch.inflight.lock().remove(&run.id);
-        let ended = ended?;
         let t = match &job {
             Job::Golden(c, _) => self.score_golden(cx, c, n, &ended).await,
             Job::Injection(c, _, _) => self.score_injection(cx, c, n, &ended).await,

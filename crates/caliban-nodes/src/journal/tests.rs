@@ -63,6 +63,10 @@ fn step(run: &str, id: &str) -> StepRecord {
 
 const TTL: Duration = Duration::from_secs(30);
 
+pub(crate) async fn until_pub(what: &str, f: impl AsyncFnMut() -> bool) {
+    until(what, f).await;
+}
+
 async fn until(what: &str, mut f: impl AsyncFnMut() -> bool) {
     for _ in 0..500 {
         if f().await {
