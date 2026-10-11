@@ -349,6 +349,12 @@ impl Dek {
             .map_err(|_| "decryption failed (wrong tenant key or context?)".to_string())?;
         String::from_utf8(pt.to_vec()).map_err(|e| e.to_string())
     }
+
+    /// A 32-byte key derived from this DEK for one purpose (BLAKE3 keyed hash of `purpose`), e.g.
+    /// the keyed term ids of a tenant's retrieval index. Destroying the DEK destroys it too.
+    pub fn derive(&self, purpose: &str) -> [u8; 32] {
+        *blake3::keyed_hash(&self.0, purpose.as_bytes()).as_bytes()
+    }
 }
 
 /// A DEK wrapped by the KEK `kek_id`: base64(nonce ‖ ciphertext), associated data = tenant id and

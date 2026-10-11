@@ -1,14 +1,28 @@
 [package]
 name = "caliban-rag"
-description = "Retrieval: chunking, hybrid index (BM25 + vectors), RRF fusion, token budget manager."
+description = "Retrieval: structure-aware chunking, hybrid dense + BM25 index on Qdrant, RRF, navigation trees, the token budget manager, ingest with poisoning controls."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+caliban-config.workspace = true
+caliban-mcp.workspace = true
+caliban-nodes.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

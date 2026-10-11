@@ -63,6 +63,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (26, "tool_manifest_network", include_str!("../../../../migrations/0026_tool_manifest_network.sql")),
     (27, "api_key_purpose", include_str!("../../../../migrations/0027_api_key_purpose.sql")),
     (28, "usage_routing_content_class", include_str!("../../../../migrations/0028_usage_routing_content_class.sql")),
+    (29, "rag", include_str!("../../../../migrations/0029_rag.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.

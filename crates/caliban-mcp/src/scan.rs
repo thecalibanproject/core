@@ -114,6 +114,14 @@ fn walk(v: &serde_json::Value, ptr: &str, out: &mut Vec<Finding>) {
     }
 }
 
+/// Every finding in a piece of text that reaches the model as data, such as a document chunk
+/// ingested for retrieval (`caliban-rag`), reported at `location`. The same rules as manifests.
+pub fn scan_document(text: &str, location: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    scan_text(text, location, &mut out);
+    out
+}
+
 /// Every finding in a manifest's name, description and input schema.
 pub fn scan(m: &crate::ToolManifest) -> Vec<Finding> {
     let mut out = Vec::new();
