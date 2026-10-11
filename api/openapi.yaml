@@ -37,6 +37,7 @@ tags:
   - name: ontology
   - name: nodes
   - name: tools
+  - name: evals
   - name: usage
   - name: system
   - name: auth
@@ -1009,9 +1010,12 @@ paths:
         `node_caps`; `mcp://` tools are pinned (resolving them against an approved tool registry
         comes with the MCP client). The spec is then sealed under the tenant's data key (created on
         first use; needs `CALIBAN_KEK`, else 400) and ships to routers and workers in the signed
-        snapshot. With `promote` (default `true`) it also becomes the live version. Needs
-        `nodes.publish`; audited as `node.publish`. A version that is not a draft is a 409; a
-        validation failure is a 422 listing every problem.
+        snapshot. With `promote` (default `true`) it also becomes the live version, which needs the
+        node's promotion bar met: a version with write tools (or a node with a golden bar) is
+        refused (`422`, problems of kind `eval_gate`) since a draft has no evals yet; publish it with
+        `{"promote": false}`, run its evals, then promote it. Needs `nodes.publish`; audited as
+        `node.publish` (with the evals that met the bar, under `evals`). A version that is not a
+        draft is a 409; a validation failure is a 422 listing every problem.
       requestBody:
         required: false
         content:
@@ -1063,9 +1067,12 @@ paths:
       summary: Move the promotion pointer (promote or roll back)
       description: |
         Makes a published version the live one (what `POST /v1/nodes/{name}/runs` without a version
-        runs). Its budgets are checked against the tenant's current `node_caps` (422). A draft or a
-        retired version is a 409. Needs `nodes.publish`; audited as `node.promote` with the
-        previous live version.
+        runs). Its budgets are checked against the tenant's current `node_caps` (422). The node's
+        promotion bar must be met by the version's latest finished evals (422, problems of kind
+        `eval_gate`): the golden bar when the node sets one, and for a version with write tools
+        always an injection eval (default bar: every attack blocked). A draft or a retired version
+        is a 409. Needs `nodes.publish`; audited as `node.promote` with the previous live version
+        and the evals that met the bar (`evals`).
       requestBody:
         required: true
         content:
@@ -1119,6 +1126,196 @@ paths:
                         from: {}
                         to: {}
         '404': { $ref: '#/components/responses/Error' }
+
+  # ───────────────────────────── Evals ─────────────────────────────
+  /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/golden-set:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { $ref: '#/components/parameters/NodeName' }
+      - { $ref: '#/components/parameters/NodeVersion' }
+    get:
+      tags: [evals]
+      summary: The golden set of a version
+      description: Metadata with `nodes.read`; the cases (tenant content, sealed at rest) also with `runs.data`. 503 without a node journal.
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/GoldenSet' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [evals]
+      summary: Create or replace the golden set of a version
+      description: |
+        At most 200 cases, unique ids, at least one check each; inputs are checked against the
+        version's `prompt.input_schema` (422 listing every problem, kind `golden_set`). Sealed under
+        the tenant's data key. Needs `nodes.write`; audited as `node.golden_set.update` (counts and
+        hashes, never cases).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cases]
+              properties:
+                cases: { type: array, items: { $ref: '#/components/schemas/GoldenCase' } }
+      responses:
+        '200': { description: Stored, content: { application/json: { schema: { $ref: '#/components/schemas/GoldenSet' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [evals]
+      summary: Delete the golden set of a version
+      description: Needs `nodes.write`; audited as `node.golden_set.delete`.
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/nodes/{nodeName}/eval-policy:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { $ref: '#/components/parameters/NodeName' }
+    get:
+      tags: [evals]
+      summary: The node's promotion bar
+      description: '`nodes.read`. `injection_bar` is the bar in effect for versions with write tools.'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [node.eval_policy] }
+                  node: { type: string }
+                  policy: { $ref: '#/components/schemas/EvalPolicy' }
+                  injection_bar: { type: number }
+                  updated_at: { type: [string, 'null'], format: date-time }
+                  updated_by: { type: [string, 'null'] }
+    put:
+      tags: [evals]
+      summary: Set the node's promotion bar
+      description: Needs `nodes.publish` (it decides what may be promoted); audited as `node.eval_policy.update` with the old and new bar.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/EvalPolicy' } } }
+      responses:
+        '200': { description: Stored }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/evals:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { $ref: '#/components/parameters/NodeName' }
+      - { $ref: '#/components/parameters/NodeVersion' }
+    post:
+      tags: [evals]
+      summary: Start an eval of a published version
+      description: |
+        `golden`: every case of the version's golden set (or `cases`) runs `k` times (default 3) as
+        ordinary node runs on workers, through the request pipeline, as the API key `api_key_id`
+        (it must be active and allowed to run the node; its quotas apply and its usage is metered).
+        `injection`: the built-in injection suite against sandboxed tools (`k` default 1); the run
+        input is `input`, else the input of `input_case` (or the golden set's first case), whose
+        checks then measure utility under attack. Needs `nodes.run`; audited as `node.eval.start`.
+        A version that is not published is a 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [suite, api_key_id]
+              properties:
+                suite: { type: string, enum: [golden, injection] }
+                api_key_id: { type: string }
+                k: { type: integer, minimum: 1, maximum: 10 }
+                concurrency: { type: integer, minimum: 1, maximum: 16, default: 4 }
+                cases: { type: array, items: { type: string }, description: 'Golden: only these cases' }
+                judge_model: { type: string, description: 'Golden: the default judge model (recorded in the summary)' }
+                input: { description: 'Injection: the run input' }
+                input_case: { type: string, description: 'Injection: take the input (and its checks) from this golden case' }
+      responses:
+        '202': { description: Started, content: { application/json: { schema: { $ref: '#/components/schemas/Eval' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/gate:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { $ref: '#/components/parameters/NodeName' }
+      - { $ref: '#/components/parameters/NodeVersion' }
+    get:
+      tags: [evals]
+      summary: What promoting the version would say
+      description: '`nodes.read`.'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node: { type: string }
+                  version: { type: integer }
+                  has_write_tools: { type: boolean }
+                  allowed: { type: boolean }
+                  evidence: { description: 'The evals that meet the bar (`golden`, `injection`), null when no gate applies' }
+                  problems: { type: array, items: { type: object } }
+
+  /api/v1/tenants/{tenantId}/evals:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [evals]
+      summary: The tenant's evals, newest first
+      description: '`nodes.read`. Metrics included, content never.'
+      parameters:
+        - { name: node, in: query, schema: { type: string } }
+        - { name: version, in: query, schema: { type: integer } }
+        - { name: suite, in: query, schema: { type: string, enum: [golden, injection] } }
+        - { name: status, in: query, schema: { type: string }, description: 'Comma separated' }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [list] }
+                  data: { type: array, items: { $ref: '#/components/schemas/Eval' } }
+                  next_cursor: { type: [string, 'null'] }
+
+  /api/v1/tenants/{tenantId}/evals/{evalId}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: evalId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [evals]
+      summary: An eval and its trials
+      description: '`nodes.read`; each trial''s `detail` (outputs, what the scorers said, what sandboxed tools received) with `runs.data`.'
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Eval' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/evals/{evalId}/cancel:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: evalId, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [evals]
+      summary: Cancel an eval
+      description: 'A pending eval ends at once (200); a running one stops, with its runs in flight, at its worker''s next check (202). An eval that ended otherwise is a 409. Needs `nodes.run`; audited as `node.eval.cancel`.'
+      responses:
+        '200': { description: Cancelled, content: { application/json: { schema: { $ref: '#/components/schemas/Eval' } } } }
+        '202': { description: Cancellation asked for, content: { application/json: { schema: { $ref: '#/components/schemas/Eval' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/provider-keys:
     parameters: [ { $ref: '#/components/parameters/TenantId' } ]
@@ -2141,7 +2338,7 @@ components:
                 type: object
                 required: [kind, message]
                 properties:
-                  kind: { type: string, enum: [spec, tool, datasource_scope, budget, node_ref, cycle] }
+                  kind: { type: string, enum: [spec, tool, datasource_scope, budget, node_ref, cycle, eval_gate, golden_set] }
                   message: { type: string }
                   path: { type: string, description: 'Where in the spec: `tools[0]`, `datasources.scopes[1]`, `budgets.steps`, `node://risk@v2`' }
 
@@ -2553,6 +2750,149 @@ components:
         created_by: { type: [string, 'null'] }
         published_at: { type: [string, 'null'], format: date-time }
         retired_at: { type: [string, 'null'], format: date-time }
+        warnings:
+          type: array
+          description: 'Broad `allow_tainted` entries (`*`, or a `tool:` pattern wider than one server): standing authority for tainted writes. Warnings, not refusals: the injection suite runs every version with its real allowlist.'
+          items:
+            type: object
+            required: [kind, message]
+            properties:
+              kind: { type: string, enum: [allowlist] }
+              message: { type: string }
+              path: { type: string, description: 'e.g. `tools[1].allow_tainted[0]`' }
+    GoldenCase:
+      type: object
+      required: [id, input]
+      additionalProperties: false
+      properties:
+        id: { type: string, pattern: '^[A-Za-z0-9_.-]{1,64}$' }
+        input: { description: 'The run input (checked against prompt.input_schema)' }
+        expected: { description: 'Shorthand for an exact check' }
+        checks:
+          type: array
+          items: { $ref: '#/components/schemas/EvalCheck' }
+        answers:
+          type: object
+          additionalProperties: true
+          description: 'Scripted answers to human steps, by step id (`clarify#0`, `write#0@approve`) or vertex id (`clarify`, `write@approve`). A question without one fails the trial; a tainted write without one is denied.'
+        tags: { type: array, items: { type: string } }
+    EvalCheck:
+      description: 'A check of the run output. Text checks see the output as text (a string as is, other JSON compact).'
+      oneOf:
+        - type: object
+          required: [type, value]
+          properties:
+            type: { const: exact }
+            value: { description: 'A string compares with the output text; any other JSON with the output parsed as JSON' }
+            strip: { type: boolean, default: true }
+            case_sensitive: { type: boolean, default: true }
+        - type: object
+          required: [type, value]
+          properties:
+            type: { const: contains }
+            value: { oneOf: [ { type: string }, { type: array, items: { type: string } } ] }
+            case_sensitive: { type: boolean, default: true }
+        - type: object
+          required: [type, pattern]
+          properties:
+            type: { const: regex }
+            pattern: { type: string }
+            flags: { type: array, items: { type: string, enum: [IGNORECASE, MULTILINE, DOTALL] } }
+        - type: object
+          required: [type, schema]
+          properties:
+            type: { const: json_schema }
+            schema: { type: object, description: 'The JSON Schema subset node specs use' }
+        - type: object
+          required: [type, rubric]
+          properties:
+            type: { const: llm_judge }
+            rubric: { type: string }
+            model: { type: string, description: 'Default: the eval''s judge_model, else caliban/auto. Called through the gateway as the eval''s API key.' }
+            threshold: { type: number, minimum: 0, maximum: 1, default: 0.5 }
+    GoldenSet:
+      type: object
+      required: [object, node, version, hash, case_count, updated_at, updated_by, content_visible]
+      properties:
+        object: { type: string, enum: [node.golden_set] }
+        node: { type: string }
+        version: { type: integer }
+        hash: { type: string, description: '`sha256:<hex>` of the cases'' canonical JSON' }
+        case_count: { type: integer }
+        updated_at: { type: string, format: date-time }
+        updated_by: { type: string }
+        content_visible: { type: boolean, description: 'The caller holds runs.data: `cases` is included' }
+        cases: { type: array, items: { $ref: '#/components/schemas/GoldenCase' } }
+    EvalPolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        golden:
+          type: object
+          additionalProperties: false
+          required: [min_pass_k]
+          properties:
+            min_pass_k: { type: number, minimum: 0, maximum: 1, description: 'Least pass^k: the share of cases whose k runs all passed' }
+            min_k: { type: integer, minimum: 1, maximum: 10, default: 1 }
+            max_cost_per_success_usd: { type: number, exclusiveMinimum: 0 }
+            max_p95_latency_ms: { type: integer, minimum: 1 }
+        injection:
+          type: object
+          additionalProperties: false
+          required: [min_pass_rate]
+          properties:
+            min_pass_rate: { type: number, minimum: 0, maximum: 1, description: 'Least share of attacks blocked. Default 1 (every attack). An injection eval is required for versions with write tools whatever the bar.' }
+    Eval:
+      type: object
+      required: [id, object, node, version, hash, suite, k, status, case_count, created_at]
+      properties:
+        id: { type: string }
+        object: { type: string, enum: [node.eval] }
+        node: { type: string }
+        version: { type: integer }
+        hash: { type: string }
+        suite: { type: string, enum: [golden, injection] }
+        k: { type: integer }
+        concurrency: { type: integer }
+        case_count: { type: integer }
+        status: { type: string, enum: [pending, running, succeeded, failed, cancelled] }
+        created_by: { type: string }
+        api_key_id: { type: [string, 'null'] }
+        summary:
+          type: [object, 'null']
+          description: |
+            Metrics only. Golden: `k`, `cases`, `trials`, `passed_trials`, `errors`, `pass_hat_k`
+            (pass^k), `pass_at_1`, `pass_at_k`, `cost_usd`, `cost_per_success_usd`,
+            `judge_cost_usd`, `tokens`, `latency_ms` (`p50`, `p95`), `by_case`, `golden_hash`,
+            `judge` (default model, prompt version and hash, temperature). Injection:
+            `suite_version`, `trials`, `blocked`, `pass_rate`, `attack_success_rate`,
+            `attacks_succeeded`, `attacked` (the model followed the injection),
+            `utility_under_attack`, `by_category`, `not_applicable` (`case`, `reason`), `cases`,
+            `cost_usd`, `latency_ms`.
+        error: { type: [string, 'null'] }
+        cancel_requested: { type: boolean }
+        cancelled_by: { type: [string, 'null'] }
+        claims: { type: integer }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        trials:
+          type: array
+          description: 'Detail only.'
+          items:
+            type: object
+            properties:
+              case: { type: string }
+              trial: { type: integer }
+              run_id: { type: [string, 'null'] }
+              status: { type: string, enum: [running, passed, failed, error] }
+              cost_usd: { type: number }
+              latency_ms: { type: integer }
+              tokens: { type: integer }
+              verdict: { type: object, description: 'Metadata: checks passed (golden); category, attacked, succeeded, defenses, utility (injection)' }
+              detail: { description: 'With runs.data only: the output and what the scorers said, or what the sandboxed tools received' }
+              finished_at: { type: [string, 'null'], format: date-time }
+        content_visible: { type: boolean }
     NodeRun:
       type: object
       required: [id, object, node, version, hash, status, steps, budget, created_at]
