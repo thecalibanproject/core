@@ -13,6 +13,7 @@
 use crate::error::Dialect;
 use crate::metering::{self, Metered};
 use crate::route_embed::{self, RouteMeta};
+use crate::timing::{self, Timings};
 use crate::{ApiError, Gateway, auth, limits, quirks, semantic, stream, telemetry};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -61,6 +62,8 @@ pub(crate) struct Outcome {
     pub auto_fallback: Option<&'static str>,
     /// An internal call's purpose (`rag.ingest`, `rag.search`), from its [`auth::InternalCaller`].
     pub purpose: Option<&'static str>,
+    /// Per-stage durations (`Server-Timing`, the usage event's `timings`).
+    pub timings: Timings,
 }
 
 /// Entry point for both chat dialects.
@@ -110,12 +113,14 @@ async fn run(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let snap = gw.config.load();
+    let mut timings = Timings::new(snap.config.telemetry.server_timing);
     let caller = auth::resolve(&snap, headers, internal)?;
     let tenant = caller.tenant.clone();
     span.record("caliban.tenant", tenant.id.as_str());
 
     let policy = limits::policy(&snap.limits_for(&tenant));
     limits::check_rate(&gw, tenant.id.as_str(), Some(&caller.key_hash), &policy).await?;
+    timings.auth = Some(started.elapsed());
 
     let (req, native) = parse(body, dialect)?;
     span.record("otel.name", format!("chat {}", req.model));
@@ -135,7 +140,9 @@ async fn run(
 
     let (decision, escalation) = {
         let s = telemetry::child("route");
-        let mut d = route_embed::route(&gw, &snap, &tenant, &req).instrument(s.clone()).await.map_err(|e| match e {
+        let route_started = Instant::now();
+        let (d, embed) = route_embed::route(&gw, &snap, &tenant, &req).instrument(s.clone()).await;
+        let mut d = d.map_err(|e| match e {
             RouteError::UnknownModel(_) => CalibanError::InvalidRequest(e.to_string()),
             _ => CalibanError::PolicyViolation(e.to_string()),
         })?;
@@ -144,6 +151,9 @@ async fn run(
             crate::escalation::admit(gw.quota.as_ref(), &gw.escalations, &snap, &tenant, &caller.key_hash, &mut d)
                 .await;
         telemetry::record_route(&s, &d);
+        timings.route = Some(route_started.elapsed());
+        timings.route_stage = Some(timing::route_stage(d.policy, d.stage));
+        timings.embed = embed;
         if let Some(h) = esc.header() {
             s.record("caliban.route.escalation", h);
         }
@@ -183,6 +193,7 @@ async fn run(
                     origin: Some("auto".into()),
                     check_spend: true,
                     headers: vec![(HeaderName::from_static("x-caliban-intent"), route_meta.header.clone())],
+                    timing: Some((timings.clone(), started)),
                 };
                 match crate::node_chat::respond(&runs, &node_caller, headers, &req, dialect, nc).await {
                     Ok(resp) => return Ok(resp),
@@ -211,8 +222,10 @@ async fn run(
         s.record("caliban.pii.mode", pii_mode_str(pii_mode));
         s.record("caliban.pii.surrogate_scope", surrogate_scope.as_str());
         // Off the async runtime when the engine runs the NER model (see `pii_pool`).
+        let pii_started = Instant::now();
         let (pr, p) =
             gw.protect(Some(tenant.id.as_str()), req.clone(), pii_mode, &scope_key).instrument(s.clone()).await?;
+        timings.add_pii(pii_started.elapsed());
         s.record("caliban.pii.entities", p.entities);
         (pr, p)
     };
@@ -248,8 +261,10 @@ async fn run(
             Some(nb) => {
                 let (mut b, entities, rh) = if use_protected {
                     if native_protected.is_none() {
+                        let pii_started = Instant::now();
                         native_protected =
                             Some(protect_native(&gw, tenant.id.as_str(), nb, pii_mode, &scope_key).await?);
+                        timings.add_pii(pii_started.elapsed());
                     }
                     let np = native_protected.as_ref().expect("initialized above");
                     (np.body.clone(), np.entities, Some(Arc::clone(&np.rehydrator)))
@@ -326,7 +341,7 @@ async fn run(
             })
             .flatten();
 
-        let outcome = Outcome {
+        let mut outcome = Outcome {
             request_id: request_id.clone(),
             tenant_id: tenant.id.to_string(),
             model: model.clone(),
@@ -343,11 +358,14 @@ async fn run(
             node: internal.and_then(|i| i.node.clone()),
             auto_fallback,
             purpose: internal.and_then(|i| i.purpose),
+            timings: timings.clone(),
         };
 
         if let Some(k) = &key {
             let cs = telemetry::child("cache");
+            let lookup_started = Instant::now();
             let hit = gw.cache.get(k).instrument(cs.clone()).await;
+            outcome.timings.add_cache(lookup_started.elapsed(), hit.is_some());
             cs.record("caliban.cache", if hit.is_some() { "hit" } else { "miss" });
             if let Some(hit) = hit {
                 let outcome = Outcome { cache: CacheStatus::Hit, cache_tier: Some(CacheTier::Exact), ..outcome };
@@ -361,9 +379,16 @@ async fn run(
                 return Ok(json_response(&outcome, body, Some(0.0), billed));
             }
         }
-        if let Some(s) = sem.as_mut()
-            && let Some(hit) = s.lookup().await
-        {
+        let sem_hit = match sem.as_mut() {
+            Some(s) => {
+                let lookup_started = Instant::now();
+                let hit = s.lookup().await;
+                outcome.timings.add_cache(lookup_started.elapsed(), hit.is_some());
+                hit
+            }
+            None => None,
+        };
+        if let Some(hit) = sem_hit {
             let outcome = Outcome { cache: CacheStatus::Hit, cache_tier: Some(CacheTier::Semantic), ..outcome };
             return Ok(semantic::respond(Arc::clone(&gw), outcome, &hit, rh, is_native, req.stream, settlement).await);
         }
@@ -371,11 +396,19 @@ async fn run(
         let adapter = gw.providers.adapter(provider.kind).map_err(|e| CalibanError::Upstream(e.to_string()))?;
         let us = telemetry::upstream_span("chat", &model, &provider, attempt, is_native);
         settlement.set_in_flight(true);
-        let result = if is_native {
-            adapter.messages(&provider, upstream_body, req.stream, &native_opts).instrument(us.clone()).await
-        } else {
-            adapter.chat(&provider, upstream_body, req.stream).instrument(us.clone()).await
-        };
+        let upstream_started = Instant::now();
+        let (result, headers_at) = caliban_providers::time_to_headers(async {
+            if is_native {
+                adapter.messages(&provider, upstream_body, req.stream, &native_opts).instrument(us.clone()).await
+            } else {
+                adapter.chat(&provider, upstream_body, req.stream).instrument(us.clone()).await
+            }
+        })
+        .await;
+        outcome.timings.upstream_call(upstream_started, headers_at);
+        if matches!(result, Ok(ProviderResponse::Json(_))) {
+            outcome.timings.upstream_done();
+        }
         match result {
             Ok(ProviderResponse::Json(mut v)) => {
                 if let Some(m) = v.get("model").and_then(Value::as_str) {
@@ -449,6 +482,8 @@ async fn run(
             }
             Err(e) => {
                 settlement.set_in_flight(false);
+                // The next candidate keeps this attempt's cache lookup time.
+                timings = outcome.timings;
                 telemetry::record_error(&us, e.kind());
                 if e.is_retryable() && attempt + 1 < decision.candidates.len() {
                     tracing::warn!(request_id = %request_id, model = %model.id, error = %e, "upstream failed, trying fallback");
@@ -637,6 +672,9 @@ pub(crate) fn caliban_headers(h: &mut HeaderMap, o: &Outcome) {
         // Anthropic SDKs surface this as `_request_id`.
         set("request-id", o.request_id.to_string());
     }
+    if let Some(v) = o.timings.header(o.started) {
+        h.insert(timing::HEADER, v);
+    }
 }
 
 /// Non-streaming responses also carry `x-caliban-cost-usd` (the routed model's cost) when the
@@ -751,7 +789,7 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
             .or_else(|| o.auto_fallback.map(|_| format!("model:{}", o.model.id))),
         route_fallback: o.auto_fallback.map(str::to_owned),
         purpose: o.purpose.map(str::to_owned),
-        timings: None,
+        timings: Some(o.timings.usage(o.started)),
     };
     let billed = if auto.is_some() { event.billed_usd } else { cost };
     gw.usage.record(event).await;

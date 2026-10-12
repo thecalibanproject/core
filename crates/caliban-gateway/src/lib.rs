@@ -44,6 +44,7 @@ mod stream;
 pub mod telemetry;
 #[cfg(test)]
 mod tests;
+mod timing;
 pub mod tools;
 
 pub use auth::{InternalCaller, NodeTag};
@@ -221,7 +222,8 @@ impl Gateway {
 }
 
 /// Browser SDKs authenticate with a bearer key (no cookies), so any origin may call the API;
-/// the `x-caliban-*` headers are exposed so clients can read routing/cache/PII metadata.
+/// the `x-caliban-*` headers and `Server-Timing` are exposed so clients can read routing, cache,
+/// PII and timing metadata.
 fn cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)
@@ -254,6 +256,7 @@ fn cors() -> CorsLayer {
             HeaderName::from_static(node_chat::ROUTE_FALLBACK_HEADER),
             HeaderName::from_static(runs::RUN_ID_HEADER),
             HeaderName::from_static("x-caliban-run-status"),
+            HeaderName::from_static(timing::HEADER),
         ])
 }
 

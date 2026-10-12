@@ -7,6 +7,7 @@
 use crate::error::Dialect;
 use crate::metering::Metered;
 use crate::pipeline::{Outcome, caliban_headers, finish, resolve};
+use crate::timing::Timings;
 use crate::{ApiError, Gateway, auth, limits, telemetry};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -51,6 +52,8 @@ async fn run(
     span.record("caliban.tenant", tenant.id.as_str());
     let policy = limits::policy(&snap.limits_for(&tenant));
     limits::check_rate(&gw, tenant.id.as_str(), caller.key(), &policy).await?;
+    let mut timings = Timings::new(snap.config.telemetry.server_timing);
+    timings.auth = Some(started.elapsed());
 
     let mut v: Value = serde_json::from_slice(&body).map_err(|e| CalibanError::InvalidRequest(e.to_string()))?;
     let model_id = v
@@ -79,7 +82,9 @@ async fn run(
     if snap.pii_protection(&tenant, None, floor, external).is_some() {
         let s = telemetry::child("pii");
         s.record("caliban.pii.mode", "mask");
+        let pii_started = Instant::now();
         entities = mask_inputs(&gw, tenant.id.as_str(), &mut v).instrument(s.clone()).await?;
+        timings.add_pii(pii_started.elapsed());
         s.record("caliban.pii.entities", entities);
     }
     v["model"] = Value::String(model.upstream_model.clone());
@@ -90,7 +95,12 @@ async fn run(
     let adapter = gw.providers.adapter(provider.kind).map_err(|e| CalibanError::Upstream(e.to_string()))?;
     let us = telemetry::upstream_span("embeddings", &model, &provider, 0, false);
     settlement.set_in_flight(true);
-    let mut out = match adapter.embeddings(&provider, v).instrument(us.clone()).await {
+    let upstream_started = Instant::now();
+    let (out, headers_at) =
+        caliban_providers::time_to_headers(adapter.embeddings(&provider, v).instrument(us.clone())).await;
+    timings.upstream_call(upstream_started, headers_at);
+    timings.upstream_done();
+    let mut out = match out {
         Ok(out) => out,
         Err(e) => {
             settlement.set_in_flight(false);
@@ -123,6 +133,7 @@ async fn run(
         purpose: internal.as_ref().and_then(|i| i.purpose),
         node: internal.and_then(|i| i.node),
         auto_fallback: None,
+        timings,
     };
     finish(&gw, &outcome, usage, 0, settlement).await;
     let mut resp = axum::Json(out).into_response();

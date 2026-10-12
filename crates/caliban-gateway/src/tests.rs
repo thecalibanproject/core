@@ -154,6 +154,11 @@ async fn setup_with_keys(keys: Option<SurrogateKeys>) -> (Router, Log, Arc<InMem
 
 /// [`setup_with_keys`], also returning the usage events.
 async fn setup_full(keys: Option<SurrogateKeys>) -> (Router, Log, Arc<InMemoryQuota>, RecentUsage) {
+    setup_extra(keys, "").await
+}
+
+/// [`setup_full`] with `extra` appended to the config file.
+async fn setup_extra(keys: Option<SurrogateKeys>, extra: &str) -> (Router, Log, Arc<InMemoryQuota>, RecentUsage) {
     let (base, log) = mock_upstream().await;
     let key_file = std::env::temp_dir().join(format!("caliban-gw-test-anthropic-{}", std::process::id()));
     std::fs::write(&key_file, "sk-ant-test").unwrap();
@@ -269,6 +274,7 @@ requests_per_minute = 1
 
 [limits.tenants.budget]
 tokens_per_day = 2000
+{extra}
 "#,
         acme = hash("cal_acme"),
         globex = hash("cal_globex"),
@@ -2120,7 +2126,7 @@ api_key_hashes = ["{acme}"]
                     .unwrap();
                     let started = Instant::now();
                     let d = if knn {
-                        route_embed::route(&gw, &snap, &tenant, &req).await.unwrap()
+                        route_embed::route(&gw, &snap, &tenant, &req).await.0.unwrap()
                     } else {
                         gw.router.route(&snap, &tenant, &req, caliban_route::Constraints::default()).unwrap()
                     };
@@ -2644,4 +2650,122 @@ api_key_hashes = ["{a}", "{b}"]
     let text = String::from_utf8(axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
     assert!(text.contains("caliban_escalations_total{outcome=\"admitted\"} 3"), "{text}");
     assert!(text.contains("caliban_escalations_total{outcome=\"denied\"} 1"), "{text}");
+}
+
+/// `Server-Timing` metrics: (name, dur, desc), in header order.
+fn server_timing(h: &HeaderMap) -> Vec<(String, Option<f64>, Option<String>)> {
+    let v = h.get("server-timing").expect("Server-Timing header").to_str().unwrap();
+    v.split(", ")
+        .map(|m| {
+            let mut parts = m.split(';');
+            let name = parts.next().unwrap().to_owned();
+            let (mut dur, mut desc) = (None, None);
+            for p in parts {
+                if let Some(d) = p.strip_prefix("dur=") {
+                    dur = Some(d.parse::<f64>().unwrap());
+                } else if let Some(d) = p.strip_prefix("desc=") {
+                    desc = Some(d.trim_matches('"').to_owned());
+                }
+            }
+            (name, dur, desc)
+        })
+        .collect()
+}
+
+fn names(m: &[(String, Option<f64>, Option<String>)]) -> Vec<&str> {
+    m.iter().map(|(n, _, _)| n.as_str()).collect()
+}
+
+fn dur(m: &[(String, Option<f64>, Option<String>)], name: &str) -> f64 {
+    m.iter().find(|(n, _, _)| n == name).and_then(|(_, d, _)| *d).unwrap_or_else(|| panic!("{name} has a dur"))
+}
+
+fn desc<'a>(m: &'a [(String, Option<f64>, Option<String>)], name: &str) -> Option<&'a str> {
+    m.iter().find(|(n, _, _)| n == name).and_then(|(_, _, d)| d.as_deref())
+}
+
+/// Every duration is non-negative and no stage outlasts the request (never absolute values).
+fn consistent(m: &[(String, Option<f64>, Option<String>)]) {
+    let total = dur(m, "total");
+    for (n, d, _) in m {
+        let d = d.unwrap_or(0.0);
+        assert!(d >= 0.0 && d <= total, "{n}: {d} (total {total})");
+    }
+}
+
+#[tokio::test]
+async fn server_timing_reports_each_stage_and_the_usage_event_keeps_it() {
+    let (app, log, _, usage) = setup_full(None).await;
+    // A miss: every stage up to the upstream's full call, in pipeline order.
+    let body = chat_body("timing please");
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let m = server_timing(&h);
+    assert_eq!(names(&m), ["auth", "route", "pii", "cache", "upstream", "upstream_total", "total"], "{m:?}");
+    assert_eq!(desc(&m, "route"), Some("pinned"));
+    assert_eq!(desc(&m, "cache"), Some("miss"));
+    consistent(&m);
+    assert!(dur(&m, "upstream") <= dur(&m, "upstream_total"));
+    let ev = usage.snapshot(Some("acme"), 1).pop().unwrap();
+    let t = ev.timings.expect("the usage event carries timings");
+    for d in [t.auth_ms, t.route_ms, t.pii_ms, t.cache_ms, t.upstream_ms, t.upstream_total_ms, t.total_ms] {
+        assert!(d.is_some_and(|d| d >= 0.0), "{t:?}");
+    }
+    assert!(t.upstream_ms <= t.upstream_total_ms && t.upstream_total_ms <= t.total_ms, "{t:?}");
+    assert!(t.embed_ms.is_none(), "no routing embedder for a pinned model");
+
+    // A cache hit: no upstream call, so no upstream entries.
+    let calls = upstream_calls(&log);
+    let (_, h, _) = call(&app, "/v1/chat/completions", BEARER, body).await;
+    assert_eq!(h["x-caliban-cache"], "hit");
+    assert_eq!(upstream_calls(&log), calls);
+    let m = server_timing(&h);
+    assert_eq!(names(&m), ["auth", "route", "pii", "cache", "total"], "{m:?}");
+    assert_eq!(desc(&m, "cache"), Some("hit"));
+    consistent(&m);
+    let t = usage.snapshot(Some("acme"), 1).pop().unwrap().timings.unwrap();
+    assert!(t.cache_ms.is_some() && t.upstream_ms.is_none() && t.upstream_total_ms.is_none(), "{t:?}");
+
+    // Streamed: the headers leave before the body, so the upstream's total is only in the usage
+    // event; the stream itself is unchanged OpenAI chunks.
+    let mut body = chat_body("stream the timing");
+    body["stream"] = json!(true);
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let m = server_timing(&h);
+    assert_eq!(names(&m), ["auth", "route", "pii", "upstream", "total"], "{m:?}");
+    consistent(&m);
+    assert!(!out.contains("timings") && !out.contains("server_timing"), "{out}");
+    let mut t = None;
+    for _ in 0..200 {
+        if let Some(e) =
+            usage.snapshot(Some("acme"), 1).pop().filter(|e| e.timings.is_some_and(|t| t.cache_ms.is_none()))
+        {
+            t = e.timings;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let t = t.expect("the stream's usage event");
+    assert!(
+        t.upstream_ms.is_some() && t.upstream_ms <= t.upstream_total_ms && t.upstream_total_ms <= t.total_ms,
+        "{t:?}"
+    );
+
+    // Anthropic clients get the same header.
+    let msg = json!({"model": "ext/mock", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]});
+    let (status, h, out) = call(&app, "/v1/messages", ANTH, msg).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(names(&server_timing(&h))[..2], ["auth", "route"]);
+}
+
+#[tokio::test]
+async fn server_timing_can_be_turned_off() {
+    let (app, _, _, usage) = setup_extra(None, "[telemetry]\nserver_timing = false").await;
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, chat_body("no timing")).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(h.get("server-timing").is_none(), "{h:?}");
+    assert!(h.get("x-caliban-intent").is_some(), "the other headers stay");
+    // The usage event keeps the durations.
+    assert!(usage.snapshot(Some("acme"), 1).pop().unwrap().timings.is_some_and(|t| t.total_ms.is_some()));
 }

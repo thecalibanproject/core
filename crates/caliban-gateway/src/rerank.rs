@@ -10,6 +10,7 @@ use crate::embeddings::mask_texts;
 use crate::error::Dialect;
 use crate::metering::Metered;
 use crate::pipeline::{Outcome, caliban_headers, finish, resolve};
+use crate::timing::Timings;
 use crate::{ApiError, Gateway, auth, limits, telemetry};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -65,6 +66,8 @@ async fn run(
     span.record("caliban.tenant", tenant.id.as_str());
     let policy = limits::policy(&snap.limits_for(&tenant));
     limits::check_rate(&gw, tenant.id.as_str(), caller.key(), &policy).await?;
+    let mut timings = Timings::new(snap.config.telemetry.server_timing);
+    timings.auth = Some(started.elapsed());
 
     let req: RerankRequest = serde_json::from_slice(&body).map_err(|e| CalibanError::InvalidRequest(e.to_string()))?;
     if req.documents.is_empty() {
@@ -90,7 +93,9 @@ async fn run(
     if snap.pii_protection(&tenant, None, None, external).is_some() {
         let mut all = vec![query];
         all.extend(docs);
+        let pii_started = Instant::now();
         let (masked, n) = mask_texts(&gw, Some(tenant.id.as_str()), all).await?;
+        timings.add_pii(pii_started.elapsed());
         entities = n;
         let mut it = masked.into_iter();
         query = it.next().unwrap_or_default();
@@ -104,7 +109,12 @@ async fn run(
     let adapter = gw.providers.adapter(provider.kind).map_err(|e| CalibanError::Upstream(e.to_string()))?;
     let us = telemetry::upstream_span("rerank", &model, &provider, 0, false);
     settlement.set_in_flight(true);
-    let raw = match adapter.rerank(&provider, upstream_body).instrument(us.clone()).await {
+    let upstream_started = Instant::now();
+    let (raw, headers_at) =
+        caliban_providers::time_to_headers(adapter.rerank(&provider, upstream_body).instrument(us.clone())).await;
+    timings.upstream_call(upstream_started, headers_at);
+    timings.upstream_done();
+    let raw = match raw {
         Ok(v) => v,
         Err(e) => {
             settlement.set_in_flight(false);
@@ -150,6 +160,7 @@ async fn run(
         purpose: internal.as_ref().and_then(|i| i.purpose),
         node: internal.and_then(|i| i.node),
         auto_fallback: None,
+        timings,
     };
     let model_id = outcome.model.id.to_string();
     finish(&gw, &outcome, usage, 0, settlement).await;

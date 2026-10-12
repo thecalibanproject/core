@@ -35,6 +35,8 @@ pub(crate) struct RouteEmbedder<'a> {
     space: String,
     /// Mask PII before prompt text leaves the trust boundary.
     mask: bool,
+    /// Microseconds spent in finished `embed` calls (the `embed` stage timing).
+    spent_us: std::sync::atomic::AtomicU64,
 }
 
 impl<'a> RouteEmbedder<'a> {
@@ -52,6 +54,7 @@ impl<'a> RouteEmbedder<'a> {
             tenant: tenant.map(|t| t.id.clone()),
             space: space_id(&model.id, &model.upstream_model, &shared.provider.base_url),
             mask: tenant.is_some_and(|t| snap.pii_protection(t, None, None, external).is_some()),
+            spent_us: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -88,6 +91,16 @@ impl PromptEmbedder for RouteEmbedder<'_> {
     }
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let started = std::time::Instant::now();
+        let out = self.embed_inner(texts).await;
+        let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.spent_us.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+}
+
+impl RouteEmbedder<'_> {
+    async fn embed_inner(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         let input = if self.mask {
             mask_texts(self.gw, self.tenant.as_ref().map(|t| t.as_str()), texts.to_vec())
                 .await
@@ -142,15 +155,18 @@ impl RouteMeta {
 
 /// Routes a chat request: Stage 0 rules, Stage-1 kNN within `[routing] budget_ms`, then the
 /// quality-floor policy. Also kicks off a background asset refresh when the snapshot changed.
+/// Returns the time spent in finished routing embedder calls next to the decision (`None` when
+/// none finished, e.g. Stage 1 off or timed out).
 pub(crate) async fn route(
     gw: &Arc<Gateway>,
     snap: &Arc<Snapshot>,
     tenant: &TenantConfig,
     req: &ChatRequest,
-) -> Result<RouteDecision, RouteError> {
+) -> (Result<RouteDecision, RouteError>, Option<std::time::Duration>) {
     spawn_refresh_if_needed(gw, snap);
     let embedder = RouteEmbedder::for_tenant(gw, snap, tenant);
-    gw.router
+    let d = gw
+        .router
         .route_auto(
             snap,
             tenant,
@@ -159,7 +175,12 @@ pub(crate) async fn route(
             embedder.as_ref().map(|e| e as &dyn PromptEmbedder),
             &AlwaysHealthy,
         )
-        .await
+        .await;
+    let spent = embedder
+        .map(|e| e.spent_us.load(std::sync::atomic::Ordering::Relaxed))
+        .filter(|us| *us > 0)
+        .map(std::time::Duration::from_micros);
+    (d, spent)
 }
 
 /// Starts a background refresh of the routing assets when the snapshot changed them.
