@@ -386,8 +386,13 @@ in the file and from the admin API, which overrides the file intent by intent an
 `PUT /api/v1/tenants/{t}/intents/{intent}` `{"exemplars": ["my chest hurts", ...]}` (an empty list
 removes a file intent for the tenant), `DELETE` to fall back to the file, `GET
 /api/v1/tenants/{t}/intents` for what routers use (with each intent's `source` and `node`). Routers
-rebuild their kNN index with the snapshot that changes them. So onboarding a new intent and its
-node is two API calls: the intent, then `node_routes`.
+rebuild their kNN index in the background as soon as they apply the snapshot that changes them,
+keeping the previous index until the new one is swapped in. The `PUT` answers with the
+`config_version` (`cp-<n>`) that carries the change; a router serves the new exemplars once its
+`GET /healthz` reports `routing.version` at `cp-<n>` or later (compare the numbers: a later change
+moves it on), with `routing.building` false. So onboarding a new intent and its node is two API
+calls: the intent, then `node_routes`; wait for the routers before sending traffic that relies on
+it.
 
 When a `caliban/auto` request classifies into an intent that maps to a node, the node runs instead of
 a model call, through the same path as `model: "node/<name>"` (the run's `origin` is `auto`: the
