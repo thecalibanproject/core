@@ -289,7 +289,17 @@ writes a query in CQIR (ontology ids only; never a collection, a path or an oper
 
 It runs on the native MongoDB lane through a connector that checks its principal is read only (a
 principal that can write is refused), with the compiler's `maxTimeMS`, at most 200 rows. Other
-datasource kinds are refused until their lane exists. The datasources (credentials sealed) and the
+datasource kinds are refused until their lane exists.
+
+**Where the queries read.** A compiled query reads with `readPreference: secondary` and the tag
+`{workload: analytics}`, so analytics never load the primary (note 08: a tagged or hidden
+secondary, or an Atlas analytics node). A replica set without a member tagged `workload:
+analytics` fails every query, with `no MongoDB member matches the read preference secondary with
+tags {workload: analytics}` after the driver's server-selection timeout (10 s). Either tag a
+secondary (`rs.reconfig` with `members[i].tags = {workload: "analytics"}`), or set the
+datasource's `read_preference` (and optionally `read_tag`) on its connection, which then wins over
+the compiled one: for example `"read_preference": "secondaryPreferred"`, or `"primary"` for a
+single server. See [datasources.md](datasources.md#read-preference). The datasources (credentials sealed) and the
 approved ontology reach the data plane only when a published node of the tenant uses the tool.
 
 **`builtin://rag_search`** (read only; the node must declare at least one

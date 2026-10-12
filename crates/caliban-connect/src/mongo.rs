@@ -155,6 +155,49 @@ fn src(e: impl std::fmt::Display) -> ConnectError {
     ConnectError::Source(e.to_string())
 }
 
+/// `selection` as a reader would write it: `secondary with tags {workload: analytics}`.
+fn describe_selection(selection: &SelectionCriteria) -> String {
+    let SelectionCriteria::ReadPreference(rp) = selection else {
+        return "a custom server predicate".into();
+    };
+    let (mode, options) = match rp {
+        ReadPreference::Primary => ("primary", None),
+        ReadPreference::PrimaryPreferred { options } => ("primaryPreferred", options.as_ref()),
+        ReadPreference::Secondary { options } => ("secondary", options.as_ref()),
+        ReadPreference::SecondaryPreferred { options } => ("secondaryPreferred", options.as_ref()),
+        ReadPreference::Nearest { options } => ("nearest", options.as_ref()),
+        _ => ("custom", None),
+    };
+    let tags: Vec<String> = options
+        .and_then(|o| o.tag_sets.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|set| {
+            let mut kv: Vec<String> = set.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+            kv.sort();
+            format!("{{{}}}", kv.join(", "))
+        })
+        .collect();
+    if tags.is_empty() { mode.to_owned() } else { format!("{mode} with tags {}", tags.join(" or ")) }
+}
+
+/// A query error; a server-selection failure says which member the query looked for and how to
+/// fix it (a compiled query reads from a tagged analytics secondary unless the connection sets
+/// `read_preference`).
+fn query_error(e: mongodb::error::Error, selection: &SelectionCriteria, configured: bool) -> ConnectError {
+    if !matches!(e.kind.as_ref(), mongodb::error::ErrorKind::ServerSelection { .. }) {
+        return src(e);
+    }
+    let wanted = describe_selection(selection);
+    let fix = if configured {
+        "check the connection's read_preference and read_tag against the deployment's members"
+    } else {
+        "add a secondary with that tag (a hidden or analytics member, see docs/tools.md), or set the \
+         connection's read_preference (for example secondaryPreferred, or primary on a standalone server)"
+    };
+    ConnectError::Source(format!("no MongoDB member matches the read preference {wanted}: {fix} ({e})"))
+}
+
 /// Packs a BSON timestamp as `(seconds << 32) | increment`, ordered like cluster time.
 pub fn ts_to_u64(t: Timestamp) -> u64 {
     (u64::from(t.time) << 32) | u64::from(t.increment)
@@ -546,15 +589,16 @@ impl MongoConnector {
         let max_ms = q.options.get("maxTimeMS").and_then(J::as_u64).unwrap_or(cap_ms).min(cap_ms);
         let comment = q.options.get("comment").and_then(J::as_str).unwrap_or("caliban:unset").to_owned();
         let selection = self.query_selection(q.options.get("readPreference"))?;
+        let configured = self.cfg.read_preference.is_some();
         let c: Collection<Document> = self.db.collection(&q.collection);
         let mut cursor = c
             .aggregate(pipeline)
             .allow_disk_use(false)
             .max_time(Duration::from_millis(max_ms))
             .comment(Bson::String(comment))
-            .selection_criteria(selection)
+            .selection_criteria(selection.clone())
             .await
-            .map_err(src)?;
+            .map_err(|e| query_error(e, &selection, configured))?;
         let mut rows = Vec::new();
         let mut truncated = false;
         while let Some(d) = cursor.try_next().await.map_err(src)? {
@@ -578,7 +622,13 @@ impl MongoConnector {
             "comment": comment,
         };
         let selection = self.query_selection(q.options.get("readPreference"))?;
-        let reply = self.db.run_command(cmd).selection_criteria(selection).await.map_err(src)?;
+        let configured = self.cfg.read_preference.is_some();
+        let reply = self
+            .db
+            .run_command(cmd)
+            .selection_criteria(selection.clone())
+            .await
+            .map_err(|e| query_error(e, &selection, configured))?;
         Ok(doc_to_json(&reply))
     }
 
@@ -663,6 +713,34 @@ mod tests {
         assert!(json_to_bson(&json!({ "$code": "while(1){}" })).is_err());
         assert!(json_to_bson(&json!({ "x": { "$oid": "65a1f0c2e4b0a1b2c3d4e5f6" } })).is_err());
         assert!(json_to_bson(&json!({ "$date": "yesterday" })).is_err());
+    }
+
+    #[test]
+    fn a_missing_tagged_secondary_gets_a_clear_error() {
+        let tag = ReadTag::Pair("workload:analytics".into()).tag_set().unwrap();
+        let selection = SelectionCriteria::ReadPreference(read_preference("secondary", vec![tag], None).unwrap());
+        assert_eq!(describe_selection(&selection), "secondary with tags {workload: analytics}");
+        // A real server-selection failure from the driver: nothing listens on port 1.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let e = rt.block_on(async {
+            let mut o = ClientOptions::parse("mongodb://127.0.0.1:1/").await.unwrap();
+            o.server_selection_timeout = Some(Duration::from_millis(200));
+            let c = Client::with_options(o).unwrap();
+            c.database("x").run_command(doc! {"ping": 1}).selection_criteria(selection.clone()).await.unwrap_err()
+        });
+        let msg = query_error(e, &selection, false).to_string();
+        assert!(msg.contains("no MongoDB member matches the read preference secondary with tags {workload: analytics}"));
+        assert!(msg.contains("set the connection's read_preference"), "{msg}");
+        let configured = query_error(
+            rt.block_on(async {
+                let mut o = ClientOptions::parse("mongodb://127.0.0.1:1/").await.unwrap();
+                o.server_selection_timeout = Some(Duration::from_millis(200));
+                Client::with_options(o).unwrap().database("x").run_command(doc! {"ping": 1}).await.unwrap_err()
+            }),
+            &selection,
+            true,
+        );
+        assert!(configured.to_string().contains("check the connection's read_preference"), "{configured}");
     }
 
     #[test]
