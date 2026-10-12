@@ -190,7 +190,13 @@ fn exec_vertex<'a>(
     }))
 }
 
-/// The chat request of an `llm`-like vertex.
+/// The chat request of an `llm`-like vertex. `schema`: constrain the answer to this JSON Schema
+/// (`response_format: json_schema`) unless the vertex sets `structured_output: "prompt"`.
+///
+/// `reasoning` (`off`, `low`, `medium`, `high`; the vertex's, else `model_policy.reasoning`) goes
+/// as `caliban.reasoning`, which the gateway maps per model family like a client's (Qwen3
+/// `enable_thinking`, `reasoning_effort`), so a classification step need not think at the model's
+/// default effort.
 fn chat_body(
     cx: &RunCx,
     node: &ResolvedNode,
@@ -198,6 +204,7 @@ fn chat_body(
     system: Option<String>,
     user: String,
     ledger: &Ledger,
+    schema: Option<&Value>,
 ) -> Value {
     let c = &v.config;
     let model = c.get("model").and_then(Value::as_str).map_or_else(|| node.spec.default_model(), str::to_owned);
@@ -214,7 +221,27 @@ fn chat_body(
         "max_tokens": cx.max_tokens(ledger, wanted),
     });
     super::guardrails(&node.spec, &mut body);
+    if let Some(r) = c.get("reasoning").or_else(|| node.spec.reasoning()) {
+        super::set_ext(&mut body, "reasoning", r.clone());
+    }
+    if let Some(s) = schema
+        && crate::constrained(v)
+    {
+        body["response_format"] = response_format(&v.id, s);
+    }
     body
+}
+
+/// `response_format` asking the server for output constrained to `schema` (vLLM and SGLang guided
+/// decoding, OpenAI structured outputs). Not strict: strict mode accepts only a subset of JSON
+/// Schema, and the answer is validated against the full schema here anyway.
+fn response_format(vertex: &str, schema: &Value) -> Value {
+    let name: String = vertex
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .take(64)
+        .collect();
+    json!({"type": "json_schema", "json_schema": {"name": if name.is_empty() { "output".into() } else { name }, "schema": schema, "strict": false}})
 }
 
 fn content_of(message: &Value) -> String {
@@ -267,7 +294,7 @@ async fn llm(
         system.push_str(&s.to_string());
     }
     let user = c.get("prompt").and_then(Value::as_str).map_or_else(|| as_text(input), |t| render_str(t, &scope));
-    let body = chat_body(cx, node, v, Some(system), user, ledger);
+    let body = chat_body(cx, node, v, Some(system), user, ledger, schema);
     let first = model_step(cx, ledger, base, &v.id, kind, body.clone()).await?;
     let Some(schema) = schema else { return Ok(first) };
     let text = first.output.as_str().unwrap_or_default().to_owned();
@@ -335,10 +362,18 @@ async fn router(
         system.push_str(&format!("\n- {label}: {}", as_text(desc)));
     }
     let user = c.get("prompt").and_then(Value::as_str).map_or_else(|| as_text(input), |t| render_str(t, &scope));
-    let body = chat_body(cx, node, v, Some(system), user, ledger);
+    // Constrained to one of the labels when the server supports guided decoding.
+    let label_schema = json!({"type": "object", "required": ["label"], "additionalProperties": false,
+                              "properties": {"label": {"type": "string", "enum": labels}}});
+    let body = chat_body(cx, node, v, Some(system), user, ledger, Some(&label_schema));
     let out = model_step(cx, ledger, base, &v.id, "router", body).await?;
     let answer = out.output.as_str().unwrap_or_default();
-    let label = pick_label(answer, &labels)
+    let structured = extract_json(answer)
+        .and_then(|j| j.get("label").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|l| labels.iter().find(|x| **x == l).cloned());
+    let label = structured
+        .as_ref()
+        .or_else(|| pick_label(answer, &labels))
         .cloned()
         .or_else(|| c.get("default").and_then(Value::as_str).map(str::to_owned))
         .ok_or_else(|| Stop::Fail(format!("vertex '{}': the classifier answered none of the labels", v.id)))?;
@@ -733,7 +768,7 @@ async fn verify(
             );
             let user =
                 c.get("prompt").and_then(Value::as_str).map_or_else(|| as_text(input), |t| render_str(t, &scope));
-            let body = chat_body(cx, node, v, Some(system), user, ledger);
+            let body = chat_body(cx, node, v, Some(system), user, ledger, None);
             let out = model_step(cx, ledger, base, &v.id, "verify", body).await?;
             let answer = out.output.as_str().unwrap_or_default().trim().to_owned();
             let pass = answer.to_uppercase().starts_with("PASS");

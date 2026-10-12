@@ -23,6 +23,7 @@ checked by `NodeSpec::validate` (`crates/caliban-nodes`). The parts the core enf
 | `description` | What the node does (the MCP server's tool description) |
 | `prompt.input_schema`, `prompt.output_schema` | Checked against the run input and the run output; the input schema is also the MCP tool's input schema and decides how chat messages become the input ([Chat shortcut](#the-chat-shortcut-model-nodename)) |
 | `model_policy.model` | The model the calls ask for; default: the first `candidates` entry that is a model id (not `tier:...`), else `caliban/auto` |
+| `model_policy.reasoning` | `off`, `low`, `medium` or `high`: the default reasoning effort of the node's model calls (a vertex's `config.reasoning` overrides it) |
 | `tools` | `{"ref", "effect": "read"\|"write", "allow_tainted"?: [label patterns]}`. `ref`: `mcp://server/tool#sha256:<hash>` (an approved, pinned manifest of a registered server; see [tools.md](tools.md)), `node://name@vN` (another node of the tenant, pinned to a version), `builtin://datasource_query` or `builtin://rag_search` (both read only) |
 | `datasources.scopes` | `<datasource>.<object>:<read\|write>`; `rag.<collection or *>:read` names document collections for `builtin://rag_search` ([rag.md](rag.md)) |
 | `budgets` | `steps`, `tokens`, `wall_clock_s`, optional `usd`; `depth` (subnode nesting, default 3) and `fanout` (map concurrency, default 8). See [Budgets](#budgets) |
@@ -45,8 +46,8 @@ produces a value; `router` and `verify` also produce a label. When a vertex decl
 
 | Type | Config | Does |
 |---|---|---|
-| `llm` | `prompt` (template, default: the input), `system`, `model`, `temperature` (0), `max_tokens` (1024, capped by the tokens left), `output_schema` | One model call. With `output_schema` the answer must be JSON matching it (one corrective retry, then the run fails) |
-| `router` | `routes` (label to description), `default`, `prompt` | A model call that picks one label; the output is the input with `route` set; the label selects the edge |
+| `llm` | `prompt` (template, default: the input), `system`, `model`, `temperature` (0), `max_tokens` (1024, capped by the tokens left), `output_schema`, `reasoning`, `structured_output` | One model call. With `output_schema` the answer must be JSON matching it: the server is asked for constrained decoding (see below), and the answer is validated (one corrective retry, then the run fails) |
+| `router` | `routes` (label to description), `default`, `prompt`, `reasoning`, `structured_output` | A model call that picks one label (constrained to the labels, see below); the output is the input with `route` set; the label selects the edge |
 | `tool` | `tool` (a reference declared in `tools`), `args` (JSON template, default: the input) | Calls the tool; `node://` runs the node inside this run |
 | `map` | `over` (JSON pointer to an array, default: the input), `body` (a vertex, not `map` or `human`), `concurrency` | Applies `body` to every item, concurrently (at most `budgets.fanout` at once); the output is the array of results, in input order |
 | `reduce` | `mode`: `concat` (default, flattens one level), `merge` (objects), `llm` (a model call, like `llm`) | Joins a fan-out |
@@ -54,6 +55,18 @@ produces a value; `router` and `verify` also produce a label. When a vertex decl
 | `human` | `question` (template), `timeout_s`, `default` | Suspends the run until `POST /v1/runs/{id}/input` answers it; the output is the input with `answer` set. Past `timeout_s` the `default` is used, or the run fails |
 | `subnode` | `node` (`node://name@vN`), `input` (template) | Runs the node inside this run under a child budget |
 | `code` | | Not yet supported (WASM sandbox, P3 M8): refused when the version is created |
+
+**Reasoning and constrained decoding** (model vertices: `llm`, `router`, `verify`, `reduce` with
+mode `llm`). `config.reasoning` (`off`, `low`, `medium`, `high`; default `model_policy.reasoning`,
+else the model's default) goes as `caliban.reasoning` and the gateway maps it per model family, as
+for a client (Qwen3 `enable_thinking`, `reasoning_effort`; note 02, "When to Reason"): a
+classification step need not think at the model's default effort. `config.structured_output`:
+`json_schema` (the default) sends the vertex's `output_schema` (a router: an object whose `label` is
+one of its labels) as `response_format: {"type": "json_schema", ...}`, which vLLM and SGLang serve
+with guided decoding and OpenAI with structured outputs (non-strict, since strict mode accepts a
+subset of JSON Schema); `prompt` puts the schema in the system prompt only, for servers without
+guided decoding. The answer is validated against the schema either way (note 08: small models need
+constrained decoding for structured outputs).
 
 **Edges.** After a vertex, the first outgoing edge (in declaration order) whose `when` is absent or
 equals the label is taken; no matching edge ends the run with the last value. Fan-out happens only

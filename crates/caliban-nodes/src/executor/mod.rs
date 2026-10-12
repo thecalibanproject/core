@@ -1654,8 +1654,16 @@ impl Drop for AbortOnDrop {
 /// strengthens the tenant's protection). Bodies of nodes without guardrails are unchanged.
 pub(crate) fn guardrails(spec: &crate::NodeSpec, body: &mut Value) {
     if let Some(p) = spec.pii_guardrail() {
-        body["caliban"] = serde_json::json!({"pii_floor": p});
+        set_ext(body, "pii_floor", Value::String(p.to_owned()));
     }
+}
+
+/// Sets `caliban.<key>` on a chat request body.
+pub(crate) fn set_ext(body: &mut Value, key: &str, v: Value) {
+    if !body.get("caliban").is_some_and(Value::is_object) {
+        body["caliban"] = serde_json::json!({});
+    }
+    body["caliban"][key] = v;
 }
 
 pub fn idempotency_key(run_id: &str, step_id: &str) -> String {

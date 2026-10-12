@@ -26,7 +26,8 @@
         "candidates": { "type": "array", "items": { "type": "string" }, "description": "Model ids or tiers (tier:small, tier:frontier)" },
         "escalate_on": { "type": "array", "items": { "enum": ["schema_violation", "low_confidence", "tool_error"] } },
         "max_cost_usd": { "type": "number", "minimum": 0 },
-        "min_trust_tier": { "enum": ["t0_sovereign", "t1_attested", "t2_contracted", "t3_public"] }
+        "min_trust_tier": { "enum": ["t0_sovereign", "t1_attested", "t2_contracted", "t3_public"] },
+        "reasoning": { "enum": ["off", "low", "medium", "high"], "description": "Default reasoning effort of the node's model calls (a vertex's config.reasoning overrides it); mapped per model family by the gateway" }
       }
     },
     "tools": {
@@ -103,7 +104,14 @@
             "properties": {
               "id": { "type": "string" },
               "type": { "enum": ["llm", "tool", "router", "map", "reduce", "verify", "human", "subnode", "code"], "description": "code is not yet supported (refused at publish)" },
-              "config": { "type": "object" },
+              "config": {
+                "type": "object",
+                "description": "Per vertex type (docs/nodes.md). Model vertices (llm, router, verify, reduce with mode llm) also take reasoning and structured_output.",
+                "properties": {
+                  "reasoning": { "enum": ["off", "low", "medium", "high"], "description": "Reasoning effort of this vertex's model call, mapped per model family by the gateway (Qwen3 enable_thinking, reasoning_effort); overrides model_policy.reasoning" },
+                  "structured_output": { "enum": ["json_schema", "prompt"], "default": "json_schema", "description": "With an output_schema (llm, reduce) and for router labels: json_schema asks the server for constrained decoding (response_format json_schema; vLLM and SGLang guided decoding, OpenAI structured outputs); prompt puts the schema in the prompt only. The answer is validated either way." }
+                }
+              },
               "max_iterations": { "type": "integer", "minimum": 1 }
             }
           }

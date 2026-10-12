@@ -413,6 +413,74 @@ async fn guardrails_pii_reaches_every_model_call_as_a_floor() {
 }
 
 #[tokio::test]
+async fn vertices_set_reasoning_and_constrained_decoding() {
+    for j in journals().await {
+        let h = Harness::new(j);
+        let schema = json!({"type": "object", "required": ["n"], "properties": {"n": {"type": "integer"}}});
+        h.nodes.add(
+            "shaped",
+            1,
+            json!({
+                "kind": "workflow", "model_policy": {"reasoning": "low"}, "budgets": budgets(10, 100_000),
+                "graph": {"vertices": [
+                    {"id": "pick", "type": "router", "config": {"routes": {"a": "first", "b": "second"}, "reasoning": "off"}},
+                    {"id": "count", "type": "llm", "config": {"prompt": "{{input}}", "output_schema": schema}},
+                    {"id": "free", "type": "llm", "config": {"prompt": "x", "output_schema": schema, "structured_output": "prompt", "reasoning": "high"}}
+                ], "edges": [{"from": "pick", "to": "count", "when": "b"}, {"from": "count", "to": "free"}]}
+            }),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        let model = FakeModel::new(move |body| {
+            s2.lock().push(body.clone());
+            if body["response_format"]["json_schema"]["name"] == "pick" {
+                // A constrained answer: the label as JSON (the word "a" appears in no other form).
+                text("{\"label\": \"b\"}")
+            } else {
+                text("{\"n\": 3}")
+            }
+        });
+        let ex = h.executor(&model, "w1");
+        let v = run(&ex, "shaped", json!("x")).await;
+        assert_eq!(v.status, RunStatus::Succeeded, "{v:?}");
+        assert_eq!(v.output, Some(json!({"n": 3})));
+        let bodies = seen.lock().clone();
+        assert_eq!(bodies.len(), 3, "the router took the constrained label b");
+        // The router: its own reasoning, constrained to its labels.
+        assert_eq!(bodies[0]["caliban"]["reasoning"], "off");
+        assert_eq!(
+            bodies[0]["response_format"]["json_schema"]["schema"]["properties"]["label"]["enum"],
+            json!(["a", "b"])
+        );
+        // An llm vertex with an output schema: constrained, the node's default reasoning.
+        assert_eq!(bodies[1]["caliban"]["reasoning"], "low");
+        assert_eq!(bodies[1]["response_format"]["type"], "json_schema");
+        assert_eq!(bodies[1]["response_format"]["json_schema"]["schema"], schema);
+        // structured_output: prompt keeps the schema in the prompt only.
+        assert!(bodies[2].get("response_format").is_none());
+        assert_eq!(bodies[2]["caliban"]["reasoning"], "high");
+    }
+    // Unknown values are refused when the version is created.
+    for (spec, why) in [
+        (json!({"model_policy": {"reasoning": "max"}}), "model_policy: reasoning"),
+        (
+            json!({"graph": {"vertices": [{"id": "a", "type": "llm", "config": {"reasoning": "extreme"}}], "edges": []}}),
+            "config.reasoning",
+        ),
+        (
+            json!({"graph": {"vertices": [{"id": "a", "type": "llm", "config": {"structured_output": "grammar"}}], "edges": []}}),
+            "config.structured_output",
+        ),
+    ] {
+        let mut s = json!({"kind": "workflow", "budgets": {"steps": 1, "tokens": 10, "wall_clock_s": 1},
+                           "graph": {"vertices": [{"id": "a", "type": "llm"}], "edges": []}});
+        s.as_object_mut().unwrap().extend(spec.as_object().unwrap().clone());
+        let spec: crate::NodeSpec = serde_json::from_value(s).unwrap();
+        assert!(spec.validate().unwrap_err().to_string().contains(why), "{why}");
+    }
+}
+
+#[tokio::test]
 async fn a_loop_that_leaves_by_its_exit_edge_ends_without_a_stop_reason() {
     // The reference node's shape: `assess` loops through a question at most twice, then leaves by
     // its other edge. That is the loop working as designed, not a limit.

@@ -116,6 +116,16 @@ fn parse_node_ref(s: &str) -> Option<ToolTarget> {
     valid_node_name(name).then(|| ToolTarget::Node { name: name.to_owned(), version })
 }
 
+/// Reasoning efforts a node may ask for (mapped per model family by the gateway).
+pub const REASONING: &[&str] = &["off", "low", "medium", "high"];
+
+/// Whether a model vertex asks the server for constrained decoding of its structured output
+/// (`config.structured_output`: `json_schema`, the default, or `prompt`: the schema is only in the
+/// prompt, for servers without guided decoding).
+pub fn constrained(v: &Vertex) -> bool {
+    v.config.get("structured_output").and_then(serde_json::Value::as_str) != Some("prompt")
+}
+
 /// Node names: 1 to 64 characters of `[a-z0-9_-]`, starting with a letter or digit.
 pub fn valid_node_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -300,6 +310,8 @@ pub enum SpecError {
     BadTool(String),
     #[error("guardrails: {0}")]
     BadGuardrails(String),
+    #[error("model_policy: {0}")]
+    BadModelPolicy(String),
     #[error("{0}")]
     BadSchema(String),
 }
@@ -315,6 +327,11 @@ impl NodeSpec {
             return Err(SpecError::BadBudgets("usd must be a positive number".into()));
         }
         self.guards_checked()?;
+        if let Some(r) = self.reasoning()
+            && !r.as_str().is_some_and(|r| REASONING.contains(&r))
+        {
+            return Err(SpecError::BadModelPolicy("reasoning must be off, low, medium or high".into()));
+        }
         if let Some(g) = self.rest.get("guardrails").and_then(|g| g.get("pii"))
             && !g.as_str().is_some_and(|m| ["off", "mask", "reversible"].contains(&m))
         {
@@ -383,6 +400,12 @@ impl NodeSpec {
     /// strengthens the tenant's mode, never weakens it.
     pub fn pii_guardrail(&self) -> Option<&str> {
         self.rest.get("guardrails").and_then(|g| g.get("pii")).and_then(serde_json::Value::as_str)
+    }
+
+    /// `model_policy.reasoning` (`off`, `low`, `medium`, `high`): the default reasoning effort of
+    /// the node's model calls; a vertex's `config.reasoning` overrides it.
+    pub fn reasoning(&self) -> Option<&serde_json::Value> {
+        self.rest.get("model_policy").and_then(|m| m.get("reasoning"))
     }
 
     /// `prompt.system`, if any.
@@ -472,6 +495,14 @@ impl NodeSpec {
             }
         }
         let str_field = |k: &str| c.get(k).and_then(serde_json::Value::as_str);
+        if c.get("reasoning").is_some() && !str_field("reasoning").is_some_and(|r| REASONING.contains(&r)) {
+            return Err(bad("config.reasoning must be off, low, medium or high"));
+        }
+        if c.get("structured_output").is_some()
+            && !str_field("structured_output").is_some_and(|s| s == "json_schema" || s == "prompt")
+        {
+            return Err(bad("config.structured_output must be json_schema or prompt"));
+        }
         match kind {
             VertexKind::Code => return Err(SpecError::CodeNotSupported(v.id.clone())),
             VertexKind::Llm | VertexKind::Reduce => {}

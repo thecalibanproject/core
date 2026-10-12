@@ -113,6 +113,9 @@ pub(super) async fn run_agent_at(
             body["tools"] = Value::Array(functions.clone());
         }
         super::guardrails(spec, &mut body);
+        if let Some(r) = spec.reasoning() {
+            super::set_ext(&mut body, "reasoning", r.clone());
+        }
         let request = body.clone();
         let reply = super::consuming(
             seen.clone(),
