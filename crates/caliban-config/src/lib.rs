@@ -1717,22 +1717,38 @@ impl Snapshot {
     }
 }
 
-/// Shared, hot-swappable snapshot holder.
+/// Shared, hot-swappable snapshot holder. Every [`ConfigHandle::store`] is announced to
+/// [`ConfigHandle::subscribe`]rs, so work that depends on the snapshot (the router's kNN index)
+/// starts when a snapshot is applied, not on the next request.
 #[derive(Debug, Clone)]
-pub struct ConfigHandle(Arc<ArcSwap<Snapshot>>);
+pub struct ConfigHandle(Arc<HandleInner>);
+
+#[derive(Debug)]
+struct HandleInner {
+    snapshot: ArcSwap<Snapshot>,
+    changed: tokio::sync::watch::Sender<()>,
+}
 
 impl ConfigHandle {
     pub fn new(snapshot: Snapshot) -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(snapshot)))
+        let (changed, _) = tokio::sync::watch::channel(());
+        Self(Arc::new(HandleInner { snapshot: ArcSwap::from_pointee(snapshot), changed }))
     }
 
     pub fn load(&self) -> Arc<Snapshot> {
-        self.0.load_full()
+        self.0.snapshot.load_full()
     }
 
     /// Replace the snapshot. Callers validate before swapping; a failed reload keeps the old one.
     pub fn store(&self, snapshot: Snapshot) {
-        self.0.store(Arc::new(snapshot));
+        self.0.snapshot.store(Arc::new(snapshot));
+        self.0.changed.send_replace(());
+    }
+
+    /// Wakes (`changed().await`) after each later [`ConfigHandle::store`]; several stores between
+    /// two wake-ups are seen as one, so read the current snapshot with [`ConfigHandle::load`].
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.0.changed.subscribe()
     }
 }
 
