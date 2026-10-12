@@ -9,6 +9,13 @@
 //! the French NIR (15 characters, validated by its key, or accepted without it right after words
 //! that name it, since recall matters more than precision there: research note 05, section 1).
 //! Other formats come from a tenant's own pattern list ([`crate::TenantDetectors`]).
+//!
+//! Number boundaries: a card, IBAN, SSN, phone or NIR candidate that is part of a longer number
+//! is not one. A digit right next to it, or a decimal point joining it to digits (the fraction of
+//! `0.4111111111111111`, a relevance score), or an exponent (`1.5e-4111111111111111`), rejects
+//! it. Cards also need a major industry identifier of 2 to 6 (Mastercard 2 and 5, Amex, JCB and
+//! Diners 3, Visa 4, Discover and UnionPay 6): runs starting with 0, 1 (Unix timestamps in
+//! milliseconds or microseconds), 7, 8 or 9 are ids and amounts, not cards.
 
 use crate::{Detector, EntityType, Span};
 use regex::Regex;
@@ -44,7 +51,7 @@ impl PatternDetector {
             (EntityType::Secret, r(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), always),
             (EntityType::Email, r(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b"), always),
             (EntityType::Iban, r(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b"), iban_valid),
-            (EntityType::CreditCard, r(r"\b\d(?:[ -]?\d){12,18}\b"), luhn_valid),
+            (EntityType::CreditCard, r(r"\b\d(?:[ -]?\d){12,18}\b"), card_valid),
             (EntityType::UsSsn, r(r"\b\d{3}-\d{2}-\d{4}\b"), ssn_valid),
             (EntityType::Phone, r(r"\+\d{1,3}(?:[ .-]?\(?\d{1,4}\)?){2,5}\b"), phone_valid),
             (EntityType::Phone, r(r"(?:\(\d{3}\) ?|\b\d{3}-)\d{3}-\d{4}\b"), phone_valid),
@@ -77,7 +84,7 @@ impl Detector for PatternDetector {
         let mut out = Vec::new();
         for (entity, re, valid) in &self.rules {
             for m in re.find_iter(text) {
-                if valid(m.as_str()) {
+                if valid(m.as_str()) && !(numeric(entity) && inside_number(text, m.start(), m.end())) {
                     out.push(Span { start: m.start(), end: m.end(), entity: entity.clone() });
                 }
             }
@@ -88,12 +95,41 @@ impl Detector for PatternDetector {
             while !text.is_char_boundary(from) {
                 from -= 1;
             }
+            if inside_number(text, m.start(), m.end()) {
+                continue;
+            }
             if nir_valid(m.as_str()) || self.nir_context.is_match(&text[from..m.start()]) {
                 out.push(Span { start: m.start(), end: m.end(), entity: EntityType::NationalId });
             }
         }
         out
     }
+}
+
+/// Entities written as digits, which a longer number can contain.
+fn numeric(e: &EntityType) -> bool {
+    matches!(e, EntityType::CreditCard | EntityType::Iban | EntityType::UsSsn | EntityType::Phone)
+}
+
+/// Whether `text[start..end]` is part of a longer number: a digit right before or after it, a
+/// decimal point joining it to digits (`0.4111...`, `4111....5`), or an exponent (`1e-4111...`).
+fn inside_number(text: &str, start: usize, end: usize) -> bool {
+    let b = text.as_bytes();
+    let before = |k: usize| start.checked_sub(k).map(|i| b[i]);
+    let after = |k: usize| b.get(end + k - 1).copied();
+    let digit = |c: Option<u8>| c.is_some_and(|c| c.is_ascii_digit());
+    digit(before(1))
+        || digit(after(1))
+        || (before(1) == Some(b'.') && digit(before(2)))
+        || (after(1) == Some(b'.') && digit(after(2)))
+        || (matches!(before(1), Some(b'-' | b'+'))
+            && matches!(before(2), Some(b'e' | b'E'))
+            && (digit(before(3)) || before(3) == Some(b'.')))
+}
+
+/// A payment card: a major industry identifier of 2 to 6 and a valid Luhn check digit.
+fn card_valid(s: &str) -> bool {
+    s.bytes().next().is_some_and(|c| (b'2'..=b'6').contains(&c)) && luhn_valid(s)
 }
 
 /// The NIR (French social security number) key: `97 - (the first 13 characters mod 97)`, with
@@ -250,6 +286,63 @@ mod tests {
         ] {
             assert!(kinds(t).is_empty(), "{t}: {:?}", kinds(t));
         }
+    }
+
+    /// Digit runs inside a longer number are not cards, phones, IBANs, SSNs or NIRs: decimals
+    /// (relevance scores, coordinates, amounts), timestamps and ids. The fractions here are
+    /// Luhn-valid (or a valid NIR), so only the boundaries reject them.
+    #[test]
+    fn no_false_positives_inside_numbers() {
+        assert!(luhn_valid("0322580645161292") && luhn_valid("4111111111111111"));
+        for t in [
+            "score 0.0322580645161292",
+            "score 0.4111111111111111",
+            r#"{"score":0.4111111111111111,"rank":1}"#,
+            "12.4111111111111111",
+            "4111111111111111.25",
+            "4111111111111111.5 EUR",
+            "1.5e-4111111111111111",
+            "2.0E+4111111111111111",
+            "x=-0.4111111111111111",
+            "lat 33.0612345678, lng 35.4952471234",
+            "ratio 1.123-45-6789",
+            "0.2840675115042 63",
+            "v 3.0612345678",
+            "ts 1760000000000, 1760000000000000, 1760000000000000000",
+            "epoch_ms 1728475200123, 1734567890123457",
+            "ids 2026101400123, 98765432109876543, 7000000000000005, 9000000000000001",
+            "amounts 1 250,00 EUR, 12 345 678.90, 0.000000000000001",
+            "uuid 3f2b8c1e-4a5d-4e6f-9a7b-1c2d3e4f5a6b, ulid 01HZX4Y5R6T7Q8W9E0A1S2D3F4",
+        ] {
+            assert!(kinds(t).is_empty(), "{t}: {:?}", kinds(t));
+        }
+        assert!(luhn_valid("7000000000000005") && luhn_valid("1760000000000008"));
+        assert!(kinds("ts 1760000000000008").is_empty(), "Unix microseconds are not cards");
+    }
+
+    /// Real cards in text are still caught: spaced, dashed, or a plain run bounded by non-digits
+    /// (punctuation, quotes, letters).
+    #[test]
+    fn cards_in_prose_are_still_caught() {
+        for t in [
+            "card 4111 1111 1111 1111",
+            "card 4111-1111-1111-1111",
+            "card 4111111111111111.",
+            "card: 4111111111111111, exp 12/27",
+            "the number was 5500005555555559 thanks",
+            "Amex 3782 822463 10005",
+            "\"4111111111111111\"",
+            "(4111111111111111)",
+            "carte n°4111111111111111",
+            "Mastercard 2221000000000009",
+        ] {
+            assert_eq!(kinds(t), vec![EntityType::CreditCard], "{t}");
+        }
+        // Other numeric entities next to ordinary punctuation are still found.
+        assert_eq!(kinds("tél. 06 12 34 56 78."), vec![EntityType::Phone]);
+        assert_eq!(kinds("ssn 123-45-6789."), vec![EntityType::UsSsn]);
+        assert_eq!(kinds("iban DE89 3704 0044 0532 0130 00."), vec![EntityType::Iban]);
+        assert_eq!(kinds("NIR: 2 84 06 75 115 042 63."), vec![EntityType::NationalId]);
     }
 
     #[test]
