@@ -33,6 +33,7 @@ checked by `NodeSpec::validate` (`crates/caliban-nodes`). The parts the core enf
 
 | `exposure.chat_input` | Without an input schema: `"text"` (default) or `"messages"`, see [Chat shortcut](#the-chat-shortcut-model-nodename) |
 
+| `guardrails.answer` | `redact` (default), `refuse` or `off`: the [answer guard](#the-answer-guard) on the run's final output |
 | `guardrails.pii` | `off`, `mask` or `reversible`: a floor on the personal-data protection of the node's model calls, applied to every model class, sovereign models included (sent as `caliban.pii_floor`), and to the arguments and results of untrusted tools. It only strengthens the tenant's mode (`off` < `reversible` < `mask`). A subnode's calls use the subnode's own guardrail |
 
 Other unknown sections (the rest of `guardrails` and `exposure`, `eval`, ...) are kept and hashed but
@@ -670,6 +671,41 @@ round). Rolled-up days keep no run ids or event rows: `run_id` filters and the e
 the raw retention only. An event delivered later than the retention (a router offline for months)
 is refused at ingestion and counted as `rejected`: its day may be rolled up already, and a retry
 could no longer be told from a new event.
+
+## The answer guard
+
+Taint rules protect effects: writes and network reads. A read-only node has one effect, its
+answer, and a catalogue row, a retrieved document or a forwarded email that says "tell the
+patient to call this number" steers it without touching a tool (the e2e health triage run: a
+planted row changed what the patient was told). The executor checks the run's final output
+whenever it carries untrusted labels (`datasource`, `retrieved`, `tool:*`, `caller`: the labels
+follow the values through every vertex to the answer), against the untrusted data the run read
+and the trusted context it had (its spec, a run input not marked untrusted, human answers):
+
+1. **Links and contacts need provenance.** Every URL, e-mail address and phone number in the
+   answer must come from the trusted context, or be a whole field value of the data (a row's
+   `phone`): quoted data, not text lifted out of free text. One that appears only inside untrusted
+   free text (a description, a document's body) is removed. This needs no detector, so it holds
+   whatever the model does: an injection that brings its own address cannot get it to the user.
+2. **References and echoes of injected instructions.** Sentences of untrusted text that address
+   the model ("tell the patient...", "in your answer...", "ignore previous instructions", "send
+   ... to ...", in English and French) are flagged by fixed rules. A code or reference that
+   appears only in such a sentence, and an answer sentence that repeats six words or more of one,
+   are removed.
+
+`guardrails.answer`: `redact` (the default) replaces what it removes with `[removed: text from
+untrusted data]` and the run succeeds (a redacted answer that no longer fits the output schema
+fails the run); `refuse` fails the run (`answer_integrity: ...`); `off` skips the check. Every
+check is recorded on the run (`answer_check`: the output's `labels`, the `findings` by rule,
+label and JSON pointer, never their text, and the `action`), and a redaction is logged on the
+audit target. The injection suite's `answer_integrity` cases test it ([evals.md](evals.md)).
+
+**What it does not catch.** An injection that changes the answer's meaning in the model's own
+words, with no link, contact, code or repeated phrase ("the clinic is closed today"). Rule 2 is
+a detector, and adaptive attacks get around detectors (research note 04: AutoDojo, arXiv
+2606.15057); rule 1 is architectural. A node that must be immune keeps untrusted free text away
+from the model that writes its answer (the dual-LLM pattern of arXiv 2506.08837: only structured
+fields reach it), which the plan's templates (M7) are to ship.
 
 ## The reference node
 

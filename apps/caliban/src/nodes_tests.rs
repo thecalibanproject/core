@@ -219,9 +219,21 @@ pub(crate) async fn send(
 }
 
 impl Env {
-    /// Creates, publishes and promotes a version of `name`.
+    /// Creates, publishes and promotes a version of `name`. These tests are not about evals: the
+    /// node's policy makes the injection eval optional for read-only versions (a version with
+    /// write tools still needs one).
     pub(crate) async fn publish(&self, name: &str, spec: Value) {
+        self.read_only_evals_optional(name).await;
         self.publish_with(name, spec, true).await;
+    }
+
+    /// The node's eval policy: read-only versions promote without an injection eval.
+    pub(crate) async fn read_only_evals_optional(&self, name: &str) {
+        let uri = format!("/api/v1/tenants/acme/nodes/{name}/eval-policy");
+        let policy = json!({"injection": {"min_pass_rate": 1.0, "read_only": "optional"}});
+        let (s, v) = send(&self.cp_app, "PUT", &uri, ADMIN, Some(policy), &[]).await;
+        // A control plane without a journal has no evals (and gates no read-only version).
+        assert!(s == StatusCode::OK || s == StatusCode::SERVICE_UNAVAILABLE, "{s} {v}");
     }
 
     /// Creates and publishes a version of `name` (promoted when `promote`; a version with write

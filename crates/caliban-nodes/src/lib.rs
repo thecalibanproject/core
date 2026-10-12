@@ -332,6 +332,11 @@ impl NodeSpec {
         {
             return Err(SpecError::BadModelPolicy("reasoning must be off, low, medium or high".into()));
         }
+        if let Some(a) = self.rest.get("guardrails").and_then(|g| g.get("answer"))
+            && !a.as_str().is_some_and(executor::answer::Mode::valid)
+        {
+            return Err(SpecError::BadGuardrails("answer must be redact, refuse or off".into()));
+        }
         if let Some(g) = self.rest.get("guardrails").and_then(|g| g.get("pii"))
             && !g.as_str().is_some_and(|m| ["off", "mask", "reversible"].contains(&m))
         {

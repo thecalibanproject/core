@@ -336,6 +336,8 @@ pub(crate) async fn gate(cp: &Cp, n: &NodeRecord) -> Result<Option<Value>, NodeE
 /// The gate of one version on its own evals (not its subnodes').
 async fn own_gate(cp: &Cp, n: &NodeRecord) -> Result<Option<Value>, NodeError> {
     let spec = spec_of(n)?;
+    // Without a journal there are no evals: versions with write tools cannot be promoted; read-only
+    // versions can (a control plane without a database runs no nodes of its own).
     let Some(j) = cp.journal() else {
         if eval::has_write_tools(&spec) {
             return Err(NodeError::Api(ApiError(
@@ -348,8 +350,12 @@ async fn own_gate(cp: &Cp, n: &NodeRecord) -> Result<Option<Value>, NodeError> {
         return Ok(None);
     };
     let (policy, _) = policy_of(&j, &n.tenant_id, &n.name).await?;
-    if policy.golden.is_none() && !eval::has_write_tools(&spec) {
-        return Ok(None);
+    if policy.golden.is_none() && !eval::needs_injection_eval(&policy, &spec) {
+        // Nothing gates it, unless a finished injection eval says otherwise.
+        let injection = latest(&j, &n.tenant_id, &n.name, n.version, Suite::Injection).await?;
+        if injection.is_none() {
+            return Ok(None);
+        }
     }
     let golden = latest(&j, &n.tenant_id, &n.name, n.version, Suite::Golden).await?;
     let injection = latest(&j, &n.tenant_id, &n.name, n.version, Suite::Injection).await?;
@@ -373,14 +379,18 @@ pub(crate) async fn get_gate(
 ) -> ApiResult<Json<Value>> {
     crate::ensure_tenant(&cp, &tenant_id)?;
     let n = version_of(&cp.store.state(), &tenant_id, &name, version)?;
-    let write = eval::has_write_tools(&spec_of(&n)?);
+    let spec = spec_of(&n)?;
+    let write = eval::has_write_tools(&spec);
+    let reads = eval::has_untrusted_reads(&spec);
     let (allowed, evidence, problems) = match gate(&cp, &n).await {
         Ok(e) => (true, e, vec![]),
         Err(NodeError::Problems(_, p)) => (false, None, p),
         Err(NodeError::Api(e)) => return Err(e),
     };
-    Ok(Json(json!({"node": name, "version": version, "has_write_tools": write, "allowed": allowed,
-                   "evidence": evidence, "problems": problems})))
+    Ok(Json(
+        json!({"node": name, "version": version, "has_write_tools": write, "has_untrusted_reads": reads, "allowed": allowed,
+                   "evidence": evidence, "problems": problems}),
+    ))
 }
 
 // ───────────────────────────── eval runs ─────────────────────────────

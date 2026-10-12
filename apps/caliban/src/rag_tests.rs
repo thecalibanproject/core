@@ -307,6 +307,7 @@ async fn documents_are_ingested_indexed_and_searched_by_a_node() {
     // other datasources cannot search.
     let mut bad = spec.clone();
     bad["datasources"]["scopes"] = json!(["rag.other:read"]);
+    e.read_only_evals_optional("other").await;
     let (s, v) =
         send(&e.cp_app, "POST", "/api/v1/tenants/acme/nodes/other/versions", ADMIN, Some(json!({"spec": bad})), &[])
             .await;

@@ -1318,6 +1318,7 @@ paths:
                   node: { type: string }
                   version: { type: integer }
                   has_write_tools: { type: boolean }
+                  has_untrusted_reads: { type: boolean, description: 'Read tools that bring data in (MCP, datasource_query, rag_search): the version is gated on an injection eval unless the policy makes it optional' }
                   allowed: { type: boolean }
                   evidence: { oneOf: [ { $ref: '#/components/schemas/GateEvidence' }, { type: 'null' } ], description: 'The evals that meet the bar; null when no gate applies' }
                   problems:
@@ -3447,6 +3448,7 @@ components:
           required: [min_pass_rate]
           properties:
             min_pass_rate: { type: number, minimum: 0, maximum: 1, description: 'Least share of attacks blocked. Default 1 (every attack). An injection eval is required for versions with write tools whatever the bar.' }
+            read_only: { type: string, enum: [required, optional], default: required, description: 'Read-only versions (read tools, no write tool): `required` gates them on an injection eval too (their answer can be steered by what they read); `optional` lets them promote without one. A finished injection eval is checked against the bar either way.' }
     EvalPolicyView:
       type: object
       required: [object, node, policy, injection_bar]
@@ -3454,7 +3456,7 @@ components:
         object: { type: string, enum: [node.eval_policy] }
         node: { type: string }
         policy: { $ref: '#/components/schemas/EvalPolicy' }
-        injection_bar: { type: number, description: 'The injection bar in effect for versions with write tools (default 1)' }
+        injection_bar: { type: number, description: 'The injection bar in effect for versions with write tools and read-only versions (default 1)' }
         updated_at: { type: [string, 'null'], format: date-time }
         updated_by: { type: [string, 'null'] }
     GateEvidence:
@@ -3685,6 +3687,20 @@ components:
             fanout_used: { type: integer, description: 'Widest map reached' }
         cost_usd: { type: number, description: 'What the run spent on model calls so far (USD): the sum of `charged_usd` over its usage events. For a run `caliban/auto` started, the flat auto price.' }
         model_cost_usd: { type: number, description: 'The real cost of the models its calls were routed to; equals `cost_usd` unless the run is billed as `caliban/auto`.' }
+        answer_check:
+          type: object
+          description: 'The answer guard (docs/nodes.md): present when the final output carried untrusted labels.'
+          properties:
+            labels: { type: array, items: { type: string } }
+            findings:
+              type: array
+              items:
+                type: object
+                properties:
+                  rule: { type: string, enum: [untrusted_link, untrusted_contact, untrusted_reference, instruction_echo] }
+                  label: { type: string }
+                  at: { type: string, description: 'JSON pointer into the output' }
+            action: { type: string, enum: [passed, redacted, refused] }
         usage: { $ref: '#/components/schemas/RunUsage' }
         steps:
           type: array

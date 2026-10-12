@@ -281,6 +281,21 @@ pub fn has_write_tools(spec: &NodeSpec) -> bool {
     spec.tools.iter().any(|t| t.effect == Effect::Write)
 }
 
+/// Read tools that bring untrusted data into the run (MCP tools, `builtin://datasource_query`,
+/// `builtin://rag_search`; a `node://` tool is gated as its own version).
+pub fn has_untrusted_reads(spec: &NodeSpec) -> bool {
+    spec.tools.iter().any(|t| t.effect == Effect::Read && !t.reference.starts_with("node://"))
+}
+
+/// Whether promoting a version needs an injection eval under `policy`: it has write tools, or
+/// read tools whose data can steer its answer (the suite's `answer_integrity` cases), unless the
+/// node's policy exempts read-only versions.
+pub fn needs_injection_eval(policy: &EvalPolicy, spec: &NodeSpec) -> bool {
+    has_write_tools(spec)
+        || (has_untrusted_reads(spec)
+            && policy.injection.as_ref().is_none_or(|i| i.read_only != ReadOnlyGate::Optional))
+}
+
 /// The promotion bar of a node.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -321,6 +336,25 @@ pub struct GoldenBar {
 pub struct InjectionBar {
     /// Least share of the suite's attacks blocked, 0 to 1. An injection eval is still required.
     pub min_pass_rate: f64,
+    /// Read-only versions (read tools, no write tool): `required` (the default) gates them on an
+    /// injection eval like versions with write tools (their answer is their effect); `optional`
+    /// lets them promote without one (a finished one is still checked against the bar).
+    #[serde(default, skip_serializing_if = "ReadOnlyGate::is_default")]
+    pub read_only: ReadOnlyGate,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadOnlyGate {
+    #[default]
+    Required,
+    Optional,
+}
+
+impl ReadOnlyGate {
+    fn is_default(&self) -> bool {
+        *self == ReadOnlyGate::Required
+    }
 }
 
 impl EvalPolicy {
@@ -408,13 +442,17 @@ pub fn gate(
             }
         }
     }
-    if has_write_tools(spec) {
+    // Versions with write tools, and read-only versions whose data can steer their answer: an
+    // injection eval that meets the bar. A finished one of a version that needs none is checked too.
+    let needed = needs_injection_eval(policy, spec);
+    let finished = usable(injection, Suite::Injection, spec_hash);
+    if needed || finished.is_some() {
         let bar = policy.injection_bar();
-        match usable(injection, Suite::Injection, spec_hash) {
-            None => problems.push(
-                "a version with write tools needs a finished injection eval before it is promoted (POST .../evals {\"suite\": \"injection\"})"
-                    .to_owned(),
-            ),
+        match finished {
+            None => problems.push(format!(
+                "a version with {} needs a finished injection eval before it is promoted (POST .../evals {{\"suite\": \"injection\"}})",
+                if has_write_tools(spec) { "write tools" } else { "read tools (its answer can be steered by what they read)" }
+            )),
             Some((e, s)) => {
                 let rate = s["pass_rate"].as_f64().unwrap_or(0.0);
                 if rate < bar {

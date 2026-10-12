@@ -19,6 +19,7 @@
 //! execution time only (not time spent waiting for a human or a timer).
 
 mod agent;
+pub mod answer;
 pub mod breaker;
 mod graph;
 pub mod taint;
@@ -298,6 +299,11 @@ pub struct RunView {
     /// Taint labels the run input carries from the start (`caller`: it holds untrusted caller
     /// data). `pii` is found when the run executes and shows on its steps.
     pub input_labels: Vec<String>,
+    /// The answer guard's check of the final output (when it carried untrusted labels): the
+    /// output's `labels`, the `findings` removed (rule, label, where) and the `action`
+    /// (`passed`, `redacted`, `refused`). See [`answer`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer_check: Option<Value>,
     /// A cancellation was asked for and the run has not stopped yet.
     pub cancel_requested: bool,
     /// The number of the run's last event (`GET /v1/runs/{id}/events?after=` resumes there).
@@ -660,6 +666,10 @@ impl Executor {
         let output = open(&r.output)?.map(|o| serde_json::from_str(&o).unwrap_or(Value::String(o)));
         let question = open(&r.prompt)?;
         let usage = RunUsage::of(&steps);
+        let answer_check = match self.journal.event(run_id, answer::EVENT).await? {
+            Some(ev) => open(&ev.payload)?.and_then(|s| serde_json::from_str(&s).ok()),
+            None => None,
+        };
         Ok(Some(RunView {
             id: r.id.clone(),
             object: "node.run",
@@ -680,6 +690,7 @@ impl Executor {
             claims: r.claims,
             origin: r.origin.clone(),
             input_labels: r.input_labels.clone(),
+            answer_check,
             cancel_requested: r.cancel_requested_at.is_some() && !r.status.is_terminal(),
             last_event: r.last_event,
             created_at: r.created_at,
@@ -825,26 +836,98 @@ impl Executor {
             NodeKind::Agent => {
                 agent::run_agent_at(&cx, &cx.root, cx.input.clone(), input_taint, "", &cx.ledger, 0).await
             }
-        }
-        .map(|(v, _)| v);
-        let result = result.and_then(|out| match cx.root.spec.output_schema() {
+        };
+        let result = result.and_then(|(out, labels)| match cx.root.spec.output_schema() {
             Some(s) => {
                 let v = match &out {
                     Value::String(t) => template::extract_json(t).unwrap_or(out.clone()),
                     other => other.clone(),
                 };
                 crate::schema::validate(s, &v)
-                    .map(|()| v)
+                    .map(|()| (v, labels))
                     .map_err(|e| Stop::Fail(format!("the run's output does not match prompt.output_schema: {e}")))
             }
-            None => Ok(out),
+            None => Ok((out, labels)),
         });
+        // What the node tells its user cannot be steered by data it read (`answer`).
+        let result = match result {
+            Ok((out, labels)) => self.guard_answer(&cx, out, &labels).await,
+            Err(e) => Err(e),
+        };
         let budget = cx.budget_state();
         let partial = cx.last.lock().clone();
         let note = cx.note.lock().clone();
         match result {
             Ok(out) => self.end(&id, &cx.run.tenant_id, Stop::Done(out, note), None, budget).await,
             Err(stop) => self.end(&id, &cx.run.tenant_id, stop, partial, budget).await,
+        }
+    }
+
+    /// The answer guard on a run's final output that carries untrusted labels (see [`answer`]):
+    /// records the check as an observation, and redacts or refuses as `guardrails.answer` says.
+    async fn guard_answer(&self, cx: &RunCx, out: Value, labels: &taint::Taint) -> Result<Value, Stop> {
+        let mode = answer::Mode::of(&cx.root.spec);
+        if mode == answer::Mode::Off || taint::untrusted(labels).is_empty() {
+            return Ok(out);
+        }
+        let tenant = cx.tenant();
+        let run_id = &cx.run.id;
+        let steps = self.journal.steps(run_id).await.map_err(|e| Stop::Fail(e.to_string()))?;
+        let mut corpus = answer::Corpus::default();
+        // Trusted: the specs the run started on, a trusted input, human answers.
+        corpus.add_trusted(&serde_json::to_value(&cx.root.spec).unwrap_or_default());
+        for n in cx.pinned.values() {
+            corpus.add_trusted(&serde_json::to_value(&n.spec).unwrap_or_default());
+        }
+        if cx.run.input_labels.iter().any(|l| l == taint::CALLER) {
+            corpus.add_untrusted(&cx.input, &[taint::CALLER.to_owned()].into_iter().collect());
+        } else {
+            corpus.add_trusted(&cx.input);
+        }
+        for s in steps.iter().filter(|s| s.kind == "tool" || s.kind == "human") {
+            let Some(sealed) = &s.result else { continue };
+            let body = self.sealer.open(tenant, run_id, sealed).map_err(Stop::Fail)?;
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let output = v.get("output").cloned().unwrap_or(Value::Null);
+            if s.kind == "human" {
+                corpus.add_trusted(&output);
+            } else {
+                corpus.add_untrusted(&output, &s.labels.iter().cloned().collect());
+            }
+        }
+        let (checked, findings) = answer::check(&out, &corpus);
+        let rec = answer::record(labels, &findings, mode);
+        let sealed = self.sealer.seal(tenant, run_id, &rec.to_string()).map_err(Stop::Fail)?;
+        self.journal
+            .put_event(tenant, run_id, answer::EVENT, crate::journal::EventKind::Observation, Some(sealed))
+            .await
+            .map_err(|e| Stop::Fail(e.to_string()))?;
+        if findings.is_empty() {
+            return Ok(out);
+        }
+        tracing::warn!(target: "caliban::audit", tenant, run = %run_id, findings = findings.len(),
+            rules = ?findings.iter().map(|f| f.rule).collect::<Vec<_>>(), "the answer carried text from untrusted data");
+        match mode {
+            answer::Mode::Refuse => Err(Stop::Fail(format!(
+                "answer_integrity: the answer carried {} item(s) that only untrusted data ({}) supplied; refused by guardrails.answer",
+                findings.len(),
+                findings
+                    .iter()
+                    .map(|f| f.label.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+            _ => match cx.root.spec.output_schema() {
+                // Redacted text must still fit the node's output schema, or the run fails closed.
+                Some(s) => crate::schema::validate(s, &checked).map(|()| checked).map_err(|e| {
+                    Stop::Fail(format!(
+                        "answer_integrity: the redacted answer no longer matches prompt.output_schema: {e}"
+                    ))
+                }),
+                None => Ok(checked),
+            },
         }
     }
 

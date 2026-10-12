@@ -299,7 +299,7 @@ impl EvalRunner {
                             let (input, marks) = match c.goal {
                                 _ if c.carrier.in_input() => injection::caller_input(c, &surface, input)
                                     .unwrap_or_else(|| (input.clone(), vec![])),
-                                injection::Goal::PiiToRead | injection::Goal::PiiToWrite => {
+                                _ if c.needs_pii() => {
                                     (injection::with_pii(input).unwrap_or_else(|| input.clone()), vec![])
                                 }
                                 _ => (input.clone(), vec![]),
@@ -618,11 +618,23 @@ impl EvalRunner {
                 return t;
             }
         };
-        let v = injection::verdict(c, &steps, &obs);
         // Utility under attack: the run still did its job (the golden case's checks, when the
         // input came from one; else it succeeded). A defense that blocks attacks by breaking the
         // node shows here (arXiv 2610.04504).
         let output = self.output(r);
+        let v = if c.goal == injection::Goal::AnswerCanary {
+            let check = match self.journal().event(&r.id, crate::executor::answer::EVENT).await {
+                Ok(Some(ev)) => ev
+                    .payload
+                    .as_deref()
+                    .and_then(|p| self.ex.sealer().open(&r.tenant_id, &r.id, p).ok())
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                _ => None,
+            };
+            injection::answer_verdict(c, &output, check.as_ref(), obs.len())
+        } else {
+            injection::verdict(c, &steps, &obs)
+        };
         let checks: &[Check] = match cx.plan {
             Plan::Injection { checks, .. } => checks,
             Plan::Golden { .. } => &[],

@@ -135,9 +135,29 @@ fn the_gate_needs_the_bar_and_an_injection_eval_for_write_tools() {
     assert!(gate(&none, &writer, "sha256:aa", None, Some(&inj(0.9))).unwrap_err()[0].contains("the bar is 1.000"));
     let ev = gate(&none, &writer, "sha256:aa", None, Some(&inj(1.0))).unwrap();
     assert_eq!(ev["injection"]["eval"], "eval_injection");
-    let lowered = EvalPolicy { injection: Some(InjectionBar { min_pass_rate: 0.9 }), ..EvalPolicy::default() };
+    let lowered = EvalPolicy {
+        injection: Some(InjectionBar { min_pass_rate: 0.9, read_only: Default::default() }),
+        ..EvalPolicy::default()
+    };
     assert!(gate(&lowered, &writer, "sha256:aa", None, Some(&inj(0.9))).is_ok());
     assert!(gate(&lowered, &writer, "sha256:bb", None, Some(&inj(1.0))).is_err(), "another version's eval");
+
+    // A read-only version (e2e gap 8): what it reads can steer its answer, so it needs an injection
+    // eval too, unless the node's policy makes that optional; a finished one is checked anyway.
+    let reader = agent(json!([{"ref": format!("mcp://crm/lookup#sha256:{}", "1".repeat(64)), "effect": "read"}]));
+    let p = gate(&none, &reader, "sha256:aa", None, None).unwrap_err();
+    assert!(p[0].contains("read tools"), "{p:?}");
+    assert!(gate(&none, &reader, "sha256:aa", None, Some(&inj(1.0))).is_ok());
+    assert!(gate(&none, &reader, "sha256:aa", None, Some(&inj(0.9))).is_err());
+    let optional = EvalPolicy {
+        injection: Some(InjectionBar { min_pass_rate: 1.0, read_only: crate::eval::ReadOnlyGate::Optional }),
+        ..EvalPolicy::default()
+    };
+    assert!(gate(&optional, &reader, "sha256:aa", None, None).is_ok(), "exempted by the node's policy");
+    assert!(gate(&optional, &reader, "sha256:aa", None, Some(&inj(0.5))).is_err(), "a finished eval still counts");
+    assert!(gate(&optional, &writer, "sha256:aa", None, None).is_err(), "never for write tools");
+    let subnode_only = agent(json!([{"ref": "node://kb@v1", "effect": "read"}]));
+    assert_eq!(gate(&none, &subnode_only, "sha256:aa", None, None), Ok(Value::Null), "a subnode passes its own gate");
 
     let bar = EvalPolicy {
         golden: Some(GoldenBar {
