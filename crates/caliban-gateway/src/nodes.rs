@@ -106,7 +106,12 @@ impl ModelClient for GatewayModels {
             .filter(|o| *o == "auto" || o.starts_with("auto:"))
             .map(|_| format!("node/{}@v{}", ctx.node, ctx.node_version));
         let node = NodeTag { node: ctx.node.clone(), version: ctx.node_version, run_id: ctx.run_id.clone(), route };
-        req.extensions_mut().insert(InternalCaller { tenant: ctx.tenant.clone(), key_hash, node: Some(node) });
+        req.extensions_mut().insert(InternalCaller {
+            tenant: ctx.tenant.clone(),
+            key_hash,
+            node: Some(node),
+            purpose: None,
+        });
         let resp = crate::app(gw).oneshot(req).await.map_err(|e| ModelError::Unavailable(e.to_string()))?;
         let status = resp.status();
         let headers = resp.headers().clone();

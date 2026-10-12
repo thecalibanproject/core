@@ -200,7 +200,8 @@ impl Indexer {
         // What is indexed: heading path + text, personal data pseudonymised.
         let indexed: Vec<String> = chunks.iter().map(|c| c.indexed_text(title.as_deref())).collect();
         let (protected, pii_entities) = self.services.protect(tenant, indexed).await?;
-        let scope = CallScope { tenant: tenant.to_owned(), ..CallScope::default() };
+        let scope =
+            CallScope { tenant: tenant.to_owned(), purpose: crate::CallPurpose::Ingest, ..CallScope::default() };
         let mut dense: Vec<Vec<f32>> = Vec::with_capacity(protected.len());
         for batch in protected.chunks(EMBED_BATCH) {
             let v = self.services.embed(&scope, &collection.embedding_model, batch).await?;

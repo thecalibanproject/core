@@ -416,6 +416,7 @@ mod tests {
             run_id: None,
             route: None,
             route_fallback: None,
+            purpose: None,
         }
     }
 

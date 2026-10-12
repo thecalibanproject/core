@@ -59,6 +59,8 @@ pub(crate) struct Outcome {
     /// A `caliban/auto` request of a tenant that maps intents to nodes, answered by a model: why
     /// it did not go to a node (`x-caliban-route-fallback`, the usage event's `route_fallback`).
     pub auto_fallback: Option<&'static str>,
+    /// An internal call's purpose (`rag.ingest`, `rag.search`), from its [`auth::InternalCaller`].
+    pub purpose: Option<&'static str>,
 }
 
 /// Entry point for both chat dialects.
@@ -329,6 +331,7 @@ async fn run(
             client_usage,
             node: internal.and_then(|i| i.node.clone()),
             auto_fallback,
+            purpose: internal.and_then(|i| i.purpose),
         };
 
         if let Some(k) = &key {
@@ -735,6 +738,7 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
             .and_then(|n| n.route.clone())
             .or_else(|| o.auto_fallback.map(|_| format!("model:{}", o.model.id))),
         route_fallback: o.auto_fallback.map(str::to_owned),
+        purpose: o.purpose.map(str::to_owned),
     };
     let billed = if auto.is_some() { event.billed_usd } else { cost };
     gw.usage.record(event).await;

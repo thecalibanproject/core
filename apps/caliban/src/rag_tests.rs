@@ -249,6 +249,14 @@ async fn documents_are_ingested_indexed_and_searched_by_a_node() {
     // embedder never saw the email in the document.
     let ingest_usage: Vec<_> = w.usage.snapshot(Some("acme"), 100);
     assert!(ingest_usage.iter().any(|u| u.model == "oa/emb" && u.node.is_none()), "{ingest_usage:?}");
+    // Labelled as retrieval's indexing, not as the tenant's own embedding calls.
+    assert!(
+        ingest_usage
+            .iter()
+            .filter(|u| u.model == "oa/emb")
+            .all(|u| u.purpose.as_deref() == Some("rag.ingest") && u.intent == "rag.ingest"),
+        "{ingest_usage:?}"
+    );
     let embedded: Vec<String> =
         e.mock.log().iter().filter(|x| x.path == "/v1/embeddings").map(|x| x.body.to_string()).collect();
     assert!(!embedded.is_empty());
@@ -289,6 +297,11 @@ async fn documents_are_ingested_indexed_and_searched_by_a_node() {
     assert!(run_usage.iter().any(|u| u.model == "oa/emb"), "{run_usage:?}");
     assert!(run_usage.iter().any(|u| u.model == "oa/rr"), "{run_usage:?}");
     assert!(run_usage.iter().all(|u| u.node.as_deref() == Some("helpdesk")));
+    // The search's calls are labelled `rag.search`; the node's model calls carry no purpose.
+    for u in &run_usage {
+        let want = (u.model == "oa/emb" || u.model == "oa/rr").then_some("rag.search");
+        assert_eq!(u.purpose.as_deref(), want, "{u:?}");
+    }
 
     // Scopes: a collection the tenant does not have cannot be published; a key restricted to
     // other datasources cannot search.

@@ -109,7 +109,8 @@ async fn run(
         request_id,
         tenant_id: tenant.id.to_string(),
         model,
-        intent: "embedding".into(),
+        // Retrieval's own embedding calls are labelled by what they do, not as client embeddings.
+        intent: internal.as_ref().and_then(|i| i.purpose).unwrap_or("embedding").into(),
         cache: CacheStatus::Bypass,
         cache_tier: None,
         pii_entities: entities,
@@ -119,6 +120,7 @@ async fn run(
         est_prompt_tokens: est,
         route: None,
         client_usage: true,
+        purpose: internal.as_ref().and_then(|i| i.purpose),
         node: internal.and_then(|i| i.node),
         auto_fallback: None,
     };

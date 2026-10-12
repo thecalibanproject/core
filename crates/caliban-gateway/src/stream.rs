@@ -921,6 +921,7 @@ trust_tier = "t2_contracted"
             client_usage,
             node: None,
             auto_fallback: None,
+            purpose: None,
         }
     }
 

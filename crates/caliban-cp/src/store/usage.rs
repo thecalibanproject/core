@@ -148,6 +148,14 @@ impl UsageFilter {
     }
 }
 
+/// Totals of the work Caliban did on the tenant's behalf, per purpose (`rag.ingest`,
+/// `rag.search`): retrieval spend, separable from the tenant's own calls.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct PurposeUsage {
+    pub purpose: String,
+    pub totals: UsageTotals,
+}
+
 /// Totals of one node version's runs.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct NodeUsage {
@@ -214,6 +222,8 @@ pub struct UsageReport {
     pub events: Vec<UsageEvent>,
     pub totals: UsageTotals,
     pub by_node: Vec<NodeUsage>,
+    /// Internal work per purpose (events with a `purpose`; client and node model calls have none).
+    pub by_purpose: Vec<PurposeUsage>,
     pub by_route: Vec<RouteCount>,
 }
 
@@ -269,10 +279,20 @@ impl MemoryUsage {
             .into_iter()
             .map(|((node, node_version), ev)| NodeUsage { node, node_version, totals: UsageTotals::from_events(&ev) })
             .collect();
+        let mut purposes: std::collections::BTreeMap<String, Vec<UsageEvent>> = Default::default();
+        for e in &all {
+            if let Some(p) = &e.purpose {
+                purposes.entry(p.clone()).or_default().push(e.clone());
+            }
+        }
+        let by_purpose = purposes
+            .into_iter()
+            .map(|(purpose, ev)| PurposeUsage { purpose, totals: UsageTotals::from_events(&ev) })
+            .collect();
         let by_route = if f.node.is_some() || f.run_id.is_some() { vec![] } else { route_counts(all.iter()) };
         all.truncate(f.limit);
         all.iter_mut().for_each(strip_routing);
-        UsageReport { events: all, totals, by_node, by_route }
+        UsageReport { events: all, totals, by_node, by_purpose, by_route }
     }
 }
 

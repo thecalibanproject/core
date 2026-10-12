@@ -121,6 +121,7 @@ impl GatewayRag {
             tenant: scope.tenant.clone(),
             key_hash: scope.key_hash.clone().unwrap_or_default(),
             node,
+            purpose: Some(scope.purpose.as_str()),
         });
         let resp = crate::app(gw).oneshot(req).await.map_err(|e| RagError::Unavailable(e.to_string()))?;
         let status = resp.status();
@@ -381,6 +382,7 @@ impl Tool for RagSearch {
             key_hash: Some(key),
             node: Some(NodeCall { node: ctx.node.clone(), version: ctx.node_version, run_id: ctx.run_id.clone() }),
             idempotency_key: Some(ctx.idempotency_key.clone()),
+            purpose: caliban_rag::CallPurpose::Search,
         };
         let a = SearchArgs { query, k, max_tokens, doc_id, evidence, now: chrono::Utc::now().timestamp() };
         let out = retriever.search(&scope, &collections, &a).await.map_err(|e| match e {

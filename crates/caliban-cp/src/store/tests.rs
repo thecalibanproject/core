@@ -1477,10 +1477,18 @@ async fn usage_by_node(s: &Store) -> usage::UsageReport {
             usage_event("n3", "initech", 3, pinned("triage", 2, "run_b")),
             usage_event("n4", "initech", 4, node("other", 1, "run_c")),
             usage_event("n5", "initech", 5, json!({})),
+            usage_event("p1", "initech", 6, json!({"purpose": "rag.ingest", "requested_model": null})),
+            usage_event("p2", "initech", 7, json!({"purpose": "rag.ingest", "requested_model": null})),
+            usage_event("p3", "initech", 8, {
+                let mut x = node("triage", 1, "run_a");
+                x["purpose"] = json!("rag.search");
+                x["requested_model"] = json!(null);
+                x
+            }),
         ])
         .await
         .unwrap();
-    assert_eq!(r.accepted, 5);
+    assert_eq!(r.accepted, 8);
     let q = |node: Option<&str>, run: Option<&str>| usage::UsageFilter {
         tenants: Some(vec!["initech".into()]),
         node: node.map(str::to_owned),
@@ -1499,18 +1507,23 @@ async fn usage_by_node(s: &Store) -> usage::UsageReport {
     assert_eq!(s.usage_query(&later).await.unwrap().totals.requests, 0);
     let close = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} vs {b}");
     let all = s.usage_query(&q(None, None)).await.unwrap();
-    assert_eq!(all.totals.requests, 5);
-    // auto events charge their billed price ($0.001), the pinned one its cost ($0.0005).
-    close(all.totals.charged_usd, 0.001 * 4.0 + 0.0005);
+    assert_eq!(all.totals.requests, 8);
+    // auto events charge their billed price ($0.001), the others their cost ($0.0005).
+    close(all.totals.charged_usd, 0.001 * 4.0 + 0.0005 * 4.0);
+    // Retrieval's own spend, separable from client calls (indexing, and a node's searches).
+    let purposes: Vec<(String, u64)> = all.by_purpose.iter().map(|g| (g.purpose.clone(), g.totals.requests)).collect();
+    assert_eq!(purposes, [("rag.ingest".into(), 2), ("rag.search".into(), 1)]);
+    close(all.by_purpose[0].totals.cost_usd, 0.001);
+    assert_eq!(all.events.iter().find(|e| e.request_id == "p1").unwrap().purpose.as_deref(), Some("rag.ingest"));
     let triage = s.usage_query(&q(Some("triage"), None)).await.unwrap();
-    assert_eq!((triage.totals.requests, triage.events.len()), (3, 3));
-    close(triage.totals.charged_usd, 0.0025);
+    assert_eq!((triage.totals.requests, triage.events.len()), (4, 4));
+    close(triage.totals.charged_usd, 0.003);
     let run = s.usage_query(&q(None, Some("run_a"))).await.unwrap();
-    assert_eq!(run.totals.requests, 2);
-    close(run.totals.charged_usd, 0.002);
+    assert_eq!(run.totals.requests, 3);
+    close(run.totals.charged_usd, 0.0025);
     let groups: Vec<(String, u32, u64)> =
         all.by_node.iter().map(|g| (g.node.clone(), g.node_version, g.totals.requests)).collect();
-    assert_eq!(groups, [("other".into(), 1, 1), ("triage".into(), 1, 2), ("triage".into(), 2, 1)]);
+    assert_eq!(groups, [("other".into(), 1, 1), ("triage".into(), 1, 3), ("triage".into(), 2, 1)]);
     close(all.by_node[2].totals.charged_usd, 0.0005);
     assert_eq!(all.events.iter().find(|e| e.request_id == "n3").unwrap().run_id.as_deref(), Some("run_b"));
     all
@@ -1531,6 +1544,10 @@ async fn postgres_usage_by_node_matches_memory() {
     let mem_report = usage_by_node(&Store::new(cfg.clone(), handle(&cfg), RecentUsage::default())).await;
     assert_eq!(pg_report.events, mem_report.events);
     assert_eq!(serde_json::to_value(&pg_report.by_node).unwrap(), serde_json::to_value(&mem_report.by_node).unwrap());
+    assert_eq!(
+        serde_json::to_value(&pg_report.by_purpose).unwrap(),
+        serde_json::to_value(&mem_report.by_purpose).unwrap()
+    );
 }
 
 /// Raw usage retention: old days move into the daily roll-up and every total (all-time, per
@@ -1555,7 +1572,12 @@ async fn postgres_usage_retention_keeps_totals_identical() {
     let node = json!({"node": "triage", "node_version": 1, "run_id": "run_old"});
     let mut events = vec![];
     for i in 0..30 {
-        events.push(old(&format!("o{i}"), 100 + i % 3, if i % 2 == 0 { node.clone() } else { json!({}) }));
+        let extra = match i % 4 {
+            0 => node.clone(),
+            1 => json!({"purpose": "rag.ingest"}),
+            _ => json!({}),
+        };
+        events.push(old(&format!("o{i}"), 100 + i % 3, extra));
     }
     events.push(old("hit", 120, json!({"cache": "hit", "cache_tier": "exact", "billed_usd": 0.0002, "saved_usd": 0.0008, "routed_model_cost_usd": 0.0})));
     events.push(old("new", 1, node.clone()));
@@ -1594,6 +1616,9 @@ async fn postgres_usage_retention_keeps_totals_identical() {
         same(&x.totals, &y.totals);
     }
     assert_eq!(before.0.by_node.len(), after.0.by_node.len());
+    assert_eq!(before.0.by_purpose.len(), 1);
+    assert_eq!(before.0.by_purpose.len(), after.0.by_purpose.len(), "rolled-up days keep their purpose");
+    same(&before.0.by_purpose[0].totals, &after.0.by_purpose[0].totals);
     for (x, y) in before.0.by_node.iter().zip(&after.0.by_node) {
         assert_eq!((&x.node, x.node_version), (&y.node, y.node_version));
         same(&x.totals, &y.totals);
@@ -1608,7 +1633,7 @@ async fn postgres_usage_retention_keeps_totals_identical() {
     };
     let w = s.usage_query(&old_days).await.unwrap();
     assert_eq!((w.totals.requests, w.events.len()), (31, 0), "the rolled-up days only");
-    assert_eq!(w.by_node.iter().map(|g| g.totals.requests).sum::<u64>(), 15);
+    assert_eq!(w.by_node.iter().map(|g| g.totals.requests).sum::<u64>(), 8);
 
     // With retention on, an event older than it is refused; a retried recent one is a duplicate.
     s.set_usage_retention_days(90);

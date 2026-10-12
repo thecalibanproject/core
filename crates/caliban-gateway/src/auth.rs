@@ -27,6 +27,9 @@ pub struct InternalCaller {
     pub key_hash: String,
     /// The node run the call is for: its usage event is tagged with it.
     pub node: Option<NodeTag>,
+    /// What the call does on the tenant's behalf (`rag.ingest`, `rag.search`): the usage event's
+    /// `purpose` and intent, so that spend is separable from client calls.
+    pub purpose: Option<&'static str>,
 }
 
 /// Which node run a model call belongs to.

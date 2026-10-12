@@ -124,6 +124,12 @@ pub struct UsageEvent {
     /// `no_node_for_intent`, `node_not_allowed`, `node_unavailable`, `node_over_budget`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_fallback: Option<String>,
+    /// What an internal call did on the tenant's behalf: `rag.ingest` (embedding a collection's
+    /// documents) or `rag.search` (a node's retrieval query: its embedding and reranking). Absent
+    /// for client calls and node model calls. Billing-class: it says which feature spent, not
+    /// what a request was about, so it is stored (unlike the intent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 impl UsageEvent {

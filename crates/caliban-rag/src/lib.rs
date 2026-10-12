@@ -113,6 +113,28 @@ pub struct CallScope {
     pub node: Option<NodeCall>,
     /// Makes embedding and rerank calls of a replayed step hit the stored response.
     pub idempotency_key: Option<String>,
+    /// What the calls do (their usage events' `purpose`): indexing or a search.
+    pub purpose: CallPurpose,
+}
+
+/// What retrieval's embedding and rerank calls are for, so their spend is separable from the
+/// tenant's own embedding calls (usage `purpose`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CallPurpose {
+    /// Embedding a collection's documents (the tenant's background work).
+    #[default]
+    Ingest,
+    /// A node's retrieval query: its embedding and reranking.
+    Search,
+}
+
+impl CallPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CallPurpose::Ingest => "rag.ingest",
+            CallPurpose::Search => "rag.search",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

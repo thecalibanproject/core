@@ -65,6 +65,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (28, "usage_routing_content_class", include_str!("../../../../migrations/0028_usage_routing_content_class.sql")),
     (29, "rag", include_str!("../../../../migrations/0029_rag.sql")),
     (30, "tenant_pii_on_sovereign", include_str!("../../../../migrations/0030_tenant_pii_on_sovereign.sql")),
+    (31, "usage_purpose", include_str!("../../../../migrations/0031_usage_purpose.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -334,12 +335,12 @@ impl PgBackend {
                                       cached_prompt_tokens, tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts,
                                       requested_model, intent_confidence, route_stage, routed_model_cost_usd, flat_price_usd,
                                       cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens, billed_usd, saved_usd,
-                                      node, node_version, run_id, route, route_fallback)
+                                      node, node_version, run_id, route, route_fallback, purpose)
              SELECT * FROM UNNEST($1::TEXT[], $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::BIGINT[], $6::BIGINT[],
                                   $7::BIGINT[], $8::BIGINT[], $9::TEXT[], $10::INTEGER[], $11::FLOAT8[], $12::BIGINT[],
                                   $13::TIMESTAMPTZ[], $14::TEXT[], $15::REAL[], $16::TEXT[], $17::FLOAT8[], $18::FLOAT8[],
                                   $19::TEXT[], $20::TEXT[], $21::BIGINT[], $22::BIGINT[], $23::FLOAT8[], $24::FLOAT8[],
-                                  $25::TEXT[], $26::INTEGER[], $27::TEXT[], $28::TEXT[], $29::TEXT[])
+                                  $25::TEXT[], $26::INTEGER[], $27::TEXT[], $28::TEXT[], $29::TEXT[], $30::TEXT[])
              ON CONFLICT (request_id) DO NOTHING RETURNING request_id",
         )
         .bind(col(&|e| e.request_id.clone()))
@@ -371,6 +372,7 @@ impl PgBackend {
         .bind(opt(&|e| e.run_id.clone()))
         .bind(&none_text)
         .bind(&none_text)
+        .bind(opt(&|e| e.purpose.clone()))
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
@@ -673,7 +675,8 @@ impl Backend for PgBackend {
             "SELECT request_id, tenant_id, model, intent, prompt_tokens, completion_tokens, cached_prompt_tokens,
                     tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts, requested_model, intent_confidence,
                     route_stage, routed_model_cost_usd, flat_price_usd, cache_tier, usage_source, cache_write_tokens,
-                    cache_write_1h_tokens, billed_usd, saved_usd, node, node_version, run_id, route, route_fallback
+                    cache_write_1h_tokens, billed_usd, saved_usd, node, node_version, run_id, route, route_fallback,
+                    purpose
              FROM usage_event
              WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2)
                    AND ($3::TEXT IS NULL OR run_id = $3)
@@ -756,6 +759,38 @@ impl Backend for PgBackend {
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
+        // Internal work per purpose (`rag.ingest`, `rag.search`): raw events and rolled-up days.
+        let by_purpose_sql = format!(
+            "SELECT purpose, {outer} FROM (
+                 SELECT purpose, {raw}
+                 FROM (SELECT *, {priced} AS priced FROM usage_event
+                       WHERE purpose IS NOT NULL AND ($1::TEXT[] IS NULL OR tenant_id = ANY($1))
+                             AND ($2::TEXT IS NULL OR node = $2) AND ($3::TEXT IS NULL OR run_id = $3)
+                             AND ($4::TIMESTAMPTZ IS NULL OR ts >= $4) AND ($5::TIMESTAMPTZ IS NULL OR ts < $5)) u
+                 GROUP BY 1
+                 UNION ALL
+                 SELECT purpose, {cols} FROM usage_daily
+                 WHERE purpose <> '' AND ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2)
+                       AND $3::TEXT IS NULL AND ($4::TIMESTAMPTZ IS NULL OR (day::TIMESTAMP AT TIME ZONE 'UTC') >= $4)
+                       AND ($5::TIMESTAMPTZ IS NULL OR (day::TIMESTAMP AT TIME ZONE 'UTC') < $5)
+             ) t GROUP BY purpose ORDER BY purpose",
+            outer = usage_sums(),
+            raw = usage_aggregates(),
+            priced = USAGE_PRICED,
+            cols = usage_columns(),
+        );
+        let by_purpose = sqlx::query(sqlx::AssertSqlSafe(by_purpose_sql))
+            .bind(&tenants)
+            .bind(&f.node)
+            .bind(&f.run_id)
+            .bind(f.from)
+            .bind(f.to)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?
+            .iter()
+            .map(|r| Ok(super::usage::PurposeUsage { purpose: get(r, "purpose")?, totals: usage_totals(r)? }))
+            .collect::<Result<Vec<_>, StoreError>>()?;
         // Routing counts (per day; none when filtering by node or run: they carry neither).
         let by_route = if f.node.is_some() || f.run_id.is_some() {
             vec![]
@@ -786,7 +821,7 @@ impl Backend for PgBackend {
             })
             .collect::<Result<Vec<_>, StoreError>>()?
         };
-        Ok(Some(super::usage::UsageReport { events, totals, by_node, by_route }))
+        Ok(Some(super::usage::UsageReport { events, totals, by_node, by_purpose, by_route }))
     }
 
     async fn usage_boundary(&self, days: u32) -> Result<Option<DateTime<Utc>>, StoreError> {
@@ -822,12 +857,12 @@ impl Backend for PgBackend {
                                     SELECT request_id FROM usage_event, boundary WHERE ts < boundary.b
                                     ORDER BY ts LIMIT $2 FOR UPDATE OF usage_event SKIP LOCKED)
                                 RETURNING *),
-                      added AS (INSERT INTO usage_daily (tenant_id, day, node, node_version, {cols})
+                      added AS (INSERT INTO usage_daily (tenant_id, day, node, node_version, purpose, {cols})
                                 SELECT tenant_id, (ts AT TIME ZONE 'UTC')::date, COALESCE(node, ''),
-                                       COALESCE(node_version, 0), {raw}
+                                       COALESCE(node_version, 0), COALESCE(purpose, ''), {raw}
                                 FROM (SELECT *, {priced} AS priced FROM moved) u
-                                GROUP BY 1, 2, 3, 4
-                                ON CONFLICT (tenant_id, day, node, node_version) DO UPDATE SET {upsert}
+                                GROUP BY 1, 2, 3, 4, 5
+                                ON CONFLICT (tenant_id, day, node, node_version, purpose) DO UPDATE SET {upsert}
                                 RETURNING 1)
                  SELECT (SELECT count(*) FROM moved)::BIGINT",
                 cols = usage_columns(),
@@ -927,6 +962,7 @@ fn usage_row(r: &PgRow) -> Result<caliban_meter::UsageEvent, StoreError> {
         run_id: get(r, "run_id")?,
         route: get(r, "route")?,
         route_fallback: get(r, "route_fallback")?,
+        purpose: get(r, "purpose")?,
     })
 }
 

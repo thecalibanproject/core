@@ -224,6 +224,11 @@ becomes ready, in one transaction; until then the previous version is served.
 - Embedding and rerank calls are made as the run's invoking API key, tagged with the node run in
   usage, and with an `Idempotency-Key` derived from the step, so a replayed step does not pay twice
   (with the shared Valkey store).
+- **Metering**: retrieval's own calls carry a usage `purpose` (and the same intent):
+  `rag.ingest` for indexing embeddings (the tenant's background work), `rag.search` for a node's
+  query embedding and rerank. `GET /api/v1/usage` totals them in `by_purpose`, raw and rolled-up
+  days alike (migration 0031), so retrieval spend is separable from the tenant's own
+  `/v1/embeddings` calls (intent `embedding`, no purpose).
 
 There is no data-plane search endpoint: the P3 plan calls for RAG search as a built-in node tool,
 and grounding plain chat requests (stage 8 of the reference architecture) is not built.
