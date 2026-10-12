@@ -7,7 +7,9 @@
 //!
 //! **Loops.** A vertex with `max_iterations: N` runs at most N times per run. Once it has, its
 //! edges back into vertices already visited (the loop) are no longer taken; the walk continues on
-//! another matching edge, or ends with the last value and a note in `stop_reason`.
+//! another matching edge (the loop's designed exit: a normal completion, no `stop_reason`), or,
+//! when the cap leaves no edge to take, ends with the last value and a note in `stop_reason` (the
+//! run succeeded, but a limit ended it).
 
 use super::agent;
 use super::taint::{self, Taint};
@@ -105,13 +107,17 @@ pub(super) async fn run_graph(
             }
             matches
         });
-        if skipped_loop {
-            let max = current.max_iterations.unwrap_or_default();
-            note(cx, format!("vertex '{}' reached max_iterations ({max}); its loop stopped", current.id));
-        }
         match next.and_then(|e| g.vertex(&e.to)) {
             Some(v) => current = v,
-            None => return Ok((value, taint)),
+            None => {
+                // The cap cut the loop and no other edge leads on: a limit ended the run. A loop that
+                // leaves by another edge once capped ends as designed and leaves no note.
+                if skipped_loop {
+                    let max = current.max_iterations.unwrap_or_default();
+                    note(cx, format!("vertex '{}' reached max_iterations ({max}); the run ended there", current.id));
+                }
+                return Ok((value, taint));
+            }
         }
     }
 }

@@ -362,8 +362,41 @@ async fn a_bounded_loop_stops_at_max_iterations() {
         assert_eq!(v.status, RunStatus::Succeeded, "{v:?}");
         let ids: Vec<&str> = v.steps.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["draft#0", "check#0", "draft#1", "check#1", "draft#2", "check#2"]);
-        assert!(v.stop_reason.unwrap().contains("max_iterations (3)"));
+        // No edge leads on once the loop is cut: a limit ended the run, and it says so.
+        assert!(v.stop_reason.unwrap().contains("max_iterations (3); the run ended there"));
         assert_eq!(v.output.unwrap()["feedback"], "not yet");
+    }
+}
+
+#[tokio::test]
+async fn a_loop_that_leaves_by_its_exit_edge_ends_without_a_stop_reason() {
+    // The reference node's shape: `assess` loops through a question at most twice, then leaves by
+    // its other edge. That is the loop working as designed, not a limit.
+    for j in journals().await {
+        let h = Harness::new(j);
+        h.nodes.add(
+            "ask",
+            1,
+            json!({
+                "kind": "workflow", "model_policy": {}, "budgets": budgets(50, 100_000),
+                "graph": {
+                    "vertices": [{"id": "assess", "type": "llm", "config": {"prompt": "assess: {{input}}"}, "max_iterations": 2},
+                                 {"id": "check", "type": "verify", "config": {"check": "llm", "criteria": "clear"}},
+                                 {"id": "done", "type": "llm", "config": {"prompt": "answer: {{input}}"}}],
+                    "edges": [{"from": "assess", "to": "check"}, {"from": "assess", "to": "done"},
+                              {"from": "check", "to": "done", "when": "pass"}, {"from": "check", "to": "assess", "when": "fail"}]
+                }
+            }),
+        );
+        let model = FakeModel::new(|body| {
+            if system(body).contains("criteria") { text("FAIL: unclear") } else { text("ok") }
+        });
+        let ex = h.executor(&model, "w1");
+        let v = run(&ex, "ask", json!("x")).await;
+        assert_eq!(v.status, RunStatus::Succeeded, "{v:?}");
+        let ids: Vec<&str> = v.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["assess#0", "check#0", "assess#1", "done#0"]);
+        assert_eq!(v.stop_reason, None, "a designed loop exit is a normal completion");
     }
 }
 

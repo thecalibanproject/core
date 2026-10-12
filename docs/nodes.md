@@ -57,8 +57,10 @@ produces a value; `router` and `verify` also produce a label. When a vertex decl
 equals the label is taken; no matching edge ends the run with the last value. Fan-out happens only
 inside `map`. **Loops**: every cycle must contain a vertex with `max_iterations`; such a vertex runs
 at most that many times, and once it has, its edges back into vertices already visited are no
-longer taken (the run continues on another matching edge, or ends with the last value and a note
-in `stop_reason`).
+longer taken. The run then continues on another matching edge (the loop's designed exit: a normal
+completion, with no `stop_reason`), or, when no other edge leads on, ends with the last value and
+`stop_reason` saying which vertex's cap ended it. On a `succeeded` run, `stop_reason` is set only
+when a loop cap ended it.
 
 **Templates.** `{{input}}`, `{{input.a.b}}`, `{{outputs.<vertex>}}` (the latest output of a vertex of
 the same node), with `.field` and `.<index>` segments. Strings are inserted as is, other values as
