@@ -3430,7 +3430,8 @@ components:
             depth_used: { type: integer, description: 'Deepest subnode nesting reached' }
             fanout_limit: { type: integer }
             fanout_used: { type: integer, description: 'Widest map reached' }
-        cost_usd: { type: number, description: 'What the run spent on model calls so far (USD): the sum of `charged_usd` over its usage events' }
+        cost_usd: { type: number, description: 'What the run spent on model calls so far (USD): the sum of `charged_usd` over its usage events. For a run `caliban/auto` started, the flat auto price.' }
+        model_cost_usd: { type: number, description: 'The real cost of the models its calls were routed to; equals `cost_usd` unless the run is billed as `caliban/auto`.' }
         usage: { $ref: '#/components/schemas/RunUsage' }
         steps:
           type: array
@@ -3475,6 +3476,7 @@ components:
         prompt_tokens: { type: integer }
         completion_tokens: { type: integer }
         total_tokens: { type: integer }
+        pii_entities: { type: integer, description: 'Personal-data entities the gateway protected in the run''s model calls' }
     RunStep:
       type: object
       required: [id, vertex, kind, status, tokens, usd, labels, started_at, duration_ms]
@@ -3486,7 +3488,9 @@ components:
         tokens: { type: integer }
         prompt_tokens: { type: integer }
         completion_tokens: { type: integer }
-        usd: { type: number }
+        usd: { type: number, description: 'What the step''s model call is billed' }
+        model_cost_usd: { type: number, description: 'The routed model''s real cost (differs from `usd` only for calls billed as `caliban/auto`)' }
+        pii_entities: { type: integer }
         labels: { type: array, items: { type: string }, description: 'Taint labels of the step''s output' }
         started_at: { type: string, format: date-time }
         duration_ms: { type: integer }

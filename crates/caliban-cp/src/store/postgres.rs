@@ -66,6 +66,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (29, "rag", include_str!("../../../../migrations/0029_rag.sql")),
     (30, "tenant_pii_on_sovereign", include_str!("../../../../migrations/0030_tenant_pii_on_sovereign.sql")),
     (31, "usage_purpose", include_str!("../../../../migrations/0031_usage_purpose.sql")),
+    (32, "node_step_metering", include_str!("../../../../migrations/0032_node_step_metering.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.

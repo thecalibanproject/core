@@ -89,7 +89,13 @@ pub struct ModelReply {
     pub tokens: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// What the call is billed (`x-caliban-billed-usd`, else the model's cost).
     pub usd: f64,
+    /// The routed model's real cost (`x-caliban-cost-usd`; equals `usd` unless billed as
+    /// `caliban/auto`).
+    pub model_cost_usd: f64,
+    /// Personal-data entities the gateway protected (`x-caliban-pii-entities`).
+    pub pii_entities: u64,
     /// The response was a stored one (an `Idempotency-Key` replay): nothing was paid again.
     pub replayed: bool,
 }
@@ -279,6 +285,9 @@ pub struct RunView {
     pub budget: BudgetState,
     /// What the run spent on model calls so far (USD, priced like the metering).
     pub cost_usd: f64,
+    /// The real cost of the models its calls were routed to (equals `cost_usd` unless the run is
+    /// billed as `caliban/auto`: started by it, the calls are priced at the flat auto price).
+    pub model_cost_usd: f64,
     /// The run's model calls so far (prompt and completion tokens).
     pub usage: RunUsage,
     pub steps: Vec<StepView>,
@@ -304,12 +313,16 @@ pub struct RunUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// Personal-data entities the gateway protected across the run's model calls.
+    pub pii_entities: u64,
 }
 
 impl RunUsage {
     pub fn of(steps: &[StepRecord]) -> Self {
-        let (p, c) = steps.iter().fold((0, 0), |(p, c), s| (p + s.prompt_tokens, c + s.completion_tokens));
-        Self { prompt_tokens: p, completion_tokens: c, total_tokens: p + c }
+        let (p, c, n) = steps
+            .iter()
+            .fold((0, 0, 0), |(p, c, n), s| (p + s.prompt_tokens, c + s.completion_tokens, n + s.pii_entities));
+        Self { prompt_tokens: p, completion_tokens: c, total_tokens: p + c, pii_entities: n }
     }
 }
 
@@ -364,6 +377,10 @@ pub struct StepView {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub usd: f64,
+    /// The routed model's real cost (differs from `usd` only for calls billed as `caliban/auto`).
+    pub model_cost_usd: f64,
+    /// Personal-data entities the gateway protected in the step's model call.
+    pub pii_entities: u64,
     /// Taint labels of the step's output.
     pub labels: Vec<String>,
     pub started_at: DateTime<Utc>,
@@ -381,6 +398,8 @@ impl StepView {
             prompt_tokens: s.prompt_tokens,
             completion_tokens: s.completion_tokens,
             usd: s.usd,
+            model_cost_usd: s.model_cost_usd,
+            pii_entities: s.pii_entities,
             labels: s.labels.clone(),
             started_at: s.started_at,
             duration_ms: (s.finished_at - s.started_at).num_milliseconds(),
@@ -655,6 +674,7 @@ impl Executor {
             awaiting: r.awaiting.clone().map(|step| Awaiting { step, question }),
             budget: r.budget,
             cost_usd: r.budget.usd,
+            model_cost_usd: crate::journal::usd_total(steps.iter().map(|s| s.model_cost_usd)),
             usage,
             steps: steps.iter().map(StepView::of).collect(),
             claims: r.claims,
@@ -944,6 +964,8 @@ pub(crate) struct StepOut {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub usd: f64,
+    pub model_cost_usd: f64,
+    pub pii_entities: u64,
     /// Taint labels of the output, journaled with tool steps so a replay sees the same labels
     /// (model steps leave it empty: their labels come from their inputs).
     pub taint: taint::Taint,
@@ -958,6 +980,8 @@ impl StepOut {
             prompt_tokens: 0,
             completion_tokens: 0,
             usd: 0.0,
+            model_cost_usd: 0.0,
+            pii_entities: 0,
             taint: taint::Taint::new(),
         }
     }
@@ -969,6 +993,8 @@ impl StepOut {
             prompt_tokens: r.prompt_tokens,
             completion_tokens: r.completion_tokens,
             usd: r.usd,
+            model_cost_usd: r.model_cost_usd,
+            pii_entities: r.pii_entities,
             ..Self::value(output)
         }
     }
@@ -1288,6 +1314,8 @@ impl RunCx {
             prompt_tokens: out.prompt_tokens,
             completion_tokens: out.completion_tokens,
             usd: out.usd,
+            model_cost_usd: out.model_cost_usd,
+            pii_entities: out.pii_entities,
             labels: labels.into_iter().collect(),
             started_at: started,
             finished_at: Utc::now(),
@@ -1319,6 +1347,8 @@ impl RunCx {
             prompt_tokens: rec.prompt_tokens,
             completion_tokens: rec.completion_tokens,
             usd: rec.usd,
+            model_cost_usd: rec.model_cost_usd,
+            pii_entities: rec.pii_entities,
             taint: v.get("taint").and_then(|t| serde_json::from_value(t.clone()).ok()).unwrap_or_default(),
         })
     }

@@ -145,10 +145,11 @@ impl ModelClient for GatewayModels {
         let u = |k: &str| v.pointer(&format!("/usage/{k}")).and_then(Value::as_u64).unwrap_or(0);
         // Priced like the metering prices it: the flat caliban/auto price (cache hits discounted)
         // or the pinned model's price.
-        let usd = ["x-caliban-billed-usd", "x-caliban-cost-usd"]
-            .iter()
-            .find_map(|h| headers.get(*h).and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<f64>().ok()))
-            .unwrap_or(0.0);
+        let num = |h: &str| headers.get(h).and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<f64>().ok());
+        let usd = num("x-caliban-billed-usd").or_else(|| num("x-caliban-cost-usd")).unwrap_or(0.0);
+        let model_cost_usd = num("x-caliban-cost-usd").unwrap_or(usd);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let pii_entities = num("x-caliban-pii-entities").map_or(0, |n| n.max(0.0) as u64);
         let replayed = headers.get(idempotency::REPLAYED).is_some();
         let (prompt_tokens, completion_tokens) = (u("prompt_tokens"), u("completion_tokens"));
         Ok(ModelReply {
@@ -157,6 +158,8 @@ impl ModelClient for GatewayModels {
             prompt_tokens,
             completion_tokens,
             usd,
+            model_cost_usd,
+            pii_entities,
             replayed,
         })
     }

@@ -192,7 +192,7 @@ Data plane, tenant API key as bearer token, the key allowed to run the node:
 |---|---|
 | `POST /v1/nodes/{name}/runs` `{"input": ..., "version"?: v, "async"?: false, "stream"?: false, "wait_s"?: s, "budget"?: {...}, "untrusted"?: true \| ["/field", ...]}` | Starts a run of the live version (or `version`). Sync by default: waits until the run ends or waits for a human, at most `CALIBAN_NODE_SYNC_WAIT_SECS` (default 60) or `wait_s`; `200` when it ended, else `202` with the run so far. `"async": true` answers `202` at once. `"stream": true` answers with the run's [events](#streaming-run-events) (SSE) until it ends or waits for a human. Instead of `input`, `"chat": {"messages": [...]}` gives chat messages that are mapped to the node's input as the [chat shortcut](#the-chat-shortcut-model-nodename) does. `Idempotency-Key` returns the run the first request created (`Idempotent-Replayed: true`); the same key with another body is a `422`. The input is checked against `prompt.input_schema` (`400`). `untrusted` marks [untrusted caller data](tools.md#untrusted-caller-data) |
 | `GET /v1/runs` | The tenant's runs the key may see (its node allowlist), newest first: `?node=`, `?status=` (comma separated), `?created_after=`, `?created_before=` (RFC 3339), `?limit=` (default 50, at most 200), `?cursor=` (`next_cursor` of the previous page). Summaries only (no content, no steps) |
-| `GET /v1/runs/{id}` | The run: `status`, `output`, `partial`, `error`, `stop_reason`, `awaiting` (`step`, `question`), `budget` (limits and spend), `cost_usd`, `usage` (prompt and completion tokens of its model calls), `steps` (id, vertex, kind, status, tokens, usd, taint labels, start, duration), `origin`, `input_labels` (`caller` when the input holds untrusted caller data), `cancel_requested`, `last_event` |
+| `GET /v1/runs/{id}` | The run: `status`, `output`, `partial`, `error`, `stop_reason`, `awaiting` (`step`, `question`), `budget` (limits and spend), `cost_usd` (billed), `model_cost_usd` (the routed models' real cost), `usage` (prompt and completion tokens of its model calls, and `pii_entities` protected in them), `steps` (id, vertex, kind, status, tokens, usd, taint labels, start, duration), `origin`, `input_labels` (`caller` when the input holds untrusted caller data), `cancel_requested`, `last_event` |
 | `GET /v1/runs/{id}/events` | The run's [events](#streaming-run-events) (SSE), resumable with `Last-Event-ID` (or `?after=`) |
 | `POST /v1/runs/{id}/input` `{"answer": ..., "step"?: id}` | Answers the human step the run waits for; `202`, the run resumes. `409` when it is not waiting |
 | `POST /v1/runs/{id}/cancel` | Cancels the run (see [Cancellation](#cancellation)): `200` when it ended at once (or was already cancelled), `202` when a running run was asked to stop, `409` (`run_already_ended`) when it ended otherwise |
@@ -281,7 +281,12 @@ and `length` / `max_tokens` when it ended on its budget (partial output). A run 
 whose run is still going after `CALIBAN_NODE_SYNC_WAIT_SECS` is a `504` (`node_run_timeout`) and the
 run carries on (follow it with the run API). `usage` is the sum of the run's model calls so far
 (`prompt_tokens`, `completion_tokens`; Anthropic `input_tokens`, `output_tokens`). The response
-carries `Caliban-Run-Id`, `x-caliban-route: node/<name>@v<N>` and `x-caliban-run-status`, and a
+carries `Caliban-Run-Id`, `x-caliban-route: node/<name>@v<N>` and `x-caliban-run-status`, the
+headers of every chat response (`x-caliban-request-id`, also `request-id` on `/v1/messages`;
+`x-caliban-routed-model: node/<name>@v<N>`; `x-caliban-cache: bypass`), and on non-streaming
+answers `x-caliban-pii-entities` (entities protected across the run's model calls),
+`x-caliban-cost-usd` (the routed models' real cost, the run's `model_cost_usd`) and
+`x-caliban-billed-usd` (what the run is billed, its `cost_usd`), and a
 `caliban` object (`run_id`, `status`, `node`, `version`, `cost_usd`, `awaiting`, `stop_reason`)
 that the SDKs keep as an extra field (`completion.model_extra["caliban"]` in the OpenAI Python SDK).
 
@@ -376,7 +381,15 @@ Otherwise a model answers, and the response says why in `x-caliban-route-fallbac
 `caliban/auto` answer of a tenant that maps intents to nodes). Usage events carry it from the data
 plane (`route: node/<name>@v<N>` on the node's model calls, `route: model:<id>` and
 `route_fallback` on a model answer), but the usage store keeps only daily counts of the fallback
-reasons (`by_route`), not per-request routing facts (README, "Routing records are content-class"). A run that started is never replaced by a
+reasons (`by_route`), not per-request routing facts (README, "Routing records are content-class").
+
+**Billing.** A request for `caliban/auto` is billed as `caliban/auto` whether a model or a node
+answers it. Every model call of a run that `caliban/auto` started is billed at the flat auto price
+(`requested_model: caliban/auto`, `flat_price_usd`, `billed_usd`; a cache hit at the tenant's
+discounted fraction), whatever model the node pins, and the routed model's real cost is metered
+next to it (`routed_model_cost_usd`), exactly as for a model answer; the run's `cost_usd` is what it
+is billed and `model_cost_usd` the real cost. `auto_requests` counts those calls. A run started
+through the run API or `model: "node/<name>"` is billed at its models' prices. A run that started is never replaced by a
 model call: its failure is the answer. Streams work on both paths. To continue a run that
 `caliban/auto` started, send `model: "caliban/auto"` with `Caliban-Run-Id`: it goes on with the
 run's node, without classifying again.

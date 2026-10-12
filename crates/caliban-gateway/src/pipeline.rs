@@ -149,7 +149,16 @@ async fn run(
         }
         (d, esc)
     };
-    let route_meta = RouteMeta { escalation: escalation.header(), ..RouteMeta::new(&decision, &snap, &tenant, &req) };
+    let mut route_meta =
+        RouteMeta { escalation: escalation.header(), ..RouteMeta::new(&decision, &snap, &tenant, &req) };
+    // A model call of a run that `caliban/auto` started is billed as `caliban/auto`, whatever model
+    // the node pins: the client chose the flat price, and the answer coming from a node rather
+    // than a model does not change that. The flat price is billed (cache hits discounted) and the
+    // routed model's real cost is metered next to it, as for a model answer.
+    if internal.and_then(|i| i.node.as_ref()).is_some_and(|n| n.route.is_some()) && !route_meta.auto {
+        route_meta.auto = true;
+        route_meta.requested_model = caliban_route::AUTO_MODEL.into();
+    }
     span.record("caliban.route.stage", decision.stage);
 
     // caliban/auto may hand the request to one of the tenant's nodes, with this classification

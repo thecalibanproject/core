@@ -61,7 +61,16 @@ impl ModelClient for FakeModel {
             self.release.notified().await;
         }
         let message = (self.script)(&body);
-        Ok(ModelReply { message, tokens: 10, prompt_tokens: 7, completion_tokens: 3, usd: 0.001, replayed: false })
+        Ok(ModelReply {
+            message,
+            tokens: 10,
+            prompt_tokens: 7,
+            completion_tokens: 3,
+            usd: 0.001,
+            model_cost_usd: 0.001,
+            pii_entities: 0,
+            replayed: false,
+        })
     }
 }
 
@@ -1573,7 +1582,7 @@ async fn step_events_carry_taint_labels_costs_and_usage() {
         h.nodes.add("triage", 1, triage_spec());
         let ex = h.executor(&triage_model(), "w1");
         let v = run(&ex, "triage", json!({"case": "chest pain"})).await;
-        assert_eq!(v.usage, RunUsage { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 });
+        assert_eq!(v.usage, RunUsage { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10, pii_entities: 0 });
         assert_eq!((v.steps[0].prompt_tokens, v.steps[0].completion_tokens), (7, 3));
         assert_eq!(v.last_event, 4, "created, started, finished, input required: {v:?}");
     }

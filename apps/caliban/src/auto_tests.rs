@@ -56,6 +56,8 @@ fn routing(emb: &str) -> String {
         r#"
 [routing]
 embedding_model = "emb/mock"
+auto_price_in_per_mtok = 2.0
+auto_price_out_per_mtok = 4.0
 default_exemplars = false
 budget_ms = 5000
 oos_threshold = 0.95
@@ -179,6 +181,14 @@ async fn auto_hands_a_classified_request_to_the_node_and_classifies_once() {
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_eq!(h["x-caliban-route"], "node/flow@v1");
     assert!(h["x-caliban-intent"].to_str().unwrap().starts_with("triage;"), "{:?}", h["x-caliban-intent"]);
+    // The documented headers of every chat response, on a node answer too.
+    assert!(h["x-caliban-request-id"].to_str().unwrap().starts_with("req_"), "{h:?}");
+    assert_eq!(h["x-caliban-routed-model"], "node/flow@v1");
+    assert_eq!(h["x-caliban-pii-entities"], "0");
+    assert_eq!(h["x-caliban-cache"], "bypass");
+    let billed: f64 = h["x-caliban-billed-usd"].to_str().unwrap().parse().unwrap();
+    let cost: f64 = h["x-caliban-cost-usd"].to_str().unwrap().parse().unwrap();
+    assert!(billed > 0.0 && cost > 0.0 && billed > cost, "the flat auto price (2/4 per Mtok) vs oa/m: {billed} {cost}");
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["choices"][0]["finish_reason"], "input_required");
     assert_eq!(v["choices"][0]["message"]["content"], "Since when (clinical)?");
@@ -201,7 +211,19 @@ async fn auto_hands_a_classified_request_to_the_node_and_classifies_once() {
             (e.route.as_deref(), e.run_id.as_deref(), e.route_fallback.as_deref()),
             (Some("node/flow@v1"), Some(run.as_str()), None)
         );
+        // Billed as caliban/auto (what the client asked for), the routed model's cost next to it.
+        assert_eq!(e.requested_model.as_deref(), Some("caliban/auto"), "{e:?}");
+        let flat = (e.prompt_tokens as f64 * 2.0 + e.completion_tokens as f64 * 4.0) / 1e6;
+        assert!((e.flat_price_usd.unwrap() - flat).abs() < 1e-12, "{e:?}");
+        assert_eq!(e.billed_usd, e.flat_price_usd, "a miss bills the flat price");
+        assert_eq!(e.routed_model_cost_usd, e.cost_usd, "the real cost is metered alongside");
     }
+    // The run's cost is what it is billed; its headers say both.
+    assert!(
+        (r["cost_usd"].as_f64().unwrap() - evs.iter().filter_map(|e| e.billed_usd).sum::<f64>()).abs() < 1e-12,
+        "{r}"
+    );
+    assert!((r["model_cost_usd"].as_f64().unwrap() - evs.iter().filter_map(|e| e.cost_usd).sum::<f64>()).abs() < 1e-12);
     // Streamed: the node's answer in chunks, the path in the headers.
     let again = "My chest hurts since Tuesday...";
     let (s, h, body) = chat(&a.w.app, KEY, auto(again, true), &[]).await;

@@ -206,7 +206,14 @@ pub struct StepRecord {
     /// Prompt and completion tokens of a model step (their sum is `tokens`); 0 for other steps.
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// What the step's model call is billed (the flat `caliban/auto` price for runs `caliban/auto`
+    /// started, cache hits discounted; the model's price otherwise).
     pub usd: f64,
+    /// The real cost of the routed model (equals `usd` unless the call was billed as
+    /// `caliban/auto`).
+    pub model_cost_usd: f64,
+    /// Personal-data entities the gateway protected in the step's model call.
+    pub pii_entities: u64,
     /// Taint labels of the step's output (what it consumed, plus a tool's own label).
     pub labels: Vec<String>,
     pub started_at: DateTime<Utc>,
@@ -332,6 +339,11 @@ pub struct RunEvent {
     pub kind: String,
     pub data: serde_json::Value,
     pub created_at: DateTime<Utc>,
+}
+
+/// A USD sum starting from +0.0 (an empty `sum::<f64>()` is -0.0).
+pub fn usd_total(amounts: impl Iterator<Item = f64>) -> f64 {
+    amounts.fold(0.0, |a, x| a + x)
 }
 
 /// The event data of a checkpointed step (also what `step.started` carries, without results).

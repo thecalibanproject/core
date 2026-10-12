@@ -626,7 +626,7 @@ async fn map(
     });
     let results = futures::future::join_all(branches).await;
     let mut out = Vec::with_capacity(results.len());
-    let (mut tokens, mut prompt, mut completion, mut usd) = (0, 0, 0, 0.0);
+    let (mut tokens, mut prompt, mut completion, mut usd, mut cost, mut pii) = (0, 0, 0, 0.0, 0.0, 0);
     // A lost lease wins over everything, then a cancellation, failures, then budget stops.
     let rank = |s: &Stop| match s {
         Stop::LeaseLost => 0,
@@ -645,6 +645,8 @@ async fn map(
                 prompt += s.prompt_tokens;
                 completion += s.completion_tokens;
                 usd += s.usd;
+                cost += s.model_cost_usd;
+                pii += s.pii_entities;
                 out.push(s.output);
             }
             Err(e) => {
@@ -663,6 +665,8 @@ async fn map(
         prompt_tokens: prompt,
         completion_tokens: completion,
         usd,
+        model_cost_usd: cost,
+        pii_entities: pii,
         ..StepOut::value(Value::Array(out))
     };
     Ok((out, taint))

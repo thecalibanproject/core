@@ -325,6 +325,10 @@ async fn chat_completions_and_messages_run_nodes_with_a_human_step() {
     assert_eq!(v["choices"][0]["finish_reason"], "stop");
     assert_eq!(v["choices"][0]["message"]["content"], "You said: Case Chest pain, since two days");
     assert_eq!(h["x-caliban-run-status"], "succeeded");
+    // The documented headers of every chat response.
+    assert_eq!(h["x-caliban-routed-model"], "node/flow@v1");
+    assert!(h.contains_key("x-caliban-request-id") && h.contains_key("x-caliban-pii-entities"));
+    assert!(h.contains_key("x-caliban-cost-usd") && h.contains_key("x-caliban-billed-usd"));
     // Usage: the run's model calls (the classifier, then the answer), as metered.
     let u = &v["usage"];
     assert_eq!(

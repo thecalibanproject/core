@@ -2206,6 +2206,8 @@ async fn postgres_worker_grants_are_enough() {
             prompt_tokens: 2,
             completion_tokens: 1,
             usd: 0.01,
+            model_cost_usd: 0.01,
+            pii_entities: 0,
             labels: vec![],
             started_at: now,
             finished_at: now,

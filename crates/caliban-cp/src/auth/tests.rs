@@ -1616,6 +1616,8 @@ async fn run_content_and_answers_follow_the_roles() {
         prompt_tokens: 7,
         completion_tokens: 3,
         usd: 0.25,
+        model_cost_usd: 0.25,
+        pii_entities: 0,
         labels: vec![],
         started_at: at,
         finished_at: at,

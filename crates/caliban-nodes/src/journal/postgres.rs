@@ -22,13 +22,14 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../../../migrations/0021_node_exposure.sql"),
     include_str!("../../../../migrations/0024_node_evals.sql"),
     include_str!("../../../../migrations/0025_node_run_input_labels.sql"),
+    include_str!("../../../../migrations/0032_node_step_metering.sql"),
 ];
 
 /// Columns of `node_step` rows ([`step_row`]).
 macro_rules! step_columns {
     () => {
         "run_id, tenant_id, step_id, attempt, vertex, kind, input_hash, status, result, tokens, prompt_tokens, \
-         completion_tokens, usd, labels, started_at, finished_at"
+         completion_tokens, usd, labels, started_at, finished_at, model_cost_usd, pii_entities"
     };
 }
 
@@ -180,6 +181,8 @@ fn step_row(r: &PgRow) -> JResult<StepRecord> {
         prompt_tokens: u64_of(r, "prompt_tokens")?,
         completion_tokens: u64_of(r, "completion_tokens")?,
         usd: get(r, "usd")?,
+        model_cost_usd: get::<Option<f64>>(r, "model_cost_usd")?.unwrap_or(get(r, "usd")?),
+        pii_entities: u64::try_from(get::<i32>(r, "pii_entities")?).unwrap_or(0),
         labels: serde_json::from_value(get::<Json<serde_json::Value>>(r, "labels")?.0).unwrap_or_default(),
         started_at: get(r, "started_at")?,
         finished_at: get(r, "finished_at")?,
@@ -437,8 +440,9 @@ impl Journal for PgJournal {
         }
         let inserted = sqlx::query(
             "INSERT INTO node_step (run_id, step_id, tenant_id, attempt, vertex, kind, input_hash, status, result, tokens,
-                                    usd, started_at, finished_at, prompt_tokens, completion_tokens, labels)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                                    usd, started_at, finished_at, prompt_tokens, completion_tokens, labels,
+                                    model_cost_usd, pii_entities)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
              ON CONFLICT (run_id, step_id) DO NOTHING",
         )
         .bind(&step.run_id)
@@ -460,6 +464,8 @@ impl Journal for PgJournal {
         .bind(i64_of(step.prompt_tokens))
         .bind(i64_of(step.completion_tokens))
         .bind(Json(&step.labels))
+        .bind(step.model_cost_usd)
+        .bind(i32::try_from(step.pii_entities).unwrap_or(i32::MAX))
         .execute(&mut *tx)
         .await
         .map_err(db)?;

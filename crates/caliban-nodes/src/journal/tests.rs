@@ -56,6 +56,8 @@ fn step(run: &str, id: &str) -> StepRecord {
         prompt_tokens: 9,
         completion_tokens: 3,
         usd: 0.001,
+        model_cost_usd: 0.0004,
+        pii_entities: 2,
         labels: vec!["pii".into()],
         started_at: now,
         finished_at: now,
@@ -425,6 +427,8 @@ async fn run_events_are_numbered_in_order_and_resume_after_any_number() {
         // Steps keep their usage split and labels.
         let s = &j.steps("run_1").await.unwrap()[0];
         assert_eq!((s.prompt_tokens, s.completion_tokens, s.labels.clone()), (9, 3, vec!["pii".to_owned()]), "{n}");
+        // And what the model really cost next to what was billed, and the PII it protected.
+        assert_eq!((s.usd, s.model_cost_usd, s.pii_entities), (0.001, 0.0004, 2), "{n}");
     }
 }
 

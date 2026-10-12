@@ -11,6 +11,11 @@
 //!   `input_required` when it waits for a human: the question is the assistant message.
 //! - **The run**: `Caliban-Run-Id` response header, and a `caliban` object in the body (`run_id`,
 //!   `status`, `node`, `version`, `awaiting`, `cost_usd`) that the SDKs keep as an extra field.
+//! - **Headers** every chat response carries: `x-caliban-request-id` (this request),
+//!   `x-caliban-routed-model` (`node/<name>@v<N>`: the node answered), `x-caliban-cache: bypass`,
+//!   and on non-streaming answers `x-caliban-pii-entities` (entities protected across the run's
+//!   model calls), `x-caliban-cost-usd` (the routed models' real cost) and `x-caliban-billed-usd`
+//!   (what the run is billed: the flat `caliban/auto` price when `caliban/auto` started it).
 //! - **Continuing** a run that waits for a human: send the next request with header
 //!   `Caliban-Run-Id: <run id>` and the answer as the last user message (JSON objects, booleans and
 //!   numbers are passed as JSON, anything else as text). The response is the rest of the run.
@@ -246,6 +251,12 @@ pub(crate) async fn respond(
     if let Ok(v) = HeaderValue::from_str(&run_id) {
         extra.push((HeaderName::from_static(RUN_ID_HEADER), v.to_str().unwrap_or_default().to_owned()));
     }
+    let request_id = caliban_types::RequestId::new().to_string();
+    extra.push((HeaderName::from_static("x-caliban-request-id"), request_id.clone()));
+    extra.push((HeaderName::from_static("x-caliban-cache"), "bypass".into()));
+    if dialect == Dialect::Anthropic {
+        extra.push((HeaderName::from_static("request-id"), request_id));
+    }
     if req.stream {
         let usage = dialect == Dialect::Anthropic || crate::metering::client_wants_stream_usage(&req.extra);
         let label = format!("node/{}@v{version}", nc.target.name);
@@ -318,8 +329,19 @@ fn add_headers(h: &mut HeaderMap, run: &Value, extra: Vec<(HeaderName, String)>)
         }
     };
     set(HeaderName::from_static(ROUTE_HEADER), &label(run));
+    set(HeaderName::from_static("x-caliban-routed-model"), &label(run));
     if let Some(s) = run["status"].as_str() {
         set(HeaderName::from_static("x-caliban-run-status"), s);
+    }
+    set(
+        HeaderName::from_static("x-caliban-pii-entities"),
+        &run["usage"]["pii_entities"].as_u64().unwrap_or(0).to_string(),
+    );
+    if let Some(c) = run["model_cost_usd"].as_f64() {
+        set(HeaderName::from_static("x-caliban-cost-usd"), &format!("{c:.8}"));
+    }
+    if let Some(b) = run["cost_usd"].as_f64() {
+        set(HeaderName::from_static("x-caliban-billed-usd"), &format!("{b:.8}"));
     }
     for (n, v) in extra {
         set(n, &v);
@@ -522,7 +544,8 @@ fn stream(
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     if let Ok(v) = HeaderValue::from_str(&label) {
-        h.insert(ROUTE_HEADER, v);
+        h.insert(ROUTE_HEADER, v.clone());
+        h.insert("x-caliban-routed-model", v);
     }
     for (n, v) in extra {
         if let Ok(v) = HeaderValue::from_str(&v) {
