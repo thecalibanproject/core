@@ -91,6 +91,7 @@ fn tenant(id: &str) -> Tenant {
         pii_on_sovereign: false,
         pii_patterns: vec![],
         pii_dictionary: vec![],
+        intents: Default::default(),
         semantic_cache: SemanticCacheMode::Off,
         auto_cache_hit_fraction: None,
         node_caps: None,
@@ -229,6 +230,19 @@ async fn suite(s: &Store) {
     s.apply(A, sovereign).await.unwrap();
     assert!(s.state().tenant("globex").unwrap().pii_on_sovereign);
     assert!(s.config.load().tenant(&"globex".into()).unwrap().pii_on_sovereign);
+    // caliban/auto intents managed at runtime: persisted, rendered into the routing section.
+    let intent = |ex: Option<Vec<&str>>| Mutation::SetTenantIntent {
+        tenant_id: "globex".into(),
+        intent: "triage".into(),
+        exemplars: ex.map(|v| v.into_iter().map(str::to_owned).collect()),
+    };
+    s.apply(A, intent(Some(vec!["my chest hurts"]))).await.unwrap();
+    assert_eq!(s.state().tenant("globex").unwrap().intents["triage"], ["my chest hurts"]);
+    let routed = s.config.load().config.routing.tenants.get(&"globex".into()).unwrap().exemplars.clone();
+    assert_eq!(routed["triage"], ["my chest hurts"]);
+    s.apply(A, intent(None)).await.unwrap();
+    assert_eq!(s.apply(A, intent(None)).await.unwrap_err(), StoreError::NotFound("intent 'triage'".into()));
+    s.apply(A, intent(Some(vec!["fever for days"]))).await.unwrap();
     // Semantic cache: off by default, switched on per tenant, shipped in the snapshot.
     assert_eq!(s.state().tenant("globex").unwrap().semantic_cache, SemanticCacheMode::Off);
     let on = Mutation::UpdateTenant {

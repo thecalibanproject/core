@@ -68,6 +68,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (31, "usage_purpose", include_str!("../../../../migrations/0031_usage_purpose.sql")),
     (32, "node_step_metering", include_str!("../../../../migrations/0032_node_step_metering.sql")),
     (33, "tenant_pii_detectors", include_str!("../../../../migrations/0033_tenant_pii_detectors.sql")),
+    (34, "tenant_intents", include_str!("../../../../migrations/0034_tenant_intents.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -1160,6 +1161,12 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
             ontology_commit(c, tenant_id, &message, &changed).await
         }
         Mutation::CreateDek { tenant_id, dek } => insert_dek(c, tenant_id, dek).await,
+        Mutation::SetTenantIntent { tenant_id, .. } => {
+            let t = next.tenant(tenant_id).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
+            let q = "UPDATE tenant SET intents = $2 WHERE id = $1 AND status = 'active'";
+            exec(c, sqlx::query(q).bind(tenant_id).bind((!t.intents.is_empty()).then(|| Json(json_of(&t.intents)))))
+                .await
+        }
         Mutation::Rekey(r) => rekey(c, r).await,
         Mutation::Login { user, session } => login(c, user, session).await,
         Mutation::Logout { session_id, user_id, at } => {
@@ -1779,7 +1786,7 @@ async fn rows(c: &mut PgConnection, sql: &'static str) -> Result<Vec<PgRow>, Sto
 async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     let mut st = State::default();
 
-    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes, settings, created_at, status, deleted_at, pii_on_sovereign, pii_patterns, pii_dictionary FROM tenant ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes, settings, created_at, status, deleted_at, pii_on_sovereign, pii_patterns, pii_dictionary, intents FROM tenant ORDER BY ord").await? {
         st.tenants.push(Tenant {
             id: get(&r, "id")?,
             name: get(&r, "name")?,
@@ -1792,6 +1799,7 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
                 .map(|j| parse(j.0))
                 .transpose()?
                 .unwrap_or_default(),
+            intents: get::<Option<Json<Value>>>(&r, "intents")?.map(|j| parse(j.0)).transpose()?.unwrap_or_default(),
             semantic_cache: parse_enum(get(&r, "semantic_cache")?)?,
             auto_cache_hit_fraction: get(&r, "auto_cache_hit_fraction")?,
             node_caps: get::<Option<Json<Value>>>(&r, "node_caps")?.map(|j| parse(j.0)).transpose()?,

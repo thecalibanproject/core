@@ -294,3 +294,35 @@ async fn auto_on_a_router_runs_the_node_on_a_worker() {
     );
     server.abort();
 }
+
+/// e2e gap 2: an intent added through the control plane at runtime reaches the routers' kNN
+/// index with the next snapshot, and `caliban/auto` hands it to a node, without a restart.
+#[tokio::test]
+async fn an_intent_added_at_runtime_routes_to_a_node() {
+    let a = Auto::new(None).await;
+    const BOOK: &str = "book an appointment with a cardiologist";
+    let before = chat(&a.w.app, KEY, auto(BOOK, false), &[]).await;
+    assert_ne!(before.1.get("x-caliban-route").map(|h| h.to_str().unwrap()), Some("node/flow@v1"), "not yet");
+    let body = json!({"exemplars": [BOOK, "I need a slot with a heart doctor"]});
+    let (s, v) = send(&a.e.cp_app, "PUT", "/api/v1/tenants/acme/intents/booking", ADMIN, Some(body), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = send(
+        &a.e.cp_app,
+        "PATCH",
+        "/api/v1/tenants/acme",
+        ADMIN,
+        Some(json!({"node_routes": {"booking": "node/flow"}})),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // The router rebuilds its index when it sees the new snapshot; wait for the routing to change.
+    let mut last = String::new();
+    until("the new intent to route to the node", async || {
+        let (s, h, body) = chat(&a.w.app, KEY, auto(&format!("{BOOK}?"), false), &[]).await;
+        last = format!("{s} {:?} {body}", h.get("x-caliban-intent"));
+        h.get("x-caliban-route").is_some_and(|r| r == "node/flow@v1")
+    })
+    .await;
+    assert!(last.contains("booking;"), "{last}");
+}

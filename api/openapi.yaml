@@ -1721,6 +1721,63 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
 
+  /api/v1/tenants/{tenantId}/intents:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [routes]
+      summary: The tenant's caliban/auto intents and exemplars as routers use them (routes.read)
+      responses:
+        '200':
+          description: 'Each intent with its exemplars, `source` (`config`: the file; `api`: set here) and the node it hands to; `removed`: file intents an empty list removes'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  intents:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        intent: { type: string }
+                        exemplars: { type: array, items: { type: string } }
+                        source: { type: string, enum: [config, api] }
+                        node: { type: [string, 'null'] }
+                  removed: { type: array, items: { type: string } }
+
+  /api/v1/tenants/{tenantId}/intents/{intent}:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: intent, in: path, required: true, schema: { type: string, pattern: '^[a-z0-9_.-]{1,64}$' } }
+    put:
+      tags: [routes]
+      summary: Set the tenant's exemplars of an intent, over the config file's (routes.write)
+      description: |
+        At most 100 intents per tenant and 200 exemplars per intent (each 1 to 2000 characters;
+        duplicates dropped). An empty list removes a config-file intent for this tenant. Shipped in
+        the snapshot: routers rebuild their kNN index without a restart. Audited as
+        `tenant.intent.set` with counts, never the texts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [exemplars]
+              additionalProperties: false
+              properties:
+                exemplars: { type: array, maxItems: 200, items: { type: string, minLength: 1, maxLength: 2000 } }
+      responses:
+        '200': { description: The intent as stored }
+        '400': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [routes]
+      summary: Drop the tenant's own exemplars of an intent (the config file's apply again)
+      responses:
+        '204': { description: Removed (audited as `tenant.intent.delete`) }
+        '404': { $ref: '#/components/responses/Error' }
+
   /api/v1/tenants/{tenantId}/ontology:
     parameters: [ { $ref: '#/components/parameters/TenantId' } ]
     get:

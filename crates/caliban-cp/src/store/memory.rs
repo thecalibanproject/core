@@ -760,6 +760,23 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 onto.version = version;
             }
         }
+        Mutation::SetTenantIntent { tenant_id, intent, exemplars } => {
+            let t = st
+                .tenants
+                .iter_mut()
+                .find(|t| &t.id == tenant_id && t.is_active())
+                .ok_or_else(|| StoreError::NotFound("tenant".into()))?;
+            match exemplars {
+                Some(ex) => {
+                    t.intents.insert(intent.clone(), ex.clone());
+                }
+                None => {
+                    if t.intents.remove(intent).is_none() {
+                        return Err(StoreError::NotFound(format!("intent '{intent}'")));
+                    }
+                }
+            }
+        }
         Mutation::CreateDek { tenant_id, dek } => {
             need_tenant(st, tenant_id)?;
             if st.deks.contains_key(tenant_id) {

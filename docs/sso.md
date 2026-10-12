@@ -185,6 +185,8 @@ tenants the caller may see. A refusal is `403` with `error.type = "permission_er
 | `POST /api/v1/datasources/{datasourceId}/introspect` | `datasources.write` (the datasource's tenant) | owner, admin, tenant_admin |
 | `GET /api/v1/datasources/{datasourceId}/introspection` | `datasources.read` (the datasource's tenant) | owner, admin, auditor, tenant_admin, developer, viewer |
 | `POST /api/v1/tenants/{t}/ontology/proposals` | `ontology.review` | owner, admin, tenant_admin, developer |
+| `GET /api/v1/tenants/{t}/intents` | `routes.read` | owner, admin, auditor, tenant_admin, developer, viewer |
+| `PUT`, `DELETE /api/v1/tenants/{t}/intents/{intent}` | `routes.write` | owner, admin, tenant_admin, developer |
 | `GET /api/v1/ontology?tenant_id=` | `ontology.read` | owner, admin, auditor, tenant_admin, developer, viewer |
 | `POST /api/v1/ontology/elements/{elementId}/review` | `ontology.review` (the `tenant_id` in the body: element ids are per tenant) | owner, admin, tenant_admin, developer |
 | `GET /api/v1/tenants/{t}/ontology` | `ontology.read` | owner, admin, auditor, tenant_admin, developer, viewer |

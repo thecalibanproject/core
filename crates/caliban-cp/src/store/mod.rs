@@ -95,6 +95,11 @@ pub struct Tenant {
     pub pii_patterns: Vec<caliban_config::PiiPattern>,
     #[serde(default)]
     pub pii_dictionary: Vec<caliban_config::PiiTerm>,
+    /// `caliban/auto` intents managed on the control plane: intent to exemplars, over the config
+    /// file's `[routing.tenants.<id>.exemplars]` intent by intent (an empty list removes a file
+    /// intent). Rendered into the snapshot's routing section.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub intents: BTreeMap<String, Vec<String>>,
     /// T2 semantic cache for this tenant (`off` by default; also needs `[cache.semantic] enabled`).
     pub semantic_cache: SemanticCacheMode,
     /// Fraction of the flat `caliban/auto` price billed for a cache hit, in 0..=1. `None`: the
@@ -461,6 +466,7 @@ impl State {
                 pii_on_sovereign: t.pii_on_sovereign,
                 pii_patterns: t.pii_patterns.clone(),
                 pii_dictionary: t.pii_dictionary.clone(),
+                intents: BTreeMap::new(),
                 semantic_cache: t.semantic_cache,
                 auto_cache_hit_fraction: t.auto_cache_hit_fraction,
                 node_caps: None,
@@ -652,6 +658,17 @@ fn tenant_settings(t: &TenantConfig) -> Map<String, Value> {
 /// next snapshot it applies.
 pub fn render(base: &Config, st: &State) -> Result<Config, String> {
     let mut cfg = base.clone();
+    // Intents managed on the control plane, over the file's, intent by intent.
+    for t in st.tenants.iter().filter(|t| t.is_active() && !t.intents.is_empty()) {
+        let r = cfg.routing.tenants.entry(t.id.as_str().into()).or_default();
+        for (intent, ex) in &t.intents {
+            if ex.is_empty() {
+                r.exemplars.remove(intent);
+            } else {
+                r.exemplars.insert(intent.clone(), ex.clone());
+            }
+        }
+    }
     cfg.models = st.models.clone();
     cfg.providers = st.shared_providers.clone();
     cfg.tenants = st
@@ -1072,6 +1089,12 @@ pub enum Mutation {
         tenant_id: String,
         decisions: Vec<(String, Status)>,
     },
+    /// Sets (`Some`) or removes (`None`) the tenant's own exemplars of one `caliban/auto` intent.
+    SetTenantIntent {
+        tenant_id: String,
+        intent: String,
+        exemplars: Option<Vec<String>>,
+    },
     /// Stores a tenant's first DEK (wrapped). Conflict if the tenant already has one.
     CreateDek {
         tenant_id: String,
@@ -1449,6 +1472,23 @@ impl Mutation {
             ),
             Mutation::CreateDek { tenant_id, dek } => {
                 d(Some(tenant_id), "tenant_key.create", tenant_id, json!({"kek_id": dek.wrapped.kek_id}))
+            }
+            Mutation::SetTenantIntent { tenant_id, intent, exemplars } => {
+                let before_n = before.tenant(tenant_id).and_then(|t| t.intents.get(intent)).map(Vec::len);
+                match exemplars {
+                    Some(ex) => d(
+                        Some(tenant_id),
+                        "tenant.intent.set",
+                        intent,
+                        json!({"intent": intent, "exemplars": ex.len(), "previous_exemplars": before_n}),
+                    ),
+                    None => d(
+                        Some(tenant_id),
+                        "tenant.intent.delete",
+                        intent,
+                        json!({"intent": intent, "previous_exemplars": before_n}),
+                    ),
+                }
             }
             Mutation::Rekey(r) => AuditDraft {
                 tenant_id: None,

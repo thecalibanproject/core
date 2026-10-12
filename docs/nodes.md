@@ -372,7 +372,13 @@ triage = "node/triage"              # the live version; "node/triage@published" 
 and as a tenant setting on the control plane, `PATCH /api/v1/tenants/{t}` `{"node_routes":
 {"triage": "node/triage"}}` (`null` clears it; shipped in the snapshot; it overrides the file intent
 by intent; audited as `tenant.update`). The intents are the tenant's `caliban/auto` intents (its own
-exemplars in `[routing.tenants.<id>.exemplars]`, and the deployment's).
+exemplars, and the deployment's). A tenant's exemplars come from `[routing.tenants.<id>.exemplars]`
+in the file and from the admin API, which overrides the file intent by intent and needs no restart:
+`PUT /api/v1/tenants/{t}/intents/{intent}` `{"exemplars": ["my chest hurts", ...]}` (an empty list
+removes a file intent for the tenant), `DELETE` to fall back to the file, `GET
+/api/v1/tenants/{t}/intents` for what routers use (with each intent's `source` and `node`). Routers
+rebuild their kNN index with the snapshot that changes them. So onboarding a new intent and its
+node is two API calls: the intent, then `node_routes`.
 
 When a `caliban/auto` request classifies into an intent that maps to a node, the node runs instead of
 a model call, through the same path as `model: "node/<name>"` (the run's `origin` is `auto`: the

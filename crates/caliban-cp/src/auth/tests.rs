@@ -1130,6 +1130,23 @@ fn cases() -> Vec<Case> {
             "owner admin tenant_admin developer",
         ),
         c("GET", "/tenants/{tenant_id}/ontology", "/api/v1/tenants/{t}/ontology", None, true, READERS),
+        c("GET", "/tenants/{tenant_id}/intents", "/api/v1/tenants/{t}/intents", None, true, READERS),
+        c(
+            "PUT",
+            "/tenants/{tenant_id}/intents/{intent}",
+            "/api/v1/tenants/{t}/intents/triage",
+            Some(json!({"exemplars": ["my chest hurts"]})),
+            true,
+            "owner admin tenant_admin developer",
+        ),
+        c(
+            "DELETE",
+            "/tenants/{tenant_id}/intents/{intent}",
+            "/api/v1/tenants/{t}/intents/nope",
+            None,
+            true,
+            "owner admin tenant_admin developer",
+        ),
         c(
             "POST",
             "/tenants/{tenant_id}/ontology/review",

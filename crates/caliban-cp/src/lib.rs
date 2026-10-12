@@ -381,6 +381,8 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/datasources/{id}/introspect", post(introspect_datasource))
         .route("/ontology", get(get_ontology))
         .route("/ontology/elements/{id}/review", post(review_element))
+        .route("/tenants/{tenant_id}/intents", get(list_intents))
+        .route("/tenants/{tenant_id}/intents/{intent}", axum::routing::put(put_intent).delete(delete_intent))
         .route("/tenants/{tenant_id}/ontology", get(get_tenant_ontology))
         .route("/tenants/{tenant_id}/ontology/proposals", post(propose_ontology))
         .route("/datasources/{id}/introspection", get(get_introspection))
@@ -640,6 +642,7 @@ async fn create_tenant(
         pii_on_sovereign: body.pii_on_sovereign.unwrap_or(false),
         pii_patterns: body.pii_patterns.unwrap_or_default(),
         pii_dictionary: body.pii_dictionary.unwrap_or_default(),
+        intents: std::collections::BTreeMap::new(),
         semantic_cache: body.semantic_cache.unwrap_or_default(),
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
         node_caps: body.node_caps,
@@ -1212,6 +1215,98 @@ async fn get_ontology(
         version: 0,
         elements: vec![],
     })))
+}
+
+// ───────────────────────────── caliban/auto intents ─────────────────────────────
+
+/// Limits on a tenant's own intents (kNN exemplars).
+const MAX_INTENTS: usize = 100;
+const MAX_EXEMPLARS: usize = 200;
+const MAX_EXEMPLAR_CHARS: usize = 2000;
+
+/// `GET /api/v1/tenants/{t}/intents`: the tenant's `caliban/auto` intents as routers see them, with
+/// where each comes from (`config`: the file's `[routing.tenants.<id>.exemplars]`; `api`: set
+/// here) and the node it hands to, if any.
+async fn list_intents(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiResult<Json<Value>> {
+    ensure_tenant(&cp, &tenant_id)?;
+    let st = cp.store.state();
+    let t = st.tenant(&tenant_id).ok_or_else(|| not_found("tenant"))?;
+    let base = cp.store.base();
+    let file = base.routing.tenants.get(&tenant_id.as_str().into());
+    let snap = cp.store.config.load();
+    let rendered = snap.config.routing.tenants.get(&tenant_id.as_str().into());
+    let routes = file.map(|f| f.routes.clone()).unwrap_or_default();
+    let node_routes = t.node_routes.clone().unwrap_or_default();
+    let mut out = Vec::new();
+    for (intent, ex) in rendered.map(|r| r.exemplars.clone()).unwrap_or_default() {
+        let source = if t.intents.contains_key(&intent) { "api" } else { "config" };
+        let node = node_routes.get(&intent).or_else(|| routes.get(&intent));
+        out.push(json!({"intent": intent, "exemplars": ex, "source": source, "node": node}));
+    }
+    let removed: Vec<&String> = t.intents.iter().filter(|(_, ex)| ex.is_empty()).map(|(i, _)| i).collect();
+    Ok(Json(json!({"tenant_id": tenant_id, "intents": out, "removed": removed})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntentBody {
+    exemplars: Vec<String>,
+}
+
+fn valid_intent(i: &str) -> bool {
+    (1..=64).contains(&i.len())
+        && i.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.')
+        && i != "pinned"
+}
+
+/// `PUT /api/v1/tenants/{t}/intents/{intent}` `{"exemplars": [...]}`: the tenant's exemplars for
+/// the intent, over the config file's (an empty list removes a file intent for the tenant).
+/// Audited (`tenant.intent.set`, with counts, not the texts); routers rebuild their kNN index with
+/// the next snapshot, without a restart.
+async fn put_intent(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path((tenant_id, intent)): Path<(String, String)>,
+    Json(b): Json<IntentBody>,
+) -> ApiResult<Json<Value>> {
+    ensure_tenant(&cp, &tenant_id)?;
+    if !valid_intent(&intent) {
+        return Err(bad("intent: 1 to 64 characters of [a-z0-9_.-] ('pinned' is reserved)"));
+    }
+    let mut ex: Vec<String> = Vec::new();
+    for e in b.exemplars {
+        let e = e.trim().to_owned();
+        if e.is_empty() || e.chars().count() > MAX_EXEMPLAR_CHARS {
+            return Err(bad(format!("an exemplar is 1 to {MAX_EXEMPLAR_CHARS} characters")));
+        }
+        if !ex.contains(&e) {
+            ex.push(e);
+        }
+    }
+    if ex.len() > MAX_EXEMPLARS {
+        return Err(bad(format!("at most {MAX_EXEMPLARS} exemplars per intent")));
+    }
+    let st = cp.store.state();
+    let t = st.tenant(&tenant_id).ok_or_else(|| not_found("tenant"))?;
+    if !t.intents.contains_key(&intent) && t.intents.len() >= MAX_INTENTS {
+        return Err(bad(format!("at most {MAX_INTENTS} intents per tenant")));
+    }
+    let m =
+        Mutation::SetTenantIntent { tenant_id: tenant_id.clone(), intent: intent.clone(), exemplars: Some(ex.clone()) };
+    cp.store.apply(&p.actor, m).await?;
+    Ok(Json(json!({"tenant_id": tenant_id, "intent": intent, "exemplars": ex, "source": "api"})))
+}
+
+/// `DELETE /api/v1/tenants/{t}/intents/{intent}`: drops the tenant's own exemplars of the intent
+/// (the config file's, if any, apply again). `404` when it has none.
+async fn delete_intent(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path((tenant_id, intent)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    ensure_tenant(&cp, &tenant_id)?;
+    cp.store.apply(&p.actor, Mutation::SetTenantIntent { tenant_id, intent, exemplars: None }).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /api/v1/tenants/{t}/ontology`: the same as `GET /api/v1/ontology?tenant_id=`.
@@ -2366,5 +2461,81 @@ mod tests {
             call(&app, "POST", &format!("/api/v1/datasources/{}/introspect", ds["id"].as_str().unwrap()), None, true)
                 .await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// e2e gap 2: a tenant's caliban/auto intents and exemplars at runtime, over the config file's.
+    #[tokio::test]
+    async fn tenant_intents_are_managed_at_runtime_over_the_config_file() {
+        let toml = format!(
+            "{}\n[routing.tenants.acme]\nexemplars = {{ \"legal.review\" = [\"review this NDA clause\"] }}\n",
+            include_str!("../../../config/caliban.example.toml")
+        );
+        let cfg = Config::from_toml_str(&toml).unwrap();
+        let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "boot"));
+        let c = Arc::new(
+            ControlPlane::new(
+                Store::new(cfg, handle.clone(), RecentUsage::default()),
+                "admin-secret".into(),
+                "standalone",
+            )
+            .with_keyring(Some(Arc::new(test_ring()))),
+        );
+        let app = app(Arc::clone(&c), None);
+        let ex = |h: &ConfigHandle, i: &str| {
+            h.load().config.routing.tenants.get(&"acme".into()).and_then(|t| t.exemplars.get(i).cloned())
+        };
+        // The file's intent, as the bootstrap.
+        let (_, l) = call(&app, "GET", "/api/v1/tenants/acme/intents", None, true).await;
+        assert_eq!(
+            (l["intents"][0]["intent"].as_str(), l["intents"][0]["source"].as_str()),
+            (Some("legal.review"), Some("config"))
+        );
+        // A new intent, shipped in the snapshot routers read (no restart).
+        let body = json!({"exemplars": ["my chest hurts since tuesday", "fever and cough for days", " fever and cough for days "]});
+        let (s, v) = call(&app, "PUT", "/api/v1/tenants/acme/intents/triage", Some(body), true).await;
+        assert_eq!((s, v["exemplars"].as_array().map(Vec::len)), (StatusCode::OK, Some(2)), "{v}");
+        assert_eq!(ex(&handle, "triage").map(|v| v.len()), Some(2));
+        // Overriding the file's intent, then removing it for this tenant, then back to the file's.
+        let (s, _) =
+            call(&app, "PUT", "/api/v1/tenants/acme/intents/legal.review", Some(json!({"exemplars": []})), true).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(ex(&handle, "legal.review"), None, "an empty list removes the file's intent");
+        let (_, l) = call(&app, "GET", "/api/v1/tenants/acme/intents", None, true).await;
+        assert_eq!(l["removed"], json!(["legal.review"]));
+        assert_eq!(
+            call(&app, "DELETE", "/api/v1/tenants/acme/intents/legal.review", None, true).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(ex(&handle, "legal.review").map(|v| v.len()), Some(1));
+        assert_eq!(
+            call(&app, "DELETE", "/api/v1/tenants/acme/intents/legal.review", None, true).await.0,
+            StatusCode::NOT_FOUND
+        );
+        // Audited with counts, never the texts.
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=5", None, true).await;
+        assert!(
+            a["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["action"] == "tenant.intent.set" && e["detail"]["exemplars"] == 2)
+        );
+        assert!(!a.to_string().contains("chest hurts"), "exemplar texts stay out of the audit log");
+        // Checked.
+        for (intent, body) in [
+            ("Bad Name", json!({"exemplars": ["x"]})),
+            ("pinned", json!({"exemplars": ["x"]})),
+            ("ok", json!({"exemplars": [""]})),
+        ] {
+            let (s, _) = call(
+                &app,
+                "PUT",
+                &format!("/api/v1/tenants/acme/intents/{}", intent.replace(' ', "%20")),
+                Some(body),
+                true,
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{intent}");
+        }
     }
 }
