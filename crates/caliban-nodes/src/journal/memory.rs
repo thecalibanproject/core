@@ -66,6 +66,28 @@ impl MemoryJournal {
         Self::default()
     }
 
+    fn claim_audit_where(
+        &self,
+        worker: &str,
+        ttl: Duration,
+        limit: usize,
+        keep: impl Fn(&AuditEvent) -> bool,
+    ) -> JResult<Vec<AuditEvent>> {
+        let now = Utc::now();
+        let mut t = self.t.lock();
+        let mut out = Vec::new();
+        for (a, held) in &mut t.audit {
+            if out.len() >= limit {
+                break;
+            }
+            if keep(a) && held.as_ref().is_none_or(|(_, until)| *until < now) {
+                *held = Some((worker.to_owned(), now + lease(ttl)));
+                out.push(a.clone());
+            }
+        }
+        Ok(out)
+    }
+
     /// Ends the lease of a run as if its worker had died long ago (tests).
     pub fn expire_lease(&self, run_id: &str) {
         if let Some(r) = self.t.lock().runs.iter_mut().find(|r| r.id == run_id) {
@@ -454,19 +476,17 @@ impl Journal for MemoryJournal {
     }
 
     async fn claim_audit(&self, worker: &str, ttl: Duration, limit: usize) -> JResult<Vec<AuditEvent>> {
-        let now = Utc::now();
-        let mut t = self.t.lock();
-        let mut out = Vec::new();
-        for (a, held) in &mut t.audit {
-            if out.len() >= limit {
-                break;
-            }
-            if held.as_ref().is_none_or(|(_, until)| *until < now) {
-                *held = Some((worker.to_owned(), now + lease(ttl)));
-                out.push(a.clone());
-            }
-        }
-        Ok(out)
+        self.claim_audit_where(worker, ttl, limit, |_| true)
+    }
+
+    async fn claim_audit_of(
+        &self,
+        worker: &str,
+        ttl: Duration,
+        limit: usize,
+        actions: &[&str],
+    ) -> JResult<Vec<AuditEvent>> {
+        self.claim_audit_where(worker, ttl, limit, |a| actions.contains(&a.action.as_str()))
     }
 
     async fn ack_audit(&self, ids: &[String]) -> JResult<()> {

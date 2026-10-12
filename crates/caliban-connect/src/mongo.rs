@@ -729,7 +729,9 @@ mod tests {
             c.database("x").run_command(doc! {"ping": 1}).selection_criteria(selection.clone()).await.unwrap_err()
         });
         let msg = query_error(e, &selection, false).to_string();
-        assert!(msg.contains("no MongoDB member matches the read preference secondary with tags {workload: analytics}"));
+        assert!(
+            msg.contains("no MongoDB member matches the read preference secondary with tags {workload: analytics}")
+        );
         assert!(msg.contains("set the connection's read_preference"), "{msg}");
         let configured = query_error(
             rt.block_on(async {

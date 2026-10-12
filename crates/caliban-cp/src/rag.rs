@@ -74,7 +74,7 @@ fn event(tenant: &str, p: &Principal, action: &str, target: &str, detail: Value)
 }
 
 /// Moves the registry's audit events into the hash chain now.
-async fn drain(cp: &Cp, r: &Arc<dyn RagStore>) -> ApiResult<()> {
+pub(crate) async fn drain(cp: &Cp, r: &Arc<dyn RagStore>) -> ApiResult<()> {
     let pending = r.claim_audit("control-plane", std::time::Duration::from_secs(60), 1000).await.map_err(rag_error)?;
     if pending.is_empty() {
         return Ok(());

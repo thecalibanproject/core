@@ -234,6 +234,47 @@ impl PgJournal {
         &self.pool
     }
 
+    /// Takes outbox rows (all actions, or only `actions`).
+    async fn claim_audit_rows(
+        &self,
+        worker: &str,
+        ttl: Duration,
+        limit: usize,
+        actions: Option<&[&str]>,
+    ) -> JResult<Vec<AuditEvent>> {
+        let actions: Option<Vec<String>> = actions.map(|a| a.iter().map(|s| (*s).to_owned()).collect());
+        let rows = sqlx::query(
+            "UPDATE node_audit SET claimed_by = $1, claimed_until = now() + make_interval(secs => $2)
+             WHERE id IN (SELECT id FROM node_audit WHERE (claimed_until IS NULL OR claimed_until < now())
+                            AND ($4::text[] IS NULL OR action = ANY($4))
+                          ORDER BY created_at LIMIT $3 FOR UPDATE SKIP LOCKED)
+             RETURNING id, tenant_id, actor, action, target, detail, created_at",
+        )
+        .bind(worker)
+        .bind(secs(ttl))
+        .bind(i64_of(limit as u64))
+        .bind(actions)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let mut out: Vec<AuditEvent> = rows
+            .iter()
+            .map(|r| {
+                Ok(AuditEvent {
+                    id: get(r, "id")?,
+                    tenant_id: get(r, "tenant_id")?,
+                    actor: get(r, "actor")?,
+                    action: get(r, "action")?,
+                    target: get(r, "target")?,
+                    detail: get::<Json<serde_json::Value>>(r, "detail")?.0,
+                    at: get(r, "created_at")?,
+                })
+            })
+            .collect::<JResult<_>>()?;
+        out.sort_by_key(|a| a.at);
+        Ok(out)
+    }
+
     async fn one(
         &self,
         q: sqlx::query::Query<'_, Postgres, sqlx::postgres::PgArguments>,
@@ -782,34 +823,17 @@ impl Journal for PgJournal {
     }
 
     async fn claim_audit(&self, worker: &str, ttl: Duration, limit: usize) -> JResult<Vec<AuditEvent>> {
-        let rows = sqlx::query(
-            "UPDATE node_audit SET claimed_by = $1, claimed_until = now() + make_interval(secs => $2)
-             WHERE id IN (SELECT id FROM node_audit WHERE claimed_until IS NULL OR claimed_until < now()
-                          ORDER BY created_at LIMIT $3 FOR UPDATE SKIP LOCKED)
-             RETURNING id, tenant_id, actor, action, target, detail, created_at",
-        )
-        .bind(worker)
-        .bind(secs(ttl))
-        .bind(i64_of(limit as u64))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db)?;
-        let mut out: Vec<AuditEvent> = rows
-            .iter()
-            .map(|r| {
-                Ok(AuditEvent {
-                    id: get(r, "id")?,
-                    tenant_id: get(r, "tenant_id")?,
-                    actor: get(r, "actor")?,
-                    action: get(r, "action")?,
-                    target: get(r, "target")?,
-                    detail: get::<Json<serde_json::Value>>(r, "detail")?.0,
-                    at: get(r, "created_at")?,
-                })
-            })
-            .collect::<JResult<_>>()?;
-        out.sort_by_key(|a| a.at);
-        Ok(out)
+        self.claim_audit_rows(worker, ttl, limit, None).await
+    }
+
+    async fn claim_audit_of(
+        &self,
+        worker: &str,
+        ttl: Duration,
+        limit: usize,
+        actions: &[&str],
+    ) -> JResult<Vec<AuditEvent>> {
+        self.claim_audit_rows(worker, ttl, limit, Some(actions)).await
     }
 
     async fn ack_audit(&self, ids: &[String]) -> JResult<()> {

@@ -321,6 +321,11 @@ impl crate::nodes::AuditTransport for HttpAuditTransport {
         let text: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
         Err(format!("control plane returned {status}: {text}"))
     }
+
+    /// The control plane accepts only the data plane's decisions over this endpoint.
+    fn actions(&self) -> Option<&'static [&'static str]> {
+        Some(caliban_nodes::journal::WORKER_AUDIT_ACTIONS)
+    }
 }
 
 /// Write-then-rename so a crash never leaves a torn cache file. Owner-only permissions: the

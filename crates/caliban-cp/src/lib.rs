@@ -219,6 +219,30 @@ pub fn spawn_usage_retention(cp: Cp, days: u32, every: Duration) -> tokio::task:
     })
 }
 
+/// Drains the control plane's own entries of the shared outboxes (the node journal's and the
+/// retrieval registry's) into the audit chain every `every`. Each write drains at once; this
+/// catches entries a control plane left behind (it stopped between the write and the drain),
+/// since workers ship only the data plane's decisions.
+pub fn spawn_audit_drain(cp: Cp, every: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Some(j) = cp.journal()
+                && let Err(e) = runs::drain_audit(&cp, &j).await
+            {
+                tracing::warn!(error = %e.1, "draining the node journal's audit outbox failed; retrying later");
+            }
+            if let Some(r) = cp.rag()
+                && let Err(e) = rag::drain(&cp, &r).await
+            {
+                tracing::warn!(error = %e.1, "draining the retrieval registry's audit outbox failed; retrying later");
+            }
+        }
+    })
+}
+
 pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiError {
@@ -1153,8 +1177,11 @@ struct AuditIngest {
 }
 
 /// `POST /api/v1/audit/ingest`: a worker delivers decisions made on the data plane (human answers,
-/// approvals and denials of tainted writes, cancellations), with the router token. Each is
-/// recorded in the hash-chained audit log once (by its id), so retries are harmless.
+/// approvals and denials of tainted writes, cancellations, eval results), with the router token.
+/// Each is recorded in the hash-chained audit log once (by its id), so retries are harmless. Only
+/// [`caliban_nodes::journal::WORKER_AUDIT_ACTIONS`] are accepted: the control plane's own actions
+/// (`rag.*`, golden sets, promotion bars, eval starts) are refused here, so a compromised router
+/// cannot forge them; they are counted as `rejected`.
 async fn ingest_audit(State(cp): State<Cp>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     let Some(token) = cp.router_token.as_deref() else {
         return ApiError(
@@ -1173,8 +1200,17 @@ async fn ingest_audit(State(cp): State<Cp>, headers: HeaderMap, body: axum::body
     if batch.events.len() > 1000 {
         return ApiError(StatusCode::PAYLOAD_TOO_LARGE, "at most 1000 events per batch".into()).into_response();
     }
-    match cp.store.ingest_audit(batch.events).await {
-        Ok(r) => {
+    let (events, forged): (Vec<_>, Vec<_>) = batch
+        .events
+        .into_iter()
+        .partition(|e| caliban_nodes::journal::WORKER_AUDIT_ACTIONS.contains(&e.action.as_str()));
+    for e in &forged {
+        tracing::warn!(router = ?batch.router_id, action = %e.action, id = %e.id, tenant = %e.tenant_id,
+            "refused an audit event a router may not deliver");
+    }
+    match cp.store.ingest_audit(events).await {
+        Ok(mut r) => {
+            r.rejected += forged.len() as u64;
             tracing::debug!(router = ?batch.router_id, accepted = r.accepted, duplicates = r.duplicates, "audit events ingested");
             Json(json!(r)).into_response()
         }
@@ -1828,5 +1864,67 @@ mod tests {
         assert_eq!(call(&app, "DELETE", "/api/v1/tenants/initech", None, true).await.0, StatusCode::NO_CONTENT);
         let (_, _, body) = get("Bearer router-secret", etag4).await;
         assert!(verify(&body).config.tenants.iter().all(|t| t.id.as_str() != "initech"));
+    }
+
+    #[tokio::test]
+    async fn routers_may_deliver_only_the_data_planes_audit_actions() {
+        let base = cp();
+        let cfg = base.store.base().clone();
+        let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "boot"));
+        let (seed, _) = generate_signing_key();
+        let c = Arc::new(
+            ControlPlane::new(Store::new(cfg, handle, RecentUsage::default()), "admin-secret".into(), "control-plane")
+                .with_snapshots(Some(SnapshotSigner::from_b64(&seed).unwrap()), Some("router-secret".into())),
+        );
+        let app = app(Arc::clone(&c), None);
+        let ev = |id: &str, action: &str| {
+            json!({"id": id, "tenant_id": "acme", "actor": "api_key:abc", "action": action,
+                   "target": "triage", "detail": {}, "at": "2026-10-12T08:00:00Z"})
+        };
+        let batch = json!({"router_id": "r1", "events": [
+            ev("run_1/answer", "node.run.answer"),
+            ev("run_1/cancel", "node.run.cancel"),
+            // What a compromised router could try to forge: the control plane's own actions.
+            ev("cp/rag.collection.delete/x", "rag.collection.delete"),
+            ev("cp/rag.document.release/x", "rag.document.release"),
+            ev("cp/golden", "node.golden_set.update"),
+            ev("cp/bar", "node.eval_policy.update"),
+            ev("cp/start", "node.eval.start"),
+            ev("forged", "tenant.delete"),
+        ]});
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/audit/ingest")
+                    .header("authorization", "Bearer router-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(batch.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let r: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!((r["accepted"].as_u64(), r["rejected"].as_u64()), (Some(2), Some(6)), "{r}");
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=20", None, true).await;
+        let actions: Vec<&str> = a["entries"].as_array().unwrap().iter().filter_map(|e| e["action"].as_str()).collect();
+        assert!(actions.contains(&"node.run.answer") && actions.contains(&"node.run.cancel"), "{actions:?}");
+        assert!(
+            !actions.iter().any(|a| a.starts_with("rag.") || a.starts_with("node.golden") || *a == "node.eval.start")
+        );
+        assert!(!actions.contains(&"node.eval_policy.update") && !actions.contains(&"tenant.delete"), "{actions:?}");
+        // The control plane itself still records its own actions (its outbox drains).
+        let own = caliban_nodes::journal::AuditEvent {
+            id: "cp/golden".into(),
+            tenant_id: "acme".into(),
+            actor: "user:jo".into(),
+            action: "node.golden_set.update".into(),
+            target: Some("triage".into()),
+            detail: json!({}),
+            at: chrono::Utc::now(),
+        };
+        assert_eq!(c.store.ingest_audit(vec![own]).await.unwrap().accepted, 1);
     }
 }

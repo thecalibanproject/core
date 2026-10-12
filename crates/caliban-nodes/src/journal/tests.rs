@@ -522,6 +522,13 @@ async fn cancel_ends_waiting_runs_and_stops_running_ones_at_the_next_step() {
         assert_eq!((second[0].action.as_str(), second[0].actor.as_str()), ("node.run.cancel", "api_key:abc"));
         j.ack_audit(&["run_p/cancel".to_owned(), "run_r/cancel".to_owned()]).await.unwrap();
         assert!(j.claim_audit("w3", TTL, 10).await.unwrap().is_empty(), "{n}");
+        // A worker's claim takes the data plane's decisions, nothing else.
+        j.create_run(new_run("run_y", "acme", None)).await.unwrap();
+        j.cancel("acme", "run_y", "api_key:abc", Some(audit("run_y"))).await.unwrap();
+        let taken = j.claim_audit_of("w1", TTL, 10, WORKER_AUDIT_ACTIONS).await.unwrap();
+        assert_eq!(taken.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["run_y/cancel"], "{n}");
+        assert!(j.claim_audit_of("w2", TTL, 10, &["node.eval.start"]).await.unwrap().is_empty(), "{n}");
+        j.ack_audit(&["run_y/cancel".to_owned()]).await.unwrap();
         // A worker that dies before the acknowledgement: another one ships the entry after the hold.
         j.create_run(new_run("run_x", "acme", None)).await.unwrap();
         j.cancel("acme", "run_x", "api_key:abc", Some(audit("run_x"))).await.unwrap();
@@ -703,6 +710,8 @@ async fn golden_sets_and_promotion_bars_are_stored_per_version_with_their_audit(
         let got = j.eval_policy("acme", "triage").await.unwrap().expect(n);
         assert_eq!(got.policy["golden"]["min_pass_k"], 0.9, "{n}");
 
+        // A worker takes only the actions it may ship: these are the control plane's to drain.
+        assert!(j.claim_audit_of("w1", TTL, 100, WORKER_AUDIT_ACTIONS).await.unwrap().is_empty(), "{n}");
         // Every write recorded its audit event in the outbox (a no-op delete recorded nothing).
         let mut ids: Vec<String> =
             j.claim_audit("cp", TTL, 100).await.unwrap().into_iter().map(|a| a.id).collect::<Vec<_>>();

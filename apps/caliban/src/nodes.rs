@@ -228,6 +228,11 @@ fn tool_registry(
 pub trait AuditTransport: Send + Sync {
     /// `Ok` once the control plane recorded (or already had) every event.
     async fn send(&self, events: &[caliban_nodes::journal::AuditEvent]) -> Result<(), String>;
+    /// The actions this transport may deliver (`None`: every action, the in-process control plane
+    /// of a standalone process). Others stay in the outbox for the control plane to drain.
+    fn actions(&self) -> Option<&'static [&'static str]> {
+        None
+    }
 }
 
 /// How long a worker holds the outbox entries it is shipping before another worker may take them.
@@ -246,7 +251,11 @@ pub async fn ship_audit(
 ) {
     let mut backoff = every;
     loop {
-        let wait = match journal.claim_audit(&owner, AUDIT_HOLD, 200).await {
+        let claimed = match transport.actions() {
+            Some(actions) => journal.claim_audit_of(&owner, AUDIT_HOLD, 200, actions).await,
+            None => journal.claim_audit(&owner, AUDIT_HOLD, 200).await,
+        };
+        let wait = match claimed {
             Ok(batch) if !batch.is_empty() => match transport.send(&batch).await {
                 Ok(()) => {
                     let ids: Vec<String> = batch.into_iter().map(|e| e.id).collect();

@@ -2450,9 +2450,11 @@ paths:
       summary: Run decisions from the data plane
       description: |
         Authenticated with the router token. Workers deliver the decisions made on the data plane
-        (`node.run.answer`, `node.write.approve`, `node.write.deny`, `node.run.cancel`) at least once;
-        each event id is recorded once in the hash-chained audit log, so a retry appends nothing.
-        Other actions are `rejected`.
+        (`node.run.answer`, `node.write.approve`, `node.write.deny`, `node.run.cancel`,
+        `node.eval.finish`) at least once; each event id is recorded once in the hash-chained audit
+        log, so a retry appends nothing. Every other action, including the control plane's own
+        (`rag.*`, `node.golden_set.*`, `node.eval_policy.update`, `node.eval.start`,
+        `node.eval.cancel`), is counted as `rejected` and not recorded.
       requestBody:
         required: true
         content:

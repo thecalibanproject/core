@@ -635,6 +635,9 @@ async fn control_plane(
             None => caliban_cp::store::usage::DEFAULT_RETENTION_DAYS,
         };
         caliban_cp::spawn_usage_retention(Arc::clone(&cp), days, Duration::from_secs(3600));
+        // The control plane's own audit entries left in the shared outboxes (workers ship only the
+        // data plane's decisions).
+        caliban_cp::spawn_audit_drain(Arc::clone(&cp), Duration::from_secs(30));
     }
     if let Some(t) = local_ship {
         let _ = t.cp.set(Arc::clone(&cp));

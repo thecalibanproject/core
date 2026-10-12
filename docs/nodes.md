@@ -423,6 +423,14 @@ Each event has a stable id (`<run>/<step>/answer`, `<run>/cancel`), and the cont
 id once (`audit_ingest`), so a redelivery appends nothing and `chain_verified` holds. A standalone
 process delivers to its own control plane in-process; the console's answers are recorded directly.
 
+The ingest endpoint accepts only the actions workers decide: `node.run.answer`,
+`node.write.approve`, `node.write.deny`, `node.run.cancel` and `node.eval.finish`. Anything else
+(`rag.*`, golden sets, promotion bars, eval starts and cancellations, or any other action) is
+counted as `rejected` and logged, so a compromised router cannot forge control-plane rows. A worker
+takes only those actions from the shared outbox; the control plane drains its own entries when it
+writes them and every 30 s after (an entry left behind by a control plane that stopped in
+between).
+
 ### Where runs execute
 
 | Mode | Node runs |

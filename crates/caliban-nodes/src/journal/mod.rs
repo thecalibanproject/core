@@ -386,6 +386,13 @@ pub enum Cancelled {
     NotFound,
 }
 
+/// The audit actions a worker ships (`POST /api/v1/audit/ingest`, router token): the decisions
+/// made on the data plane. The control plane refuses any other action on that endpoint, so a
+/// compromised router cannot forge control-plane rows (`rag.*`, golden sets, promotion bars, eval
+/// starts); the control plane drains its own entries of the shared outbox itself.
+pub const WORKER_AUDIT_ACTIONS: &[&str] =
+    &["node.run.answer", "node.write.approve", "node.write.deny", "node.run.cancel", "node.eval.finish"];
+
 /// An entry for the control plane's audit log, written by the data plane in the transaction of
 /// what it records (the outbox) and shipped at least once. `id` is stable (the same decision always
 /// has the same id), so the control plane records it once.
@@ -534,6 +541,15 @@ pub trait Journal: evals::EvalStore + Send + Sync {
     /// Takes up to `limit` audit events not yet shipped and not taken by another worker in the
     /// last `ttl`.
     async fn claim_audit(&self, worker: &str, ttl: Duration, limit: usize) -> JResult<Vec<AuditEvent>>;
+    /// [`Journal::claim_audit`], limited to events whose action is one of `actions` (a worker
+    /// takes only [`WORKER_AUDIT_ACTIONS`]; the rest stay for the control plane).
+    async fn claim_audit_of(
+        &self,
+        worker: &str,
+        ttl: Duration,
+        limit: usize,
+        actions: &[&str],
+    ) -> JResult<Vec<AuditEvent>>;
     /// The control plane stored these: they leave the outbox.
     async fn ack_audit(&self, ids: &[String]) -> JResult<()>;
 

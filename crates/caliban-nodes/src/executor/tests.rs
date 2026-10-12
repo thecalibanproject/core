@@ -388,9 +388,8 @@ async fn a_loop_that_leaves_by_its_exit_edge_ends_without_a_stop_reason() {
                 }
             }),
         );
-        let model = FakeModel::new(|body| {
-            if system(body).contains("criteria") { text("FAIL: unclear") } else { text("ok") }
-        });
+        let model =
+            FakeModel::new(|body| if system(body).contains("criteria") { text("FAIL: unclear") } else { text("ok") });
         let ex = h.executor(&model, "w1");
         let v = run(&ex, "ask", json!("x")).await;
         assert_eq!(v.status, RunStatus::Succeeded, "{v:?}");
