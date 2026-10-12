@@ -120,9 +120,26 @@ fn http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
+tokio::task_local! {
+    /// When the last upstream response's headers arrived, inside [`time_to_headers`].
+    static HEADERS_AT: std::cell::Cell<Option<std::time::Instant>>;
+}
+
+/// Runs a provider call and also returns when its upstream response headers arrived (the time to
+/// first byte; a non-streaming body is read after that). `None` when no response arrived.
+pub async fn time_to_headers<F: std::future::Future>(f: F) -> (F::Output, Option<std::time::Instant>) {
+    HEADERS_AT
+        .scope(std::cell::Cell::new(None), async move {
+            let out = f.await;
+            (out, HEADERS_AT.with(std::cell::Cell::get))
+        })
+        .await
+}
+
 /// Sends a request; non-2xx becomes `ProviderError::Status` with a short body prefix.
 async fn send(req: reqwest::RequestBuilder) -> Result<reqwest::Response, ProviderError> {
     let resp = req.send().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+    let _ = HEADERS_AT.try_with(|c| c.set(Some(std::time::Instant::now())));
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
