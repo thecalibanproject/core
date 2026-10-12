@@ -4,8 +4,10 @@
 //! `required`, `additionalProperties` (boolean or schema), `items` (one schema), `minItems`,
 //! `maxItems`, `minLength`, `maxLength`, `pattern`, `minimum`, `maximum`, `anyOf`, `allOf`.
 //! Annotations (`title`, `description`, `default`, `examples`, `$schema`, `$id`, `$comment`,
-//! `format`) are accepted and not checked, and so is `x-caliban-untrusted` (a boolean: the value is
-//! untrusted caller data, labelled `caller` in a run; see `executor::taint`). Any other keyword (`$ref`, `oneOf`, `if`, ...) is
+//! `format`) are accepted and not checked, and so are `x-caliban-untrusted` (a boolean: the value is
+//! untrusted caller data, labelled `caller` in a run; see `executor::taint`) and
+//! `x-caliban-injection-target` (a boolean: the field the injection suite writes its caller payload
+//! into; see `eval::injection`). Any other keyword (`$ref`, `oneOf`, `if`, ...) is
 //! refused when the node version is published ([`check_supported`]), so a schema is never
 //! silently weaker than it reads.
 
@@ -48,7 +50,7 @@ fn check_at(schema: &Value, at: &str) -> Result<(), String> {
         if ANNOTATIONS.contains(&k.as_str()) {
             continue;
         }
-        if k == crate::executor::taint::UNTRUSTED_KEYWORD {
+        if k == crate::executor::taint::UNTRUSTED_KEYWORD || k == crate::eval::injection::TARGET_KEYWORD {
             if !v.is_boolean() {
                 return Err(format!("{k} at {} must be a boolean", here()));
             }
@@ -298,5 +300,8 @@ mod tests {
             assert!(check_supported(&s).is_err(), "{s}");
         }
         assert!(check_supported(&json!({"type": "string", "format": "email", "description": "d"})).is_ok());
+        let target = json!({"properties": {"m": {"type": "string", "x-caliban-injection-target": true}}});
+        assert!(check_supported(&target).is_ok());
+        assert!(check_supported(&json!({"properties": {"m": {"x-caliban-injection-target": "yes"}}})).is_err());
     }
 }

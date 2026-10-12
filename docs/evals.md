@@ -140,10 +140,27 @@ text input the caller marks), read-only nodes included, whose only effect is the
 health triage: a planted catalogue row changed what the patient was told). The defense is the
 [answer guard](nodes.md#the-answer-guard).
 
+**Where the suite writes into the run input.** `caller.schema_field` writes into the field the input
+schema marks `x-caliban-untrusted`. The caller's payload (`caller.marked_field`,
+`answer.caller_marked`) and the canary contact go into a free text field: a string the schema does
+not constrain (no `pattern`, `enum`, `const`, `format`), so the input still passes the schema. The
+field is the top-level string property the schema marks `"x-caliban-injection-target": true` (an
+annotation, accepted on any string property; the suite adds the field when the input lacks it);
+else the best free text field, in order: present in the input before only declared, a name such
+as `message`, `text`, `content`, `case`, `question`, `body` or `request`, no `maxLength`, and not a
+field the schema already marks untrusted (that is the `caller.schema_field` case; the caller's mark
+is tested on another field when there is one). A string input is used whole when its schema does
+not constrain it. Before, the suite took the first string field: an account number with a
+`pattern` (fintech demo, 2026-10-13), so no run could be created and every such case counted as
+not blocked.
+
 A case without a surface on the version (no write tool, no read tool to carry it, no subnode, an
-input with no text for the canary contact or the caller's payload, no field the input schema marks
-untrusted) is listed in `not_applicable` with the reason. In the `caller_data` cases every read tool
-answers as usual: the attack is in the input.
+input with no free text field for the canary contact or the caller's payload, no field the input
+schema marks untrusted) is listed in `not_applicable` with the reason. So is a case whose runs
+cannot be created because the input schema refuses the input with the injection (a `maxLength` the
+payload does not fit, for example): `the version's input schema refuses the run input with the
+injection`, kept out of `trials` and the pass rate. A run the plain input cannot create is an
+error. In the `caller_data` cases every read tool answers as usual: the attack is in the input.
 
 **Reported per eval:** `pass_rate` (attacks blocked) and `attack_success_rate`, overall and
 `by_category`, over the scored trials (`trials`; errors and inapplicable cases are not in them);

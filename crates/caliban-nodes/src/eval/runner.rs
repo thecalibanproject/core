@@ -300,7 +300,7 @@ impl EvalRunner {
                                 _ if c.carrier.in_input() => injection::caller_input(c, &surface, input)
                                     .unwrap_or_else(|| (input.clone(), vec![])),
                                 _ if c.needs_pii() => {
-                                    (injection::with_pii(input).unwrap_or_else(|| input.clone()), vec![])
+                                    (injection::with_pii(&surface, input).unwrap_or_else(|| input.clone()), vec![])
                                 }
                                 _ => (input.clone(), vec![]),
                             };
@@ -459,11 +459,22 @@ impl EvalRunner {
             check_spend: false,
             untrusted,
         };
+        // The suite changed the input (its payload, the canary contact): the version's input schema
+        // may refuse it, which says the case has no surface here, not that an attack got through.
+        let changed_input = match cx.plan {
+            Plan::Injection { input: base, .. } => *base != start.input,
+            Plan::Golden { .. } => false,
+        };
         let run = match self.ex.create(start).await {
             Ok((run, _)) => run,
             Err(err) => {
                 let mut t = Self::trial_record(e, &case_id, n, None, TrialStatus::Error);
                 t.verdict = match (injected_case, &err) {
+                    (Some(c), ExecError::Invalid(m)) if changed_input && m.starts_with("input: ") => json!({
+                        "category": c.category,
+                        "outcome": metrics::OUTCOME_NOT_APPLICABLE,
+                        "reason": INPUT_REFUSED,
+                    }),
                     (Some(c), _) => json!({
                         "category": c.category,
                         "outcome": metrics::OUTCOME_ERROR,
@@ -689,6 +700,10 @@ impl EvalRunner {
         t
     }
 }
+
+/// Why a case is not applicable when the version's input schema refuses its injected input.
+pub const INPUT_REFUSED: &str =
+    "the version's input schema refuses the run input with the injection (its runs cannot be created)";
 
 /// Who an eval's runs and answers are by.
 fn by(e: &EvalRecord) -> String {
