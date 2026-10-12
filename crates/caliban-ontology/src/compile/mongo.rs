@@ -20,6 +20,7 @@ pub struct MongoQuery {
 
 pub struct NativeOptions<'a> {
     pub max_time_ms: u64,
+    /// The query's audit id, without a prefix: the comment is `caliban:<audit_id>`.
     pub audit_id: &'a str,
     /// Replica-set tag for the analytics secondary.
     pub read_tag: Option<(&'a str, &'a str)>,

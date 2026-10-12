@@ -202,7 +202,8 @@ impl DatasourceQuery {
             }
         }
         let plan = caliban_ontology::compile::plan(&model, &query, &[]).map_err(|e| fail(e.to_string()))?;
-        let audit = format!("caliban:node:{}:{}", ctx.run_id, ctx.step_id);
+        // The lowering adds the `caliban:` prefix (`caliban:node:<run>:<step>` on the server).
+        let audit = format!("node:{}:{}", ctx.run_id, ctx.step_id);
         let opts = NativeOptions { audit_id: &audit, ..NativeOptions::default() };
         let mq = caliban_ontology::compile::mongo::lower(&model, &plan, &opts).map_err(|e| fail(e.to_string()))?;
         let ds = t
@@ -356,6 +357,8 @@ mod tests {
         let (name, q, conn) = fake.0.lock().unwrap()[0].clone();
         assert_eq!((name.as_str(), q.collection.as_str()), ("shop", "orders"));
         assert_eq!(conn["uri"], "mongodb://reader:pw@db:27017", "credentials opened for the connector only");
+        // The query comment names the run and step once, with one `caliban:` prefix.
+        assert_eq!(q.options["comment"], "caliban:node:run_1:q#0");
         // Outside the node's scopes.
         let e = tool.call(&ctx(&["shop.orders:read"]), query("patients")).await.unwrap_err();
         assert!(e.to_string().contains("outside the datasource scopes"), "{e}");
