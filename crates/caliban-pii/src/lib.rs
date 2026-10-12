@@ -51,7 +51,7 @@ pub mod patterns;
 pub mod rehydrate;
 pub mod surrogate;
 
-pub use dictionary::DictionaryDetector;
+pub use dictionary::{DictionaryDetector, TenantDetectors, TenantPattern};
 pub use ner::NerError;
 #[cfg(feature = "ner")]
 pub use ner::{NerDetector, NerOptions};
@@ -73,6 +73,9 @@ pub enum EntityType {
     Iban,
     IpAddress,
     UsSsn,
+    /// National identity and social security numbers other than US SSNs (the French NIR, and a
+    /// tenant's own patterns may use it).
+    NationalId,
     Person,
     Organization,
     /// Cities, street addresses and other places (L1 NER `LOC` / `CITY` / `STREET_ADDRESS` ...).
@@ -92,6 +95,7 @@ impl EntityType {
             EntityType::Iban => "IBAN",
             EntityType::IpAddress => "IP",
             EntityType::UsSsn => "SSN",
+            EntityType::NationalId => "NATIONAL_ID",
             EntityType::Person => "PERSON",
             EntityType::Organization => "ORG",
             EntityType::Location => "LOCATION",
@@ -104,7 +108,7 @@ impl EntityType {
     fn risk(&self) -> u8 {
         match self {
             EntityType::Secret => 9,
-            EntityType::CreditCard | EntityType::UsSsn | EntityType::Iban => 8,
+            EntityType::CreditCard | EntityType::UsSsn | EntityType::NationalId | EntityType::Iban => 8,
             EntityType::Email | EntityType::Phone => 6,
             EntityType::Person => 5,
             EntityType::Custom(_) => 4,
@@ -302,9 +306,15 @@ impl PiiEngine {
     }
 
     fn try_detect_tier(&self, text: &str, tier: Tier) -> Result<Vec<Span>, DetectError> {
+        self.try_detect_with(text, tier, &[])
+    }
+
+    fn try_detect_with(&self, text: &str, tier: Tier, extra: &[&dyn Detector]) -> Result<Vec<Span>, DetectError> {
         let mut all = Vec::new();
-        for d in self.detectors.iter().filter(|d| tier == Tier::All || !d.is_heavy()) {
-            all.extend(d.try_detect(text)?);
+        for d in self.detectors.iter().map(AsRef::as_ref).chain(extra.iter().copied()) {
+            if tier == Tier::All || !d.is_heavy() {
+                all.extend(d.try_detect(text)?);
+            }
         }
         Ok(merge_spans(all))
     }
@@ -323,14 +333,37 @@ impl PiiEngine {
     /// request before anything is rewritten), assign surrogates to all values at once in
     /// canonical order (so collision handling does not depend on text order), then rewrite.
     pub fn protect(&self, req: &mut ChatRequest, mode: PiiMode, scope_key: &[u8]) -> Result<Protected, PiiError> {
-        self.protect_tier(req, mode, scope_key, Tier::All)
+        self.protect_tier(req, mode, scope_key, Tier::All, &[])
+    }
+
+    /// [`Self::protect`] with a tenant's own detectors next to the engine's (its pattern list and
+    /// dictionary, see [`TenantDetectors`]).
+    pub fn protect_with(
+        &self,
+        req: &mut ChatRequest,
+        mode: PiiMode,
+        scope_key: &[u8],
+        extra: &[&dyn Detector],
+    ) -> Result<Protected, PiiError> {
+        self.protect_tier(req, mode, scope_key, Tier::All, extra)
     }
 
     /// [`Self::protect`] with the cheap detectors only (regex patterns, dictionaries), skipping
     /// heavy ones such as the NER model. Detects less (names, organisations and places are found
     /// by the model), so callers must only use it as an explicit, operator-chosen degradation.
     pub fn protect_light(&self, req: &mut ChatRequest, mode: PiiMode, scope_key: &[u8]) -> Result<Protected, PiiError> {
-        self.protect_tier(req, mode, scope_key, Tier::Light)
+        self.protect_tier(req, mode, scope_key, Tier::Light, &[])
+    }
+
+    /// [`Self::protect_light`] with a tenant's own (cheap) detectors.
+    pub fn protect_light_with(
+        &self,
+        req: &mut ChatRequest,
+        mode: PiiMode,
+        scope_key: &[u8],
+        extra: &[&dyn Detector],
+    ) -> Result<Protected, PiiError> {
+        self.protect_tier(req, mode, scope_key, Tier::Light, extra)
     }
 
     fn protect_tier(
@@ -339,6 +372,7 @@ impl PiiEngine {
         mode: PiiMode,
         scope_key: &[u8],
         tier: Tier,
+        extra: &[&dyn Detector],
     ) -> Result<Protected, PiiError> {
         let mut out = Protected { vault: Vault::new(scope_key), entities: 0 };
         if mode == PiiMode::Off {
@@ -352,7 +386,7 @@ impl PiiEngine {
             if err.is_some() {
                 return;
             }
-            let spans = match self.try_detect_tier(s, tier) {
+            let spans = match self.try_detect_with(s, tier, extra) {
                 Ok(spans) => spans,
                 Err(e) => {
                     err = Some(PiiError::DetectorFailed(e));

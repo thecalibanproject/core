@@ -2843,6 +2843,8 @@ components:
         region: { type: [string, 'null'] }
         pii_default: { type: string, enum: [off, mask, reversible] }
         semantic_cache: { type: string, enum: ['off', 'on'], default: 'off', description: 'T2 semantic cache for this tenant. `on`: eligible requests may be answered with the response to an earlier, semantically similar request of the same tenant (per-entry learned thresholds, deployment error budget). Entries never cross tenants. Also needs `[cache.semantic] enabled`.' }
+        pii_patterns: { type: array, items: { $ref: '#/components/schemas/PiiPattern' } }
+        pii_dictionary: { type: array, items: { $ref: '#/components/schemas/PiiTerm' } }
         pii_on_sovereign: { type: boolean, default: false, description: 'The tenant''s PII mode also applies to models inside the trust boundary (`t0_sovereign`, `t1_attested`). Off by default: those models receive the text as is. External models always get the mode; a request''s `caliban.pii_floor` (a node''s `guardrails.pii`) applies to every model class.' }
         pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant, description: 'Surrogate consistency for reversible PII. `tenant`: the same value always gets the same surrogate in this tenant (keyed HMAC per tenant, derived from CALIBAN_KEK), so pseudonymised requests can hit the exact cache; sessions of the tenant become linkable through their surrogates. `session`: fresh surrogates per request. Surrogates never cross tenants.' }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Share of the flat `caliban/auto` price billed when a cache tier (exact or semantic) answers this tenant''s request: no model is called. `null`: the deployment''s `[routing] auto_cache_hit_fraction` (default 0.2) applies.' }
@@ -2852,6 +2854,20 @@ components:
         created_at: { type: string, format: date-time }
         status: { type: string, enum: [active, deleted], description: '`deleted` only appears with `include_deleted=true`.' }
         deleted_at: { type: [string, 'null'], format: date-time }
+    PiiPattern:
+      type: object
+      required: [label, pattern]
+      additionalProperties: false
+      properties:
+        label: { type: string, pattern: '^[A-Za-z0-9_]{1,40}$', description: 'NATIONAL_ID, PHONE, EMAIL, PERSON, ORG, LOCATION, IBAN or CARD use the built-in surrogates; other labels are custom (shape-preserving surrogates).' }
+        pattern: { type: string, maxLength: 500, description: 'A regex in the Rust regex crate''s syntax (linear time: no backreferences or lookaround); must not match the empty string.' }
+    PiiTerm:
+      type: object
+      required: [term, label]
+      additionalProperties: false
+      properties:
+        term: { type: string, minLength: 2, maxLength: 200 }
+        label: { type: string, pattern: '^[A-Za-z0-9_]{1,40}$' }
     TenantCreate:
       type: object
       required: [name]
@@ -2861,6 +2877,8 @@ components:
         pii_default: { type: string, enum: [off, mask, reversible], default: reversible }
         pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant }
         pii_on_sovereign: { type: boolean, default: false }
+        pii_patterns: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/PiiPattern' }, description: 'The tenant''s own L0 PII patterns (replaced as a whole; [] clears them).' }
+        pii_dictionary: { type: array, maxItems: 10000, items: { $ref: '#/components/schemas/PiiTerm' }, description: 'The tenant''s PII dictionary: whole-word, case-insensitive terms (replaced as a whole; [] clears it). Audited as a count of terms, never the terms.' }
         semantic_cache: { type: string, enum: ['off', 'on'], default: 'off' }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Overrides `[routing] auto_cache_hit_fraction` for this tenant. Omitted or `null`: the deployment value.' }
         node_caps: { $ref: '#/components/schemas/NodeCaps' }
@@ -2873,6 +2891,8 @@ components:
         pii_default: { type: string, enum: [off, mask, reversible] }
         pii_surrogate_scope: { type: string, enum: [tenant, session] }
         pii_on_sovereign: { type: boolean, description: 'Apply the PII mode to sovereign and attested models too.' }
+        pii_patterns: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/PiiPattern' }, description: 'The tenant''s own L0 PII patterns (replaced as a whole; [] clears them).' }
+        pii_dictionary: { type: array, maxItems: 10000, items: { $ref: '#/components/schemas/PiiTerm' }, description: 'The tenant''s PII dictionary: whole-word, case-insensitive terms (replaced as a whole; [] clears it). Audited as a count of terms, never the terms.' }
         semantic_cache: { type: string, enum: ['off', 'on'] }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'A number sets the override; `null` clears it (the deployment value applies); absent keeps it.' }
         node_caps: { oneOf: [ { $ref: '#/components/schemas/NodeCaps' }, { type: 'null' } ], description: 'Caps on the budgets of published node versions; `null` restores the defaults; absent keeps them.' }

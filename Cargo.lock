@@ -775,6 +775,7 @@ dependencies = [
  "caliban-meter",
  "caliban-nodes",
  "caliban-ontology",
+ "caliban-pii",
  "caliban-rag",
  "caliban-types",
  "chrono",

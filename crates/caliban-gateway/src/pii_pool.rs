@@ -216,27 +216,74 @@ impl Gateway {
     /// inline; a heavy engine runs on the worker pool, with its overflow policy when the queue is
     /// full. A detector failure or a credential is a 403 and a pool failure a 500: both fail
     /// closed, nothing is sent upstream.
+    /// The tenant's own detectors (its `pii_patterns` and `pii_dictionary`), compiled once per
+    /// version of those settings. `None` when it has none (or they do not compile, which the
+    /// control plane refuses on write: logged, and the built-in detectors still run).
+    pub(crate) fn tenant_detectors(&self, tenant: &str) -> Option<Arc<caliban_pii::TenantDetectors>> {
+        let snap = self.config.load();
+        let t = snap.tenant(&tenant.into())?;
+        if t.pii_patterns.is_empty() && t.pii_dictionary.is_empty() {
+            return None;
+        }
+        let version =
+            blake3::hash(serde_json::to_string(&(&t.pii_patterns, &t.pii_dictionary)).unwrap_or_default().as_bytes());
+        let mut cache = self.tenant_pii.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((v, d)) = cache.get(tenant)
+            && *v == version
+        {
+            return Some(Arc::clone(d));
+        }
+        let patterns: Vec<caliban_pii::TenantPattern> = t
+            .pii_patterns
+            .iter()
+            .map(|p| caliban_pii::TenantPattern { label: p.label.clone(), pattern: p.pattern.clone() })
+            .collect();
+        let dict: Vec<(String, String)> = t.pii_dictionary.iter().map(|d| (d.term.clone(), d.label.clone())).collect();
+        match caliban_pii::TenantDetectors::build(&patterns, &dict) {
+            Ok(d) => {
+                let d = Arc::new(d);
+                cache.insert(tenant.to_owned(), (version, Arc::clone(&d)));
+                Some(d)
+            }
+            Err(e) => {
+                tracing::error!(tenant, error = %e, "the tenant's PII patterns do not compile; using the built-in detectors only");
+                None
+            }
+        }
+    }
+
+    /// Protects `req` with the engine's detectors and, for `tenant`, its own ones.
     pub(crate) async fn protect(
         &self,
+        tenant: Option<&str>,
         mut req: ChatRequest,
         mode: PiiMode,
         scope_key: &[u8],
     ) -> Result<(ChatRequest, Protected), ApiError> {
         let policy = |e: PiiError| ApiError::from(CalibanError::PolicyViolation(e.to_string()));
+        let extra = tenant.and_then(|t| self.tenant_detectors(t));
         let Some(pool) = self.pii_pool.as_ref().filter(|_| mode != PiiMode::Off) else {
-            let p = self.pii.protect(&mut req, mode, scope_key).map_err(policy)?;
+            let p = match &extra {
+                Some(d) => self.pii.protect_with(&mut req, mode, scope_key, &[d.as_ref()]),
+                None => self.pii.protect(&mut req, mode, scope_key),
+            }
+            .map_err(policy)?;
             return Ok((req, p));
         };
         let permit = match pool.admit().await {
             Ok(p) => p,
-            Err(PoolError::Full) => return self.overflow(pool, req, mode, scope_key),
+            Err(PoolError::Full) => return self.overflow(pool, req, mode, scope_key, extra),
             Err(PoolError::Failed) => return Err(pool_failed()),
         };
         let engine = Arc::clone(&self.pii);
         let key = scope_key.to_vec();
         let job = move || {
             let mut req = req;
-            engine.protect(&mut req, mode, &key).map(|p| (req, p))
+            match &extra {
+                Some(d) => engine.protect_with(&mut req, mode, &key, &[d.as_ref()]),
+                None => engine.protect(&mut req, mode, &key),
+            }
+            .map(|p| (req, p))
         };
         match pool.run_admitted(permit, job).await {
             Ok(r) => r.map_err(policy),
@@ -250,6 +297,7 @@ impl Gateway {
         mut req: ChatRequest,
         mode: PiiMode,
         scope_key: &[u8],
+        extra: Option<Arc<caliban_pii::TenantDetectors>>,
     ) -> Result<(ChatRequest, Protected), ApiError> {
         match pool.opts.overflow {
             Overflow::Reject => {
@@ -273,9 +321,11 @@ impl Gateway {
                     "PII model queue full: screened with the regex tier only (CALIBAN_PII_NER_OVERFLOW=degrade)"
                 );
                 tracing::Span::current().record("caliban.pii.degraded", true);
+                let extra: Vec<&dyn caliban_pii::Detector> =
+                    extra.as_ref().map(|d| d.as_ref() as &dyn caliban_pii::Detector).into_iter().collect();
                 let p = self
                     .pii
-                    .protect_light(&mut req, mode, scope_key)
+                    .protect_light_with(&mut req, mode, scope_key, &extra)
                     .map_err(|e| ApiError::from(CalibanError::PolicyViolation(e.to_string())))?;
                 Ok((req, p))
             }
@@ -449,7 +499,7 @@ mod tests {
     /// Occupies the single worker (its detector waits on `gate`) and returns the pending call.
     async fn occupy(gw: &Arc<Gateway>) -> tokio::task::JoinHandle<Result<(ChatRequest, Protected), ApiError>> {
         let g = Arc::clone(gw);
-        let h = tokio::spawn(async move { g.protect(chat(TEXT), PiiMode::Reversible, b"k").await });
+        let h = tokio::spawn(async move { g.protect(None, chat(TEXT), PiiMode::Reversible, b"k").await });
         tokio::time::sleep(Duration::from_millis(50)).await;
         h
     }
@@ -459,7 +509,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let gw = gateway(SlowModel { gate: None, calls: Arc::clone(&calls), fail: false }, PiiPoolOptions::new(2));
         assert!(gw.pii_pool.is_some());
-        let (req, p) = gw.protect(chat(TEXT), PiiMode::Reversible, b"k").await.unwrap();
+        let (req, p) = gw.protect(None, chat(TEXT), PiiMode::Reversible, b"k").await.unwrap();
         let sent = req.last_user_text().unwrap();
         assert!(!sent.contains("Zed") && !sent.contains("zed@acme.com"), "{sent}");
         assert_eq!(p.entities, 2);
@@ -475,7 +525,7 @@ mod tests {
             PiiPoolOptions { queue: 0, ..PiiPoolOptions::new(1) },
         );
         let busy = occupy(&gw).await;
-        let err = gw.protect(chat(TEXT), PiiMode::Reversible, b"k").await.unwrap_err();
+        let err = gw.protect(None, chat(TEXT), PiiMode::Reversible, b"k").await.unwrap_err();
         assert!(matches!(err.error, CalibanError::Overloaded(_)));
         let resp = err.into_response();
         assert_eq!(resp.status(), 503);
@@ -483,7 +533,7 @@ mod tests {
         assert!(resp.headers().get("x-caliban-ratelimit-scope").is_none());
         assert_eq!(gw.pii_pool.as_ref().unwrap().stats.rejected.load(Ordering::Relaxed), 1);
         // PII off never needs the model, so it is not affected by the full queue.
-        let (req, p) = gw.protect(chat(TEXT), PiiMode::Off, b"k").await.unwrap();
+        let (req, p) = gw.protect(None, chat(TEXT), PiiMode::Off, b"k").await.unwrap();
         assert_eq!((req.last_user_text().unwrap(), p.entities), (TEXT.to_owned(), 0));
         tokio::task::spawn_blocking(move || gate.wait()).await.unwrap();
         busy.await.unwrap().unwrap();
@@ -497,7 +547,7 @@ mod tests {
         let opts = PiiPoolOptions { queue: 0, overflow: Overflow::Degrade, ..PiiPoolOptions::new(1) };
         let gw = gateway(SlowModel { gate: Some(Arc::clone(&gate)), calls: Arc::clone(&calls), fail: false }, opts);
         let busy = occupy(&gw).await;
-        let (req, p) = gw.protect(chat(TEXT), PiiMode::Reversible, b"k").await.unwrap();
+        let (req, p) = gw.protect(None, chat(TEXT), PiiMode::Reversible, b"k").await.unwrap();
         let sent = req.last_user_text().unwrap();
         assert!(!sent.contains("zed@acme.com"), "the regex tier still runs: {sent}");
         assert!(sent.starts_with("Zed "), "the model was skipped: {sent}");
@@ -511,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn model_failure_on_the_pool_blocks_the_request() {
         let gw = gateway(SlowModel { gate: None, calls: Arc::default(), fail: true }, PiiPoolOptions::new(1));
-        let err = gw.protect(chat(TEXT), PiiMode::Reversible, b"k").await.unwrap_err();
+        let err = gw.protect(None, chat(TEXT), PiiMode::Reversible, b"k").await.unwrap_err();
         assert!(matches!(err.error, CalibanError::PolicyViolation(_)), "{:?}", err.error);
     }
 
@@ -521,7 +571,7 @@ mod tests {
         let gw = Gateway::new(ConfigHandle::new(Snapshot::new(cfg, "test")), Arc::new(RecentUsage::default()))
             .with_pii(PiiEngine::default(), PiiPoolOptions::new(4));
         assert!(gw.pii_pool.is_none());
-        let (req, _) = gw.protect(chat(TEXT), PiiMode::Mask, b"k").await.unwrap();
+        let (req, _) = gw.protect(None, chat(TEXT), PiiMode::Mask, b"k").await.unwrap();
         assert_eq!(req.last_user_text().unwrap(), "Zed wrote from [EMAIL]");
     }
 }

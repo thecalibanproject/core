@@ -1079,6 +1079,14 @@ pub struct TenantConfig {
     /// leaves the boundary (research note 05, §4). Omitted from the snapshot when off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pii_on_sovereign: bool,
+    /// The tenant's own L0 PII patterns (identifier formats the built-in patterns do not know),
+    /// next to the built-in ones. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pii_patterns: Vec<PiiPattern>,
+    /// The tenant's PII dictionary: exact terms (customer names, account ids, internal codes),
+    /// matched as whole words, case-insensitively. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pii_dictionary: Vec<PiiTerm>,
     /// T2 semantic cache for this tenant: `off` (default) or `on`. Also needs
     /// `[cache.semantic] enabled`. Omitted from the rendered snapshot when it is the default.
     #[serde(default, skip_serializing_if = "SemanticCacheMode::is_default")]
@@ -1135,6 +1143,23 @@ pub struct TenantConfig {
     /// control plane; overrides `[routing.tenants.<id>.routes]` intent by intent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub node_routes: BTreeMap<String, String>,
+}
+
+/// A tenant PII pattern: a regex (`regex` crate syntax) and what it finds (`NATIONAL_ID`,
+/// `PHONE`, ... map to the built-in types; other labels are custom).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PiiPattern {
+    pub label: String,
+    pub pattern: String,
+}
+
+/// A tenant PII dictionary term and its label.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PiiTerm {
+    pub term: String,
+    pub label: String,
 }
 
 /// A datasource as the data plane sees it. Credentials in `connection` stay sealed under the

@@ -1,4 +1,14 @@
-//! L0 deterministic detectors: regexes plus validators (Luhn, IBAN mod-97, SSN rules).
+//! L0 deterministic detectors: regexes plus validators (Luhn, IBAN mod-97, SSN rules, the French
+//! NIR key).
+//!
+//! Phone numbers: international (`+` and a country code, then 2 to 5 groups of 1 to 4 digits:
+//! `+961 3 456 789`, `+33 6 12 34 56 78`), North American (`(415) 555-2671`) and French national
+//! (`06 12 34 56 78`, ten digits starting with 0). National formats without a trunk prefix (a
+//! Lebanese `71 234 567`) are not matched: they are indistinguishable from amounts
+//! (`75 000 000` LBP) and codes, and a false positive rewrites a price. National IDs: US SSNs and
+//! the French NIR (15 characters, validated by its key, or accepted without it right after words
+//! that name it, since recall matters more than precision there: research note 05, section 1).
+//! Other formats come from a tenant's own pattern list ([`crate::TenantDetectors`]).
 
 use crate::{Detector, EntityType, Span};
 use regex::Regex;
@@ -7,6 +17,11 @@ type Rule = (EntityType, Regex, fn(&str) -> bool);
 
 pub struct PatternDetector {
     rules: Vec<Rule>,
+    /// The shape of a French NIR: sex, year, month, department (two digits, or 2A / 2B),
+    /// commune, order, key; spaces or dots between the groups.
+    nir: Regex,
+    /// Words that name a social security number (French and English).
+    nir_context: Regex,
 }
 
 fn always(_: &str) -> bool {
@@ -31,15 +46,23 @@ impl PatternDetector {
             (EntityType::Iban, r(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b"), iban_valid),
             (EntityType::CreditCard, r(r"\b\d(?:[ -]?\d){12,18}\b"), luhn_valid),
             (EntityType::UsSsn, r(r"\b\d{3}-\d{2}-\d{4}\b"), ssn_valid),
-            (EntityType::Phone, r(r"\+\d{1,3}(?:[ .-]?\(?\d{2,4}\)?){2,4}\b"), phone_valid),
+            (EntityType::Phone, r(r"\+\d{1,3}(?:[ .-]?\(?\d{1,4}\)?){2,5}\b"), phone_valid),
             (EntityType::Phone, r(r"(?:\(\d{3}\) ?|\b\d{3}-)\d{3}-\d{4}\b"), phone_valid),
+            // French national format: 0 and nine digits, in pairs (`06 12 34 56 78`, `01.23.45.67.89`).
+            (EntityType::Phone, r(r"\b0[1-9](?:[ .-]?\d{2}){4}\b"), phone_valid),
             (
                 EntityType::IpAddress,
                 r(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"),
                 always,
             ),
         ];
-        Self { rules }
+        Self {
+            rules,
+            nir: r(r"\b[1-478][ .]?\d{2}[ .]?\d{2}[ .]?(?:\d{2}|2[AaBb])[ .]?\d{3}[ .]?\d{3}[ .]?\d{2}\b"),
+            nir_context: r(
+                r"(?i)(?:s[ée]curit[ée] sociale|\bs[ée]cu\b|\bNIR\b|\bINSEE\b|social security|\bn°\s*ss\b|\bnum[ée]ro\s+ss\b)",
+            ),
+        }
     }
 }
 
@@ -59,7 +82,36 @@ impl Detector for PatternDetector {
                 }
             }
         }
+        for m in self.nir.find_iter(text) {
+            // Its key, or words naming it just before (at most 60 bytes back).
+            let mut from = m.start().saturating_sub(60);
+            while !text.is_char_boundary(from) {
+                from -= 1;
+            }
+            if nir_valid(m.as_str()) || self.nir_context.is_match(&text[from..m.start()]) {
+                out.push(Span { start: m.start(), end: m.end(), entity: EntityType::NationalId });
+            }
+        }
         out
+    }
+}
+
+/// The NIR (French social security number) key: `97 - (the first 13 characters mod 97)`, with
+/// Corsica's departments 2A and 2B counted as 19 and 18 (INSEE).
+pub fn nir_valid(s: &str) -> bool {
+    let c: String = s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_uppercase();
+    if c.len() != 15 {
+        return false;
+    }
+    let (body, key) = c.split_at(13);
+    let body = match &body[5..7] {
+        "2A" => format!("{}19{}", &body[..5], &body[7..]),
+        "2B" => format!("{}18{}", &body[..5], &body[7..]),
+        _ => body.to_owned(),
+    };
+    match (body.parse::<u64>(), key.parse::<u64>()) {
+        (Ok(n), Ok(k)) => 97 - n % 97 == k,
+        _ => false,
     }
 }
 
@@ -141,6 +193,63 @@ mod tests {
         assert_eq!(kinds("call (415) 555-2671"), vec![EntityType::Phone]);
         assert_eq!(kinds("host 192.168.1.20"), vec![EntityType::IpAddress]);
         assert_eq!(kinds("AKIAIOSFODNN7EXAMPLE"), vec![EntityType::Secret]);
+    }
+
+    #[test]
+    fn phones_of_the_reference_market() {
+        for t in [
+            "tél. 06 12 34 56 78",
+            "fixe 01.23.45.67.89",
+            "portable 0612345678",
+            "call +961 3 456 789",
+            "call +961 71 234 567",
+            "appelez le +33 6 12 34 56 78",
+            "+33 1 23 45 67 89",
+        ] {
+            assert_eq!(kinds(t), vec![EntityType::Phone], "{t}");
+        }
+    }
+
+    #[test]
+    fn french_nir_by_key_or_by_name() {
+        // A valid key: found anywhere.
+        assert!(nir_valid("2 84 06 75 115 042 63"));
+        assert_eq!(kinds("ref 2 84 06 75 115 042 63"), vec![EntityType::NationalId]);
+        assert_eq!(kinds("1850578006048 22").len(), 0, "key 22 is wrong for this number");
+        assert!(nir_valid("1 85 05 78 006 048 22") == (97 - 1_850_578_006_048u64 % 97 == 22));
+        // Corsica.
+        let corsica = 2_690_219_018_004u64; // 2 69 02 2A 018 004 (2A counted as 19)
+        let key = 97 - corsica % 97;
+        assert!(nir_valid(&format!("2 69 02 2A 018 004 {key:02}")));
+        // A wrong key, but named as a social security number: still protected (recall first).
+        assert_eq!(
+            kinds("numéro de sécurité sociale 2 84 06 75 115 042 87"),
+            vec![EntityType::NationalId],
+            "the e2e's value has a wrong key"
+        );
+        assert_eq!(kinds("my social security number is 1 85 05 78 006 048 99"), vec![EntityType::NationalId]);
+        // The same digits without a name and with a wrong key: not an ID.
+        assert!(kinds("order 2 84 06 75 115 042 87").iter().all(|k| *k != EntityType::NationalId));
+    }
+
+    /// Values of the health-triage end-to-end data (deploy repo) that are not personal data:
+    /// prices, dates, times, opening hours, ages, slot and catalogue codes, amounts.
+    #[test]
+    fn no_false_positives_on_prices_dates_and_codes() {
+        for t in [
+            "Echocardiography 150 USD, ECG 40 USD, consultation 60 USD",
+            "price_usd: 110, 120, 140, 160, 25, 35, 55, 65, 95",
+            "Lun-Sam 08:30-19:30, Mon-Fri 09:00-18:00, Mon-Sat 08:00-20:00, 24/7",
+            "next slot 2026-10-14T09:30:00Z, then 14/10/2026 at 10:30, or 14.10.2026",
+            "slot-0012, slot-0147, svc-card-echo, fac-bey-cedar-valley, LB-4471-9902-3",
+            "children up to 16, my son is 4, fever for 2 days, wait 12 days",
+            "11e arrondissement, 13e arrondissement",
+            "75 000 000 LBP, 1 250,00 EUR, 3 500 000",
+            "booking ref 2026101400123, order 0012-4471",
+            "ontology medmarket@52, version 1.2.3, 10/12",
+        ] {
+            assert!(kinds(t).is_empty(), "{t}: {:?}", kinds(t));
+        }
     }
 
     #[test]

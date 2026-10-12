@@ -67,6 +67,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (30, "tenant_pii_on_sovereign", include_str!("../../../../migrations/0030_tenant_pii_on_sovereign.sql")),
     (31, "usage_purpose", include_str!("../../../../migrations/0031_usage_purpose.sql")),
     (32, "node_step_metering", include_str!("../../../../migrations/0032_node_step_metering.sql")),
+    (33, "tenant_pii_detectors", include_str!("../../../../migrations/0033_tenant_pii_detectors.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -1002,7 +1003,8 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
         Mutation::UpdateTenant { id, .. } => {
             let t = next.tenant(id).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
             let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3, semantic_cache = $4, auto_cache_hit_fraction = $5,
-                                       node_caps = $6, node_spend_caps = $7, node_routes = $8, pii_on_sovereign = $9
+                                       node_caps = $6, node_spend_caps = $7, node_routes = $8, pii_on_sovereign = $9,
+                                       pii_patterns = $10, pii_dictionary = $11
                      WHERE id = $1 AND status = 'active'";
             exec(
                 c,
@@ -1015,7 +1017,9 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
                     .bind(caps_json(t.node_caps)?)
                     .bind(spend_json(t.node_spend_caps)?)
                     .bind(t.node_routes.as_ref().map(|r| Json(json_of(r))))
-                    .bind(t.pii_on_sovereign),
+                    .bind(t.pii_on_sovereign)
+                    .bind((!t.pii_patterns.is_empty()).then(|| Json(json_of(&t.pii_patterns))))
+                    .bind((!t.pii_dictionary.is_empty()).then(|| Json(json_of(&t.pii_dictionary)))),
             )
             .await
         }
@@ -1362,8 +1366,9 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         c,
         sqlx::query(
             "INSERT INTO tenant (id, name, region, pii_default, pii_surrogate_scope, semantic_cache, settings, created_at, status, deleted_at,
-                                 auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes, pii_on_sovereign)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                                 auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes, pii_on_sovereign,
+                                 pii_patterns, pii_dictionary)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
         )
         .bind(&t.id)
         .bind(&t.name)
@@ -1379,7 +1384,9 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         .bind(caps_json(t.node_caps)?)
         .bind(spend_json(t.node_spend_caps)?)
         .bind(t.node_routes.as_ref().map(|r| Json(json_of(r))))
-        .bind(t.pii_on_sovereign),
+        .bind(t.pii_on_sovereign)
+        .bind((!t.pii_patterns.is_empty()).then(|| Json(json_of(&t.pii_patterns))))
+        .bind((!t.pii_dictionary.is_empty()).then(|| Json(json_of(&t.pii_dictionary)))),
     )
     .await
 }
@@ -1758,7 +1765,7 @@ async fn rows(c: &mut PgConnection, sql: &'static str) -> Result<Vec<PgRow>, Sto
 async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     let mut st = State::default();
 
-    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes, settings, created_at, status, deleted_at, pii_on_sovereign FROM tenant ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes, settings, created_at, status, deleted_at, pii_on_sovereign, pii_patterns, pii_dictionary FROM tenant ORDER BY ord").await? {
         st.tenants.push(Tenant {
             id: get(&r, "id")?,
             name: get(&r, "name")?,
@@ -1766,6 +1773,11 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             pii_default: parse_enum(get(&r, "pii_default")?)?,
             pii_surrogate_scope: parse_enum(get(&r, "pii_surrogate_scope")?)?,
             pii_on_sovereign: get(&r, "pii_on_sovereign")?,
+            pii_patterns: get::<Option<Json<Value>>>(&r, "pii_patterns")?.map(|j| parse(j.0)).transpose()?.unwrap_or_default(),
+            pii_dictionary: get::<Option<Json<Value>>>(&r, "pii_dictionary")?
+                .map(|j| parse(j.0))
+                .transpose()?
+                .unwrap_or_default(),
             semantic_cache: parse_enum(get(&r, "semantic_cache")?)?,
             auto_cache_hit_fraction: get(&r, "auto_cache_hit_fraction")?,
             node_caps: get::<Option<Json<Value>>>(&r, "node_caps")?.map(|j| parse(j.0)).transpose()?,

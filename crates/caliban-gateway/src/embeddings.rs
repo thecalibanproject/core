@@ -79,7 +79,7 @@ async fn run(
     if snap.pii_protection(&tenant, None, floor, external).is_some() {
         let s = telemetry::child("pii");
         s.record("caliban.pii.mode", "mask");
-        entities = mask_inputs(&gw, &mut v).instrument(s.clone()).await?;
+        entities = mask_inputs(&gw, tenant.id.as_str(), &mut v).instrument(s.clone()).await?;
         s.record("caliban.pii.entities", entities);
     }
     v["model"] = Value::String(model.upstream_model.clone());
@@ -131,7 +131,7 @@ async fn run(
 }
 
 /// Masks PII in `input` (string or array of strings) in place; returns the entity count.
-async fn mask_inputs(gw: &Gateway, v: &mut Value) -> Result<usize, ApiError> {
+async fn mask_inputs(gw: &Gateway, tenant: &str, v: &mut Value) -> Result<usize, ApiError> {
     let texts: Vec<String> = match v.get("input") {
         Some(Value::String(s)) => vec![s.clone()],
         Some(Value::Array(a)) if a.iter().all(Value::is_string) => {
@@ -140,7 +140,7 @@ async fn mask_inputs(gw: &Gateway, v: &mut Value) -> Result<usize, ApiError> {
         // Token-id inputs carry no text to scan.
         _ => return Ok(0),
     };
-    let (masked, entities) = mask_texts(gw, texts).await?;
+    let (masked, entities) = mask_texts(gw, Some(tenant), texts).await?;
     let masked: Vec<Value> = masked.into_iter().map(Value::String).collect();
     v["input"] = if v.get("input").is_some_and(Value::is_string) {
         masked.into_iter().next().unwrap_or(Value::Null)
@@ -151,7 +151,11 @@ async fn mask_inputs(gw: &Gateway, v: &mut Value) -> Result<usize, ApiError> {
 }
 
 /// Masks PII in each text (`[EMAIL]`, `[PERSON]`, …); credentials still block the request.
-pub(crate) async fn mask_texts(gw: &Gateway, texts: Vec<String>) -> Result<(Vec<String>, usize), ApiError> {
+pub(crate) async fn mask_texts(
+    gw: &Gateway,
+    tenant: Option<&str>,
+    texts: Vec<String>,
+) -> Result<(Vec<String>, usize), ApiError> {
     let req = ChatRequest {
         model: String::new(),
         messages: texts
@@ -162,7 +166,7 @@ pub(crate) async fn mask_texts(gw: &Gateway, texts: Vec<String>) -> Result<(Vec<
         caliban: None,
         extra: Default::default(),
     };
-    let (req, p) = gw.protect(req, PiiMode::Mask, b"embeddings").await?;
+    let (req, p) = gw.protect(tenant, req, PiiMode::Mask, b"embeddings").await?;
     let masked = req.messages.into_iter().map(|m| m.content.as_str().unwrap_or_default().to_owned()).collect();
     Ok((masked, p.entities))
 }

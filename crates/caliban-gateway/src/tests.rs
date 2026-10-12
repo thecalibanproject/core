@@ -252,6 +252,18 @@ api_key_hashes = ["{careful}"]
   base_url = "{base}"
   trust_tier = "t0_sovereign"
 
+[[tenants]]
+id = "market"
+name = "Market"
+api_key_hashes = ["{market}"]
+pii_patterns = [{{ label = "NATIONAL_ID", pattern = '\bLB-\d{{4}}-\d{{4}}-\d\b' }}]
+pii_dictionary = [{{ term = "Cedar Valley Clinic", label = "ORG" }}]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t2_contracted"
+
 [limits.tenants.limited]
 requests_per_minute = 1
 
@@ -264,6 +276,7 @@ tokens_per_day = 2000
         limited = hash("cal_limited"),
         budget = hash("cal_budget"),
         careful = hash("cal_careful"),
+        market = hash("cal_market"),
         key = key_file.display(),
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
@@ -368,6 +381,33 @@ async fn sovereign_models_get_pii_protection_when_the_tenant_or_a_floor_asks() {
     assert_eq!(status, StatusCode::OK, "{out}");
     assert!(!log.last().2.to_string().contains(EMAIL), "the tenant opted in");
     assert_eq!(h["x-caliban-pii-entities"], "1");
+}
+
+/// The reference market's identifiers (e2e health triage): French and Lebanese phones and a French
+/// NIR by the built-in L0 patterns, a national ID format by the tenant's own pattern list, and a
+/// clinic name by its dictionary. None of them reaches the external model; all are restored.
+#[tokio::test]
+async fn tenant_patterns_dictionary_and_market_formats_are_protected() {
+    let (app, log, _) = setup().await;
+    let text = "Camille, NIR 2 84 06 75 115 042 87, tél. 06 12 34 56 78, or +961 3 456 789, \
+                ID LB-4471-9902-3, seen at Cedar Valley Clinic. Visit costs 60 USD on 2026-10-14 at 09:30.";
+    let body = json!({"model": "ext/mock", "messages": [{"role": "user", "content": text}]});
+    let (status, h, out) = call(&app, "/v1/chat/completions", ("authorization", "Bearer cal_market"), body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let sent = log.last().2.to_string();
+    for raw in ["2 84 06 75 115 042 87", "06 12 34 56 78", "+961 3 456 789", "LB-4471-9902-3", "Cedar Valley Clinic"] {
+        assert!(!sent.contains(raw), "{raw} reached the model: {sent}");
+    }
+    for kept in ["60 USD", "2026-10-14", "09:30"] {
+        assert!(sent.contains(kept), "{kept} is not personal data: {sent}");
+    }
+    assert_eq!(h["x-caliban-pii-entities"], "5");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], format!("You said: {text}"), "restored");
+    // Another tenant has no such pattern: its ID format is not known to it.
+    let other = json!({"model": "ext/mock", "messages": [{"role": "user", "content": "ID LB-4471-9902-3"}]});
+    call(&app, "/v1/chat/completions", BEARER, other).await;
+    assert!(log.last().2.to_string().contains("LB-4471-9902-3"));
 }
 
 #[tokio::test]

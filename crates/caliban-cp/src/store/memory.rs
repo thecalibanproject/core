@@ -261,6 +261,8 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             pii_default,
             pii_surrogate_scope,
             pii_on_sovereign,
+            pii_patterns,
+            pii_dictionary,
             semantic_cache,
             auto_cache_hit_fraction,
             node_caps,
@@ -280,6 +282,13 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             }
             if let Some(s) = pii_on_sovereign {
                 t.pii_on_sovereign = *s;
+            }
+            if pii_patterns.is_some() || pii_dictionary.is_some() {
+                let patterns = pii_patterns.as_ref().unwrap_or(&t.pii_patterns);
+                let dictionary = pii_dictionary.as_ref().unwrap_or(&t.pii_dictionary);
+                check_pii_detectors(patterns, dictionary)?;
+                t.pii_patterns = patterns.clone();
+                t.pii_dictionary = dictionary.clone();
             }
             if let Some(s) = semantic_cache {
                 t.semantic_cache = *s;
@@ -961,4 +970,17 @@ fn check_fraction(f: Option<f64>) -> Result<(), StoreError> {
         }
         _ => Ok(()),
     }
+}
+
+/// A tenant's own PII patterns and dictionary must compile within their limits.
+pub(crate) fn check_pii_detectors(
+    patterns: &[caliban_config::PiiPattern],
+    dictionary: &[caliban_config::PiiTerm],
+) -> Result<(), StoreError> {
+    let p: Vec<caliban_pii::TenantPattern> = patterns
+        .iter()
+        .map(|p| caliban_pii::TenantPattern { label: p.label.clone(), pattern: p.pattern.clone() })
+        .collect();
+    let d: Vec<(String, String)> = dictionary.iter().map(|t| (t.term.clone(), t.label.clone())).collect();
+    caliban_pii::TenantDetectors::check(&p, &d).map_err(StoreError::Invalid)
 }

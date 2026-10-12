@@ -211,7 +211,8 @@ async fn run(
         s.record("caliban.pii.mode", pii_mode_str(pii_mode));
         s.record("caliban.pii.surrogate_scope", surrogate_scope.as_str());
         // Off the async runtime when the engine runs the NER model (see `pii_pool`).
-        let (pr, p) = gw.protect(req.clone(), pii_mode, &scope_key).instrument(s.clone()).await?;
+        let (pr, p) =
+            gw.protect(Some(tenant.id.as_str()), req.clone(), pii_mode, &scope_key).instrument(s.clone()).await?;
         s.record("caliban.pii.entities", p.entities);
         (pr, p)
     };
@@ -247,7 +248,8 @@ async fn run(
             Some(nb) => {
                 let (mut b, entities, rh) = if use_protected {
                     if native_protected.is_none() {
-                        native_protected = Some(protect_native(&gw, nb, pii_mode, &scope_key).await?);
+                        native_protected =
+                            Some(protect_native(&gw, tenant.id.as_str(), nb, pii_mode, &scope_key).await?);
                     }
                     let np = native_protected.as_ref().expect("initialized above");
                     (np.body.clone(), np.entities, Some(Arc::clone(&np.rehydrator)))
@@ -487,6 +489,7 @@ struct NativeProtected {
 /// untouched.
 async fn protect_native(
     gw: &Gateway,
+    tenant: &str,
     native: &Value,
     mode: PiiMode,
     scope_key: &[u8],
@@ -504,7 +507,7 @@ async fn protect_native(
         caliban: None,
         extra: Map::new(),
     };
-    let (tmp, p) = gw.protect(tmp, mode, scope_key).await?;
+    let (tmp, p) = gw.protect(Some(tenant), tmp, mode, scope_key).await?;
     let mut rewritten = tmp.messages.into_iter().map(|m| match m.content {
         Value::String(s) => s,
         _ => String::new(),

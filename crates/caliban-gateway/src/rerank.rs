@@ -90,7 +90,7 @@ async fn run(
     if snap.pii_protection(&tenant, None, None, external).is_some() {
         let mut all = vec![query];
         all.extend(docs);
-        let (masked, n) = mask_texts(&gw, all).await?;
+        let (masked, n) = mask_texts(&gw, Some(tenant.id.as_str()), all).await?;
         entities = n;
         let mut it = masked.into_iter();
         query = it.next().unwrap_or_default();

@@ -203,7 +203,7 @@ impl PiiGuard {
             caliban: None,
             extra: Map::new(),
         };
-        let (req, p) = gw.protect(req, mode, &key).await.map_err(|e: ApiError| e.error.to_string())?;
+        let (req, p) = gw.protect(Some(tenant), req, mode, &key).await.map_err(|e: ApiError| e.error.to_string())?;
         let mut rewritten = req.messages.into_iter().map(|m| match m.content {
             Value::String(s) => s,
             _ => String::new(),

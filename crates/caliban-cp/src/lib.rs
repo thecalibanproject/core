@@ -576,6 +576,8 @@ struct TenantCreate {
     pii_default: Option<PiiMode>,
     pii_surrogate_scope: Option<PiiSurrogateScope>,
     pii_on_sovereign: Option<bool>,
+    pii_patterns: Option<Vec<caliban_config::PiiPattern>>,
+    pii_dictionary: Option<Vec<caliban_config::PiiTerm>>,
     semantic_cache: Option<SemanticCacheMode>,
     auto_cache_hit_fraction: Option<f64>,
     node_caps: Option<NodeCaps>,
@@ -601,6 +603,11 @@ async fn create_tenant(
     if let Some(r) = &body.node_routes {
         caliban_config::check_node_routes(r).map_err(bad)?;
     }
+    store::memory::check_pii_detectors(
+        body.pii_patterns.as_deref().unwrap_or_default(),
+        body.pii_dictionary.as_deref().unwrap_or_default(),
+    )
+    .map_err(|e| bad(e.to_string()))?;
     let t = Tenant {
         id,
         name: body.name,
@@ -608,6 +615,8 @@ async fn create_tenant(
         pii_default: body.pii_default.unwrap_or(cp.store.base().pii.default_mode),
         pii_surrogate_scope: body.pii_surrogate_scope.unwrap_or_default(),
         pii_on_sovereign: body.pii_on_sovereign.unwrap_or(false),
+        pii_patterns: body.pii_patterns.unwrap_or_default(),
+        pii_dictionary: body.pii_dictionary.unwrap_or_default(),
         semantic_cache: body.semantic_cache.unwrap_or_default(),
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
         node_caps: body.node_caps,
@@ -633,6 +642,10 @@ struct TenantUpdate {
     pii_surrogate_scope: Option<PiiSurrogateScope>,
     /// The PII mode also applies to sovereign and attested models (default false).
     pii_on_sovereign: Option<bool>,
+    /// The tenant's own PII patterns (replaced; `[]` clears them).
+    pii_patterns: Option<Vec<caliban_config::PiiPattern>>,
+    /// The tenant's PII dictionary (replaced; `[]` clears it).
+    pii_dictionary: Option<Vec<caliban_config::PiiTerm>>,
     semantic_cache: Option<SemanticCacheMode>,
     /// Absent: kept. `null`: cleared (the deployment value applies). A number in 0..=1: set.
     #[serde(default, deserialize_with = "present")]
@@ -672,6 +685,8 @@ async fn update_tenant(
         pii_default: body.pii_default,
         pii_surrogate_scope: body.pii_surrogate_scope,
         pii_on_sovereign: body.pii_on_sovereign,
+        pii_patterns: body.pii_patterns,
+        pii_dictionary: body.pii_dictionary,
         semantic_cache: body.semantic_cache,
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
         node_caps: body.node_caps,
@@ -1337,6 +1352,30 @@ mod tests {
         assert!(s.is_client_error(), "only PII settings can be patched");
         let (s, _) = call(&app, "PATCH", "/api/v1/tenants/nobody", Some(json!({"pii_default": "mask"})), true).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+
+        // The tenant's own PII patterns and dictionary: checked, audited (terms counted, not
+        // recorded), shipped in the snapshot.
+        let detectors = json!({"pii_patterns": [{"label": "NATIONAL_ID", "pattern": "\\bLB-\\d{4}-\\d{4}-\\d\\b"}],
+                               "pii_dictionary": [{"term": "Cedar Valley Clinic", "label": "ORG"}]});
+        let (s, t) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(detectors), true).await;
+        assert_eq!(s, StatusCode::OK, "{t}");
+        assert_eq!(t["pii_patterns"][0]["label"], "NATIONAL_ID");
+        let snap = c.store.config.load();
+        let g = snap.tenant(&"globex".into()).unwrap();
+        assert_eq!((g.pii_patterns.len(), g.pii_dictionary.len()), (1, 1));
+        let (_, a) = call(&app, "GET", "/api/v1/audit?limit=1", None, true).await;
+        assert_eq!(a["entries"][0]["detail"]["pii_dictionary"], json!({"terms_from": 0, "terms_to": 1}));
+        assert!(!a.to_string().contains("Cedar Valley"), "dictionary terms stay out of the audit log");
+        for bad in [
+            json!({"pii_patterns": [{"label": "X", "pattern": "("}]}),
+            json!({"pii_patterns": [{"label": "X", "pattern": ".*"}]}),
+            json!({"pii_dictionary": [{"term": "a", "label": "ORG"}]}),
+        ] {
+            let (s, v) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(bad.clone()), true).await;
+            assert!(s.is_client_error(), "{bad}: {v}");
+        }
+        let (s, t) = call(&app, "PATCH", "/api/v1/tenants/globex", Some(json!({"pii_patterns": []})), true).await;
+        assert_eq!((s, t["pii_patterns"].as_array().map(Vec::len)), (StatusCode::OK, Some(0)));
     }
 
     #[tokio::test]

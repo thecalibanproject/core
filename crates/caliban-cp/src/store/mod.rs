@@ -90,6 +90,11 @@ pub struct Tenant {
     /// `t1_attested`). Off by default.
     #[serde(default)]
     pub pii_on_sovereign: bool,
+    /// The tenant's own L0 PII patterns and dictionary (shipped in the snapshot).
+    #[serde(default)]
+    pub pii_patterns: Vec<caliban_config::PiiPattern>,
+    #[serde(default)]
+    pub pii_dictionary: Vec<caliban_config::PiiTerm>,
     /// T2 semantic cache for this tenant (`off` by default; also needs `[cache.semantic] enabled`).
     pub semantic_cache: SemanticCacheMode,
     /// Fraction of the flat `caliban/auto` price billed for a cache hit, in 0..=1. `None`: the
@@ -454,6 +459,8 @@ impl State {
                 pii_default: t.pii_mode.unwrap_or(base.pii.default_mode),
                 pii_surrogate_scope: t.pii_surrogate_scope,
                 pii_on_sovereign: t.pii_on_sovereign,
+                pii_patterns: t.pii_patterns.clone(),
+                pii_dictionary: t.pii_dictionary.clone(),
                 semantic_cache: t.semantic_cache,
                 auto_cache_hit_fraction: t.auto_cache_hit_fraction,
                 node_caps: None,
@@ -610,6 +617,8 @@ const TENANT_FIELDS: &[&str] = &[
     "pii_mode",
     "pii_surrogate_scope",
     "pii_on_sovereign",
+    "pii_patterns",
+    "pii_dictionary",
     "semantic_cache",
     "auto_cache_hit_fraction",
     "api_key_hashes",
@@ -691,6 +700,12 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
             obj.insert("pii_surrogate_scope".into(), json!(t.pii_surrogate_scope));
             if t.pii_on_sovereign {
                 obj.insert("pii_on_sovereign".into(), json!(true));
+            }
+            if !t.pii_patterns.is_empty() {
+                obj.insert("pii_patterns".into(), json!(t.pii_patterns));
+            }
+            if !t.pii_dictionary.is_empty() {
+                obj.insert("pii_dictionary".into(), json!(t.pii_dictionary));
             }
             obj.insert("semantic_cache".into(), json!(t.semantic_cache));
             if let Some(f) = t.auto_cache_hit_fraction {
@@ -922,6 +937,10 @@ pub enum Mutation {
         pii_default: Option<PiiMode>,
         pii_surrogate_scope: Option<PiiSurrogateScope>,
         pii_on_sovereign: Option<bool>,
+        /// Replaces the tenant's own PII patterns (`Some(vec![])` clears them).
+        pii_patterns: Option<Vec<caliban_config::PiiPattern>>,
+        /// Replaces the tenant's PII dictionary (`Some(vec![])` clears it).
+        pii_dictionary: Option<Vec<caliban_config::PiiTerm>>,
         semantic_cache: Option<SemanticCacheMode>,
         /// `Some(None)` clears the override (back to the deployment value).
         auto_cache_hit_fraction: Option<Option<f64>>,
@@ -1177,6 +1196,8 @@ impl Mutation {
                 pii_default,
                 pii_surrogate_scope,
                 pii_on_sovereign,
+                pii_patterns,
+                pii_dictionary,
                 semantic_cache,
                 auto_cache_hit_fraction,
                 node_caps,
@@ -1202,6 +1223,15 @@ impl Mutation {
                 }
                 if let Some(to) = pii_on_sovereign {
                     detail["pii_on_sovereign"] = json!({"from": t.map(|t| t.pii_on_sovereign), "to": to});
+                }
+                // Patterns are recorded; dictionary terms are not (they are what the tenant
+                // protects): only their count.
+                if let Some(to) = pii_patterns {
+                    detail["pii_patterns"] = json!({"from": t.map(|t| t.pii_patterns.clone()), "to": to});
+                }
+                if let Some(to) = pii_dictionary {
+                    detail["pii_dictionary"] =
+                        json!({"terms_from": t.map(|t| t.pii_dictionary.len()), "terms_to": to.len()});
                 }
                 if let Some(to) = node_routes {
                     detail["node_routes"] = json!({"from": t.and_then(|t| t.node_routes.clone()), "to": to});

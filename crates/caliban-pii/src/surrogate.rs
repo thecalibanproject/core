@@ -433,6 +433,7 @@ fn normalize(entity: &EntityType, s: &str) -> String {
         EntityType::CreditCard | EntityType::Phone | EntityType::UsSsn => {
             s.chars().filter(char::is_ascii_digit).collect()
         }
+        EntityType::NationalId => s.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_uppercase(),
         EntityType::Iban => s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase(),
         _ => s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase(),
     }
@@ -463,6 +464,7 @@ fn generate(entity: &EntityType, original: &str, d: &mut Draw) -> String {
         EntityType::Phone => shuffle_shape(original, d, 1),
         EntityType::CreditCard => card(original, d),
         EntityType::Iban => iban(original, d),
+        EntityType::NationalId => national_id(original, d),
         EntityType::Custom(_) => shuffle_shape(original, d, 0),
         // Secrets never reach surrogate generation (the request is blocked).
         EntityType::Secret => String::new(),
@@ -499,6 +501,30 @@ fn shuffle_shape(original: &str, d: &mut Draw, keep_leading_digits: usize) -> St
             }
         })
         .collect()
+}
+
+/// National ID surrogate: a French NIR keeps its shape and first digit and gets a valid key (so a
+/// model that checks it is not misled); any other format keeps its shape.
+fn national_id(original: &str, d: &mut Draw) -> String {
+    if !crate::patterns::nir_valid(original) {
+        return shuffle_shape(original, d, 0);
+    }
+    // Same separators; digits redrawn (department digits too, so 2A/2B become digits).
+    let mut out: Vec<char> = shuffle_shape(original, d, 1).chars().collect();
+    let digit_pos: Vec<usize> =
+        out.iter().enumerate().filter(|(_, c)| c.is_ascii_alphanumeric()).map(|(i, _)| i).collect();
+    for &i in &digit_pos {
+        if !out[i].is_ascii_digit() {
+            out[i] = char::from(b'0' + d.digit());
+        }
+    }
+    let body: String = digit_pos[..13].iter().map(|&i| out[i]).collect();
+    let key = 97 - body.parse::<u64>().unwrap_or(0) % 97;
+    let key = format!("{key:02}");
+    for (k, &i) in key.chars().zip(&digit_pos[13..]) {
+        out[i] = k;
+    }
+    out.into_iter().collect()
 }
 
 /// Card surrogate: same length and separators, first digit kept, valid Luhn check digit.
@@ -556,6 +582,12 @@ mod tests {
         assert!(i.starts_with("DE"));
         let ssn = v.surrogate_for(&EntityType::UsSsn, "123-45-6789");
         assert!(ssn.starts_with('9') && ssn.len() == 11, "{ssn}");
+        // A NIR keeps its shape and first digit, and gets a valid key; another ID format its shape.
+        let nir = v.surrogate_for(&EntityType::NationalId, "2 84 06 75 115 042 63");
+        assert!(crate::patterns::nir_valid(&nir) && nir.starts_with("2 ") && nir.len() == 21, "{nir}");
+        assert_ne!(nir, "2 84 06 75 115 042 63");
+        let other = v.surrogate_for(&EntityType::NationalId, "LB-4471-9902-3");
+        assert!(other.len() == 14 && other.chars().nth(2) == Some('-'), "{other}");
         let ip = v.surrogate_for(&EntityType::IpAddress, "10.1.2.3");
         assert!(TEST_NETS.iter().any(|n| ip.starts_with(&format!("{n}."))), "{ip}");
         let e = v.surrogate_for(&EntityType::Email, "jane@acme.com");

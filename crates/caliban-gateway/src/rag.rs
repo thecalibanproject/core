@@ -183,7 +183,7 @@ impl RagServices for GatewayRag {
             caliban: None,
             extra: Map::new(),
         };
-        let (req, p) = gw.protect(req, mode, &key).await.map_err(|e| {
+        let (req, p) = gw.protect(Some(tenant), req, mode, &key).await.map_err(|e| {
             // A credential in the text, or a detector failure: fail closed.
             if matches!(e.error, caliban_types::CalibanError::PolicyViolation(_)) {
                 RagError::Invalid(format!("personal data protection refused the text: {}", e.error))

@@ -115,6 +115,9 @@ pub struct Gateway {
     mcp: std::sync::OnceLock<McpSettings>,
     /// Escalation admissions and denials (`[routing.escalation]`), for `/metrics`.
     pub escalations: escalation::EscalationStats,
+    /// Each tenant's own PII detectors (`pii_patterns`, `pii_dictionary`), compiled once per
+    /// version of those settings.
+    tenant_pii: std::sync::Mutex<std::collections::HashMap<String, (blake3::Hash, Arc<caliban_pii::TenantDetectors>)>>,
 }
 
 impl Gateway {
@@ -148,6 +151,7 @@ impl Gateway {
             keyring: std::sync::OnceLock::new(),
             mcp: std::sync::OnceLock::new(),
             escalations: escalation::EscalationStats::default(),
+            tenant_pii: std::sync::Mutex::default(),
         }
     }
 

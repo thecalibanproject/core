@@ -89,7 +89,10 @@ impl PromptEmbedder for RouteEmbedder<'_> {
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         let input = if self.mask {
-            mask_texts(self.gw, texts.to_vec()).await.map_err(|e| EmbedError::Unavailable(e.error.to_string()))?.0
+            mask_texts(self.gw, self.tenant.as_ref().map(|t| t.as_str()), texts.to_vec())
+                .await
+                .map_err(|e| EmbedError::Unavailable(e.error.to_string()))?
+                .0
         } else {
             texts.to_vec()
         };
