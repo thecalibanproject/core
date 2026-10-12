@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use caliban_config::ModelKind;
 use caliban_ir::Usage;
 use caliban_meter::quota::Amount;
-use caliban_types::{CacheStatus, CalibanError, ModelId, PiiMode, RequestId};
+use caliban_types::{CacheStatus, CalibanError, ModelId, RequestId};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -86,7 +86,8 @@ async fn run(
 
     let (mut query, mut docs, mut entities) = (req.query.clone(), req.documents.clone(), 0);
     let external = model.trust_tier.is_external() || provider.trust_tier.is_external();
-    if external && snap.pii_mode_for(&tenant) != PiiMode::Off {
+    // Inside the trust boundary only when the tenant asks for it (`Snapshot::pii_protection`).
+    if snap.pii_protection(&tenant, None, None, external).is_some() {
         let mut all = vec![query];
         all.extend(docs);
         let (masked, n) = mask_texts(&gw, all).await?;

@@ -260,6 +260,7 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             id,
             pii_default,
             pii_surrogate_scope,
+            pii_on_sovereign,
             semantic_cache,
             auto_cache_hit_fraction,
             node_caps,
@@ -276,6 +277,9 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
             }
             if let Some(s) = pii_surrogate_scope {
                 t.pii_surrogate_scope = *s;
+            }
+            if let Some(s) = pii_on_sovereign {
+                t.pii_on_sovereign = *s;
             }
             if let Some(s) = semantic_cache {
                 t.semantic_cache = *s;

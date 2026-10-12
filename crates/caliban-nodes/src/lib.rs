@@ -298,6 +298,8 @@ pub enum SpecError {
     BadBudgets(String),
     #[error("tools: {0}")]
     BadTool(String),
+    #[error("guardrails: {0}")]
+    BadGuardrails(String),
     #[error("{0}")]
     BadSchema(String),
 }
@@ -313,6 +315,11 @@ impl NodeSpec {
             return Err(SpecError::BadBudgets("usd must be a positive number".into()));
         }
         self.guards_checked()?;
+        if let Some(g) = self.rest.get("guardrails").and_then(|g| g.get("pii"))
+            && !g.as_str().is_some_and(|m| ["off", "mask", "reversible"].contains(&m))
+        {
+            return Err(SpecError::BadGuardrails("pii must be off, mask or reversible".into()));
+        }
         for t in &self.tools {
             if let ToolTarget::Builtin { name } = ToolTarget::parse(&t.reference)? {
                 if t.effect != Effect::Read {
@@ -368,6 +375,14 @@ impl NodeSpec {
             max_repeats: num("max_repeats", Guards::DEFAULT.max_repeats, 1)?,
             tool_retries: num("tool_retries", Guards::DEFAULT.tool_retries, 0)?,
         })
+    }
+
+    /// `guardrails.pii` (`off`, `mask` or `reversible`), if set: a floor on the personal-data
+    /// protection of the node's model calls that applies to every model class, sovereign models
+    /// included (sent as `caliban.pii_floor`), and to the arguments of untrusted tools. It only
+    /// strengthens the tenant's mode, never weakens it.
+    pub fn pii_guardrail(&self) -> Option<&str> {
+        self.rest.get("guardrails").and_then(|g| g.get("pii")).and_then(serde_json::Value::as_str)
     }
 
     /// `prompt.system`, if any.

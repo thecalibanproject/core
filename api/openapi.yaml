@@ -2679,6 +2679,7 @@ components:
       description: Caliban-specific request options. Unknown to OpenAI clients; safe to omit.
       properties:
         pii: { type: string, enum: [off, mask, reversible], default: reversible }
+        pii_floor: { type: string, enum: [off, mask, reversible], description: 'A minimum protection applied to every model class, sovereign and attested models included (a node''s `guardrails.pii` sets it on its calls). Only strengthens: the request gets the stricter of this and `pii` (or the tenant''s mode), ordered off < reversible < mask.' }
         cache: { type: string, enum: [off, exact, semantic], default: exact, description: '`off`: no cache. `exact`: exact cache only. `semantic`: exact, then the semantic cache when the tenant has it on, whatever the temperature (without it, the semantic cache applies only up to `[cache.semantic] max_temperature`). Unset: exact, plus semantic within the temperature limit when the tenant has it on.' }
         datasources: { type: array, items: { type: string } }
         node: { type: string }
@@ -2824,6 +2825,7 @@ components:
         region: { type: [string, 'null'] }
         pii_default: { type: string, enum: [off, mask, reversible] }
         semantic_cache: { type: string, enum: ['off', 'on'], default: 'off', description: 'T2 semantic cache for this tenant. `on`: eligible requests may be answered with the response to an earlier, semantically similar request of the same tenant (per-entry learned thresholds, deployment error budget). Entries never cross tenants. Also needs `[cache.semantic] enabled`.' }
+        pii_on_sovereign: { type: boolean, default: false, description: 'The tenant''s PII mode also applies to models inside the trust boundary (`t0_sovereign`, `t1_attested`). Off by default: those models receive the text as is. External models always get the mode; a request''s `caliban.pii_floor` (a node''s `guardrails.pii`) applies to every model class.' }
         pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant, description: 'Surrogate consistency for reversible PII. `tenant`: the same value always gets the same surrogate in this tenant (keyed HMAC per tenant, derived from CALIBAN_KEK), so pseudonymised requests can hit the exact cache; sessions of the tenant become linkable through their surrogates. `session`: fresh surrogates per request. Surrogates never cross tenants.' }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Share of the flat `caliban/auto` price billed when a cache tier (exact or semantic) answers this tenant''s request: no model is called. `null`: the deployment''s `[routing] auto_cache_hit_fraction` (default 0.2) applies.' }
         node_caps: { oneOf: [ { $ref: '#/components/schemas/NodeCaps' }, { type: 'null' } ], description: '`null`: the defaults (steps 200, tokens 2000000, wall_clock_s 3600, depth 5, fanout 32).' }
@@ -2840,6 +2842,7 @@ components:
         region: { type: string }
         pii_default: { type: string, enum: [off, mask, reversible], default: reversible }
         pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant }
+        pii_on_sovereign: { type: boolean, default: false }
         semantic_cache: { type: string, enum: ['off', 'on'], default: 'off' }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Overrides `[routing] auto_cache_hit_fraction` for this tenant. Omitted or `null`: the deployment value.' }
         node_caps: { $ref: '#/components/schemas/NodeCaps' }
@@ -2851,6 +2854,7 @@ components:
       properties:
         pii_default: { type: string, enum: [off, mask, reversible] }
         pii_surrogate_scope: { type: string, enum: [tenant, session] }
+        pii_on_sovereign: { type: boolean, description: 'Apply the PII mode to sovereign and attested models too.' }
         semantic_cache: { type: string, enum: ['off', 'on'] }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'A number sets the override; `null` clears it (the deployment value applies); absent keeps it.' }
         node_caps: { oneOf: [ { $ref: '#/components/schemas/NodeCaps' }, { type: 'null' } ], description: 'Caps on the budgets of published node versions; `null` restores the defaults; absent keeps them.' }

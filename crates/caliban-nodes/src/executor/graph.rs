@@ -207,12 +207,14 @@ fn chat_body(
     }
     messages.push(json!({"role": "user", "content": user}));
     let wanted = c.get("max_tokens").and_then(Value::as_u64).unwrap_or(1024);
-    json!({
+    let mut body = json!({
         "model": model,
         "messages": messages,
         "temperature": c.get("temperature").cloned().unwrap_or(json!(0)),
         "max_tokens": cx.max_tokens(ledger, wanted),
-    })
+    });
+    super::guardrails(&node.spec, &mut body);
+    body
 }
 
 fn content_of(message: &Value) -> String {
@@ -406,7 +408,7 @@ pub(super) async fn call_tool(
                     step_id: step_id.to_owned(),
                     idempotency_key: idempotency_key(&cx.run.id, step_id),
                 };
-                let out = guarded_call(cx, reference, tool.as_ref(), &ctx, args).await?;
+                let out = guarded_call(cx, reference, tool.as_ref(), &ctx, args, node.spec.pii_guardrail()).await?;
                 out_taint.extend(taint::label_for(reference));
                 out
             }
@@ -495,6 +497,7 @@ async fn guarded_call(
     tool: &dyn super::tools::Tool,
     ctx: &ToolCtx,
     args: Value,
+    pii_floor: Option<&str>,
 ) -> Result<Value, Stop> {
     let ex = &cx.ex;
     let breaker = super::breaker::tool_key(reference);
@@ -511,7 +514,7 @@ async fn guarded_call(
         args
     } else {
         ex.data
-            .protect(cx.tenant(), args)
+            .protect_at_least(cx.tenant(), args, pii_floor)
             .await
             .map_err(|e| {
                 Stop::Fail(format!("tool '{reference}': its arguments could not be checked for personal data: {e}"))
@@ -543,7 +546,7 @@ async fn guarded_call(
     })?;
     // Untrusted input: anonymized as it enters the run.
     ex.data
-        .anonymize(cx.tenant(), out)
+        .anonymize_at_least(cx.tenant(), out, pii_floor)
         .await
         .map_err(|e| Stop::Fail(format!("tool '{reference}': its result could not be anonymized: {e}")))
 }

@@ -56,7 +56,7 @@
     "guardrails": {
       "type": "object",
       "properties": {
-        "pii": { "enum": ["off", "mask", "reversible"] },
+        "pii": { "enum": ["off", "mask", "reversible"], "description": "A floor on the personal-data protection of the node's model calls, on every model class (sovereign models included), and of untrusted tool arguments and results. Only strengthens the tenant's mode." },
         "injection_mode": { "enum": ["none", "plan_then_execute", "camel"] },
         "egress": { "type": "array", "items": { "type": "string" } }
       }

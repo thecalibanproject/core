@@ -127,7 +127,9 @@ async fn run(
         anthropic_beta: header_str(headers, "anthropic-beta"),
     };
     let ext = req.ext();
-    let pii_mode = ext.pii.unwrap_or_else(|| snap.pii_mode_for(&tenant));
+    // The request's mode (or the tenant's), raised to the floor a node's `guardrails.pii` (or the
+    // caller) sets. Which candidates get the protected copy is decided per model below.
+    let pii_mode = ext.pii.unwrap_or_else(|| snap.pii_mode_for(&tenant)).at_least(ext.pii_floor);
 
     let (decision, escalation) = {
         let s = telemetry::child("route");
@@ -186,8 +188,9 @@ async fn run(
         }
     }
 
-    // Pseudonymize once; the protected copy is only sent to destinations outside the trust
-    // boundary. Credentials block the request regardless. Tenant scope (default) uses the
+    // Pseudonymize once; the protected copy is sent to destinations outside the trust boundary,
+    // and to models inside it (t0, t1) when the tenant (`pii_on_sovereign`) or a floor asks for it
+    // (`Snapshot::pii_protection`). Credentials block the request regardless. Tenant scope (default) uses the
     // tenant's surrogate key, so the same value always gets the same surrogate in this tenant
     // and the protected request is cacheable; session scope uses a fresh random key.
     let surrogate_scope = snap.pii_surrogate_scope_for(&tenant);
@@ -225,7 +228,7 @@ async fn run(
             continue;
         }
         let external = model.trust_tier.is_external() || provider.trust_tier.is_external();
-        let use_protected = external && pii_mode != PiiMode::Off;
+        let use_protected = snap.pii_protection(&tenant, ext.pii, ext.pii_floor, external).is_some();
         let native_body = native.as_ref().filter(|_| provider.kind == ProviderKind::Anthropic);
         let is_native = native_body.is_some();
 

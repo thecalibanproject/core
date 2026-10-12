@@ -32,7 +32,9 @@ checked by `NodeSpec::validate` (`crates/caliban-nodes`). The parts the core enf
 
 | `exposure.chat_input` | Without an input schema: `"text"` (default) or `"messages"`, see [Chat shortcut](#the-chat-shortcut-model-nodename) |
 
-Other unknown sections (`guardrails`, the rest of `exposure`, `eval`, ...) are kept and hashed but
+| `guardrails.pii` | `off`, `mask` or `reversible`: a floor on the personal-data protection of the node's model calls, applied to every model class, sovereign models included (sent as `caliban.pii_floor`), and to the arguments and results of untrusted tools. It only strengthens the tenant's mode (`off` < `reversible` < `mask`). A subnode's calls use the subnode's own guardrail |
+
+Other unknown sections (the rest of `guardrails` and `exposure`, `eval`, ...) are kept and hashed but
 not enforced yet.
 
 ### Vertices
@@ -642,8 +644,9 @@ could no longer be told from a new event.
 [`config/nodes/triage.node.json`](../config/nodes/triage.node.json) (P3 decision 6): a `router`
 vertex classifies the case (clinical, administrative, billing), a `human` vertex asks one
 clarifying question, the pinned catalogue tool finds matching services, and an `llm` vertex returns
-a recommendation that must match the output schema. With the tenant in `mask` PII mode, no model
-call sees the person's identifiers. The end-to-end test (`apps/caliban/src/nodes_tests.rs`) runs it
+a recommendation that must match the output schema. Its `guardrails.pii: mask` masks the person's
+identifiers in every model call, on sovereign models too (the tenant's own setting keeps them off
+for sovereign models by default; the guardrail raises it for this node). The end-to-end test (`apps/caliban/src/nodes_tests.rs`) runs it
 against the mock model server, with the catalogue as a real MCP server (`rmcp`, Streamable HTTP):
 registered, discovered, scanned and approved through the control plane, then called with tokens
 minted per call that the server verifies against Caliban's JWKS. Neither the client's API key nor

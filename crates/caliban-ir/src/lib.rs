@@ -16,6 +16,12 @@ use serde_json::{Map, Value};
 #[serde(deny_unknown_fields)]
 pub struct CalibanExt {
     pub pii: Option<PiiMode>,
+    /// A floor for personal-data protection that applies to **every** model class, sovereign and
+    /// attested models included (a node spec's `guardrails.pii` arrives here). It only ever
+    /// strengthens: the request is protected with the stricter of this and its mode (`pii`, else
+    /// the tenant's), and a model inside the trust boundary is protected too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii_floor: Option<PiiMode>,
     pub cache: Option<CacheMode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub datasources: Vec<String>,

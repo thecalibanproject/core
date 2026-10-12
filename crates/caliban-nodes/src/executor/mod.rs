@@ -1619,6 +1619,15 @@ impl Drop for AbortOnDrop {
 }
 
 /// `Idempotency-Key` of a step's side effects: a hash of (run id, step id).
+/// What a node's `guardrails` add to its model calls: `guardrails.pii` becomes `caliban.pii_floor`,
+/// which the gateway applies to every model class, sovereign models included (it only ever
+/// strengthens the tenant's protection). Bodies of nodes without guardrails are unchanged.
+pub(crate) fn guardrails(spec: &crate::NodeSpec, body: &mut Value) {
+    if let Some(p) = spec.pii_guardrail() {
+        body["caliban"] = serde_json::json!({"pii_floor": p});
+    }
+}
+
 pub fn idempotency_key(run_id: &str, step_id: &str) -> String {
     let mut h = Sha256::new();
     h.update(run_id.as_bytes());

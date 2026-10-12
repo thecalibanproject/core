@@ -173,12 +173,16 @@ impl PiiGuard {
 
     /// Runs the PII engine over every string of `v` (keys are left alone). Returns the rewritten
     /// value and how many entities it found.
-    async fn rewrite(&self, tenant: &str, v: Value) -> Result<(Value, usize), String> {
+    async fn rewrite(&self, tenant: &str, v: Value, floor: Option<&str>) -> Result<(Value, usize), String> {
         let gw = self.gw.upgrade().ok_or("the gateway is shutting down")?;
+        let floor = match floor {
+            Some(f) => Some(serde_json::from_value::<PiiMode>(Value::String(f.to_owned())).map_err(|e| e.to_string())?),
+            None => None,
+        };
         let (mode, key) = {
             let snap = gw.config.load();
             let t = snap.tenant(&tenant.into()).ok_or("unknown tenant")?;
-            let mode = snap.pii_mode_for(t);
+            let mode = snap.pii_mode_for(t).at_least(floor);
             (mode, gw.pii_keys.scope_key(snap.pii_surrogate_scope_for(t), tenant))
         };
         if mode == PiiMode::Off {
@@ -235,15 +239,23 @@ fn replace(v: &mut Value, with: &mut impl Iterator<Item = String>) {
 #[async_trait::async_trait]
 impl DataGuard for PiiGuard {
     async fn protect(&self, tenant: &str, v: Value) -> Result<(Value, bool), String> {
-        self.rewrite(tenant, v).await.map(|(v, n)| (v, n > 0))
+        self.rewrite(tenant, v, None).await.map(|(v, n)| (v, n > 0))
     }
 
     async fn anonymize(&self, tenant: &str, v: Value) -> Result<Value, String> {
-        self.rewrite(tenant, v).await.map(|(v, _)| v)
+        self.rewrite(tenant, v, None).await.map(|(v, _)| v)
+    }
+
+    async fn protect_at_least(&self, tenant: &str, v: Value, floor: Option<&str>) -> Result<(Value, bool), String> {
+        self.rewrite(tenant, v, floor).await.map(|(v, n)| (v, n > 0))
+    }
+
+    async fn anonymize_at_least(&self, tenant: &str, v: Value, floor: Option<&str>) -> Result<Value, String> {
+        self.rewrite(tenant, v, floor).await.map(|(v, _)| v)
     }
 
     async fn has_pii(&self, tenant: &str, v: &Value) -> bool {
-        self.rewrite(tenant, v.clone()).await.is_ok_and(|(_, n)| n > 0)
+        self.rewrite(tenant, v.clone(), None).await.is_ok_and(|(_, n)| n > 0)
     }
 }
 

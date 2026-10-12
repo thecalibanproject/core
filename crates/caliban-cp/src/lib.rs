@@ -574,6 +574,7 @@ struct TenantCreate {
     region: Option<String>,
     pii_default: Option<PiiMode>,
     pii_surrogate_scope: Option<PiiSurrogateScope>,
+    pii_on_sovereign: Option<bool>,
     semantic_cache: Option<SemanticCacheMode>,
     auto_cache_hit_fraction: Option<f64>,
     node_caps: Option<NodeCaps>,
@@ -605,6 +606,7 @@ async fn create_tenant(
         region: body.region,
         pii_default: body.pii_default.unwrap_or(cp.store.base().pii.default_mode),
         pii_surrogate_scope: body.pii_surrogate_scope.unwrap_or_default(),
+        pii_on_sovereign: body.pii_on_sovereign.unwrap_or(false),
         semantic_cache: body.semantic_cache.unwrap_or_default(),
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
         node_caps: body.node_caps,
@@ -628,6 +630,8 @@ async fn get_tenant(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiR
 struct TenantUpdate {
     pii_default: Option<PiiMode>,
     pii_surrogate_scope: Option<PiiSurrogateScope>,
+    /// The PII mode also applies to sovereign and attested models (default false).
+    pii_on_sovereign: Option<bool>,
     semantic_cache: Option<SemanticCacheMode>,
     /// Absent: kept. `null`: cleared (the deployment value applies). A number in 0..=1: set.
     #[serde(default, deserialize_with = "present")]
@@ -666,6 +670,7 @@ async fn update_tenant(
         id: tenant_id.clone(),
         pii_default: body.pii_default,
         pii_surrogate_scope: body.pii_surrogate_scope,
+        pii_on_sovereign: body.pii_on_sovereign,
         semantic_cache: body.semantic_cache,
         auto_cache_hit_fraction: body.auto_cache_hit_fraction,
         node_caps: body.node_caps,

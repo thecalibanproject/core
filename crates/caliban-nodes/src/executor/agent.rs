@@ -112,6 +112,7 @@ pub(super) async fn run_agent_at(
         if !functions.is_empty() {
             body["tools"] = Value::Array(functions.clone());
         }
+        super::guardrails(spec, &mut body);
         let request = body.clone();
         let reply = super::consuming(
             seen.clone(),

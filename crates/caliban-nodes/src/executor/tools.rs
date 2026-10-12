@@ -85,6 +85,15 @@ pub trait DataGuard: Send + Sync {
     async fn anonymize(&self, _tenant: &str, v: Value) -> Result<Value, String> {
         Ok(v)
     }
+    /// [`DataGuard::protect`] with the node's `guardrails.pii` as a floor on the tenant's mode
+    /// (`off`, `mask`, `reversible`; it only strengthens).
+    async fn protect_at_least(&self, tenant: &str, v: Value, _floor: Option<&str>) -> Result<(Value, bool), String> {
+        self.protect(tenant, v).await
+    }
+    /// [`DataGuard::anonymize`] with the node's `guardrails.pii` as a floor.
+    async fn anonymize_at_least(&self, tenant: &str, v: Value, _floor: Option<&str>) -> Result<Value, String> {
+        self.anonymize(tenant, v).await
+    }
     /// Whether the value holds personal data (the `pii` taint label).
     async fn has_pii(&self, _tenant: &str, _v: &Value) -> bool {
         false

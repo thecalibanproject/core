@@ -241,6 +241,17 @@ api_key_hashes = ["{budget}"]
   base_url = "{base}"
   trust_tier = "t0_sovereign"
 
+[[tenants]]
+id = "careful"
+name = "Careful"
+pii_on_sovereign = true
+api_key_hashes = ["{careful}"]
+  [[tenants.providers]]
+  id = "mocklocal"
+  kind = "openai_compatible"
+  base_url = "{base}"
+  trust_tier = "t0_sovereign"
+
 [limits.tenants.limited]
 requests_per_minute = 1
 
@@ -252,6 +263,7 @@ tokens_per_day = 2000
         solo = hash("cal_solo"),
         limited = hash("cal_limited"),
         budget = hash("cal_budget"),
+        careful = hash("cal_careful"),
         key = key_file.display(),
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
@@ -313,6 +325,49 @@ async fn anthropic_client_on_openai_upstream() {
     assert!(!sent.to_string().contains(EMAIL), "upstream saw surrogates only: {sent}");
     assert_eq!(sent["max_tokens"], 100);
     assert_eq!(sent["model"], "mock-external");
+}
+
+/// Personal data and models inside the trust boundary (founder decision 2026-10-11): a sovereign
+/// model gets the text as is by default; a tenant that turns `pii_on_sovereign` on, or a request
+/// (a node's `guardrails.pii`) that sets `caliban.pii_floor`, protects it there too.
+#[tokio::test]
+async fn sovereign_models_get_pii_protection_when_the_tenant_or_a_floor_asks() {
+    let (app, log, _) = setup().await;
+    let chat = |model: &str, ext: Option<Value>| {
+        let mut b = json!({"model": model, "messages": [{"role": "user", "content": PII}]});
+        if let Some(e) = ext {
+            b["caliban"] = e;
+        }
+        b
+    };
+    // Default: the sovereign model sees the original, nothing is counted.
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, chat("local/mock", None)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(log.last().2.to_string().contains(EMAIL), "off by default on t0");
+    assert_eq!(h["x-caliban-pii-entities"], "0");
+    // A floor on the request (what a node with guardrails.pii sends): protected, then restored.
+    let (status, h, out) =
+        call(&app, "/v1/chat/completions", BEARER, chat("local/mock", Some(json!({"pii_floor": "reversible"})))).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let sent = log.last().2;
+    assert!(!sent.to_string().contains(EMAIL), "the floor applies to sovereign models: {sent}");
+    assert_eq!(h["x-caliban-pii-entities"], "1");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], format!("You said: {PII}"), "rehydrated for the caller");
+    // A floor never lowers protection: `off` on an external model keeps the tenant's mode.
+    call(&app, "/v1/chat/completions", BEARER, chat("ext/mock", Some(json!({"pii_floor": "off"})))).await;
+    assert!(!log.last().2.to_string().contains(EMAIL));
+    // `mask` as a floor masks, irreversibly.
+    let (_, _, out) =
+        call(&app, "/v1/chat/completions", BEARER, chat("local/mock", Some(json!({"pii_floor": "mask"})))).await;
+    assert!(!log.last().2.to_string().contains(EMAIL));
+    assert!(!out.contains(EMAIL), "masked answers carry no original: {out}");
+    // A tenant with pii_on_sovereign: its mode applies on its sovereign model.
+    let careful = ("authorization", "Bearer cal_careful");
+    let (status, h, out) = call(&app, "/v1/chat/completions", careful, chat("local/mock", None)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(!log.last().2.to_string().contains(EMAIL), "the tenant opted in");
+    assert_eq!(h["x-caliban-pii-entities"], "1");
 }
 
 #[tokio::test]

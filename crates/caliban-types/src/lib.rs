@@ -99,6 +99,26 @@ pub enum PiiMode {
     Reversible,
 }
 
+impl PiiMode {
+    /// How much the mode hides from a model: `off` < `reversible` < `mask` (masking keeps no way
+    /// back to the originals, so a masked answer can never carry them).
+    pub fn strictness(self) -> u8 {
+        match self {
+            PiiMode::Off => 0,
+            PiiMode::Reversible => 1,
+            PiiMode::Mask => 2,
+        }
+    }
+
+    /// The stricter of `self` and `other` (a floor only ever strengthens protection).
+    pub fn at_least(self, other: Option<PiiMode>) -> PiiMode {
+        match other {
+            Some(o) if o.strictness() > self.strictness() => o,
+            _ => self,
+        }
+    }
+}
+
 /// How far a reversible surrogate stays the same (docs/architecture §9, "Surrogate scope").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

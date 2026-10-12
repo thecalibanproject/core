@@ -73,7 +73,10 @@ async fn run(
 
     let mut entities = 0;
     let external = model.trust_tier.is_external() || provider.trust_tier.is_external();
-    if external && snap.pii_mode_for(&tenant) != PiiMode::Off {
+    // Masked (embeddings cannot be rehydrated); inside the trust boundary only when the tenant or a
+    // `caliban.pii_floor` asks for it (`Snapshot::pii_protection`).
+    let floor = v.pointer("/caliban/pii_floor").and_then(|f| serde_json::from_value::<PiiMode>(f.clone()).ok());
+    if snap.pii_protection(&tenant, None, floor, external).is_some() {
         let s = telemetry::child("pii");
         s.record("caliban.pii.mode", "mask");
         entities = mask_inputs(&gw, &mut v).instrument(s.clone()).await?;

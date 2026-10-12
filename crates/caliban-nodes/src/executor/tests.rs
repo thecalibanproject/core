@@ -369,6 +369,41 @@ async fn a_bounded_loop_stops_at_max_iterations() {
 }
 
 #[tokio::test]
+async fn guardrails_pii_reaches_every_model_call_as_a_floor() {
+    for j in journals().await {
+        let h = Harness::new(j);
+        let spec = |pii: Option<&str>| {
+            let mut s = json!({
+                "kind": "workflow", "model_policy": {}, "budgets": budgets(10, 100_000),
+                "graph": {"vertices": [{"id": "a", "type": "llm", "config": {"prompt": "{{input}}"}}], "edges": []}
+            });
+            if let Some(p) = pii {
+                s["guardrails"] = json!({"pii": p});
+            }
+            s
+        };
+        h.nodes.add("guarded", 1, spec(Some("mask")));
+        h.nodes.add("plain", 1, spec(None));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        let model = FakeModel::new(move |body| {
+            s2.lock().push(body.get("caliban").cloned());
+            text("ok")
+        });
+        let ex = h.executor(&model, "w1");
+        assert_eq!(run(&ex, "guarded", json!("x")).await.status, RunStatus::Succeeded);
+        assert_eq!(run(&ex, "plain", json!("x")).await.status, RunStatus::Succeeded);
+        assert_eq!(*seen.lock(), [Some(json!({"pii_floor": "mask"})), None], "no guardrail, body unchanged");
+    }
+    // Unknown modes are refused when the version is created.
+    let bad: crate::NodeSpec = serde_json::from_value(json!({
+        "kind": "agent", "budgets": {"steps": 1, "tokens": 10, "wall_clock_s": 1}, "guardrails": {"pii": "hide"}
+    }))
+    .unwrap();
+    assert!(bad.validate().unwrap_err().to_string().contains("guardrails: pii must be"));
+}
+
+#[tokio::test]
 async fn a_loop_that_leaves_by_its_exit_edge_ends_without_a_stop_reason() {
     // The reference node's shape: `assess` loops through a question at most twice, then leaves by
     // its other edge. That is the loop working as designed, not a limit.

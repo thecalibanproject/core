@@ -64,6 +64,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (27, "api_key_purpose", include_str!("../../../../migrations/0027_api_key_purpose.sql")),
     (28, "usage_routing_content_class", include_str!("../../../../migrations/0028_usage_routing_content_class.sql")),
     (29, "rag", include_str!("../../../../migrations/0029_rag.sql")),
+    (30, "tenant_pii_on_sovereign", include_str!("../../../../migrations/0030_tenant_pii_on_sovereign.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -964,7 +965,7 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
         Mutation::UpdateTenant { id, .. } => {
             let t = next.tenant(id).ok_or_else(|| StoreError::NotFound("tenant".into()))?;
             let q = "UPDATE tenant SET pii_default = $2, pii_surrogate_scope = $3, semantic_cache = $4, auto_cache_hit_fraction = $5,
-                                       node_caps = $6, node_spend_caps = $7, node_routes = $8
+                                       node_caps = $6, node_spend_caps = $7, node_routes = $8, pii_on_sovereign = $9
                      WHERE id = $1 AND status = 'active'";
             exec(
                 c,
@@ -976,7 +977,8 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
                     .bind(t.auto_cache_hit_fraction)
                     .bind(caps_json(t.node_caps)?)
                     .bind(spend_json(t.node_spend_caps)?)
-                    .bind(t.node_routes.as_ref().map(|r| Json(json_of(r)))),
+                    .bind(t.node_routes.as_ref().map(|r| Json(json_of(r))))
+                    .bind(t.pii_on_sovereign),
             )
             .await
         }
@@ -1323,8 +1325,8 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         c,
         sqlx::query(
             "INSERT INTO tenant (id, name, region, pii_default, pii_surrogate_scope, semantic_cache, settings, created_at, status, deleted_at,
-                                 auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                                 auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes, pii_on_sovereign)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(&t.id)
         .bind(&t.name)
@@ -1339,7 +1341,8 @@ async fn insert_tenant(c: &mut PgConnection, t: &Tenant) -> Result<(), StoreErro
         .bind(t.auto_cache_hit_fraction)
         .bind(caps_json(t.node_caps)?)
         .bind(spend_json(t.node_spend_caps)?)
-        .bind(t.node_routes.as_ref().map(|r| Json(json_of(r)))),
+        .bind(t.node_routes.as_ref().map(|r| Json(json_of(r))))
+        .bind(t.pii_on_sovereign),
     )
     .await
 }
@@ -1718,13 +1721,14 @@ async fn rows(c: &mut PgConnection, sql: &'static str) -> Result<Vec<PgRow>, Sto
 async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
     let mut st = State::default();
 
-    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes, settings, created_at, status, deleted_at FROM tenant ORDER BY ord").await? {
+    for r in rows(c, "SELECT id, name, region, pii_default, pii_surrogate_scope, semantic_cache, auto_cache_hit_fraction, node_caps, node_spend_caps, node_routes, settings, created_at, status, deleted_at, pii_on_sovereign FROM tenant ORDER BY ord").await? {
         st.tenants.push(Tenant {
             id: get(&r, "id")?,
             name: get(&r, "name")?,
             region: get(&r, "region")?,
             pii_default: parse_enum(get(&r, "pii_default")?)?,
             pii_surrogate_scope: parse_enum(get(&r, "pii_surrogate_scope")?)?,
+            pii_on_sovereign: get(&r, "pii_on_sovereign")?,
             semantic_cache: parse_enum(get(&r, "semantic_cache")?)?,
             auto_cache_hit_fraction: get(&r, "auto_cache_hit_fraction")?,
             node_caps: get::<Option<Json<Value>>>(&r, "node_caps")?.map(|j| parse(j.0)).transpose()?,

@@ -86,6 +86,10 @@ pub struct Tenant {
     /// `tenant` (default): the same value always gets the same surrogate in this tenant, so
     /// pseudonymised requests can hit the cache. `session`: fresh surrogates per request.
     pub pii_surrogate_scope: PiiSurrogateScope,
+    /// The tenant's PII mode also applies to models inside the trust boundary (`t0_sovereign`,
+    /// `t1_attested`). Off by default.
+    #[serde(default)]
+    pub pii_on_sovereign: bool,
     /// T2 semantic cache for this tenant (`off` by default; also needs `[cache.semantic] enabled`).
     pub semantic_cache: SemanticCacheMode,
     /// Fraction of the flat `caliban/auto` price billed for a cache hit, in 0..=1. `None`: the
@@ -449,6 +453,7 @@ impl State {
                 region: None,
                 pii_default: t.pii_mode.unwrap_or(base.pii.default_mode),
                 pii_surrogate_scope: t.pii_surrogate_scope,
+                pii_on_sovereign: t.pii_on_sovereign,
                 semantic_cache: t.semantic_cache,
                 auto_cache_hit_fraction: t.auto_cache_hit_fraction,
                 node_caps: None,
@@ -604,6 +609,7 @@ const TENANT_FIELDS: &[&str] = &[
     "name",
     "pii_mode",
     "pii_surrogate_scope",
+    "pii_on_sovereign",
     "semantic_cache",
     "auto_cache_hit_fraction",
     "api_key_hashes",
@@ -683,6 +689,9 @@ pub fn render(base: &Config, st: &State) -> Result<Config, String> {
             obj.insert("name".into(), json!(t.name));
             obj.insert("pii_mode".into(), json!(t.pii_default));
             obj.insert("pii_surrogate_scope".into(), json!(t.pii_surrogate_scope));
+            if t.pii_on_sovereign {
+                obj.insert("pii_on_sovereign".into(), json!(true));
+            }
             obj.insert("semantic_cache".into(), json!(t.semantic_cache));
             if let Some(f) = t.auto_cache_hit_fraction {
                 obj.insert("auto_cache_hit_fraction".into(), json!(f));
@@ -912,6 +921,7 @@ pub enum Mutation {
         id: String,
         pii_default: Option<PiiMode>,
         pii_surrogate_scope: Option<PiiSurrogateScope>,
+        pii_on_sovereign: Option<bool>,
         semantic_cache: Option<SemanticCacheMode>,
         /// `Some(None)` clears the override (back to the deployment value).
         auto_cache_hit_fraction: Option<Option<f64>>,
@@ -1154,6 +1164,9 @@ impl Mutation {
         match self {
             Mutation::CreateTenant(t) => {
                 let mut detail = json!({"name": t.name, "pii_default": t.pii_default, "pii_surrogate_scope": t.pii_surrogate_scope, "semantic_cache": t.semantic_cache});
+                if t.pii_on_sovereign {
+                    detail["pii_on_sovereign"] = json!(true);
+                }
                 if let Some(f) = t.auto_cache_hit_fraction {
                     detail["auto_cache_hit_fraction"] = json!(f);
                 }
@@ -1163,6 +1176,7 @@ impl Mutation {
                 id,
                 pii_default,
                 pii_surrogate_scope,
+                pii_on_sovereign,
                 semantic_cache,
                 auto_cache_hit_fraction,
                 node_caps,
@@ -1185,6 +1199,9 @@ impl Mutation {
                 }
                 if let Some(to) = node_spend_caps {
                     detail["node_spend_caps"] = json!({"from": t.and_then(|t| t.node_spend_caps), "to": to});
+                }
+                if let Some(to) = pii_on_sovereign {
+                    detail["pii_on_sovereign"] = json!({"from": t.map(|t| t.pii_on_sovereign), "to": to});
                 }
                 if let Some(to) = node_routes {
                     detail["node_routes"] = json!({"from": t.and_then(|t| t.node_routes.clone()), "to": to});

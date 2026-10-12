@@ -1074,6 +1074,11 @@ pub struct TenantConfig {
     /// Omitted from the rendered snapshot when it is the default.
     #[serde(default, skip_serializing_if = "PiiSurrogateScope::is_default")]
     pub pii_surrogate_scope: PiiSurrogateScope,
+    /// Apply the tenant's PII mode to models inside the trust boundary too (`t0_sovereign`,
+    /// `t1_attested`). Off by default: those models receive the text as is, since it never
+    /// leaves the boundary (research note 05, §4). Omitted from the snapshot when off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pii_on_sovereign: bool,
     /// T2 semantic cache for this tenant: `off` (default) or `on`. Also needs
     /// `[cache.semantic] enabled`. Omitted from the rendered snapshot when it is the default.
     #[serde(default, skip_serializing_if = "SemanticCacheMode::is_default")]
@@ -1603,6 +1608,25 @@ impl Snapshot {
 
     pub fn pii_mode_for(&self, tenant: &TenantConfig) -> PiiMode {
         tenant.pii_mode.unwrap_or(self.config.pii.default_mode)
+    }
+
+    /// The PII mode a request to a model gets, or `None` when the model receives the text as is.
+    /// `requested`: the request's own mode (`caliban.pii`), else the tenant's. `floor`: a minimum
+    /// that applies to every model class (`caliban.pii_floor`, a node's `guardrails.pii`).
+    /// `external`: the model or its provider is outside the trust boundary (t2, t3).
+    ///
+    /// External models always get the mode. Models inside the boundary (t0, t1) get it only when
+    /// the tenant turned `pii_on_sovereign` on, or a floor above `off` asks for it.
+    pub fn pii_protection(
+        &self,
+        tenant: &TenantConfig,
+        requested: Option<PiiMode>,
+        floor: Option<PiiMode>,
+        external: bool,
+    ) -> Option<PiiMode> {
+        let mode = requested.unwrap_or_else(|| self.pii_mode_for(tenant)).at_least(floor);
+        let applies = external || tenant.pii_on_sovereign || floor.is_some_and(|f| f != PiiMode::Off);
+        (mode != PiiMode::Off && applies).then_some(mode)
     }
 
     pub fn pii_surrogate_scope_for(&self, tenant: &TenantConfig) -> PiiSurrogateScope {

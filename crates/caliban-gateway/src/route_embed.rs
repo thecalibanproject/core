@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use caliban_config::{Snapshot, TenantConfig};
 use caliban_ir::ChatRequest;
 use caliban_route::{AlwaysHealthy, Constraints, EmbedError, PromptEmbedder, RouteDecision, RouteError};
-use caliban_types::{ModelId, PiiMode, TenantId};
+use caliban_types::{ModelId, TenantId};
 use std::sync::Arc;
 
 /// [`PromptEmbedder`] over the gateway's [`Embedder`](caliban_types::Embedder), pinned to the routing model's shared provider.
@@ -51,7 +51,7 @@ impl<'a> RouteEmbedder<'a> {
             model: model.id.clone(),
             tenant: tenant.map(|t| t.id.clone()),
             space: space_id(&model.id, &model.upstream_model, &shared.provider.base_url),
-            mask: tenant.is_some_and(|t| external && snap.pii_mode_for(t) != PiiMode::Off),
+            mask: tenant.is_some_and(|t| snap.pii_protection(t, None, None, external).is_some()),
         })
     }
 

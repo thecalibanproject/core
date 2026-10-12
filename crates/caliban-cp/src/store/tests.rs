@@ -88,6 +88,7 @@ fn tenant(id: &str) -> Tenant {
         region: Some("eu".into()),
         pii_default: PiiMode::Off,
         pii_surrogate_scope: PiiSurrogateScope::Tenant,
+        pii_on_sovereign: false,
         semantic_cache: SemanticCacheMode::Off,
         auto_cache_hit_fraction: None,
         node_caps: None,
@@ -193,6 +194,7 @@ async fn suite(s: &Store) {
         id: "globex".into(),
         pii_default: None,
         pii_surrogate_scope: Some(PiiSurrogateScope::Session),
+        pii_on_sovereign: None,
         semantic_cache: None,
         auto_cache_hit_fraction: None,
         node_caps: None,
@@ -205,12 +207,29 @@ async fn suite(s: &Store) {
     let snap = s.config.load();
     assert_eq!(snap.pii_surrogate_scope_for(snap.tenant(&"globex".into()).unwrap()), PiiSurrogateScope::Session);
     assert_eq!(snap.pii_surrogate_scope_for(snap.tenant(&"acme".into()).unwrap()), PiiSurrogateScope::Tenant);
+    // PII on sovereign models: off by default, a per-tenant opt-in shipped in the snapshot.
+    assert!(!snap.tenant(&"globex".into()).unwrap().pii_on_sovereign);
+    let sovereign = Mutation::UpdateTenant {
+        id: "globex".into(),
+        pii_default: None,
+        pii_surrogate_scope: None,
+        pii_on_sovereign: Some(true),
+        semantic_cache: None,
+        auto_cache_hit_fraction: None,
+        node_caps: None,
+        node_spend_caps: None,
+        node_routes: None,
+    };
+    s.apply(A, sovereign).await.unwrap();
+    assert!(s.state().tenant("globex").unwrap().pii_on_sovereign);
+    assert!(s.config.load().tenant(&"globex".into()).unwrap().pii_on_sovereign);
     // Semantic cache: off by default, switched on per tenant, shipped in the snapshot.
     assert_eq!(s.state().tenant("globex").unwrap().semantic_cache, SemanticCacheMode::Off);
     let on = Mutation::UpdateTenant {
         id: "globex".into(),
         pii_default: None,
         pii_surrogate_scope: None,
+        pii_on_sovereign: None,
         semantic_cache: Some(SemanticCacheMode::On),
         auto_cache_hit_fraction: None,
         node_caps: None,
@@ -233,6 +252,7 @@ async fn suite(s: &Store) {
         id: "globex".into(),
         pii_default: None,
         pii_surrogate_scope: None,
+        pii_on_sovereign: None,
         semantic_cache: None,
         auto_cache_hit_fraction: f,
         node_caps: None,
@@ -269,6 +289,7 @@ async fn suite(s: &Store) {
         id: "nobody".into(),
         pii_default: Some(PiiMode::Mask),
         pii_surrogate_scope: None,
+        pii_on_sovereign: None,
         semantic_cache: None,
         auto_cache_hit_fraction: None,
         node_caps: None,
@@ -1154,6 +1175,7 @@ async fn node_lifecycle(s: &Store) {
         id: "globex".into(),
         pii_default: None,
         pii_surrogate_scope: None,
+        pii_on_sovereign: None,
         semantic_cache: None,
         auto_cache_hit_fraction: None,
         node_caps: Some(c),
@@ -1172,6 +1194,7 @@ async fn node_lifecycle(s: &Store) {
         id: "globex".into(),
         pii_default: None,
         pii_surrogate_scope: None,
+        pii_on_sovereign: None,
         semantic_cache: None,
         auto_cache_hit_fraction: None,
         node_caps: None,
@@ -1191,6 +1214,7 @@ async fn node_lifecycle(s: &Store) {
         id: "globex".into(),
         pii_default: None,
         pii_surrogate_scope: None,
+        pii_on_sovereign: None,
         semantic_cache: None,
         auto_cache_hit_fraction: None,
         node_caps: None,
