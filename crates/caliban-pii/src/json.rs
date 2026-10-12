@@ -242,8 +242,10 @@ mod tests {
     #[test]
     fn cqir_structure_is_frozen_but_its_filter_literals_are_data() {
         let mut v = cqir();
-        let got: Vec<String> = protectable_strings_mut(&mut v).into_iter().map(|s| s.clone()).collect();
-        assert_eq!(got, vec!["for Camila", "Camila Duarte", "Paris", "Lyon"]);
+        // Map order depends on serde_json's `preserve_order` feature (unified across the workspace).
+        let mut got: Vec<String> = protectable_strings_mut(&mut v).into_iter().map(|s| s.clone()).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec!["Camila Duarte", "Lyon", "Paris", "for Camila"]);
         let text = cqir().to_string();
         let mut raw = values(&text);
         raw.sort_unstable();
