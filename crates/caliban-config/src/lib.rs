@@ -64,6 +64,33 @@ pub struct Config {
     /// when it is the default, so older routers keep parsing it.
     #[serde(default, skip_serializing_if = "RagConfig::is_default")]
     pub rag: RagConfig,
+    /// `[telemetry]`: what responses report about their own handling. Omitted from the rendered
+    /// snapshot when it is the default, so older routers keep parsing it.
+    #[serde(default, skip_serializing_if = "TelemetryConfig::is_default")]
+    pub telemetry: TelemetryConfig,
+}
+
+/// `[telemetry]`: response-level telemetry.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Send the W3C `Server-Timing` header (per-stage durations) on the model APIs. On by default.
+    /// It only times the caller's own request, and caches are per tenant, so it carries no
+    /// cross-tenant signal.
+    #[serde(default = "yes")]
+    pub server_timing: bool,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self { server_timing: true }
+    }
+}
+
+impl TelemetryConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Where retrieval keeps document vectors.
