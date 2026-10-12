@@ -78,6 +78,7 @@ paths:
             x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
             x-caliban-cost-usd: { schema: { type: string }, description: 'Cost of this request in USD (non-streaming only; absent when the model has no price).' }
+            x-caliban-billed-usd: { schema: { type: string }, description: 'What the request is billed in USD (non-streaming only): the flat `caliban/auto` price (discounted on a cache hit) or the model''s cost; for a node answer, the run''s `cost_usd`.' }
             x-caliban-route: { schema: { type: string }, description: 'The path taken: `node/<name>@v<N>` (a node answered), or `model:<id>` (a `caliban/auto` answer by a model, for a tenant that maps intents to nodes).' }
             x-caliban-route-fallback: { schema: { type: string, enum: [low_confidence, no_node_for_intent, node_not_allowed, node_unavailable, nodes_not_enabled, node_over_budget, node_input_invalid] }, description: 'Why `caliban/auto` answered with a model rather than a node.' }
             Caliban-Run-Id: { schema: { type: string }, description: 'The node run that answered.' }
@@ -129,7 +130,11 @@ paths:
             x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] }, description: '`hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request.' }
             x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
-            x-caliban-cost-usd: { schema: { type: string } }
+            x-caliban-cost-usd: { schema: { type: string }, description: 'Cost of this request in USD (non-streaming only; absent when the model has no price).' }
+            x-caliban-billed-usd: { schema: { type: string }, description: 'What the request is billed in USD (non-streaming only): the flat `caliban/auto` price (discounted on a cache hit) or the model''s cost; for a node answer, the run''s `cost_usd`.' }
+            x-caliban-route: { schema: { type: string }, description: 'The path taken: `node/<name>@v<N>` (a node answered), or `model:<id>` (a `caliban/auto` answer by a model, for a tenant that maps intents to nodes).' }
+            Caliban-Run-Id: { schema: { type: string }, description: 'The node run that answered.' }
+            x-caliban-run-status: { schema: { type: string } }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AnthropicMessage' }
@@ -1659,8 +1664,14 @@ paths:
               required: [elements]
               additionalProperties: false
               properties:
-                elements: { type: array, minItems: 1, maxItems: 5000, items: { $ref: '#/components/schemas/OntologyElement' } }
+                elements: { type: array, minItems: 1, maxItems: 5000, items: { $ref: '#/components/schemas/OntologyElementProposal' } }
                 acknowledge_breaking: { type: boolean, default: false }
+      description: |
+        Elements are written as `proposed` in one version, whatever `status` they carry (it may be
+        left out). An element whose `spec`, `name` and `description` match the tenant's is skipped,
+        so posting the same model again makes no version and keeps every review decision. A
+        changed element goes back to `proposed`; over an approved element that withdraws it, which
+        is refused (`409`) when published node versions query it, unless `acknowledge_breaking`.
       responses:
         '201':
           description: Written (unchanged elements skipped)
@@ -1668,24 +1679,32 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [tenant_id, version, proposed, skipped, breaking]
                 properties:
                   tenant_id: { type: string }
-                  version: { type: integer }
+                  version: { type: integer, description: 'The tenant''s ontology version after the call (unchanged when nothing was written)' }
                   proposed: { type: integer }
-                  skipped: { type: integer }
+                  skipped: { type: integer, description: 'Elements left as they are: unchanged' }
+                  breaking: { type: array, items: { $ref: '#/components/schemas/OntologyBreaking' }, description: 'Approved elements this call withdrew that published node versions query (empty unless acknowledge_breaking)' }
+        '400': { $ref: '#/components/responses/Error', description: 'No elements, more than 5000, or an id that is empty, longer than 200 characters or repeated' }
+        '404': { $ref: '#/components/responses/Error', description: 'Unknown tenant' }
         '409': { $ref: '#/components/responses/Error' }
 
   /api/v1/ontology:
     get:
       tags: [ontology]
       summary: Current ontology (Caliban Semantic Model) for a tenant
-      parameters: [ { $ref: '#/components/parameters/TenantQuery' } ]
+      description: Element ids are per tenant, so `tenant_id` is required (`400` without it). Same as `GET /api/v1/tenants/{tenantId}/ontology`.
+      parameters:
+        - { name: tenant_id, in: query, required: true, schema: { type: string } }
       responses:
         '200':
           description: OK
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Ontology' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
 
   /api/v1/ontology/elements/{elementId}/review:
     parameters:
@@ -1750,7 +1769,7 @@ paths:
   /api/v1/tenants/{tenantId}/intents/{intent}:
     parameters:
       - { $ref: '#/components/parameters/TenantId' }
-      - { name: intent, in: path, required: true, schema: { type: string, pattern: '^[a-z0-9_.-]{1,64}$' } }
+      - { name: intent, in: path, required: true, schema: { type: string, pattern: '^[a-z0-9_.-]{1,64}$' }, description: '`pinned` is reserved (the intent reported for a named model) and refused with `400`.' }
     put:
       tags: [routes]
       summary: Set the tenant's exemplars of an intent, over the config file's (routes.write)
@@ -1770,8 +1789,13 @@ paths:
               properties:
                 exemplars: { type: array, maxItems: 200, items: { type: string, minLength: 1, maxLength: 2000 } }
       responses:
-        '200': { description: The intent as stored }
+        '200':
+          description: The intent as stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantIntentSet' }
         '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
     delete:
       tags: [routes]
       summary: Drop the tenant's own exemplars of an intent (the config file's apply again)
@@ -2232,12 +2256,7 @@ paths:
                 properties:
                   documents:
                     type: array
-                    items:
-                      allOf:
-                        - $ref: '#/components/schemas/RagDocument'
-                        - type: object
-                          properties:
-                            live_version: { type: [integer, 'null'], description: 'The version retrieval serves (null: none is ready)' }
+                    items: { $ref: '#/components/schemas/RagDocument' }
                   next_cursor: { type: [string, 'null'] }
         '400': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
@@ -3304,8 +3323,16 @@ components:
       type: string
       enum: [entity, attribute, relation, metric, dimension, glossary_term, policy, verified_query]
     OntologyElement:
+      allOf:
+        - $ref: '#/components/schemas/OntologyElementProposal'
+        - type: object
+          required: [status]
+          properties:
+            changed_in: { type: integer, description: 'The ontology version its spec or status last changed in. A CQIR query written for an older version keeps compiling while nothing it touches changed after that version.' }
+    OntologyElementProposal:
       type: object
-      required: [id, kind, name, status, provenance]
+      description: 'An element as proposed through `POST /api/v1/tenants/{tenantId}/ontology/proposals`: `status` is optional there and ignored (the server writes `proposed`). Stored elements (`OntologyElement`) always have it.'
+      required: [id, kind, name, provenance]
       properties:
         id: { type: string }
         kind: { $ref: '#/components/schemas/OntologyElementKind' }
@@ -3316,7 +3343,21 @@ components:
         provenance: { type: string, enum: [introspect, profile, query_log, llm, human] }
         confidence: { type: [number, 'null'] }
         spec: { type: object, additionalProperties: true, description: 'Kind-specific body; see schemas/ontology.schema.json' }
-        changed_in: { type: integer, description: 'The ontology version its spec or status last changed in. A CQIR query written for an older version keeps compiling while nothing it touches changed after that version.' }
+    OntologyBreaking:
+      type: object
+      required: [element, change, nodes]
+      properties:
+        element: { type: string }
+        change: { type: string, description: 'For example `approved -> proposed`' }
+        nodes: { type: array, items: { type: string }, description: '`name@vN` of the published node versions whose fixed queries touch it' }
+    TenantIntentSet:
+      type: object
+      required: [tenant_id, intent, exemplars, source]
+      properties:
+        tenant_id: { type: string }
+        intent: { type: string }
+        exemplars: { type: array, items: { type: string }, description: 'As stored: trimmed, duplicates dropped' }
+        source: { type: string, enum: [api] }
     IntrospectionJob:
       type: object
       properties:
@@ -4135,7 +4176,7 @@ components:
         released_by: { type: string }
         released_at: { type: string, format: date-time }
         vet_deadline_at: { type: string, format: date-time, description: 'Untrusted documents only: when its checks must have passed, or it fails. The collection''s `vet_deadline_secs` from ingest, or from its release for a released version.' }
-        live_version: { type: [integer, 'null'], description: 'In the document listing: the version being served' }
+        live_version: { type: [integer, 'null'], description: 'In the document listing: the version retrieval serves (null: none is ready)' }
     Permission:
       type: string
       enum: [tenants.create, catalog.read, catalog.write, providers.probe, audit.read, rbac.read, rbac.write,
