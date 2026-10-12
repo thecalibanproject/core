@@ -115,8 +115,12 @@ version in which its definition (spec) or approval last changed (`changed_in`). 
    query on the current version`) until a version written on the new ontology is published.
 4. **Publishing checks the version.** Every fixed CQIR query of a spec must name a version of the
    tenant's ontology that exists and that the query still compiles on (`ontology_version`
-   problems, with the JSON pointer of the query). Values filled by templates are checked when the
-   node runs.
+   problems, with the JSON pointer of the query). Filter values may be templates, filled when the
+   node runs: the whole `v` (`{"type": "string_list", "v": "{{outputs.assess.cities}}"}`), an
+   element of a list or range, or the whole typed `value`. At publish a template stands for a
+   value of the declared type, so the ids, operators, value types and structure are still checked;
+   the values themselves are checked when the node runs. A template anywhere else (an id, an
+   operator, `limit`) is refused.
 5. A query names a version newer than the current one, another tenant's, or a malformed one: refused.
 
 This follows note 08's validation step 1 (every id exists in the published ontology version) and
