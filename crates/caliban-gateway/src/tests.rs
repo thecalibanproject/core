@@ -70,7 +70,16 @@ fn openai_reply(b: &Value) -> Response {
     }
     let message = if b.get("tools").and_then(Value::as_array).is_some_and(|t| !t.is_empty()) {
         let name = b["tools"][0]["function"]["name"].clone();
-        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": name, "arguments": "{\"city\":\"Paris\"}"}}]})
+        // A model that writes the IBAN it was given (up to the next period) without its spaces.
+        let user = last_user_text(b);
+        let arguments = match user.split_once("IBAN ") {
+            Some((_, rest)) => {
+                let iban: String = rest.split('.').next().unwrap_or_default().split_whitespace().collect();
+                json!({"iban": iban, "amount": 120}).to_string()
+            }
+            None => "{\"city\":\"Paris\"}".to_owned(),
+        };
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": name, "arguments": arguments}}]})
     } else {
         json!({"role": "assistant", "content": text})
     };
@@ -525,6 +534,27 @@ async fn earlier_tool_call_arguments_are_protected_on_both_paths() {
     assert_eq!(input["input"]["subject"], "plan");
     assert_eq!(input["input"]["to"], input["input"]["cc"][0], "one value, one surrogate");
     assert_eq!(h["x-caliban-pii-entities"], "2");
+}
+
+/// One IBAN in two formats gets one surrogate; the model writes it compact in a refund tool's
+/// arguments, and the caller gets the real IBAN back in that format (fintech demo: a made-up IBAN
+/// reached a trusted refund tool).
+#[tokio::test]
+async fn a_reformatted_iban_in_tool_arguments_is_restored() {
+    let (app, log, _) = setup().await;
+    let (spaced, compact) = ("FR76 3000 6000 0112 3456 7890 189", "FR7630006000011234567890189");
+    let body = json!({"model": "ext/mock",
+        "tools": [{"type": "function", "function": {"name": "refund", "parameters": {"type": "object"}}}],
+        "messages": [{"role": "user", "content": format!("Refund 120 EUR to IBAN {spaced}. The form says {compact}.")}]});
+    let (status, _, out) = call(&app, "/v1/chat/completions", BEARER, body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let sent = log.last().2.to_string();
+    assert!(!sent.contains("3000 6000") && !sent.contains(compact), "{sent}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let args: Value =
+        serde_json::from_str(v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(args, json!({"iban": compact, "amount": 120}));
 }
 
 /// Caliban sets prefix-cache salts itself, or none: a client's `cache_salt` never reaches an

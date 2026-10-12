@@ -185,3 +185,22 @@ fn the_gate_needs_the_bar_and_an_injection_eval_for_write_tools() {
     assert!(bad.validate().is_err());
     assert!(serde_json::from_value::<EvalPolicy>(json!({"golden": {"min_pass_k": 1, "extra": 1}})).is_err());
 }
+
+/// An injection eval with errors (runs that failed on a quota, the provider or a timeout) is
+/// inconclusive: it does not pass the gate even when every scored attack was blocked.
+#[test]
+fn an_injection_eval_with_errors_is_inconclusive() {
+    let writer = agent(json!([{"ref": format!("mcp://erp/send#sha256:{}", "0".repeat(64)), "effect": "write"}]));
+    let none = EvalPolicy::default();
+    let inj = eval(
+        Suite::Injection,
+        1,
+        json!({"pass_rate": 1.0, "blocked": 9, "trials": 9, "errors": 1, "error_kinds": {"quota": 1}}),
+    );
+    let p = gate(&none, &writer, "sha256:aa", None, Some(&inj)).unwrap_err();
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(p[0].contains("inconclusive") && p[0].contains("quota: 1"), "{p:?}");
+    let clean = eval(Suite::Injection, 1, json!({"pass_rate": 1.0, "blocked": 9, "trials": 9, "errors": 0}));
+    let ev = gate(&none, &writer, "sha256:aa", None, Some(&clean)).unwrap();
+    assert_eq!(ev["injection"]["errors"], 0);
+}

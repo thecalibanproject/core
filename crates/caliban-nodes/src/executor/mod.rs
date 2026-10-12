@@ -118,6 +118,66 @@ pub enum ModelError {
 /// Durable sleeps of one step while it is rate limited, after which the run fails.
 pub const MAX_THROTTLED_SLEEPS: u32 = 5;
 
+/// How a model call that fails transiently ([`ModelError::Unavailable`]) is retried: first wait,
+/// doubled after each attempt up to the cap, for at most [`ExecutorOptions::model_retry_for`].
+pub const MODEL_RETRY_FIRST_WAIT: Duration = Duration::from_millis(50);
+pub const MODEL_RETRY_MAX_WAIT: Duration = Duration::from_secs(2);
+
+/// How long a rate-limited call waits before it calls again: the limit's `Retry-After`, within
+/// 10 ms and 5 minutes.
+pub fn throttle_pause(retry_after: Duration) -> Duration {
+    retry_after.clamp(Duration::from_millis(10), Duration::from_secs(300))
+}
+
+// What a run's error or stop reason says when it ended for a reason outside the node
+// ([`infrastructure_failure`]); the executor writes them, so they stay in step.
+const STILL_RATE_LIMITED: &str = "still rate limited after";
+const MODEL_CALL_FAILED: &str = "model call failed:";
+const MODEL_CALL_REFUSED: &str = "model call refused:";
+const SPEND_CAP: &str = "node spend cap is reached";
+
+/// Why a run ended for a reason outside the node itself: `quota` (Caliban's own limits: a rate
+/// limit that did not reset in [`MAX_THROTTLED_SLEEPS`] waits, a `429`, the tenant's node spend
+/// cap), `provider` (model calls that kept failing transiently, a `5xx`) or `timeout` (the
+/// run's wall clock, a `408` or `504`). `None` for a run that ended on its own terms: it
+/// succeeded, failed on its logic, a defense or a refused call, was cancelled, or used up its own
+/// step, token or USD budget. Evals report such runs as errors: they say nothing about the node.
+pub fn infrastructure_failure(
+    status: RunStatus,
+    error: Option<&str>,
+    stop_reason: Option<&str>,
+) -> Option<&'static str> {
+    match status {
+        RunStatus::Failed => {
+            let e = error.unwrap_or_default();
+            if e.contains(STILL_RATE_LIMITED) {
+                return Some("quota");
+            }
+            if e.contains(MODEL_CALL_FAILED) {
+                return Some("provider");
+            }
+            let refused = e.split_once(MODEL_CALL_REFUSED).map(|(_, rest)| rest.trim_start());
+            match refused.and_then(|r| r.get(..3)) {
+                Some("429") => Some("quota"),
+                Some("408" | "504") => Some("timeout"),
+                Some(c) if c.starts_with('5') && c.chars().all(|d| d.is_ascii_digit()) => Some("provider"),
+                _ => None,
+            }
+        }
+        RunStatus::BudgetExhausted => {
+            let r = stop_reason.unwrap_or_default();
+            if r.contains(SPEND_CAP) {
+                Some("quota")
+            } else if r.contains("wall-clock budget exhausted") {
+                Some("timeout")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Makes the model calls of node runs. The data plane implements it with its own request pipeline
 /// (PII, cache, routing, quotas, metering, tracing), so a node never reaches a provider directly.
 #[async_trait::async_trait]
@@ -527,6 +587,49 @@ impl Executor {
     /// The tool registry of ordinary runs.
     pub fn tools(&self) -> &Arc<dyn ToolRegistry> {
         &self.tools
+    }
+
+    /// A model call outside a run (the eval judge), retried like a run's model calls: a transient
+    /// failure is retried with the same backoff ([`MODEL_RETRY_FIRST_WAIT`], doubled up to
+    /// [`MODEL_RETRY_MAX_WAIT`]) for at most [`ExecutorOptions::model_retry_for`]; a rate limit
+    /// (`429`) waits for its `Retry-After` ([`throttle_pause`]) at most [`MAX_THROTTLED_SLEEPS`]
+    /// times, in process since there is no run to sleep durably. The idempotency key of `ctx` is
+    /// the same on every attempt, so a call that went through is never paid twice. `stop` is
+    /// checked before each wait: when it says so, the last error is returned at once.
+    pub async fn chat_retrying(
+        &self,
+        ctx: &CallCtx,
+        body: Value,
+        stop: impl Fn() -> bool,
+    ) -> Result<ModelReply, ModelError> {
+        let deadline = Instant::now() + self.opts.model_retry_for;
+        let mut wait = MODEL_RETRY_FIRST_WAIT;
+        let mut throttled = 0;
+        loop {
+            let err = match self.models.chat(ctx, body.clone()).await {
+                Ok(r) => return Ok(r),
+                Err(e) => e,
+            };
+            let pause = match &err {
+                ModelError::Rejected(_) => return Err(err),
+                ModelError::Unavailable(_) if Instant::now() + wait > deadline => return Err(err),
+                ModelError::Unavailable(_) => {
+                    let w = wait;
+                    wait = (wait * 2).min(MODEL_RETRY_MAX_WAIT);
+                    w
+                }
+                ModelError::Throttled { .. } if throttled >= MAX_THROTTLED_SLEEPS => return Err(err),
+                ModelError::Throttled { retry_after, .. } => {
+                    throttled += 1;
+                    throttle_pause(*retry_after)
+                }
+            };
+            if stop() {
+                return Err(err);
+            }
+            tracing::debug!(step = %ctx.step_id, error = %err, "model call outside a run failed; retrying");
+            tokio::time::sleep(pause).await;
+        }
     }
 
     /// Creates a run (`pending`) after validating its input. Returns the run and whether it is new
@@ -1442,12 +1545,12 @@ impl RunCx {
         self.check_tenant_spend().await?;
         self.ex.guard.before_model_call(&ctx, &self.budget_state()).await.map_err(Stop::Budget)?;
         let deadline = Instant::now() + self.ex.opts.model_retry_for;
-        let mut wait = Duration::from_millis(50);
+        let mut wait = MODEL_RETRY_FIRST_WAIT;
         loop {
             match self.ex.models.chat(&ctx, body.clone()).await {
                 Ok(r) => return Ok(r),
                 Err(ModelError::Rejected(e)) => {
-                    return Err(Stop::Fail(format!("step {step_id}: model call refused: {e}")));
+                    return Err(Stop::Fail(format!("step {step_id}: {MODEL_CALL_REFUSED} {e}")));
                 }
                 Err(ModelError::Unavailable(e)) => {
                     // A cancelled run does not retry its model call.
@@ -1455,11 +1558,11 @@ impl RunCx {
                         return Err(self.cancelled().await);
                     }
                     if Instant::now() + wait > deadline {
-                        return Err(Stop::Fail(format!("step {step_id}: model call failed: {e}")));
+                        return Err(Stop::Fail(format!("step {step_id}: {MODEL_CALL_FAILED} {e}")));
                     }
                     tracing::debug!(step = step_id, error = %e, "model call failed transiently; retrying");
                     tokio::time::sleep(wait).await;
-                    wait = (wait * 2).min(Duration::from_secs(2));
+                    wait = (wait * 2).min(MODEL_RETRY_MAX_WAIT);
                 }
                 Err(ModelError::Throttled { retry_after, message }) => {
                     return Err(self.throttled(step_id, retry_after, &message).await);
@@ -1491,7 +1594,7 @@ impl RunCx {
                 && used >= cap
             {
                 return Err(Stop::Budget(format!(
-                    "the tenant's {what} node spend cap is reached (${used:.6} spent of ${cap:.6}, UTC)"
+                    "the tenant's {what} {SPEND_CAP} (${used:.6} spent of ${cap:.6}, UTC)"
                 )));
             }
         }
@@ -1510,9 +1613,9 @@ impl RunCx {
             }
         }
         if n >= MAX_THROTTLED_SLEEPS {
-            return Stop::Fail(format!("step {step_id}: still rate limited after {n} waits: {message}"));
+            return Stop::Fail(format!("step {step_id}: {STILL_RATE_LIMITED} {n} waits: {message}"));
         }
-        let pause = retry_after.clamp(Duration::from_millis(10), Duration::from_secs(300));
+        let pause = throttle_pause(retry_after);
         match self.deadline(&format!("{step_id}:throttled:{n}"), pause).await {
             Ok(wake_at) => Stop::Suspend(Suspension {
                 status: RunStatus::Sleeping,

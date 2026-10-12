@@ -2865,8 +2865,10 @@ components:
         routing embedder call, part of `route`), `pii`, `cache` (`desc`: `hit` or `miss`),
         `upstream` (time to the upstream response headers), `upstream_total` (the whole upstream
         call; non-streaming responses only, streams record it in the usage event's `timings`),
-        `node` (a node run that answered; `desc` is the run id, whose step durations are on
-        `GET /v1/runs/{id}`; no `dur` on streams, whose headers leave before the run ends), `total`.
+        `node` (a node run that answered, or the run of a run API request: creating it and, when
+        sync, waiting for it, or delivering an answer to it; `desc` is the run id, whose step
+        durations are on `GET /v1/runs/{id}`; no `dur` on streams, whose headers leave before the
+        run ends), `total`.
         Example: `auth;dur=0.210, route;dur=4.810;desc="knn", embed;dur=4.020, pii;dur=1.130,
         cache;dur=0.040;desc="miss", upstream;dur=182.400, upstream_total;dur=611.900, total;dur=618.700`.
         Absent when `[telemetry] server_timing = false`.
@@ -3559,6 +3561,7 @@ components:
             eval: { type: string }
             pass_rate: { type: number }
             bar: { type: number }
+            errors: { type: integer, description: 'Always 0: an eval with errors is inconclusive and does not pass' }
         subnodes:
           type: object
           description: 'Per pinned subnode version (`name@vN`): its own evidence, or null when no gate applies to it'
@@ -3612,12 +3615,14 @@ components:
       properties:
         suite: { type: string, enum: [injection] }
         suite_version: { type: integer }
-        trials: { type: integer }
+        trials: { type: integer, description: 'Scored trials (blocked or succeeded): errors and inapplicable cases are not in them' }
         blocked: { type: integer }
-        pass_rate: { type: number, description: 'Share of attacks blocked' }
-        attack_success_rate: { type: number }
+        pass_rate: { type: [number, 'null'], description: 'Share of the scored attacks blocked' }
+        attack_success_rate: { type: [number, 'null'] }
         attacks_succeeded: { type: integer }
-        errors: { type: integer }
+        errors: { type: integer, description: 'Trials that ended on an error (a quota, the provider, a timeout, a run that could not be created): neither blocked nor succeeded' }
+        error_kinds: { type: object, additionalProperties: { type: integer }, description: 'Errors per kind: quota, provider, timeout, run_not_created, unscored' }
+        inconclusive: { type: boolean, description: 'There are errors: the promotion gate does not accept the eval' }
         attacked: { type: integer, description: 'Trials where the model followed the injection' }
         utility_under_attack: { type: number, description: 'Share of runs that still did their job' }
         by_category:
@@ -3628,7 +3633,8 @@ components:
             properties:
               trials: { type: integer }
               blocked: { type: integer }
-              pass_rate: { type: number }
+              errors: { type: integer }
+              pass_rate: { type: [number, 'null'] }
         not_applicable:
           type: array
           description: 'Cases this version offers no surface for, with why'
@@ -3649,6 +3655,8 @@ components:
               case: { type: string }
               trial: { type: integer }
               blocked: { type: boolean }
+              outcome: { type: string, enum: [blocked, succeeded, error] }
+              error_kind: { type: string, description: 'With outcome error' }
               attacked: { type: [boolean, 'null'] }
               defenses: { type: [array, 'null'], items: { type: string } }
               run_id: { type: [string, 'null'] }
