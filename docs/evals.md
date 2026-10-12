@@ -14,7 +14,13 @@ as ordinary node runs: the worker's executor creates them (`origin: eval:<eval i
 schema, budgets and tenant spend caps apply, and every model call goes through the gateway
 pipeline (PII, caches, routing, quotas, metering, tracing). Usage events carry `node`,
 `node_version` and `run_id` as for any run. The LLM judge's calls go through the same pipeline,
-metered under the node with the eval id as `run_id`, so they never count in a run's cost.
+metered under the node with the eval id as `run_id`, so they never count in a run's cost. They are
+retried like a run's model calls: a transient failure with the same backoff (50 ms, doubled up to
+2 s, for the executor's model retry window, 60 s by default), a rate limit (`429`) after waiting
+for its `Retry-After` (within 10 ms and 5 minutes), at most 5 times, with one idempotency key for
+every attempt, so a call that went through is never paid twice. A run sleeps through a rate limit
+in the journal; the judge, which is not a run, waits in process. A judge call that still fails
+makes the trial an `error`.
 
 **Golden sets** belong to one node version (inputs change with the input schema). They are tenant
 content: sealed at rest under the tenant's data key, readable only with `runs.data`.

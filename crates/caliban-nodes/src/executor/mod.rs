@@ -118,6 +118,17 @@ pub enum ModelError {
 /// Durable sleeps of one step while it is rate limited, after which the run fails.
 pub const MAX_THROTTLED_SLEEPS: u32 = 5;
 
+/// How a model call that fails transiently ([`ModelError::Unavailable`]) is retried: first wait,
+/// doubled after each attempt up to the cap, for at most [`ExecutorOptions::model_retry_for`].
+pub const MODEL_RETRY_FIRST_WAIT: Duration = Duration::from_millis(50);
+pub const MODEL_RETRY_MAX_WAIT: Duration = Duration::from_secs(2);
+
+/// How long a rate-limited call waits before it calls again: the limit's `Retry-After`, within
+/// 10 ms and 5 minutes.
+pub fn throttle_pause(retry_after: Duration) -> Duration {
+    retry_after.clamp(Duration::from_millis(10), Duration::from_secs(300))
+}
+
 /// Makes the model calls of node runs. The data plane implements it with its own request pipeline
 /// (PII, cache, routing, quotas, metering, tracing), so a node never reaches a provider directly.
 #[async_trait::async_trait]
@@ -527,6 +538,49 @@ impl Executor {
     /// The tool registry of ordinary runs.
     pub fn tools(&self) -> &Arc<dyn ToolRegistry> {
         &self.tools
+    }
+
+    /// A model call outside a run (the eval judge), retried like a run's model calls: a transient
+    /// failure is retried with the same backoff ([`MODEL_RETRY_FIRST_WAIT`], doubled up to
+    /// [`MODEL_RETRY_MAX_WAIT`]) for at most [`ExecutorOptions::model_retry_for`]; a rate limit
+    /// (`429`) waits for its `Retry-After` ([`throttle_pause`]) at most [`MAX_THROTTLED_SLEEPS`]
+    /// times, in process since there is no run to sleep durably. The idempotency key of `ctx` is
+    /// the same on every attempt, so a call that went through is never paid twice. `stop` is
+    /// checked before each wait: when it says so, the last error is returned at once.
+    pub async fn chat_retrying(
+        &self,
+        ctx: &CallCtx,
+        body: Value,
+        stop: impl Fn() -> bool,
+    ) -> Result<ModelReply, ModelError> {
+        let deadline = Instant::now() + self.opts.model_retry_for;
+        let mut wait = MODEL_RETRY_FIRST_WAIT;
+        let mut throttled = 0;
+        loop {
+            let err = match self.models.chat(ctx, body.clone()).await {
+                Ok(r) => return Ok(r),
+                Err(e) => e,
+            };
+            let pause = match &err {
+                ModelError::Rejected(_) => return Err(err),
+                ModelError::Unavailable(_) if Instant::now() + wait > deadline => return Err(err),
+                ModelError::Unavailable(_) => {
+                    let w = wait;
+                    wait = (wait * 2).min(MODEL_RETRY_MAX_WAIT);
+                    w
+                }
+                ModelError::Throttled { .. } if throttled >= MAX_THROTTLED_SLEEPS => return Err(err),
+                ModelError::Throttled { retry_after, .. } => {
+                    throttled += 1;
+                    throttle_pause(*retry_after)
+                }
+            };
+            if stop() {
+                return Err(err);
+            }
+            tracing::debug!(step = %ctx.step_id, error = %err, "model call outside a run failed; retrying");
+            tokio::time::sleep(pause).await;
+        }
     }
 
     /// Creates a run (`pending`) after validating its input. Returns the run and whether it is new
@@ -1442,7 +1496,7 @@ impl RunCx {
         self.check_tenant_spend().await?;
         self.ex.guard.before_model_call(&ctx, &self.budget_state()).await.map_err(Stop::Budget)?;
         let deadline = Instant::now() + self.ex.opts.model_retry_for;
-        let mut wait = Duration::from_millis(50);
+        let mut wait = MODEL_RETRY_FIRST_WAIT;
         loop {
             match self.ex.models.chat(&ctx, body.clone()).await {
                 Ok(r) => return Ok(r),
@@ -1459,7 +1513,7 @@ impl RunCx {
                     }
                     tracing::debug!(step = step_id, error = %e, "model call failed transiently; retrying");
                     tokio::time::sleep(wait).await;
-                    wait = (wait * 2).min(Duration::from_secs(2));
+                    wait = (wait * 2).min(MODEL_RETRY_MAX_WAIT);
                 }
                 Err(ModelError::Throttled { retry_after, message }) => {
                     return Err(self.throttled(step_id, retry_after, &message).await);
@@ -1512,7 +1566,7 @@ impl RunCx {
         if n >= MAX_THROTTLED_SLEEPS {
             return Stop::Fail(format!("step {step_id}: still rate limited after {n} waits: {message}"));
         }
-        let pause = retry_after.clamp(Duration::from_millis(10), Duration::from_secs(300));
+        let pause = throttle_pause(retry_after);
         match self.deadline(&format!("{step_id}:throttled:{n}"), pause).await {
             Ok(wake_at) => Stop::Suspend(Suspension {
                 status: RunStatus::Sleeping,

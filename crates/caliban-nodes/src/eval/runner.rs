@@ -569,7 +569,9 @@ impl EvalRunner {
                 };
                 let body = judge_request(&model, rubric, &c.input, c.expected.as_ref(), &output);
                 let mut res = super::CheckResult { kind: "llm_judge", passed: false, reason: None, score: None };
-                match self.ex.models().chat(&ctx, body).await {
+                // Retried like the node's own model calls (a 429 waits for its reset).
+                let stop = || cx.watch.check().is_err();
+                match self.ex.chat_retrying(&ctx, body, stop).await {
                     Ok(reply) => {
                         judge_usd += reply.usd;
                         match judge_verdict(&reply.message) {

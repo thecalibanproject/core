@@ -2007,6 +2007,52 @@ mod evals {
             assert!(t.seen.lock().is_empty(), "the real {} tool was called", t.name);
         }
     }
+
+    /// The judge's calls are retried like a node's model calls: a `429` waits for its reset and
+    /// calls again (fintech demo: one 429 failed the trial), at most `MAX_THROTTLED_SLEEPS` times.
+    #[tokio::test]
+    async fn judge_calls_wait_out_a_rate_limit_like_node_calls() {
+        for (limited, passes) in [(2, true), (100, false)] {
+            let h = Harness::new(Arc::new(MemoryJournal::new()));
+            h.nodes.add(
+                "echo",
+                1,
+                json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(10, 10_000),
+                "graph": {"vertices": [{"id": "a", "type": "llm"}], "edges": []}}),
+            );
+            let model = FakeModel::new(|body| {
+                if system(body).starts_with("You grade") {
+                    text("{\"score\": 0.9, \"reason\": \"fine\"}")
+                } else {
+                    text("hello")
+                }
+            });
+            *model.throttle.lock() = Some(("judge:j:0:0".into(), limited));
+            let ex = h.executor(&model, "w1");
+            let cases = vec![
+                serde_json::from_value::<GoldenCase>(
+                    json!({"id": "j", "input": "hi", "checks": [{"type": "llm_judge", "rubric": "Is it a greeting?"}]}),
+                )
+                .unwrap(),
+            ];
+            let plan = Plan::Golden { golden_hash: crate::eval::golden_hash(&cases), cases, judge_model: None };
+            let e = start_eval(&h, "echo", Suite::Golden, 1, &plan).await;
+            assert!(EvalRunner::new(Arc::clone(&ex), opts()).run_once().await);
+            let trials = h.journal.trials(&e.id).await.unwrap();
+            let want = if passes { TrialStatus::Passed } else { TrialStatus::Error };
+            assert_eq!(trials[0].status, want, "{:?}", trials[0].verdict);
+            let calls = model.calls_for("judge:j:0:0");
+            if passes {
+                assert_eq!(calls, 3, "two rate-limited calls, then the score");
+            } else {
+                assert_eq!(calls as u32, MAX_THROTTLED_SLEEPS + 1, "the node calls' cap on waits");
+            }
+            // One idempotency key for every attempt: a call that went through is never paid twice.
+            let keys: std::collections::HashSet<String> =
+                model.calls.lock().iter().filter(|(s, _)| s == "judge:j:0:0").map(|(_, k)| k.clone()).collect();
+            assert_eq!(keys.len(), 1);
+        }
+    }
 }
 
 /// The answer guard (e2e gap 8): a read-only node whose catalogue row carries an injection. A
