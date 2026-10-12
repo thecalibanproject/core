@@ -1839,6 +1839,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_events_report_their_stage_timings() {
+        use caliban_meter::{UsageEvent, UsageSink};
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        let timings = json!({"auth_ms": 0.1, "route_ms": 2.5, "embed_ms": 2.0, "pii_ms": 0.4, "cache_ms": 0.05,
+                             "upstream_ms": 80.0, "upstream_total_ms": 300.0, "total_ms": 304.0});
+        let ev: UsageEvent = serde_json::from_value(json!({
+            "request_id": "t1", "tenant_id": "acme", "model": "ext/gpt", "intent": "chat", "prompt_tokens": 1,
+            "completion_tokens": 1, "cached_prompt_tokens": 0, "tokens_saved": 0, "cache": "miss",
+            "pii_entities": 0, "cost_usd": 0.0, "latency_ms": 304, "ts": "2026-10-09T12:00:00Z", "timings": timings
+        }))
+        .unwrap();
+        c.store.usage.record(ev).await;
+        let (s, u) = call(&app, "GET", "/api/v1/usage", None, true).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(u["events"][0]["timings"], timings, "{u}");
+    }
+
+    #[tokio::test]
     async fn empty_usd_totals_are_positive_zero() {
         assert!(std::iter::empty::<f64>().sum::<f64>().is_sign_negative(), "the pitfall usd_total avoids");
         assert!(store::usage::usd_total(std::iter::empty()).is_sign_positive());

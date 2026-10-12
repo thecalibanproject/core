@@ -130,6 +130,40 @@ pub struct UsageEvent {
     /// what a request was about, so it is stored (unlike the intent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
+    /// How long each pipeline stage took, in milliseconds (the `Server-Timing` response header's
+    /// numbers). Durations only: which classifier stage decided is content-class and stays out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<UsageTimings>,
+}
+
+/// Per-stage durations of one request, in milliseconds (microsecond precision). A stage that did
+/// not run is absent.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct UsageTimings {
+    /// Authentication and the rate-limit check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_ms: Option<f64>,
+    /// Routing (classification and model choice), the routing embedder call included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_ms: Option<f64>,
+    /// The routing embedder call (Stage-1 kNN), part of `route_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_ms: Option<f64>,
+    /// PII screening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii_ms: Option<f64>,
+    /// Cache lookups (exact, then semantic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ms: Option<f64>,
+    /// Upstream model: time to the response headers (first byte).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_ms: Option<f64>,
+    /// Upstream model: the whole call, to the end of the body or stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_total_ms: Option<f64>,
+    /// Request start to the usage event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_ms: Option<f64>,
 }
 
 impl UsageEvent {

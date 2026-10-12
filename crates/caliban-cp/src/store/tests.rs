@@ -2207,6 +2207,32 @@ async fn postgres_usage_events_carry_cache_tier_and_usage_source() {
 }
 
 #[tokio::test]
+async fn postgres_usage_events_keep_stage_timings() {
+    let Some(pg) = pg_backend().await else { return };
+    pg.migrate().await.unwrap();
+    let timings = json!({"auth_ms": 0.1, "route_ms": 2.5, "pii_ms": 0.4, "upstream_ms": 80.0, "total_ms": 90.0});
+    let ev = |id: &str, t: Option<&Value>| -> caliban_meter::UsageEvent {
+        let mut v = json!({
+            "request_id": id, "tenant_id": "acme", "model": "ext/gpt", "intent": "chat", "prompt_tokens": 1,
+            "completion_tokens": 1, "cached_prompt_tokens": 0, "tokens_saved": 0, "cache": "miss",
+            "pii_entities": 0, "cost_usd": 0.0, "latency_ms": 90, "ts": "2026-10-09T12:00:00Z"
+        });
+        if let Some(t) = t {
+            v["timings"] = t.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    };
+    assert_eq!(pg.insert_usage_events(&[ev("t_1", Some(&timings)), ev("t_2", None)]).await.unwrap(), 2);
+    let rows: Vec<(String, Option<Value>)> = sqlx::query_as(
+        "SELECT request_id, timings FROM usage_event WHERE request_id IN ('t_1', 't_2') ORDER BY request_id",
+    )
+    .fetch_all(pg.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![("t_1".into(), Some(timings)), ("t_2".into(), None)]);
+}
+
+#[tokio::test]
 async fn postgres_rejects_edited_migrations() {
     let Some(pg) = pg_backend().await else { return };
     pg.migrate().await.unwrap();

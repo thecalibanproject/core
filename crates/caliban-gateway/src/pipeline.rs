@@ -751,6 +751,7 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
             .or_else(|| o.auto_fallback.map(|_| format!("model:{}", o.model.id))),
         route_fallback: o.auto_fallback.map(str::to_owned),
         purpose: o.purpose.map(str::to_owned),
+        timings: None,
     };
     let billed = if auto.is_some() { event.billed_usd } else { cost };
     gw.usage.record(event).await;

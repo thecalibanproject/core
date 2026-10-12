@@ -70,6 +70,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (33, "tenant_pii_detectors", include_str!("../../../../migrations/0033_tenant_pii_detectors.sql")),
     (34, "tenant_intents", include_str!("../../../../migrations/0034_tenant_intents.sql")),
     (35, "introspection_job", include_str!("../../../../migrations/0035_introspection_job.sql")),
+    (36, "usage_timings", include_str!("../../../../migrations/0036_usage_timings.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -339,12 +340,13 @@ impl PgBackend {
                                       cached_prompt_tokens, tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts,
                                       requested_model, intent_confidence, route_stage, routed_model_cost_usd, flat_price_usd,
                                       cache_tier, usage_source, cache_write_tokens, cache_write_1h_tokens, billed_usd, saved_usd,
-                                      node, node_version, run_id, route, route_fallback, purpose)
+                                      node, node_version, run_id, route, route_fallback, purpose, timings)
              SELECT * FROM UNNEST($1::TEXT[], $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::BIGINT[], $6::BIGINT[],
                                   $7::BIGINT[], $8::BIGINT[], $9::TEXT[], $10::INTEGER[], $11::FLOAT8[], $12::BIGINT[],
                                   $13::TIMESTAMPTZ[], $14::TEXT[], $15::REAL[], $16::TEXT[], $17::FLOAT8[], $18::FLOAT8[],
                                   $19::TEXT[], $20::TEXT[], $21::BIGINT[], $22::BIGINT[], $23::FLOAT8[], $24::FLOAT8[],
-                                  $25::TEXT[], $26::INTEGER[], $27::TEXT[], $28::TEXT[], $29::TEXT[], $30::TEXT[])
+                                  $25::TEXT[], $26::INTEGER[], $27::TEXT[], $28::TEXT[], $29::TEXT[], $30::TEXT[],
+                                  $31::JSONB[])
              ON CONFLICT (request_id) DO NOTHING RETURNING request_id",
         )
         .bind(col(&|e| e.request_id.clone()))
@@ -377,6 +379,7 @@ impl PgBackend {
         .bind(&none_text)
         .bind(&none_text)
         .bind(opt(&|e| e.purpose.clone()))
+        .bind(events.iter().map(|e| e.timings.and_then(|t| serde_json::to_value(t).ok())).collect::<Vec<_>>())
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
@@ -680,7 +683,7 @@ impl Backend for PgBackend {
                     tokens_saved, cache, pii_entities, cost_usd, latency_ms, ts, requested_model, intent_confidence,
                     route_stage, routed_model_cost_usd, flat_price_usd, cache_tier, usage_source, cache_write_tokens,
                     cache_write_1h_tokens, billed_usd, saved_usd, node, node_version, run_id, route, route_fallback,
-                    purpose
+                    purpose, timings
              FROM usage_event
              WHERE ($1::TEXT[] IS NULL OR tenant_id = ANY($1)) AND ($2::TEXT IS NULL OR node = $2)
                    AND ($3::TEXT IS NULL OR run_id = $3)
@@ -967,6 +970,7 @@ fn usage_row(r: &PgRow) -> Result<caliban_meter::UsageEvent, StoreError> {
         route: get(r, "route")?,
         route_fallback: get(r, "route_fallback")?,
         purpose: get(r, "purpose")?,
+        timings: get::<Option<Value>>(r, "timings")?.map(parse).transpose()?,
     })
 }
 
