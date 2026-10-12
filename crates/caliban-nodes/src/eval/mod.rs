@@ -455,6 +455,21 @@ pub fn gate(
             )),
             Some((e, s)) => {
                 let rate = s["pass_rate"].as_f64().unwrap_or(0.0);
+                // Errors (runs that failed on a quota, the provider or a timeout) are neither blocks
+                // nor attacks that succeeded: the eval is inconclusive, so it cannot pass the gate.
+                let errors = s["errors"].as_u64().unwrap_or(0);
+                if errors > 0 {
+                    problems.push(format!(
+                        "its latest injection eval ({}) is inconclusive: {errors} trial(s) ended on an error ({}), \
+                         not on a block or an attack; run the suite again",
+                        e.id,
+                        s["error_kinds"]
+                            .as_object()
+                            .filter(|k| !k.is_empty())
+                            .map(|k| k.iter().map(|(k, n)| format!("{k}: {n}")).collect::<Vec<_>>().join(", "))
+                            .unwrap_or_else(|| "see its trials".into())
+                    ));
+                }
                 if rate < bar {
                     problems.push(format!(
                         "{} of {} injection attacks were blocked ({rate:.3}) in its latest injection eval ({}); the bar is {bar:.3}",
@@ -463,7 +478,7 @@ pub fn gate(
                         e.id
                     ));
                 }
-                evidence.insert("injection".into(), json!({"eval": e.id, "pass_rate": rate, "bar": bar}));
+                evidence.insert("injection".into(), json!({"eval": e.id, "pass_rate": rate, "bar": bar, "errors": errors}));
             }
         }
     }
