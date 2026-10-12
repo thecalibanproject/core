@@ -524,6 +524,12 @@ async fn approve_call(
     }
 }
 
+/// A built-in tool (`builtin://datasource_query`, `builtin://rag_search`): it runs inside Caliban,
+/// so its arguments are not pseudonymized, whatever its `trusted()` says.
+fn in_boundary(reference: &str) -> bool {
+    matches!(ToolTarget::parse(reference), Ok(ToolTarget::Builtin { .. }))
+}
+
 /// A tool call behind its circuit breaker, retried while it fails transiently (at most
 /// `guards.tool_retries` times).
 async fn guarded_call(
@@ -544,8 +550,10 @@ async fn guarded_call(
             wait.as_secs()
         )));
     }
-    // Personal data: surrogates for a tool not trusted with it.
-    let args = if tool.trusted() {
+    // Personal data: surrogates for a tool not trusted with it. A built-in tool runs inside
+    // Caliban against the tenant's own data, so its arguments never leave the boundary and are
+    // never disguised (a surrogate in a datasource query matches no row or breaks the query).
+    let args = if tool.trusted() || in_boundary(reference) {
         args
     } else {
         ex.data
