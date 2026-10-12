@@ -702,13 +702,14 @@ async fn an_injection_in_a_retrieved_document_cannot_drive_a_write() {
     }
 }
 
-/// A catalogue row with a phone in its own field and another in its free text: the answer keeps
-/// the field's (quoted data) and loses the free text's (answer guard, rule 1). The console's run
-/// detail shows the check and the models' real cost, as the data plane's run does.
-#[tokio::test]
-async fn a_whole_field_contact_reaches_the_answer_and_the_console_shows_the_check() {
-    const FIELD: &str = "+33 1 42 68 53 00";
-    const LIFTED: &str = "+33 6 12 34 56 78";
+const FIELD_PHONE: &str = "+33 1 42 68 53 00";
+const LIFTED_PHONE: &str = "+33 6 12 34 56 78";
+
+/// A node that finds a clinic in a catalogue (a real MCP server) whose row has a phone in its own
+/// field and another in its free text; the model quotes the field and repeats the description.
+/// Runs it with the tenant's PII mode `pii` and the node's `guardrails.pii` floor; returns the
+/// environment, the run as the data plane shows it, and the bodies the model received.
+async fn catalogue_run(pii: &str, floor: Option<&str>) -> (Env, Value, Vec<String>) {
     let model = Responder::new(|body| {
         let msgs = body["messages"].as_array()?;
         if let Some(t) = msgs.iter().find(|m| m["role"] == "tool") {
@@ -722,26 +723,36 @@ async fn a_whole_field_contact_reaches_the_answer_and_the_console_shows_the_chec
     });
     let j = journal().await;
     let e = env_from(Duration::ZERO, Some(Arc::clone(&j)), model, |url| config_with(url, "")).await;
-    // PII protection off: this test is about the answer guard (issue 2 of the e2e follow-ups:
-    // with `reversible` or `mask` the caller gets a surrogate or a mask instead).
-    let (s, v) =
-        send(&e.cp_app, "PATCH", "/api/v1/tenants/acme", ADMIN, Some(json!({"pii_default": "off"})), &[]).await;
+    let (s, v) = send(&e.cp_app, "PATCH", "/api/v1/tenants/acme", ADMIN, Some(json!({"pii_default": pii})), &[]).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let m = manifest("catalogue", "Finds clinics.");
-    let row = json!({"name": "Cardiology clinic", "phone": FIELD,
-                     "description": format!("Walk-ins welcome. For urgent cases call {LIFTED}.")});
+    let row = json!({"name": "Cardiology clinic", "phone": FIELD_PHONE,
+                     "description": format!("Walk-ins welcome. For urgent cases call {LIFTED_PHONE}.")});
     let srv = TestMcpServer::start(vec![TestTool::new(m.clone(), move |_| Ok(row.clone()))], &[]).await;
     let r = register(&e, "cat", &srv, &[&m], false).await;
-    let spec = json!({"kind": "agent", "prompt": {"system": "You find clinics."}, "model_policy": {},
+    let mut spec = json!({"kind": "agent", "prompt": {"system": "You find clinics."}, "model_policy": {},
         "budgets": budgets(), "tools": [{"ref": r[0], "effect": "read"}]});
+    if let Some(f) = floor {
+        spec["guardrails"] = json!({"pii": f});
+    }
     e.publish("finder", spec).await;
     let w = worker(&e, &j, &idem(), None, "worker-1", Duration::from_secs(30));
     let (s, run) =
         send(&w.app, "POST", "/v1/nodes/finder/runs", KEY, Some(json!({"input": "find a cardiologist"})), &[]).await;
     assert_eq!((s, run["status"].as_str()), (StatusCode::OK, Some("succeeded")), "{run}");
+    let seen = e.mock.log().iter().map(|x| x.body.to_string()).collect();
+    (e, run, seen)
+}
+
+/// The answer guard on a catalogue row, PII protection off: the answer keeps the phone of the
+/// row's own field (quoted data) and loses the one of its free text (rule 1). The console's run
+/// detail shows the check and the models' real cost, as the data plane's run does.
+#[tokio::test]
+async fn a_whole_field_contact_reaches_the_answer_and_the_console_shows_the_check() {
+    let (e, run, _) = catalogue_run("off", None).await;
     let out = run["output"].as_str().unwrap();
-    assert!(out.contains(FIELD), "the field's phone is quoted data: {out}");
-    assert!(!out.contains(LIFTED) && out.contains(caliban_nodes::executor::answer::REMOVED), "{out}");
+    assert!(out.contains(FIELD_PHONE), "the field's phone is quoted data: {out}");
+    assert!(!out.contains(LIFTED_PHONE) && out.contains(caliban_nodes::executor::answer::REMOVED), "{out}");
     assert_eq!(run["answer_check"]["action"], "redacted", "{run}");
 
     let id = run["id"].as_str().unwrap();
@@ -750,4 +761,34 @@ async fn a_whole_field_contact_reaches_the_answer_and_the_console_shows_the_chec
     assert_eq!(c["answer_check"], run["answer_check"]);
     assert!(c["model_cost_usd"].is_number(), "{c}");
     assert_eq!(c["model_cost_usd"], run["model_cost_usd"]);
+}
+
+/// `reversible` (the default mode): tool results enter the run as they are, and the gateway
+/// pseudonymizes every model call and restores its reply (research note 05 §3, P3 plan M4). The
+/// caller gets the catalogue's real phone, never a surrogate: before, results were pseudonymized
+/// as they entered the run and the caller got a made-up number. The model never sees either real
+/// number, and the phone from the free text is still removed by the answer guard.
+#[tokio::test]
+async fn reversible_mode_gives_the_caller_the_real_contact_and_the_model_surrogates() {
+    let (_e, run, seen) = catalogue_run("reversible", None).await;
+    let out = run["output"].as_str().unwrap();
+    assert!(out.contains(FIELD_PHONE), "the real number, restored: {out}");
+    assert!(!out.contains(LIFTED_PHONE) && out.contains(caliban_nodes::executor::answer::REMOVED), "{out}");
+    assert_eq!(out.matches('+').count(), 1, "no made-up number next to it: {out}");
+    assert!(seen.iter().any(|b| b.contains("\"role\":\"tool\"")), "the model read the row");
+    for b in &seen {
+        assert!(!b.contains(FIELD_PHONE) && !b.contains(LIFTED_PHONE), "the model saw a real number: {b}");
+    }
+}
+
+/// `guardrails.pii: mask` stays irreversible end to end: the model and the caller get `[PHONE]`.
+#[tokio::test]
+async fn mask_mode_stays_irreversible() {
+    let (_e, run, seen) = catalogue_run("reversible", Some("mask")).await;
+    let out = run["output"].as_str().unwrap();
+    assert!(out.contains("Call the clinic on [PHONE]."), "{out}");
+    assert!(!out.contains(FIELD_PHONE) && !out.contains(LIFTED_PHONE), "{out}");
+    for b in &seen {
+        assert!(!b.contains(FIELD_PHONE) && !b.contains(LIFTED_PHONE), "the model saw a real number: {b}");
+    }
 }

@@ -157,8 +157,21 @@ platform trust store (an internal CA can be added there, or through `SSL_CERT_FI
   (`reversible`, tenant-scoped surrogates), or masks (`mask`). A server registered with
   `trusted: true` receives the values. A tenant in PII mode `off` has asked for no protection. If
   the PII engine fails on the arguments, the call is refused: nothing leaves unchecked.
-- **Results** are anonymized as they enter the run, like any untrusted input: personal data a tool
-  returns becomes surrogates or masks before a model or a later tool sees it.
+- **Results** enter the run as the tenant's PII mode (raised by the node's `guardrails.pii`)
+  says:
+  - `reversible`: as they are (research note 05 §3, P3 plan M4). Every model call is
+    pseudonymised by the gateway and its reply restored (on every model class when
+    `guardrails.pii` or `pii_on_sovereign` says so), an untrusted tool gets surrogates in its
+    arguments on every call, and a trusted tool gets the real values. A phone number from a
+    catalogue row that the answer quotes therefore reaches the caller as the real number.
+    Pseudonymising results as they entered the run (before this release) gave the caller
+    surrogates that nothing could restore: a made-up phone number or name.
+  - `mask`: masked as they enter, irreversibly. The model and every later step see `[PHONE]`,
+    and so does the caller.
+  - `off`: as they are.
+
+  Run values are stored in the journal sealed under the tenant's data key. In the console, run
+  content (step outputs included) needs `runs.data`.
 
 ## Taint (CaMeL-lite)
 
@@ -308,8 +321,8 @@ document collections the node may read, narrowed to the invoking API key's datas
 the key has any, and returns the best passages as `context` with citations (document id, heading
 path, chunk id) under a token budget. Its result carries the `retrieved` label. It runs in process
 and pseudonymises the query itself before anything is embedded, so it is a trusted tool (its
-arguments are not pseudonymised by the guard); its result is anonymized as it enters the run like
-any other. Collections, ingest, the poisoning controls and the search pipeline are described in
+arguments are not pseudonymised by the guard); its result enters the run like any other tool
+result (masked in `mask` mode, see above). Collections, ingest, the poisoning controls and the search pipeline are described in
 [rag.md](rag.md).
 
 ## Settings

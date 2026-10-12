@@ -219,8 +219,8 @@ becomes ready, in one transaction; until then the previous version is served.
   with the real tool: a document that carries an instruction is retrieved, a compromised model
   follows it, and the write waits for a human.
 - **Personal data**: the tool runs in process and pseudonymises the query itself, so it takes its
-  arguments as the run holds them (a trusted tool); its result is anonymized as it enters the run,
-  like any tool result.
+  arguments as the run holds them (a trusted tool); its result enters the run like any tool
+  result (masked in `mask` mode; see [tools.md](tools.md#personal-data)).
 - Embedding and rerank calls are made as the run's invoking API key, tagged with the node run in
   usage, and with an `Idempotency-Key` derived from the step, so a replayed step does not pay twice
   (with the shared Valkey store).

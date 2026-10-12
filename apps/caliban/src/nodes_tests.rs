@@ -734,9 +734,71 @@ async fn pii_reaches_only_trusted_tool_servers() {
     }
     assert_eq!(crm.calls()[0].args["email"], EMAIL, "the trusted server gets the value");
     assert_eq!(notes.calls()[0].args["email"], "[EMAIL]", "the untrusted one never does");
-    // Results are anonymized as they enter the run.
+    // In `mask` mode results are masked as they enter the run (irreversibly).
     for v in outputs {
         assert!(!v["output"].to_string().contains("mary.major@example.org"), "{v}");
         assert_eq!(v["output"]["owner"], "[EMAIL]", "{v}");
     }
+}
+
+/// `reversible` mode (research note 05 §3, P3 plan M4): a tool result enters the run as it is. A
+/// value from it that a later step passes on reaches a server the tenant trusts as the real value,
+/// and an untrusted one as the tenant's surrogate; the run's output carries the real value.
+#[tokio::test]
+async fn reversible_values_from_tool_results_reach_only_trusted_tool_servers() {
+    const PHONE: &str = "+33 1 42 68 53 00";
+    let e = env(Duration::ZERO).await;
+    let (s, v) =
+        send(&e.cp_app, "PATCH", "/api/v1/tenants/acme", ADMIN, Some(json!({"pii_default": "reversible"})), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let lookup = caliban_mcp::ToolManifest {
+        name: "lookup".into(),
+        description: "Finds a clinic.".into(),
+        input_schema: json!({"type": "object"}),
+    };
+    let record = caliban_mcp::ToolManifest {
+        name: "record".into(),
+        description: "Checks a phone number.".into(),
+        input_schema: json!({"type": "object", "properties": {"phone": {"type": "string"}}}),
+    };
+    let dir = TestMcpServer::start(vec![TestTool::new(lookup.clone(), |_| Ok(json!({"phone": PHONE})))], &[]).await;
+    let echo = || TestTool::new(record.clone(), |args: &Value| Ok(json!({"stored": args["phone"]})));
+    let (crm, notes) = (TestMcpServer::start(vec![echo()], &[]).await, TestMcpServer::start(vec![echo()], &[]).await);
+    let servers = "/api/v1/tenants/acme/tool-servers";
+    for (name, srv, trusted, m) in
+        [("dir", &dir, false, &lookup), ("crm", &crm, true, &record), ("notes", &notes, false, &record)]
+    {
+        let body = json!({"name": name, "url": srv.url, "auth": {"method": "none"}, "trusted": trusted});
+        assert_eq!(send(&e.cp_app, "POST", servers, ADMIN, Some(body), &[]).await.0, StatusCode::CREATED);
+        send(&e.cp_app, "POST", &format!("{servers}/{name}/discover"), ADMIN, None, &[]).await;
+        let uri = format!("{servers}/{name}/tools/{}/approve", m.name);
+        assert_eq!(send(&e.cp_app, "POST", &uri, ADMIN, Some(json!({"pin": m.pin()})), &[]).await.0, StatusCode::OK);
+    }
+    let find = format!("mcp://dir/lookup#{}", lookup.pin());
+    let spec = |s: &str| {
+        let save = format!("mcp://{s}/record#{}", record.pin());
+        json!({
+            "kind": "workflow", "model_policy": {}, "budgets": {"steps": 5, "tokens": 10000, "wall_clock_s": 60},
+            "tools": [{"ref": find, "effect": "read"}, {"ref": save, "effect": "read"}],
+            "graph": {"vertices": [
+                {"id": "find", "type": "tool", "config": {"tool": find, "args": {}}},
+                {"id": "save", "type": "tool", "config": {"tool": save, "args": {"phone": "{{outputs.find.phone}}"}}}],
+                      "edges": [{"from": "find", "to": "save"}]}
+        })
+    };
+    e.publish("to-crm", spec("crm")).await;
+    e.publish("to-notes", spec("notes")).await;
+    let j: Arc<dyn Journal> = Arc::new(MemoryJournal::new());
+    let w = worker(&e, &j, &idem(), None, "worker-1", LONG);
+    let mut outputs = vec![];
+    for node in ["to-crm", "to-notes"] {
+        let (s, v) =
+            send(&w.app, "POST", &format!("/v1/nodes/{node}/runs"), KEY, Some(json!({"input": {}})), &[]).await;
+        assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("succeeded")), "{v}");
+        outputs.push(v);
+    }
+    assert_eq!(crm.calls()[0].args["phone"], PHONE, "the trusted server gets the real value");
+    let surrogate = notes.calls()[0].args["phone"].as_str().unwrap().to_owned();
+    assert!(surrogate != PHONE && surrogate.starts_with('+'), "the untrusted one gets a surrogate: {surrogate}");
+    assert_eq!(outputs[0]["output"]["stored"], PHONE, "the result entered the run as it is: {}", outputs[0]);
 }

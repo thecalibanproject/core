@@ -579,7 +579,8 @@ async fn guarded_call(
         }
         other => Stop::Fail(format!("tool '{reference}': {other}")),
     })?;
-    // Untrusted input: anonymized as it enters the run.
+    // Untrusted input: masked as it enters the run in `mask` mode. In `reversible` mode it enters
+    // as it is; model calls and untrusted tools get surrogates (`DataGuard::anonymize`).
     ex.data
         .anonymize_at_least(cx.tenant(), out, pii_floor)
         .await

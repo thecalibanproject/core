@@ -173,17 +173,25 @@ impl PiiGuard {
 
     /// Runs the PII engine over every string of `v` (keys are left alone). Returns the rewritten
     /// value and how many entities it found.
-    async fn rewrite(&self, tenant: &str, v: Value, floor: Option<&str>) -> Result<(Value, usize), String> {
+    /// The tenant's PII mode raised to the node's `guardrails.pii` floor.
+    fn mode(&self, tenant: &str, floor: Option<&str>) -> Result<PiiMode, String> {
         let gw = self.gw.upgrade().ok_or("the gateway is shutting down")?;
         let floor = match floor {
             Some(f) => Some(serde_json::from_value::<PiiMode>(Value::String(f.to_owned())).map_err(|e| e.to_string())?),
             None => None,
         };
-        let (mode, key) = {
+        let snap = gw.config.load();
+        let t = snap.tenant(&tenant.into()).ok_or("unknown tenant")?;
+        Ok(snap.pii_mode_for(t).at_least(floor))
+    }
+
+    async fn rewrite(&self, tenant: &str, v: Value, floor: Option<&str>) -> Result<(Value, usize), String> {
+        let gw = self.gw.upgrade().ok_or("the gateway is shutting down")?;
+        let mode = self.mode(tenant, floor)?;
+        let key = {
             let snap = gw.config.load();
             let t = snap.tenant(&tenant.into()).ok_or("unknown tenant")?;
-            let mode = snap.pii_mode_for(t).at_least(floor);
-            (mode, gw.pii_keys.scope_key(snap.pii_surrogate_scope_for(t), tenant))
+            gw.pii_keys.scope_key(snap.pii_surrogate_scope_for(t), tenant)
         };
         if mode == PiiMode::Off {
             return Ok((v, 0));
@@ -243,14 +251,23 @@ impl DataGuard for PiiGuard {
     }
 
     async fn anonymize(&self, tenant: &str, v: Value) -> Result<Value, String> {
-        self.rewrite(tenant, v, None).await.map(|(v, _)| v)
+        self.anonymize_at_least(tenant, v, None).await
     }
 
     async fn protect_at_least(&self, tenant: &str, v: Value, floor: Option<&str>) -> Result<(Value, bool), String> {
         self.rewrite(tenant, v, floor).await.map(|(v, n)| (v, n > 0))
     }
 
+    /// Only `mask` rewrites a value as it enters the run. In `reversible` mode it enters as it is
+    /// (research note 05 §3, P3 plan M4): every model call is pseudonymized by the gateway and its
+    /// reply restored, an untrusted tool gets surrogates in its arguments on every call, and a
+    /// trusted tool gets the real value. Surrogates written into the run could never be restored
+    /// (their reverse map is per call), so the caller would get a made-up phone number or name.
+    /// The run's values stay sealed under the tenant's data key in the journal.
     async fn anonymize_at_least(&self, tenant: &str, v: Value, floor: Option<&str>) -> Result<Value, String> {
+        if self.mode(tenant, floor)? != PiiMode::Mask {
+            return Ok(v);
+        }
         self.rewrite(tenant, v, floor).await.map(|(v, _)| v)
     }
 

@@ -80,8 +80,10 @@ pub trait DataGuard: Send + Sync {
     async fn protect(&self, _tenant: &str, v: Value) -> Result<(Value, bool), String> {
         Ok((v, false))
     }
-    /// A value from an untrusted source (a tool result, rows, documents) as it enters the run,
-    /// with its PII anonymized.
+    /// A value from an untrusted source (a tool result, rows, documents) as it enters the run.
+    /// In `mask` mode its PII is masked (irreversibly); in `reversible` mode it enters as it is,
+    /// since every model call is pseudonymized and restored by the gateway and untrusted tools get
+    /// surrogates in their arguments (research note 05 §3).
     async fn anonymize(&self, _tenant: &str, v: Value) -> Result<Value, String> {
         Ok(v)
     }
