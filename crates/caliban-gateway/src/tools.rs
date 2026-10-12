@@ -9,7 +9,9 @@
 //!   client token never leave the gateway.
 //! - [`PiiGuard`] pseudonymizes the arguments of tools not trusted with personal data (with the
 //!   tenant's surrogate key: the same surrogates the node's model calls see) and anonymizes tool
-//!   results as they enter the run.
+//!   results as they enter the run. Built-in tools run inside Caliban against the tenant's own
+//!   data, so their arguments are never pseudonymized (the executor skips them). Only string
+//!   values are rewritten: keys, numbers and the structure of a CQIR query never are.
 
 use crate::Gateway;
 use crate::error::ApiError;
@@ -171,8 +173,6 @@ impl PiiGuard {
         Self { gw: Arc::downgrade(gw) }
     }
 
-    /// Runs the PII engine over every string of `v` (keys are left alone). Returns the rewritten
-    /// value and how many entities it found.
     /// The tenant's PII mode raised to the node's `guardrails.pii` floor.
     fn mode(&self, tenant: &str, floor: Option<&str>) -> Result<PiiMode, String> {
         let gw = self.gw.upgrade().ok_or("the gateway is shutting down")?;
@@ -185,6 +185,8 @@ impl PiiGuard {
         Ok(snap.pii_mode_for(t).at_least(floor))
     }
 
+    /// Runs the PII engine over the string values of `v` (keys, numbers and a CQIR query's
+    /// structure are left alone). Returns the rewritten value and how many entities it found.
     async fn rewrite(&self, tenant: &str, v: Value, floor: Option<&str>) -> Result<(Value, usize), String> {
         let gw = self.gw.upgrade().ok_or("the gateway is shutting down")?;
         let mode = self.mode(tenant, floor)?;
@@ -196,8 +198,10 @@ impl PiiGuard {
         if mode == PiiMode::Off {
             return Ok((v, 0));
         }
-        let mut texts = Vec::new();
-        collect(&v, &mut texts);
+        // String values only, and never a CQIR query's structure (caliban_pii::json).
+        let mut v = v;
+        let texts: Vec<String> =
+            caliban_pii::json::protectable_strings_mut(&mut v).into_iter().map(|s| s.clone()).collect();
         if texts.is_empty() {
             return Ok((v, 0));
         }
@@ -212,35 +216,14 @@ impl PiiGuard {
             extra: Map::new(),
         };
         let (req, p) = gw.protect(Some(tenant), req, mode, &key).await.map_err(|e: ApiError| e.error.to_string())?;
-        let mut rewritten = req.messages.into_iter().map(|m| match m.content {
+        let rewritten = req.messages.into_iter().map(|m| match m.content {
             Value::String(s) => s,
             _ => String::new(),
         });
-        let mut v = v;
-        replace(&mut v, &mut rewritten);
-        Ok((v, p.entities))
-    }
-}
-
-fn collect(v: &Value, out: &mut Vec<String>) {
-    match v {
-        Value::String(s) => out.push(s.clone()),
-        Value::Array(a) => a.iter().for_each(|x| collect(x, out)),
-        Value::Object(m) => m.values().for_each(|x| collect(x, out)),
-        _ => {}
-    }
-}
-
-fn replace(v: &mut Value, with: &mut impl Iterator<Item = String>) {
-    match v {
-        Value::String(s) => {
-            if let Some(t) = with.next() {
-                *s = t;
-            }
+        for (slot, s) in caliban_pii::json::protectable_strings_mut(&mut v).into_iter().zip(rewritten) {
+            *slot = s;
         }
-        Value::Array(a) => a.iter_mut().for_each(|x| replace(x, with)),
-        Value::Object(m) => m.values_mut().for_each(|x| replace(x, with)),
-        _ => {}
+        Ok((v, p.entities))
     }
 }
 
@@ -282,6 +265,80 @@ mod tests {
     use caliban_config::{Config, Snapshot};
     use caliban_mcp::egress::EgressPolicy;
     use serde_json::json;
+
+    /// A gateway whose tenant `cabinet-camila` has the dictionary term `Camila`, a word of its own
+    /// id (the law-firm demo), in PII mode `mode`.
+    fn law_firm(mode: &str) -> (Arc<Gateway>, PiiGuard) {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[tenants]]
+id = "cabinet-camila"
+name = "Cabinet Camila"
+pii_mode = "{mode}"
+pii_dictionary = [{{ term = "Camila", label = "PERSON" }}]
+"#
+        ))
+        .unwrap();
+        let gw = Arc::new(Gateway::new(
+            ConfigHandle::new(Snapshot::new(cfg, "t")),
+            Arc::new(caliban_meter::RecentUsage::default()),
+        ));
+        let guard = PiiGuard::new(&gw);
+        (gw, guard)
+    }
+
+    fn cqir_args() -> Value {
+        json!({"query": {"ir_version": "1", "ontology_version": "cabinet-Camila@5",
+            "metrics": [{"id": "m_fees_camila"}], "dimensions": [{"id": "d_client"}],
+            "filters": [{"attr": "a_client_name", "op": "eq", "value": {"type": "string", "v": "Camila Duarte"}}],
+            "order_by": [{"metric": "m_fees_camila", "dir": "desc"}], "limit": 10}})
+    }
+
+    /// Defence in depth behind the executor (which never disguises built-in arguments): wherever a
+    /// CQIR query meets the guard, its structure is left alone and only its filter literals are
+    /// data. Before the fix the dictionary rewrote `ontology_version` and every query failed.
+    #[tokio::test]
+    async fn a_cqir_query_keeps_its_structure_under_the_guard() {
+        for mode in ["reversible", "mask"] {
+            let (_gw, guard) = law_firm(mode);
+            let (out, found) = guard.protect_at_least("cabinet-camila", cqir_args(), None).await.unwrap();
+            assert!(found, "{mode}");
+            let q = &out["query"];
+            let mut expected = cqir_args();
+            expected["query"]["filters"][0]["value"]["v"] = q["filters"][0]["value"]["v"].clone();
+            assert_eq!(out, expected, "{mode}: only the filter literal changes");
+            assert!(!q["filters"][0]["value"]["v"].as_str().unwrap().contains("Camila"), "{mode}: {q}");
+            // An untrusted tool's ordinary arguments are still disguised.
+            let (note, _) =
+                guard.protect_at_least("cabinet-camila", json!({"note": "Camila called"}), None).await.unwrap();
+            assert!(!note["note"].as_str().unwrap().contains("Camila"), "{mode}: {note}");
+        }
+    }
+
+    /// The law-firm demo: in `mask` mode a `rag_search` relevance score came back as `0.[CARD]`.
+    /// Numbers and keys of a tool result are never rewritten, neither as it enters the run nor in
+    /// the tool message of a later model call; its string values still are.
+    #[tokio::test]
+    async fn json_numbers_in_a_tool_result_survive_mask_mode() {
+        let (gw, guard) = law_firm("mask");
+        let result = json!({"context": "[1] Camila Duarte, card 4111 1111 1111 1111",
+            "results": [{"doc_id": "engagement-letter", "score": 0.032_258_064_516_129_2, "chunk_id": "c-1"}]});
+        let out = guard.anonymize_at_least("cabinet-camila", result.clone(), None).await.unwrap();
+        assert_eq!(out["results"], result["results"]);
+        assert_eq!(out["context"], "[1] [PERSON] Duarte, card [CARD]");
+        // The same result as the model sees it: a tool message whose content is the JSON text.
+        let req = ChatRequest::from_openai_json(
+            json!({"model": "m", "messages": [{"role": "user", "content": "who signed?"},
+                   {"role": "tool", "tool_call_id": "c1", "content": result.to_string()}]})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let (req, _) = gw.protect(Some("cabinet-camila"), req, PiiMode::Mask, &[1; 32]).await.unwrap();
+        let sent: Value = serde_json::from_str(req.messages[1].content.as_str().unwrap()).expect("still JSON");
+        assert_eq!(sent["results"], result["results"], "{sent}");
+        assert_eq!(sent["context"], "[1] [PERSON] Duarte, card [CARD]");
+    }
 
     /// Only an approved manifest of a registered server resolves: an unregistered server, an
     /// unapproved pin or another tenant's tool is unreachable.
