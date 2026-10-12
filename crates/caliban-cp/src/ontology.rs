@@ -142,6 +142,60 @@ pub(crate) struct Breaking {
     pub change: String,
     /// `name@vN` of the published versions whose fixed queries touch it.
     pub nodes: Vec<String>,
+    /// The same versions, structured.
+    pub versions: Vec<NodeVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct NodeVersion {
+    pub node: String,
+    pub version: u32,
+}
+
+/// The error of the routes that can withdraw approved elements: a refusal because published node
+/// versions query them (`409`) carries `code: "ontology_breaking_change"` and the `breaking` list
+/// next to the message, so a client does not have to parse the message.
+pub(crate) enum OntologyError {
+    Api(crate::ApiError),
+    Breaking(String, Vec<Breaking>),
+}
+
+impl From<crate::ApiError> for OntologyError {
+    fn from(e: crate::ApiError) -> Self {
+        Self::Api(e)
+    }
+}
+
+impl From<crate::StoreError> for OntologyError {
+    fn from(e: crate::StoreError) -> Self {
+        Self::Api(e.into())
+    }
+}
+
+impl axum::response::IntoResponse for OntologyError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Api(e) => e.into_response(),
+            Self::Breaking(message, breaking) => {
+                let body = serde_json::json!({"error": {"message": message, "type": "conflict",
+                                                        "code": BREAKING_CODE, "breaking": breaking}});
+                (axum::http::StatusCode::CONFLICT, axum::Json(body)).into_response()
+            }
+        }
+    }
+}
+
+/// `error.code` of a refused withdrawal.
+pub(crate) const BREAKING_CODE: &str = "ontology_breaking_change";
+
+/// A refusal: `what` and the elements with the node versions they break.
+pub(crate) fn refuse(what: &str, breaking: Vec<Breaking>) -> OntologyError {
+    let list = breaking.iter().map(|b| format!("{} ({}): {}", b.element, b.change, b.nodes.join(", ")));
+    let message = format!(
+        "{what}; publish versions written on the new ontology, or send acknowledge_breaking: true: {}",
+        list.collect::<Vec<_>>().join("; ")
+    );
+    OntologyError::Breaking(message, breaking)
 }
 
 /// What `decisions` on the tenant's ontology would break: approved elements they withdraw that
@@ -157,13 +211,15 @@ pub(crate) fn breaking(st: &State, tenant: &str, decisions: &[(String, Status)])
         if e.status != Status::Approved || *to == Status::Approved {
             continue;
         }
-        let nodes: Vec<String> = published
+        let versions: Vec<NodeVersion> = published
             .iter()
             .filter(|n| fixed_queries(&n.spec).iter().any(|(_, q)| touched(&model, q).contains(id)))
-            .map(|n| format!("{}@v{}", n.name, n.version))
+            .map(|n| NodeVersion { node: n.name.clone(), version: n.version })
             .collect();
-        if !nodes.is_empty() {
-            out.push(Breaking { element: id.clone(), change: format!("approved -> {}", status_str(*to)), nodes });
+        if !versions.is_empty() {
+            let nodes = versions.iter().map(|v| format!("{}@v{}", v.node, v.version)).collect();
+            let change = format!("approved -> {}", status_str(*to));
+            out.push(Breaking { element: id.clone(), change, nodes, versions });
         }
     }
     out
@@ -372,5 +428,25 @@ mod tests {
         assert_eq!(write.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["Service.city", "Facility", "New"]);
         assert_eq!(b.len(), 1, "only Service.city is queried by a published node: {b:?}");
         assert_eq!((b[0].element.as_str(), b[0].change.as_str()), ("Service.city", "approved -> proposed"));
+    }
+
+    /// A refused withdrawal: `409`, a stable code and the breaking list, structured.
+    #[tokio::test]
+    async fn a_refused_withdrawal_names_the_elements_and_versions_in_the_body() {
+        use axum::response::IntoResponse;
+        let st = state(ontology(3, 1), node("acme@3", NodeState::Published));
+        let b = breaking(&st, "acme", &[("Service".into(), Status::Rejected)]);
+        let resp = refuse("these decisions withdraw approved elements", b).into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+        let body: Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap()).unwrap();
+        let e = &body["error"];
+        assert_eq!((e["type"].as_str(), e["code"].as_str()), (Some("conflict"), Some(BREAKING_CODE)));
+        assert_eq!(
+            e["breaking"],
+            json!([{"element": "Service", "change": "approved -> rejected", "nodes": ["triage@v3"],
+                    "versions": [{"node": "triage", "version": 3}]}])
+        );
+        assert!(e["message"].as_str().unwrap().contains("Service (approved -> rejected): triage@v3"), "{e}");
     }
 }

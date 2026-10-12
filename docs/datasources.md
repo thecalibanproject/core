@@ -104,6 +104,9 @@ version in which its definition (spec) or approval last changed (`changed_in`). 
 3. **Breaking changes are flagged at review time.** A decision that withdraws an approved element
    that a published node version's fixed query touches is refused with `409`, naming the elements
    and the node versions (`triage@v3`), unless the request says `acknowledge_breaking: true`. The
+   error has `code: "ontology_breaking_change"` and a `breaking` list next to the message
+   (`element`, `change`, `nodes` as `name@vN`, and `versions` as `{"node", "version"}`); proposals
+   that change approved elements are refused the same way. The
    affected versions then fail on that query (`'Service.city' changed in version 53: rebuild the
    query on the current version`) until a version written on the new ontology is published.
 4. **Publishing checks the version.** Every fixed CQIR query of a spec must name a version of the

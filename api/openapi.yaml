@@ -1688,7 +1688,7 @@ paths:
                   breaking: { type: array, items: { $ref: '#/components/schemas/OntologyBreaking' }, description: 'Approved elements this call withdrew that published node versions query (empty unless acknowledge_breaking)' }
         '400': { $ref: '#/components/responses/Error', description: 'No elements, more than 5000, or an id that is empty, longer than 200 characters or repeated' }
         '404': { $ref: '#/components/responses/Error', description: 'Unknown tenant' }
-        '409': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error', description: 'Withdraws approved elements published node versions query: `error.code` `ontology_breaking_change`, `error.breaking` lists them' }
 
   /api/v1/ontology:
     get:
@@ -1739,7 +1739,7 @@ paths:
               schema: { $ref: '#/components/schemas/OntologyElement' }
         '400': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
-        '409': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error', description: 'Withdraws approved elements published node versions query: `error.code` `ontology_breaking_change`, `error.breaking` lists them' }
 
   /api/v1/tenants/{tenantId}/intents:
     parameters: [ { $ref: '#/components/parameters/TenantId' } ]
@@ -1870,7 +1870,7 @@ paths:
                         change: { type: string }
                         nodes: { type: array, items: { type: string }, description: 'name@vN' }
         '404': { $ref: '#/components/responses/Error' }
-        '409': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error', description: 'Withdraws approved elements published node versions query: `error.code` `ontology_breaking_change`, `error.breaking` lists them' }
 
   /api/v1/tenants/{tenantId}/ontology/elements/{elementId}/review:
     parameters:
@@ -1898,7 +1898,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OntologyElement' }
         '404': { $ref: '#/components/responses/Error' }
-        '409': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error', description: 'Withdraws approved elements published node versions query: `error.code` `ontology_breaking_change`, `error.breaking` lists them' }
 
   /api/v1/nodes:
     get:
@@ -2906,11 +2906,15 @@ components:
           properties:
             message: { type: string }
             type: { type: string, description: 'e.g. invalid_request_error, authentication_error, permission_error, policy_violation, upstream_error, rate_limited' }
-            code: { type: [string, 'null'], description: 'For rate_limited: the limit that was hit (e.g. tokens_per_minute). `validation_failed` when a node version cannot be created, published or promoted (see `problems`).' }
+            code: { type: [string, 'null'], description: 'For rate_limited: the limit that was hit (e.g. tokens_per_minute). `validation_failed` when a node version cannot be created, published or promoted (see `problems`). `ontology_breaking_change` (`409`) when ontology decisions or proposals would withdraw approved elements that published node versions query (see `breaking`).' }
             problems:
               type: array
               description: 'Node version refusals (`422`, `validation_failed`): every reason, one by one, next to `message` (which joins them).'
               items: { $ref: '#/components/schemas/Problem' }
+            breaking:
+              type: array
+              description: 'Ontology refusals (`409`, `ontology_breaking_change`): each approved element withdrawn and the published node versions that query it. Send `acknowledge_breaking: true` to go ahead.'
+              items: { $ref: '#/components/schemas/OntologyBreaking' }
 
     Problem:
       type: object
@@ -3345,11 +3349,20 @@ components:
         spec: { type: object, additionalProperties: true, description: 'Kind-specific body; see schemas/ontology.schema.json' }
     OntologyBreaking:
       type: object
-      required: [element, change, nodes]
+      required: [element, change, nodes, versions]
       properties:
         element: { type: string }
         change: { type: string, description: 'For example `approved -> proposed`' }
         nodes: { type: array, items: { type: string }, description: '`name@vN` of the published node versions whose fixed queries touch it' }
+        versions:
+          type: array
+          description: The same node versions, structured
+          items:
+            type: object
+            required: [node, version]
+            properties:
+              node: { type: string }
+              version: { type: integer }
     TenantIntentSet:
       type: object
       required: [tenant_id, intent, exemplars, source]

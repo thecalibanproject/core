@@ -1148,28 +1148,23 @@ async fn propose_ontology(
     Extension(p): Extension<Principal>,
     Path(tenant_id): Path<String>,
     Json(b): Json<Proposals>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
+) -> Result<(StatusCode, Json<Value>), ontology::OntologyError> {
     ensure_tenant(&cp, &tenant_id)?;
     if b.elements.is_empty() || b.elements.len() > 5000 {
-        return Err(bad("elements: 1 to 5000"));
+        return Err(bad("elements: 1 to 5000").into());
     }
     let mut seen = std::collections::HashSet::new();
     for e in &b.elements {
         if e.id.is_empty() || e.id.len() > 200 || !seen.insert(e.id.clone()) {
-            return Err(bad(format!("element id '{}' is empty, too long or repeated", e.id)));
+            return Err(bad(format!("element id '{}' is empty, too long or repeated", e.id)).into());
         }
     }
     let st = cp.store.state();
     let (write, skipped, breaking) = ontology::proposals(&st, &tenant_id, b.elements);
     if !breaking.is_empty() && !b.acknowledge_breaking {
-        let list = breaking.iter().map(|b| format!("{}: {}", b.element, b.nodes.join(", ")));
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            format!(
-                "proposing changes to approved elements that published node versions query withdraws them; send \
-                 acknowledge_breaking: true to go ahead: {}",
-                list.collect::<Vec<_>>().join("; ")
-            ),
+        return Err(ontology::refuse(
+            "proposing changes to approved elements withdraws them, and published node versions query them",
+            breaking,
         ));
     }
     let version = if write.is_empty() {
@@ -1356,21 +1351,16 @@ async fn review(
     tenant_id: &str,
     decisions: Vec<(String, Status)>,
     acknowledge_breaking: bool,
-) -> ApiResult<Json<Value>> {
+) -> Result<Json<Value>, ontology::OntologyError> {
     ensure_tenant(cp, tenant_id)?;
     if decisions.is_empty() || decisions.len() > 1000 {
-        return Err(bad("decisions: 1 to 1000"));
+        return Err(bad("decisions: 1 to 1000").into());
     }
     let breaking = ontology::breaking(&cp.store.state(), tenant_id, &decisions);
     if !breaking.is_empty() && !acknowledge_breaking {
-        let list = breaking.iter().map(|b| format!("{} ({}): {}", b.element, b.change, b.nodes.join(", ")));
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            format!(
-                "these decisions break published node versions that query the elements; publish versions written on \
-                 the new ontology, or send acknowledge_breaking: true: {}",
-                list.collect::<Vec<_>>().join("; ")
-            ),
+        return Err(ontology::refuse(
+            "these decisions withdraw approved elements that published node versions query",
+            breaking,
         ));
     }
     let ids: Vec<String> = decisions.iter().map(|(id, _)| id.clone()).collect();
@@ -1387,14 +1377,20 @@ async fn review_batch(
     Extension(p): Extension<Principal>,
     Path(tenant_id): Path<String>,
     Json(b): Json<ReviewBatch>,
-) -> ApiResult<Json<Value>> {
+) -> Result<Json<Value>, ontology::OntologyError> {
     let decisions =
         b.decisions.iter().map(|d| Ok((d.id.clone(), decision_status(&d.decision)?))).collect::<ApiResult<Vec<_>>>()?;
     review(&cp, &p, &tenant_id, decisions, b.acknowledge_breaking).await
 }
 
 /// One element's decision, as a batch of one; answers the element.
-async fn review_one(cp: &Cp, p: &Principal, tenant_id: &str, id: String, r: &Review) -> ApiResult<Json<Value>> {
+async fn review_one(
+    cp: &Cp,
+    p: &Principal,
+    tenant_id: &str,
+    id: String,
+    r: &Review,
+) -> Result<Json<Value>, ontology::OntologyError> {
     let status = decision_status(&r.decision)?;
     let out = review(cp, p, tenant_id, vec![(id.clone(), status)], r.acknowledge_breaking).await?;
     let mut e = out.0["elements"].get(0).cloned().ok_or_else(|| not_found("ontology element"))?;
@@ -1408,7 +1404,7 @@ async fn review_tenant_element(
     Extension(p): Extension<Principal>,
     Path((tenant_id, id)): Path<(String, String)>,
     Json(r): Json<Review>,
-) -> ApiResult<Json<Value>> {
+) -> Result<Json<Value>, ontology::OntologyError> {
     review_one(&cp, &p, &tenant_id, id, &r).await
 }
 
@@ -1419,7 +1415,7 @@ async fn review_element(
     Extension(p): Extension<Principal>,
     Path(id): Path<String>,
     Json(r): Json<Review>,
-) -> ApiResult<Json<Value>> {
+) -> Result<Json<Value>, ontology::OntologyError> {
     let tenant_id = r.tenant_id.clone().ok_or_else(|| {
         bad("tenant_id is required: element ids are per tenant (or use /api/v1/tenants/{tenant_id}/ontology/elements/{id}/review)")
     })?;
