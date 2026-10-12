@@ -68,6 +68,7 @@ fn checks_score_text_and_json_outputs() {
 fn the_judge_answers_a_score_and_its_request_holds_the_rubric() {
     let body = judge_request("local/judge", "Is it polite?", &json!({"case": "x"}), Some(&json!("ref")), &json!("hi"));
     assert_eq!((body["model"].as_str(), body["temperature"].as_i64()), (Some("local/judge"), Some(0)));
+    assert_eq!(body["caliban"]["reasoning"], "off", "a thinking judge would spend its budget before the verdict");
     let user = body["messages"][1]["content"].as_str().unwrap();
     assert!(
         user.contains("Is it polite?")
