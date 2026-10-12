@@ -379,6 +379,28 @@ impl RagStore for PgRagStore {
         Ok((rec, true))
     }
 
+    async fn document_counts(
+        &self,
+        tenant: &str,
+    ) -> SResult<std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>> {
+        let rows = sqlx::query(
+            "SELECT collection_id, status, count(*) AS n FROM (
+               SELECT DISTINCT ON (collection_id, doc_id) collection_id, status FROM rag_document
+               WHERE tenant_id = $1 ORDER BY collection_id, doc_id, version DESC
+             ) latest WHERE status <> 'deleted' GROUP BY 1, 2",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let mut out: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> = Default::default();
+        for r in &rows {
+            let n: i64 = get(r, "n")?;
+            out.entry(get(r, "collection_id")?).or_default().insert(get(r, "status")?, u64::try_from(n).unwrap_or(0));
+        }
+        Ok(out)
+    }
+
     async fn documents(&self, tenant: &str, collection_id: &str, q: &DocQuery) -> SResult<Vec<DocumentSummary>> {
         let rows = sqlx::query(concat!("SELECT * FROM (
                SELECT DISTINCT ON (doc_id) ", doc_columns!(), ",

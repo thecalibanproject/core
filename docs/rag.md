@@ -36,13 +36,14 @@ once). Document content is never returned by any endpoint.
 
 | Endpoint | Permission | Audit |
 |---|---|---|
-| `GET /rag/collections` | `rag.read` | |
+| `GET /rag/collections` (each with `document_counts`: documents per status, newest version of each) | `rag.read` | |
+| `GET /rag/models` (the `embedding` and `rerank` models the tenant can reach, for the collection form) | `rag.read` | |
 | `POST /rag/collections` `{"name", "embedding_model", "rerank_model"?, "description"?, "settings"?}` | `rag.write` | `rag.collection.create` |
 | `GET /rag/collections/{c}` (with `used_by`: the published versions that name it) | `rag.read` | |
 | `DELETE /rag/collections/{c}` (`409` while a published version names it; `rag.*:read` does not hold it) | `rag.write` | `rag.collection.delete` |
 | `GET /rag/collections/{c}/documents?status=&cursor=&limit=` (newest version of each document, with `live_version`) | `rag.read` | |
 | `POST /rag/collections/{c}/documents` `{"doc_id", "content", "title"?, "content_type"?, "source"?, "trust"?, "valid_from"?, "valid_to"?}` | `rag.write` | `rag.document.ingest` |
-| `GET /rag/collections/{c}/documents/{doc_id}` (every version: status, chunks, tokens, PII count, findings) | `rag.read` | |
+| `GET /rag/collections/{c}/documents/{doc_id}` (every version: status, chunks, tokens, PII count, findings with their `heading_path`, `vet_deadline_at` for untrusted documents) | `rag.read` | |
 | `DELETE /rag/collections/{c}/documents/{doc_id}` | `rag.write` | `rag.document.delete` |
 | `POST /rag/collections/{c}/documents/{doc_id}/release` `{"version", "acknowledge_findings": true}` | `rag.approve` | `rag.document.release` (with the findings) |
 
@@ -63,7 +64,7 @@ is kept apart from registering its server.
 | `chunk_tokens` | 384 | Largest chunk, in estimated tokens (64 to 2048) |
 | `default_trust` | `untrusted` | Trust of documents ingested without one |
 | `nav_min_chunks` | 24 | Documents with at least this many chunks get a navigation tree |
-| `vet_deadline_secs` | 900 | An untrusted document whose checks have not passed this long after ingest fails and stays invisible |
+| `vet_deadline_secs` | 900 | An untrusted document whose checks have not passed this long after ingest (or after its release) fails and stays invisible |
 
 The embedding model is fixed for a collection's life (vectors of two models are not comparable):
 to change it, create another collection and ingest again.
@@ -112,7 +113,13 @@ becomes ready, in one transaction; until then the previous version is served.
    - **vetting deadline**: an untrusted document whose checks have not passed within the
      collection's `vet_deadline_secs` fails, rather than becoming visible later when a backlog
      clears (fail closed; a verifier backlog let poisoned chunks through in arXiv 2610.05826,
-     preprint).
+     preprint). The window runs from ingest, or from the release of a quarantined version: a
+     release is an administrator's decision on the findings and sends the version back to be
+     indexed, so it gets a fresh window (a backlog after the release still fails it closed).
+     Documents show the time as `vet_deadline_at`;
+   - **locating findings**: each finding names its chunk and the headings above it
+     (`heading_path`, pseudonymised, at most 80 characters each, hidden characters removed), never
+     an excerpt of the text that triggered it.
 
    Per-document checks miss sets of individually benign documents that jointly redirect answers
    (LENS, arXiv 2609.35155, preprint), so provenance (who ingests what, with which trust) stays

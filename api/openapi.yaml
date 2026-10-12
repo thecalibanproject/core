@@ -1941,6 +1941,24 @@ paths:
         '422': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
 
+  /api/v1/tenants/{tenantId}/rag/models:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    get:
+      tags: [rag]
+      summary: The embedding and rerank models the tenant can reach, for a collection (rag.read)
+      description: Catalogue models of kind `embedding` and `rerank` served by one of the tenant's providers or a shared provider that serves it.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [embedding, rerank]
+                properties:
+                  embedding: { type: array, items: { $ref: '#/components/schemas/RagModel' } }
+                  rerank: { type: array, items: { $ref: '#/components/schemas/RagModel' } }
+        '404': { $ref: '#/components/responses/Error' }
   /api/v1/tenants/{tenantId}/rag/collections/{collection}:
     parameters:
       - { $ref: '#/components/parameters/TenantId' }
@@ -3748,7 +3766,7 @@ components:
         chunk_tokens: { type: integer, minimum: 64, maximum: 2048, default: 384, description: 'Largest chunk, in estimated tokens (structure-aligned, no overlap)' }
         default_trust: { type: string, enum: [trusted, untrusted], default: untrusted, description: 'Trust of documents ingested without one' }
         nav_min_chunks: { type: integer, minimum: 4, default: 24, description: 'Documents with at least this many chunks get a navigation tree' }
-        vet_deadline_secs: { type: integer, minimum: 60, maximum: 604800, default: 900, description: 'An untrusted document whose checks have not passed this long after ingest fails (stays invisible)' }
+        vet_deadline_secs: { type: integer, minimum: 60, maximum: 604800, default: 900, description: 'An untrusted document whose checks have not passed this long after ingest (or after its release, for a released version) fails (stays invisible)' }
     RagCollection:
       type: object
       required: [id, tenant_id, name, embedding_model, settings, created_at, created_by]
@@ -3762,6 +3780,17 @@ components:
         settings: { $ref: '#/components/schemas/RagCollectionSettings' }
         created_at: { type: string, format: date-time }
         created_by: { type: string }
+        document_counts:
+          type: object
+          additionalProperties: { type: integer }
+          description: 'In the listing only: documents per status (`pending`, `ready`, `quarantined`, ...), counting each document''s newest version as the document listing shows it; deleted documents are not counted.'
+    RagModel:
+      type: object
+      required: [id, provider, trust_tier]
+      properties:
+        id: { type: string }
+        provider: { type: string }
+        trust_tier: { type: string, enum: [t0_sovereign, t1_attested, t2_contracted, t3_public] }
     RagCollectionCreate:
       type: object
       required: [name, embedding_model]
@@ -3782,6 +3811,7 @@ components:
       properties:
         kind: { type: string, description: 'instruction, exfiltration, hidden_unicode, url or near_duplicate' }
         chunk: { type: integer, description: 'The chunk (0-based) it was found in' }
+        heading_path: { type: array, items: { type: string }, description: 'The headings above that chunk, so a reviewer can find the place in the source. Pseudonymised like the indexed text, at most 80 characters each, hidden characters removed. Never an excerpt of what triggered the finding.' }
     RagDocumentIngest:
       type: object
       required: [doc_id, content]
@@ -3822,6 +3852,8 @@ components:
         indexed_at: { type: string, format: date-time }
         released_by: { type: string }
         released_at: { type: string, format: date-time }
+        vet_deadline_at: { type: string, format: date-time, description: 'Untrusted documents only: when its checks must have passed, or it fails. The collection''s `vet_deadline_secs` from ingest, or from its release for a released version.' }
+        live_version: { type: [integer, 'null'], description: 'In the document listing: the version being served' }
     Permission:
       type: string
       enum: [tenants.create, catalog.read, catalog.write, providers.probe, audit.read, rbac.read, rbac.write,

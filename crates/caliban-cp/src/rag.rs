@@ -126,12 +126,52 @@ fn check_model(cp: &Cp, tenant: &str, id: &str, kind: ModelKind, what: &str) -> 
     Ok(())
 }
 
+/// The tenant's collections, each with `document_counts`: documents per status (each document's
+/// newest version, as the document listing shows it).
 pub(crate) async fn list_collections(
     AxState(cp): AxState<Cp>,
     Path(tenant_id): Path<String>,
-) -> ApiResult<Json<Vec<CollectionRecord>>> {
+) -> ApiResult<Json<Vec<Value>>> {
     crate::ensure_tenant(&cp, &tenant_id)?;
-    Ok(Json(rag(&cp)?.collections(&tenant_id).await.map_err(rag_error)?))
+    let r = rag(&cp)?;
+    let counts = r.document_counts(&tenant_id).await.map_err(rag_error)?;
+    let out = r
+        .collections(&tenant_id)
+        .await
+        .map_err(rag_error)?
+        .into_iter()
+        .map(|c| {
+            let mut v = serde_json::to_value(&c).unwrap_or_default();
+            v["document_counts"] = json!(counts.get(&c.id).cloned().unwrap_or_default());
+            v
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+/// The embedding and rerank models the tenant can reach (in the catalogue, served by a provider
+/// of the tenant or a shared provider that serves it): what a collection may use.
+pub(crate) async fn models(AxState(cp): AxState<Cp>, Path(tenant_id): Path<String>) -> ApiResult<Json<Value>> {
+    crate::ensure_tenant(&cp, &tenant_id)?;
+    let snap = cp.store.config.load();
+    let t = snap.tenant(&tenant_id.as_str().into()).ok_or_else(|| not_found("tenant"))?;
+    let of = |kind: ModelKind| -> Vec<Value> {
+        snap.models_for(t)
+            .filter(|m| m.kind == kind)
+            .map(|m| json!({"id": m.id, "provider": m.provider, "trust_tier": m.trust_tier}))
+            .collect()
+    };
+    Ok(Json(json!({"embedding": of(ModelKind::Embedding), "rerank": of(ModelKind::Rerank)})))
+}
+
+/// A document version as the API shows it: with `vet_deadline_at`, when its checks must have
+/// passed (untrusted documents: the vetting window from ingest, or from its release).
+fn shown(d: &caliban_rag::store::DocumentRecord, c: &CollectionRecord) -> Value {
+    let mut v = serde_json::to_value(d).unwrap_or_default();
+    if let Some(at) = caliban_rag::runner::vet_deadline(d, c) {
+        v["vet_deadline_at"] = json!(at);
+    }
+    v
 }
 
 #[derive(Deserialize)]
@@ -250,7 +290,15 @@ pub(crate) async fn list_documents(
     let query = DocQuery { status, after: q.cursor.clone(), limit };
     let page = r.documents(&tenant_id, &c.id, &query).await.map_err(rag_error)?;
     let next = (page.len() == limit).then(|| page.last().map(|d| d.latest.doc_id.clone())).flatten();
-    Ok(Json(json!({"documents": page, "next_cursor": next})))
+    let docs: Vec<Value> = page
+        .iter()
+        .map(|d| {
+            let mut v = shown(&d.latest, &c);
+            v["live_version"] = json!(d.live_version);
+            v
+        })
+        .collect();
+    Ok(Json(json!({"documents": docs, "next_cursor": next})))
 }
 
 /// Ingests a document version: `202` with the pending version, or `200` with the existing one
@@ -274,7 +322,7 @@ pub(crate) async fn ingest(
     let (rec, created) = r.put_document(new, Some(a)).await.map_err(rag_error)?;
     drain(&cp, &r).await?;
     let status = if created { StatusCode::ACCEPTED } else { StatusCode::OK };
-    let mut v = serde_json::to_value(&rec).unwrap_or_default();
+    let mut v = shown(&rec, &c);
     v["unchanged"] = json!(!created);
     Ok((status, Json(v)))
 }
@@ -291,6 +339,7 @@ pub(crate) async fn get_document(
         return Err(not_found("document"));
     }
     let live = versions.iter().find(|d| d.status == DocStatus::Ready).map(|d| d.version);
+    let versions: Vec<Value> = versions.iter().map(|d| shown(d, &c)).collect();
     Ok(Json(json!({"doc_id": doc_id, "live_version": live, "versions": versions})))
 }
 
@@ -341,7 +390,7 @@ pub(crate) async fn release(
     let key = DocRef { tenant_id: tenant_id.clone(), collection_id: c.id.clone(), doc_id, version: body.version };
     let rec = r.release(&key, &p.actor, Utc::now(), Some(a)).await.map_err(rag_error)?;
     drain(&cp, &r).await?;
-    Ok(Json(serde_json::to_value(rec).unwrap_or_default()))
+    Ok(Json(shown(&rec, &c)))
 }
 
 /// Publish-time check of a spec's retrieval scopes: each `rag.<name>:read` names a live collection

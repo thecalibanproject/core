@@ -117,12 +117,13 @@ async fn suite(s: Arc<dyn RagStore>) {
         chunks: 1,
         tokens: 5,
         pii_entities: 0,
-        findings: vec![DocFinding { kind: "instruction".into(), chunk: 0 }],
+        findings: vec![DocFinding { kind: "instruction".into(), chunk: 0, heading_path: vec!["FAQ".into()] }],
     };
     assert!(s.finish(&y.key(), "w2", q).await.unwrap());
     let yk = y.key();
     let rec = s.document("acme", &c.id, "b").await.unwrap().remove(0);
     assert_eq!((rec.status, rec.findings.len()), (DocStatus::Quarantined, 1));
+    assert_eq!(rec.findings[0].heading_path, ["FAQ"], "the finding's headings are kept");
     let released = s.release(&yk, "user:jo", Utc::now(), audit("a3")).await.unwrap();
     assert!(released.findings_acknowledged && released.status == DocStatus::Pending);
     assert!(matches!(s.release(&yk, "user:jo", Utc::now(), None).await, Err(RagStoreError::Conflict(_))));
@@ -167,6 +168,10 @@ async fn suite(s: Arc<dyn RagStore>) {
     let ids: Vec<String> =
         s.documents("acme", &c.id, &after).await.unwrap().iter().map(|d| d.latest.doc_id.clone()).collect();
     assert_eq!(ids, vec!["c"]);
+    // Counts per status over each document's newest version; deleted documents are not counted.
+    let counts = s.document_counts("acme").await.unwrap();
+    let want: std::collections::BTreeMap<String, u64> = [("failed".into(), 1), ("pending".into(), 1)].into();
+    assert_eq!(counts.get(&c.id), Some(&want), "{counts:?}");
 
     // The audit outbox: claimed once, gone once acknowledged.
     let events = s.claim_audit("cp", Duration::from_secs(60), 100).await.unwrap();

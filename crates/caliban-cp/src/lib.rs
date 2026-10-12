@@ -331,6 +331,7 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/approve", post(tools::approve))
         .route("/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/revoke", post(tools::revoke))
         .route("/tenants/{tenant_id}/rag/collections", get(rag::list_collections).post(rag::create_collection))
+        .route("/tenants/{tenant_id}/rag/models", get(rag::models))
         .route(
             "/tenants/{tenant_id}/rag/collections/{collection}",
             get(rag::get_collection).delete(rag::delete_collection),

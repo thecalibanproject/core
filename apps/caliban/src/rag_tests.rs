@@ -223,6 +223,27 @@ async fn documents_are_ingested_indexed_and_searched_by_a_node() {
     assert_eq!((d["live_version"].as_u64(), d["versions"][0]["status"].as_str()), (Some(1), Some("ready")), "{d}");
     assert!(d["versions"][0]["pii_entities"].as_u64().unwrap() >= 1, "{d}");
     assert!(d["versions"][0]["chunks"].as_u64().unwrap() >= 2, "{d}");
+    // The collection form's models, per-status counts, and the vetting deadline of untrusted
+    // documents (trusted ones have none).
+    let (s, m) = send(&e.cp_app, "GET", "/api/v1/tenants/acme/rag/models", ADMIN, None, &[]).await;
+    assert_eq!(s, StatusCode::OK, "{m}");
+    assert!(m["embedding"].as_array().unwrap().iter().any(|x| x["id"] == "oa/emb"), "{m}");
+    assert!(m["embedding"].as_array().unwrap().iter().all(|x| x["id"] != "oa/m"), "chat models are not listed: {m}");
+    let (_, list) = send(&e.cp_app, "GET", C, ADMIN, None, &[]).await;
+    assert_eq!(list[0]["document_counts"], json!({"ready": 1}), "{list}");
+    assert!(d["versions"][0].get("vet_deadline_at").is_none(), "trusted: no deadline {d}");
+    let (_, u) = ingest(&e, "kb", json!({"doc_id": "note", "content": "# Note\n\nA short note."})).await;
+    let at =
+        chrono::DateTime::parse_from_rfc3339(u["vet_deadline_at"].as_str().expect("untrusted: a deadline")).unwrap();
+    let created = chrono::DateTime::parse_from_rfc3339(u["created_at"].as_str().unwrap()).unwrap();
+    assert_eq!((at - created).num_seconds(), 900, "the default window, from ingest: {u}");
+    let (_, list) = send(&e.cp_app, "GET", &format!("{C}/kb/documents"), ADMIN, None, &[]).await;
+    assert!(
+        list["documents"].as_array().unwrap().iter().any(|x| x["doc_id"] == "note" && x["vet_deadline_at"].is_string())
+    );
+    let (s, _) = send(&e.cp_app, "DELETE", &format!("{C}/kb/documents/note"), ADMIN, None, &[]).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    index_all(&w).await;
 
     // Indexing went through the pipeline: metered as the tenant's embedding calls, and the
     // embedder never saw the email in the document.

@@ -5,7 +5,10 @@
 //! Untrusted documents have a vetting deadline (the collection's `vet_deadline_secs`): one whose
 //! checks have not passed by then fails and stays invisible, rather than becoming visible later
 //! when a backlog clears (fail closed; a verifier backlog let poisoned chunks through in
-//! arXiv 2610.05826, preprint).
+//! arXiv 2610.05826, preprint). The window runs from ingest, or from the release of a quarantined
+//! version: a release is an administrator's decision on the findings and sends the version back
+//! to be indexed, so it gets a fresh window for that indexing (counting from ingest made any
+//! release after the window fail at once). A backlog after the release still fails closed.
 
 use crate::ingest::Indexer;
 use crate::store::{CollectionRecord, DocumentRecord, IndexOutcome, RagStore, Trust};
@@ -219,8 +222,14 @@ impl IndexRunner {
     }
 }
 
-/// Whether an untrusted document has missed its vetting deadline at `now`.
+/// When an untrusted document's checks must have passed: its vetting window from ingest, or from
+/// its release when an administrator released it. `None` for trusted documents (no deadline).
+pub fn vet_deadline(d: &DocumentRecord, c: &CollectionRecord) -> Option<chrono::DateTime<chrono::Utc>> {
+    let window = chrono::Duration::seconds(i64::try_from(c.settings.vet_deadline_secs).unwrap_or(i64::MAX));
+    (d.trust == Trust::Untrusted).then(|| d.released_at.unwrap_or(d.created_at) + window)
+}
+
+/// Whether an untrusted document has missed its vetting deadline at `now` ([`vet_deadline`]).
 pub fn past_deadline_at(d: &DocumentRecord, c: &CollectionRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
-    let deadline = chrono::Duration::seconds(i64::try_from(c.settings.vet_deadline_secs).unwrap_or(i64::MAX));
-    d.trust == Trust::Untrusted && now > d.created_at + deadline
+    vet_deadline(d, c).is_some_and(|at| now > at)
 }

@@ -19,7 +19,7 @@ use caliban_nodes::journal::AuditEvent;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -235,6 +235,11 @@ pub struct DocFinding {
     pub kind: String,
     /// The chunk (0-based) it was found in.
     pub chunk: u32,
+    /// The headings above that chunk (document order), so a reviewer can find the place in the
+    /// source. Pseudonymised like the indexed text, each at most 80 characters, hidden characters
+    /// removed; never the text that triggered the finding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heading_path: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -381,6 +386,9 @@ pub trait RagStore: Send + Sync {
     /// returned with `false`.
     async fn put_document(&self, d: NewDocument, audit: Option<AuditEvent>) -> SResult<(DocumentRecord, bool)>;
     async fn documents(&self, tenant: &str, collection_id: &str, q: &DocQuery) -> SResult<Vec<DocumentSummary>>;
+    /// Documents per collection and status, counting each document's newest version (as the
+    /// listing shows it; deleted documents are not counted): collection id to status to count.
+    async fn document_counts(&self, tenant: &str) -> SResult<BTreeMap<String, BTreeMap<String, u64>>>;
     /// Every version of a document, newest first (deleted ones included).
     async fn document(&self, tenant: &str, collection_id: &str, doc_id: &str) -> SResult<Vec<DocumentRecord>>;
     /// Deletes every version (content wiped). `false`: no such document.
@@ -545,6 +553,22 @@ impl RagStore for MemoryRagStore {
         g.docs.push((rec.clone(), Some(d.sealed_content)));
         g.audit.extend(audit.map(|a| (a, None)));
         Ok((rec, true))
+    }
+
+    async fn document_counts(&self, tenant: &str) -> SResult<BTreeMap<String, BTreeMap<String, u64>>> {
+        let g = self.inner.lock();
+        let mut newest: BTreeMap<(&str, &str), &DocumentRecord> = BTreeMap::new();
+        for (d, _) in g.docs.iter().filter(|(d, _)| d.tenant_id == tenant) {
+            let e = newest.entry((d.collection_id.as_str(), d.doc_id.as_str())).or_insert(d);
+            if d.version > e.version {
+                *e = d;
+            }
+        }
+        let mut out: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+        for ((c, _), d) in newest.into_iter().filter(|(_, d)| d.status != DocStatus::Deleted) {
+            *out.entry(c.to_owned()).or_default().entry(d.status.as_str().to_owned()).or_default() += 1;
+        }
+        Ok(out)
     }
 
     async fn documents(&self, tenant: &str, collection_id: &str, q: &DocQuery) -> SResult<Vec<DocumentSummary>> {

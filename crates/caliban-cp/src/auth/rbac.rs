@@ -515,6 +515,7 @@ pub const ROUTES: &[RouteRule] = &[
     r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/approve", Perm::ToolsApprove, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/tool-servers/{server}/tools/{tool}/revoke", Perm::ToolsApprove, TenantFrom::Path),
     r("GET", "/tenants/{tenant_id}/rag/collections", Perm::RagRead, TenantFrom::Path),
+    r("GET", "/tenants/{tenant_id}/rag/models", Perm::RagRead, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/rag/collections", Perm::RagWrite, TenantFrom::Path),
     r("GET", "/tenants/{tenant_id}/rag/collections/{collection}", Perm::RagRead, TenantFrom::Path),
     r("DELETE", "/tenants/{tenant_id}/rag/collections/{collection}", Perm::RagWrite, TenantFrom::Path),

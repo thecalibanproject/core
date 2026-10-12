@@ -1000,6 +1000,7 @@ fn cases() -> Vec<Case> {
             "owner admin tenant_admin",
         ),
         c("GET", "/tenants/{tenant_id}/rag/collections", "/api/v1/tenants/{t}/rag/collections", None, true, READERS),
+        c("GET", "/tenants/{tenant_id}/rag/models", "/api/v1/tenants/{t}/rag/models", None, true, READERS),
         c(
             "POST",
             "/tenants/{tenant_id}/rag/collections",

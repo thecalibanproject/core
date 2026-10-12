@@ -190,7 +190,7 @@ impl Indexer {
         let mut findings: Vec<DocFinding> = Vec::new();
         for c in &chunks {
             for f in caliban_mcp::scan::scan_document(&c.indexed_text(title.as_deref()), "chunk") {
-                let f = DocFinding { kind: f.kind, chunk: c.index };
+                let f = DocFinding { kind: f.kind, chunk: c.index, heading_path: Vec::new() };
                 if !findings.contains(&f) {
                     findings.push(f);
                 }
@@ -226,7 +226,11 @@ impl Indexer {
                 };
                 let hit = self.index.search(&name, &req).await?.dense.into_iter().next();
                 if hit.is_some_and(|h| h.score >= NEAR_DUPLICATE) {
-                    findings.push(DocFinding { kind: "near_duplicate".into(), chunk: c.index });
+                    findings.push(DocFinding {
+                        kind: "near_duplicate".into(),
+                        chunk: c.index,
+                        heading_path: Vec::new(),
+                    });
                 }
             }
         }
@@ -239,12 +243,55 @@ impl Indexer {
         let tokens: u64 = chunks.iter().map(|c| u64::from(c.tokens)).sum();
         let n = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
         let pii = u64::try_from(pii_entities).unwrap_or(u64::MAX);
+        self.locate(tenant, &chunks, &mut findings).await?;
         let blocking = !doc.findings_acknowledged && findings.iter().any(|f| quarantines(doc.trust, &f.kind));
         if blocking {
             return Ok(IndexOutcome::Quarantined { chunks: n, tokens, pii_entities: pii, findings });
         }
         self.index.set_state(&name, &doc.doc_key, doc.version, PointState::Ready).await?;
         Ok(IndexOutcome::Ready { chunks: n, tokens, pii_entities: pii, findings })
+    }
+
+    /// Gives each finding the headings above its chunk, so a reviewer can find the place in the
+    /// source without an excerpt: hidden characters removed, at most 80 characters each, and
+    /// pseudonymised with the tenant's PII engine like the indexed text.
+    async fn locate(&self, tenant: &str, chunks: &[ChunkDraft], findings: &mut [DocFinding]) -> Result<(), RagError> {
+        let clean = |h: &str| -> String {
+            let t: String = h.chars().filter(|c| !c.is_control() && !is_hidden(*c)).collect();
+            let t = t.trim();
+            match t.char_indices().nth(80) {
+                Some((i, _)) => format!("{}...", &t[..i]),
+                None => t.to_owned(),
+            }
+        };
+        let mut headings: Vec<String> = Vec::new();
+        for f in findings.iter() {
+            if let Some(c) = chunks.iter().find(|c| c.index == f.chunk) {
+                for h in &c.heading_path {
+                    let h = clean(h);
+                    if !h.is_empty() && !headings.contains(&h) {
+                        headings.push(h);
+                    }
+                }
+            }
+        }
+        if headings.is_empty() {
+            return Ok(());
+        }
+        let (protected, _) = self.services.protect(tenant, headings.clone()).await?;
+        let map: std::collections::HashMap<&String, &String> = headings.iter().zip(protected.iter()).collect();
+        for f in findings.iter_mut() {
+            if let Some(c) = chunks.iter().find(|c| c.index == f.chunk) {
+                f.heading_path = c
+                    .heading_path
+                    .iter()
+                    .map(|h| clean(h))
+                    .filter(|h| !h.is_empty())
+                    .filter_map(|h| map.get(&h).map(|p| (*p).clone()))
+                    .collect();
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -311,6 +358,12 @@ impl Indexer {
         }
         Ok(out)
     }
+}
+
+/// Format and invisible characters (zero-width, bidi controls, tags) that hide text from a reader.
+fn is_hidden(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}'
+        | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}')
 }
 
 #[cfg(test)]
