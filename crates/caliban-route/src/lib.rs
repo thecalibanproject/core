@@ -195,6 +195,25 @@ struct RefreshState {
     failed_at: Option<Instant>,
 }
 
+/// What the router serves, for `/healthz` (`routing`) and for waiting on a rebuild
+/// ([`Router::subscribe`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RoutingStatus {
+    /// The latest snapshot version whose routing assets (exemplar index, calibration, profile)
+    /// are the ones in use; `None` before the first build. Lags the served snapshot while a
+    /// rebuild is in flight, and after a failed one until a retry succeeds.
+    pub version: Option<String>,
+    /// A Stage-1 kNN index is loaded.
+    pub knn: bool,
+    /// Exemplars and intents in the loaded index (0 without one).
+    pub exemplars: usize,
+    pub intents: usize,
+    /// A rebuild is in flight; requests use the previous assets until it finishes.
+    pub building: bool,
+    /// Why the last build failed (cleared by the next success); the previous assets stay in use.
+    pub last_error: Option<String>,
+}
+
 /// What a refresh loaded (logged at startup and on config changes).
 #[derive(Debug, Clone, Default)]
 pub struct RefreshReport {
@@ -228,6 +247,8 @@ pub struct Router {
     knn: ArcSwapOption<KnnState>,
     profile: ArcSwapOption<RouterProfile>,
     refresh: Mutex<RefreshState>,
+    status: tokio::sync::watch::Sender<RoutingStatus>,
+    retry_after: Duration,
 }
 
 impl Default for Router {
@@ -287,7 +308,52 @@ impl Router {
             knn: ArcSwapOption::empty(),
             profile: ArcSwapOption::empty(),
             refresh: Mutex::new(RefreshState::default()),
+            status: tokio::sync::watch::channel(RoutingStatus::default()).0,
+            retry_after: RETRY_AFTER,
         }
+    }
+
+    /// How long after a failed build the next one is due (default 30 s).
+    #[must_use]
+    pub fn with_retry_after(mut self, d: Duration) -> Self {
+        self.retry_after = d;
+        self
+    }
+
+    /// What is served now.
+    pub fn status(&self) -> RoutingStatus {
+        self.status.borrow().clone()
+    }
+
+    /// Wakes on every status change (a build starting, finishing or failing).
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<RoutingStatus> {
+        self.status.subscribe()
+    }
+
+    /// Time until a failed build is due for a retry (`None`: the last build did not fail).
+    pub fn retry_in(&self) -> Option<Duration> {
+        let st = self.refresh.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.failed_at.map(|t| self.retry_after.saturating_sub(t.elapsed()))
+    }
+
+    fn publish_status(&self, st: &RefreshState, applied: Option<&str>, error: Option<Option<String>>) {
+        let knn = self.knn.load();
+        self.status.send_if_modified(|s| {
+            let mut next = s.clone();
+            if let Some(v) = applied {
+                next.version = Some(v.to_owned());
+            }
+            if let Some(e) = error {
+                next.last_error = e;
+            }
+            next.knn = knn.is_some();
+            next.exemplars = knn.as_ref().map_or(0, |k| k.index.len());
+            next.intents = knn.as_ref().map_or(0, |k| k.index.intents().len());
+            next.building = st.building;
+            let changed = next != *s;
+            *s = next;
+            changed
+        });
     }
 
     /// True when Stage-1 kNN has an index loaded.
@@ -304,7 +370,7 @@ impl Router {
         if st.building {
             return false;
         }
-        let retry = st.failed_at.is_some_and(|t| t.elapsed() >= RETRY_AFTER);
+        let retry = st.failed_at.is_some_and(|t| t.elapsed() >= self.retry_after);
         if st.version.as_deref() == Some(snap.version.as_str()) && !retry {
             return false;
         }
@@ -316,13 +382,19 @@ impl Router {
             self.profile.store(None);
             st.fingerprint = None;
             st.failed_at = None;
+            self.publish_status(&st, Some(&snap.version), Some(None));
             return false;
         }
         let fp = assets_fingerprint(snap);
         if !retry && st.fingerprint.as_deref() == Some(fp.as_str()) {
+            // Same assets: they are current for this version too, unless the last build failed.
+            if st.failed_at.is_none() {
+                self.publish_status(&st, Some(&snap.version), None);
+            }
             return false;
         }
         st.building = true;
+        self.publish_status(&st, None, None);
         true
     }
 
@@ -355,6 +427,11 @@ impl Router {
         st.fingerprint = Some(assets_fingerprint(snap));
         st.version = Some(snap.version.clone());
         st.failed_at = (!report.errors.is_empty()).then(Instant::now);
+        if report.errors.is_empty() {
+            self.publish_status(&st, Some(&snap.version), Some(None));
+        } else {
+            self.publish_status(&st, None, Some(Some(report.errors.join("; "))));
+        }
         report
     }
 

@@ -297,12 +297,18 @@ async fn refresh_only_when_routing_assets_change() {
     // A new snapshot that only changes floors and thresholds: no rebuild.
     let s2 = Snapshot::new(staged("abstain_threshold = 0.9\n[routing.floors]\ncode = 0.7\n").config.clone(), "v2");
     assert!(!r.needs_refresh(&s2));
+    let st = r.status();
+    assert_eq!(st.version.as_deref(), Some("v2"), "the same assets are current for v2");
+    assert!(st.knn && st.exemplars > 0 && st.intents > 0 && !st.building && st.last_error.is_none());
     // New exemplars: rebuild, and the unchanged built-in vectors are not reused (new set, new hash).
     let s3 = Snapshot::new(staged("[routing.exemplars]\nchat = [\"yo what is up\"]\n").config.clone(), "v3");
     assert!(r.needs_refresh(&s3));
     assert!(!r.needs_refresh(&s3), "a build is in flight");
+    assert_eq!((r.status().version.as_deref(), r.status().building), (Some("v2"), true));
     let rep = r.refresh(&s3, Some(&e)).await;
     assert!(rep.errors.is_empty() && !rep.from_cache);
+    assert_eq!((r.status().version.as_deref(), r.status().building), (Some("v3"), false));
+    assert_eq!(r.status().exemplars, st.exemplars + 1);
     assert!(e.calls.load(Ordering::SeqCst) > calls);
     // Same set again under a new version: reused from memory.
     let s4 = Snapshot::new(s3.config.clone(), "v4");

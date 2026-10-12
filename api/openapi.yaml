@@ -1781,8 +1781,11 @@ paths:
       description: |
         At most 100 intents per tenant and 200 exemplars per intent (each 1 to 2000 characters;
         duplicates dropped). An empty list removes a config-file intent for this tenant. Shipped in
-        the snapshot: routers rebuild their kNN index without a restart. Audited as
-        `tenant.intent.set` with counts, never the texts.
+        the snapshot: routers rebuild their kNN index in the background as soon as they apply it,
+        without a restart, and keep the previous index until the new one is ready. The response's
+        `config_version` (`cp-<n>`) is the snapshot that carries the change; a router serves it
+        once its `GET /healthz` reports `routing.version` at `cp-<n>` or later (compare the
+        numbers). Audited as `tenant.intent.set` with counts, never the texts.
       requestBody:
         required: true
         content:
@@ -3394,6 +3397,7 @@ components:
         intent: { type: string }
         exemplars: { type: array, items: { type: string }, description: 'As stored: trimmed, duplicates dropped' }
         source: { type: string, enum: [api] }
+        config_version: { type: string, description: 'The snapshot version (`cp-<n>`) that carries the change; routers serve it once their `/healthz` `routing.version` is `cp-<n>` or later' }
     IntrospectionJob:
       type: object
       required: [id, datasource_id, tenant_id, status, objects, proposed, skipped, version, started_at]

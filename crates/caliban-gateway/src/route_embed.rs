@@ -154,7 +154,8 @@ impl RouteMeta {
 }
 
 /// Routes a chat request: Stage 0 rules, Stage-1 kNN within `[routing] budget_ms`, then the
-/// quality-floor policy. Also kicks off a background asset refresh when the snapshot changed.
+/// quality-floor policy. Also kicks off a background asset refresh when the snapshot changed and
+/// no build is in flight.
 /// Returns the time spent in finished routing embedder calls next to the decision (`None` when
 /// none finished, e.g. Stage 1 off or timed out).
 pub(crate) async fn route(
@@ -183,7 +184,9 @@ pub(crate) async fn route(
     (d, spent)
 }
 
-/// Starts a background refresh of the routing assets when the snapshot changed them.
+/// Starts a background refresh of the routing assets when the snapshot changed them. A fallback:
+/// [`Gateway::keep_router_fresh`] already starts it when the snapshot is applied, so this request
+/// routes with the previous assets either way.
 pub(crate) fn spawn_refresh_if_needed(gw: &Arc<Gateway>, snap: &Arc<Snapshot>) {
     if !gw.router.needs_refresh(snap) {
         return;

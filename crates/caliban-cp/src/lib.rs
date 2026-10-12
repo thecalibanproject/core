@@ -1299,8 +1299,12 @@ async fn put_intent(
     }
     let m =
         Mutation::SetTenantIntent { tenant_id: tenant_id.clone(), intent: intent.clone(), exemplars: Some(ex.clone()) };
-    cp.store.apply(&p.actor, m).await?;
-    Ok(Json(json!({"tenant_id": tenant_id, "intent": intent, "exemplars": ex, "source": "api"})))
+    let st = cp.store.apply(&p.actor, m).await?;
+    // Routers serve the change once their `/healthz` `routing.version` reaches this version.
+    let version = format!("cp-{}", st.audit_head);
+    Ok(Json(
+        json!({"tenant_id": tenant_id, "intent": intent, "exemplars": ex, "source": "api", "config_version": version}),
+    ))
 }
 
 /// `DELETE /api/v1/tenants/{t}/intents/{intent}`: drops the tenant's own exemplars of the intent
@@ -2548,6 +2552,8 @@ mod tests {
         let (s, v) = call(&app, "PUT", "/api/v1/tenants/acme/intents/triage", Some(body), true).await;
         assert_eq!((s, v["exemplars"].as_array().map(Vec::len)), (StatusCode::OK, Some(2)), "{v}");
         assert_eq!(ex(&handle, "triage").map(|v| v.len()), Some(2));
+        // The snapshot version that carries it (routers report it in `/healthz` `routing.version`).
+        assert_eq!(v["config_version"].as_str(), Some(handle.load().version.as_str()));
         // Overriding the file's intent, then removing it for this tenant, then back to the file's.
         let (s, _) =
             call(&app, "PUT", "/api/v1/tenants/acme/intents/legal.review", Some(json!({"exemplars": []})), true).await;

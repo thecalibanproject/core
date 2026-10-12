@@ -190,12 +190,41 @@ impl Gateway {
     }
 
     /// Builds the `caliban/auto` routing assets (exemplar index, calibration, router profile) for
-    /// the current snapshot and waits for it. Call once at startup; config changes are picked up
-    /// in the background on the next request.
+    /// the current snapshot and waits for it. [`Gateway::keep_router_fresh`] does this, then
+    /// follows config changes.
     pub async fn warm_router(&self) {
         let snap = self.config.load();
         if self.router.needs_refresh(&snap) {
             route_embed::refresh(self, &snap).await;
+        }
+    }
+
+    /// Runs forever (spawn it at startup): builds the routing assets for the current snapshot,
+    /// then rebuilds them as soon as a snapshot that changes them is applied, and retries a failed
+    /// build when it is due. Requests keep the previous assets until a build finishes, and the
+    /// new index is swapped in atomically; `/healthz` `routing.version` then reports the snapshot
+    /// version it was built for. Requests also start a due build themselves (a fallback).
+    pub async fn keep_router_fresh(&self) {
+        let mut applied = self.config.subscribe();
+        let mut status = self.router.subscribe();
+        loop {
+            // Until the router is current for the snapshot loaded last (it may change mid-build).
+            loop {
+                // Changes from here on wake the wait below.
+                status.borrow_and_update();
+                let snap = self.config.load();
+                if !self.router.needs_refresh(&snap) {
+                    break;
+                }
+                route_embed::refresh(self, &snap).await;
+            }
+            let retry = self.router.retry_in();
+            tokio::select! {
+                r = applied.changed() => if r.is_err() { return },
+                // A build started by a request finished: check the snapshot did not move on.
+                r = status.changed() => if r.is_err() { return },
+                () = tokio::time::sleep(retry.unwrap_or_default()), if retry.is_some() => {}
+            }
         }
     }
 
@@ -358,6 +387,9 @@ pub(crate) async fn health(
         // `caliban keys status`).
         "snapshot": { "version": snap.version, "kek_ids": snap.kek_ids },
         "quota": gw.quota.status(),
+        // The snapshot version the `caliban/auto` routing assets were built for, the kNN index
+        // size, and whether a rebuild is in flight or the last one failed.
+        "routing": gw.router.status(),
     });
     // Usage sinks: `usage_wal` (with a WAL), `usage_shipping` (split mode).
     for (k, v) in gw.usage.status() {
