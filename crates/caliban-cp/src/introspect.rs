@@ -118,7 +118,7 @@ pub fn select(st: &State, tenant: &str, proposals: Vec<Element>) -> (Vec<Element
     for p in proposals {
         match current.and_then(|o| o.elements.iter().find(|e| e.id == p.id)) {
             Some(e) if e.status != Status::Proposed => skipped += 1,
-            Some(e) if !e.definition_changes(&p) && e.name == p.name && e.description == p.description => skipped += 1,
+            Some(e) if e.same_proposal(&p) => skipped += 1,
             _ => out.push(p),
         }
     }

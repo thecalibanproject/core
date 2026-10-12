@@ -1139,9 +1139,10 @@ struct Proposals {
 
 /// `POST /api/v1/tenants/{t}/ontology/proposals` `{"elements": [...]}`: elements written as
 /// `proposed` (one version), for a human to review; for proposals made outside Caliban (an
-/// exported model, a curated file). Proposing over an approved element withdraws it until it is
-/// approved again: refused when that breaks a published node version, unless
-/// `acknowledge_breaking`. Unchanged elements are skipped.
+/// exported model, a curated file). An element whose spec, name and description are unchanged is
+/// skipped whatever status it carries, so re-posting a reviewed element keeps the decision on it.
+/// A changed element goes back to `proposed`, which withdraws an approved one until it is approved
+/// again: refused when that breaks a published node version, unless `acknowledge_breaking`.
 async fn propose_ontology(
     State(cp): State<Cp>,
     Extension(p): Extension<Principal>,
@@ -1158,33 +1159,21 @@ async fn propose_ontology(
             return Err(bad(format!("element id '{}' is empty, too long or repeated", e.id)));
         }
     }
-    let elements: Vec<caliban_ontology::Element> = b
-        .elements
-        .into_iter()
-        .map(|e| caliban_ontology::Element { status: Status::Proposed, changed_in: None, ..e })
-        .collect();
-    let withdrawn: Vec<(String, Status)> = elements.iter().map(|e| (e.id.clone(), Status::Proposed)).collect();
-    let breaking = ontology::breaking(&cp.store.state(), &tenant_id, &withdrawn);
+    let st = cp.store.state();
+    let (write, skipped, breaking) = ontology::proposals(&st, &tenant_id, b.elements);
     if !breaking.is_empty() && !b.acknowledge_breaking {
         let list = breaking.iter().map(|b| format!("{}: {}", b.element, b.nodes.join(", ")));
         return Err(ApiError(
             StatusCode::CONFLICT,
             format!(
-                "proposing over approved elements that published node versions query withdraws them; send \
+                "proposing changes to approved elements that published node versions query withdraws them; send \
                  acknowledge_breaking: true to go ahead: {}",
                 list.collect::<Vec<_>>().join("; ")
             ),
         ));
     }
-    let st = cp.store.state();
-    let current = st.ontologies.get(&tenant_id);
-    let (write, skipped): (Vec<_>, Vec<_>) = elements.into_iter().partition(|e| {
-        current
-            .and_then(|o| o.elements.iter().find(|x| x.id == e.id))
-            .is_none_or(|x| x.definition_changes(e) || x.name != e.name || x.description != e.description)
-    });
     let version = if write.is_empty() {
-        current.map_or(0, |o| o.version)
+        st.ontologies.get(&tenant_id).map_or(0, |o| o.version)
     } else {
         let n = write.len();
         let st = cp
@@ -1194,11 +1183,11 @@ async fn propose_ontology(
         tracing::debug!(tenant = %tenant_id, proposed = n, "ontology proposals written");
         st.ontologies.get(&tenant_id).map_or(0, |o| o.version)
     };
-    let proposed = seen.len() - skipped.len();
+    let proposed = seen.len() - skipped;
     Ok((
         StatusCode::CREATED,
         Json(
-            json!({"tenant_id": tenant_id, "version": version, "proposed": proposed, "skipped": skipped.len(), "breaking": breaking}),
+            json!({"tenant_id": tenant_id, "version": version, "proposed": proposed, "skipped": skipped, "breaking": breaking}),
         ),
     ))
 }
@@ -2454,6 +2443,33 @@ mod tests {
         let (_, o) = call(&app, "GET", "/api/v1/tenants/acme/ontology", None, true).await;
         let p = o["elements"].as_array().unwrap().iter().find(|e| e["id"] == "price_total").unwrap().clone();
         assert_eq!(p["status"], "proposed", "a proposal is always proposed, whatever it says");
+        // Re-posting reviewed elements unchanged (status may be left out) keeps the decisions and
+        // makes no version; a changed one goes back to proposed.
+        let batch = json!({"decisions": [{"id": "price_total", "decision": "approve"}]});
+        call(&app, "POST", "/api/v1/tenants/acme/ontology/review", Some(batch), true).await;
+        let mut same = el.clone();
+        same.as_object_mut().unwrap().remove("status");
+        let elements = json!({"elements": [same.clone(), service.clone()]});
+        let (s, v) = call(&app, "POST", "/api/v1/tenants/acme/ontology/proposals", Some(elements), true).await;
+        assert_eq!((s, v["proposed"].as_u64(), v["skipped"].as_u64()), (StatusCode::CREATED, Some(0), Some(2)), "{v}");
+        let (_, o2) = call(&app, "GET", "/api/v1/tenants/acme/ontology", None, true).await;
+        assert_eq!(o2["version"], v["version"]);
+        let status = |o: &Value, id: &str| {
+            o["elements"].as_array().unwrap().iter().find(|e| e["id"] == id).unwrap()["status"].clone()
+        };
+        assert_eq!((status(&o2, "price_total"), status(&o2, "Service")), (json!("approved"), json!("approved")));
+        same["spec"]["maps_to"] = json!("orders.total");
+        let (s, v) =
+            call(&app, "POST", "/api/v1/tenants/acme/ontology/proposals", Some(json!({"elements": [same]})), true)
+                .await;
+        assert_eq!(
+            (s, v["proposed"].as_u64(), v["breaking"].as_array().map(Vec::len)),
+            (StatusCode::CREATED, Some(1), Some(0)),
+            "{v}"
+        );
+        let (_, o3) = call(&app, "GET", "/api/v1/tenants/acme/ontology", None, true).await;
+        assert_eq!(status(&o3, "price_total"), "proposed");
+        assert_eq!(o3["version"].as_u64(), o2["version"].as_u64().map(|v| v + 1));
         // Kinds without an introspection lane are refused.
         let pg = json!({"tenant_id": "acme", "kind": "postgres", "name": "erp", "connection": {}});
         let (_, ds) = call(&app, "POST", "/api/v1/datasources", Some(pg), true).await;

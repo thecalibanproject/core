@@ -498,8 +498,34 @@ async fn suite(s: &Store) {
     let mut renamed = element("e_b");
     renamed.status = Status::Approved;
     renamed.name = "Better name".into();
-    s.apply(A, Mutation::ProposeOntology { tenant_id: "globex".into(), elements: vec![renamed] }).await.unwrap();
+    s.apply(A, Mutation::ProposeOntology { tenant_id: "globex".into(), elements: vec![renamed.clone()] })
+        .await
+        .unwrap();
     assert_eq!(s.state().ontologies["globex"].elements[0].changed_in, Some(2));
+    // e2e follow-up: proposing reviewed elements again unchanged (as `proposed`, other synonyms
+    // and confidence) is a no-op: no version, the decisions stay. A changed spec is written.
+    let v = s.state().ontologies["globex"].version;
+    let mut same_b = renamed.clone();
+    (same_b.status, same_b.synonyms, same_b.confidence) = (Status::Proposed, vec![], Some(0.9));
+    let same_a = element("e_a");
+    let again = Mutation::ProposeOntology { tenant_id: "globex".into(), elements: vec![same_b, same_a] };
+    s.apply(A, again).await.unwrap();
+    let st = s.state();
+    let o = &st.ontologies["globex"];
+    assert_eq!(o.version, v, "nothing new: no version");
+    assert_eq!(
+        o.elements.iter().map(|e| (e.id.as_str(), e.status, e.changed_in)).collect::<Vec<_>>(),
+        [("e_b", Status::Approved, Some(2)), ("e_a", Status::Rejected, Some(3))]
+    );
+    assert_eq!(o.elements[0].synonyms, ["rev"], "a skipped element is not rewritten");
+    let mut changed = element("e_b");
+    changed.name = "Better name".into();
+    changed.spec = element("e_changed").spec;
+    s.apply(A, Mutation::ProposeOntology { tenant_id: "globex".into(), elements: vec![changed] }).await.unwrap();
+    let st = s.state();
+    let o = &st.ontologies["globex"];
+    assert_eq!((o.version, o.elements[0].status, o.elements[0].changed_in), (v + 1, Status::Proposed, Some(v + 1)));
+    assert_eq!(o.elements[1].status, Status::Rejected, "only the element proposed is touched");
 
     tenant_keys(s).await;
     node_lifecycle(s).await;

@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 
 pub use model::{ElementSpec, Model};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
+    #[default]
     Proposed,
     Approved,
     Rejected,
@@ -46,6 +47,8 @@ pub struct Element {
     pub description: Option<String>,
     #[serde(default)]
     pub synonyms: Vec<String>,
+    /// `proposed` when absent (a proposal's status is always set by the control plane).
+    #[serde(default)]
     pub status: Status,
     pub provenance: Provenance,
     pub confidence: Option<f32>,
@@ -64,6 +67,13 @@ impl Element {
     /// spec or its status. Names, descriptions, synonyms and confidence do not.
     pub fn definition_changes(&self, next: &Element) -> bool {
         self.spec != next.spec || self.status != next.status
+    }
+
+    /// Whether `next`, proposed over `self`, proposes nothing new: same spec, name and
+    /// description. Status, provenance, confidence and synonyms are not compared, so re-proposing
+    /// a reviewed element unchanged keeps the human decision on it.
+    pub fn same_proposal(&self, next: &Element) -> bool {
+        self.spec == next.spec && self.name == next.name && self.description == next.description
     }
 
     /// Relations, metrics and policies always need a human; low-risk metadata may auto-approve.

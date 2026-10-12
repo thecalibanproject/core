@@ -1136,10 +1136,26 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
             Ok(())
         }
         Mutation::ProposeOntology { tenant_id, elements } => {
-            // As applied: with the version each element's definition last changed in.
             let o = next.ontologies.get(tenant_id).ok_or_else(|| StoreError::NotFound("ontology".into()))?;
-            let applied: Vec<Element> =
-                o.elements.iter().filter(|e| elements.iter().any(|x| x.id == e.id)).cloned().collect();
+            // The version is the number of commits: none when the batch proposed nothing new.
+            let commits: i64 = sqlx::query_scalar("SELECT count(*) FROM ontology_commit WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(&mut *c)
+                .await
+                .map_err(db)?;
+            if u64::try_from(commits).ok() == Some(o.version) {
+                return Ok(());
+            }
+            // As applied: the elements written (an element skipped as unchanged keeps its row),
+            // with the version each one's definition last changed in.
+            let applied: Vec<Element> = o
+                .elements
+                .iter()
+                .filter(|e| {
+                    elements.iter().any(|x| x.id == e.id && Element { changed_in: e.changed_in, ..x.clone() } == **e)
+                })
+                .cloned()
+                .collect();
             ontology_commit(c, tenant_id, "ontology.propose", &applied).await
         }
         Mutation::ReviewOntology { tenant_id, decisions } => {

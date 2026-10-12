@@ -64,9 +64,14 @@ deterministic rules (`orders` becomes `Order`, `createdAt` becomes `created_at`)
 
 **Proposals made elsewhere** (an exported model, a curated file):
 `POST /api/v1/tenants/{t}/ontology/proposals` `{"elements": [...]}` (`ontology.review`) writes
-them as `proposed` in one version (whatever status they carry), skipping unchanged ones. Proposing
-over an approved element withdraws it until it is approved again: refused with `409` when that
-breaks a published node version, unless `acknowledge_breaking: true`.
+them as `proposed` in one version (`status` may be left out; whatever status they carry is
+ignored). An element whose spec, name and description match the tenant's is skipped, so posting
+the same model again makes no version and keeps every review decision (synonyms, confidence and
+provenance are not compared). A changed element goes back to `proposed`: over an approved element
+that withdraws it until it is approved again, refused with `409` when that breaks a published node
+version, unless `acknowledge_breaking: true`. The response gives `version`, `proposed`,
+`skipped` and `breaking` (the published node versions a withdrawal affects); `400` for an empty
+batch or an empty, too long or repeated id, `404` for an unknown tenant.
 
 ## Ontology review
 

@@ -16,11 +16,16 @@
 //! `acknowledge_breaking: true`; those versions then fail on that query until a version written on
 //! the new ontology is published. **Publishing** checks every fixed CQIR query of the spec: its
 //! version must be the tenant's, not newer than the current one, and still compatible.
+//!
+//! **Proposals** (`POST /api/v1/tenants/{t}/ontology/proposals`, [`proposals`]): an element whose
+//! spec, name and description are unchanged is skipped whatever status it is sent with, so posting
+//! the tenant's model again is a no-op and never overwrites a review decision. A changed element
+//! goes back to `proposed`; over an approved element that is a withdrawal, flagged like a review.
 
 use crate::store::{NodeRecord, NodeState, State};
 use caliban_ontology::compile::{CompileError, plan};
 use caliban_ontology::cqir::Query;
-use caliban_ontology::{Model, Ontology, Status};
+use caliban_ontology::{Element, Model, Ontology, Status};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -112,6 +117,22 @@ fn full_model(o: &Ontology) -> Model {
         e.status = Status::Approved;
     }
     Model::from_ontology(&all)
+}
+
+/// Proposed elements against the tenant's ontology: the ones to write (as `proposed`), how many
+/// were skipped as unchanged (whatever status they were sent with), and what writing them breaks.
+pub(crate) fn proposals(st: &State, tenant: &str, elements: Vec<Element>) -> (Vec<Element>, usize, Vec<Breaking>) {
+    let current = st.ontologies.get(tenant);
+    let n = elements.len();
+    let write: Vec<Element> = elements
+        .into_iter()
+        .filter(|e| current.and_then(|o| o.elements.iter().find(|x| x.id == e.id)).is_none_or(|x| !x.same_proposal(e)))
+        .map(|e| Element { status: Status::Proposed, changed_in: None, ..e })
+        .collect();
+    let withdrawn: Vec<(String, Status)> = write.iter().map(|e| (e.id.clone(), Status::Proposed)).collect();
+    let breaking = breaking(st, tenant, &withdrawn);
+    let skipped = n - write.len();
+    (write, skipped, breaking)
 }
 
 /// A published node version that review decisions would break.
@@ -313,5 +334,43 @@ mod tests {
         // Drafts and retired versions are not published: nothing breaks.
         let st = state(ontology(3, 1), node("acme@3", NodeState::Draft));
         assert!(breaking(&st, "acme", &[("Service".into(), Status::Rejected)]).is_empty());
+    }
+
+    /// e2e follow-up: re-posting an approved element unchanged was written back as `proposed`
+    /// (or refused with 409 when a published node queries it).
+    #[test]
+    fn an_unchanged_proposal_is_skipped_and_keeps_the_review_decision() {
+        let st = state(ontology(3, 1), node("acme@3", NodeState::Published));
+        let current = |id: &str| st.ontologies["acme"].elements.iter().find(|e| e.id == id).unwrap().clone();
+        // The whole model as exported, sent as proposed or with any other status: nothing to do.
+        let mut again: Vec<Element> = st.ontologies["acme"].elements.clone();
+        for (i, e) in again.iter_mut().enumerate() {
+            e.status = [Status::Proposed, Status::Rejected, Status::Approved][i % 3];
+            e.confidence = Some(0.1);
+            e.changed_in = None;
+        }
+        let (write, skipped, b) = proposals(&st, "acme", again);
+        assert_eq!((write.len(), skipped, b.len()), (0, 5, 0));
+        // A changed spec goes back to proposed and is flagged when a published node queries it.
+        let mut city = current("Service.city");
+        city.spec = el(
+            "Service.city",
+            "attribute",
+            json!({"entity": "Service", "path": "town", "column": "town", "data_type": "string"}),
+            1,
+        )
+        .spec;
+        let mut facility = current("Facility");
+        facility.description = Some("A clinic".into());
+        let (write, skipped, b) = proposals(
+            &st,
+            "acme",
+            vec![city, facility, el("New", "glossary_term", json!({"phrase": "new", "maps_to": "x"}), 0)],
+        );
+        assert_eq!(skipped, 0);
+        assert!(write.iter().all(|e| e.status == Status::Proposed && e.changed_in.is_none()));
+        assert_eq!(write.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["Service.city", "Facility", "New"]);
+        assert_eq!(b.len(), 1, "only Service.city is queried by a published node: {b:?}");
+        assert_eq!((b[0].element.as_str(), b[0].change.as_str()), ("Service.city", "approved -> proposed"));
     }
 }

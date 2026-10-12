@@ -720,9 +720,12 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 elements: vec![],
             });
             let version = onto.version + 1;
+            let mut written = false;
             for e in elements {
                 let mut e = e.clone();
                 match onto.elements.iter_mut().find(|x| x.id == e.id) {
+                    // Nothing new: the element (and any review decision on it) stays as it is.
+                    Some(x) if x.same_proposal(&e) => continue,
                     Some(x) => {
                         // A definition (spec or status) that changes is a change in this version.
                         e.changed_in = if x.definition_changes(&e) { Some(version) } else { x.changed_in };
@@ -733,8 +736,12 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                         onto.elements.push(e);
                     }
                 }
+                written = true;
             }
-            onto.version = version;
+            // A batch with nothing new makes no version.
+            if written {
+                onto.version = version;
+            }
         }
         Mutation::ReviewOntology { tenant_id, decisions } => {
             need_tenant(st, tenant_id)?;
