@@ -185,6 +185,14 @@ platform trust store (an internal CA can be added there, or through `SSL_CERT_FI
 
   Run values are stored in the journal sealed under the tenant's data key. In the console, run
   content (step outputs included) needs `runs.data`.
+- **Reformatted values.** A structured value (IBAN, card, phone, US SSN, national id) is restored
+  whatever separators the model writes its surrogate with, in the model's reply and in the
+  arguments of its tool calls: an IBAN the caller sent spaced, with its surrogate written compact
+  in a refund tool's arguments, reaches a trusted tool as the real IBAN, compact. The value is
+  laid out in the format the model used (a tool schema that wants it compact gets it compact).
+  Only the exact separator-free form of a surrogate the request issued is restored, never inside a
+  longer number; see `crates/caliban-pii/src/rehydrate.rs`. Before this release such a surrogate
+  stayed as it was, so a made-up IBAN could reach a trusted tool.
 
 ## Taint (CaMeL-lite)
 

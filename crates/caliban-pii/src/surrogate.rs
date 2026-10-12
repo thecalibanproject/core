@@ -340,8 +340,16 @@ pub struct Vault {
     scope_key: Vec<u8>,
     forward: HashMap<(EntityType, String), String>,
     reverse: Vec<(String, String)>,
+    /// The entity type of each `reverse` pair.
+    kinds: Vec<EntityType>,
     used: HashSet<String>,
+    /// The separator-free keys ([`crate::rehydrate::structured_key`]) of the structured surrogates
+    /// given so far: two values never share one, so a reformatted surrogate restores one value.
+    used_keys: HashSet<String>,
     corpus_lower: String,
+    /// The original text as structured keys see it: ASCII alphanumerics upper-cased, separators
+    /// dropped, anything else a break.
+    corpus_keys: String,
 }
 
 impl std::fmt::Debug for Vault {
@@ -359,6 +367,11 @@ impl Vault {
     /// Text that surrogates must never collide with (the original request text).
     pub fn set_collision_corpus(&mut self, text: &str) {
         self.corpus_lower = text.to_lowercase();
+        self.corpus_keys = text
+            .chars()
+            .filter(|c| !crate::rehydrate::is_separator(*c))
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '\0' })
+            .collect();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -372,6 +385,11 @@ impl Vault {
     /// `(surrogate, original)` pairs, in assignment order.
     pub fn pairs(&self) -> &[(String, String)] {
         &self.reverse
+    }
+
+    /// `(entity type, surrogate, original)`, in assignment order.
+    pub fn entries(&self) -> impl Iterator<Item = (&EntityType, &str, &str)> {
+        self.kinds.iter().zip(&self.reverse).map(|(e, (s, o))| (e, s.as_str(), o.as_str()))
     }
 
     /// Assigns surrogates to every value of a request at once, in canonical order (entity type,
@@ -399,14 +417,26 @@ impl Vault {
         }
         let surrogate = self.derive(entity, &key.1, original);
         self.used.insert(surrogate.to_lowercase());
+        if let Some(k) = crate::rehydrate::fuzzy_key(entity, &surrogate) {
+            self.used_keys.insert(k);
+        }
         self.forward.insert(key, surrogate.clone());
         self.reverse.push((surrogate.clone(), original.to_owned()));
+        self.kinds.push(entity.clone());
         surrogate
     }
 
-    fn clashes(&self, candidate: &str) -> bool {
+    /// A candidate is taken when it was given in this request or occurs in its original text; a
+    /// structured one (restored whatever its separators) also when its separator-free key was
+    /// given or occurs in the original text in any format, so a reformatted surrogate can only
+    /// ever restore its own value, and never rewrites genuine text.
+    fn clashes(&self, entity: &EntityType, candidate: &str) -> bool {
         let lower = candidate.to_lowercase();
-        candidate.is_empty() || self.used.contains(&lower) || self.corpus_lower.contains(&lower)
+        if candidate.is_empty() || self.used.contains(&lower) || self.corpus_lower.contains(&lower) {
+            return true;
+        }
+        crate::rehydrate::fuzzy_key(entity, candidate)
+            .is_some_and(|k| self.used_keys.contains(&k) || self.corpus_keys.contains(&k))
     }
 
     /// First candidate that is free in this request: realistic ones first, then a typed
@@ -420,7 +450,7 @@ impl Vault {
             } else {
                 format!("⟦{}_{}⟧", entity.label().to_uppercase(), d.tag())
             };
-            if !self.clashes(&candidate) {
+            if !self.clashes(entity, &candidate) {
                 return candidate;
             }
             attempt = attempt.saturating_add(1);
