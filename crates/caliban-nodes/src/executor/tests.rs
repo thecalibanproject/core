@@ -1500,6 +1500,43 @@ async fn pii_never_reaches_an_untrusted_tool() {
     assert_eq!(safe.seen.lock().as_slice(), [json!({"email": "jane@example.com"})], "the trusted one gets the value");
 }
 
+/// Built-in tools run inside Caliban against the tenant's own data: their arguments reach them
+/// unchanged, even when the tool does not say it is trusted, while an untrusted MCP tool in the
+/// same run still gets the disguised value (the law-firm demo: a datasource query was
+/// pseudonymised and its `ontology_version` rewritten).
+#[tokio::test]
+async fn built_in_tool_arguments_are_never_disguised() {
+    let builtin = Recorder::new("datasource_query", false, json!({"rows": []}));
+    let open = Recorder::new("notes", false, json!({"ok": true}));
+    let (r_ds, r_open) = ("builtin://datasource_query".to_owned(), format!("mcp://notes/notes#{PIN}"));
+    let tools = StaticTools::new()
+        .with(r_ds.clone(), builtin.clone() as Arc<dyn Tool>)
+        .with(r_open.clone(), open.clone() as Arc<dyn Tool>);
+    let h = Harness::new(Arc::new(MemoryJournal::new())).with_tools(tools);
+    let query = json!({"query": {"ir_version": "1", "ontology_version": "cabinet-jane@example.com@5",
+        "metrics": [{"id": "m_fees"}],
+        "filters": [{"attr": "a_email", "op": "eq", "value": {"type": "string", "v": "{{outputs.start.email}}"}}]}});
+    h.nodes.add(
+        "lookup",
+        1,
+        json!({"kind": "workflow", "model_policy": {}, "budgets": budgets(10, 1000),
+               "datasources": {"scopes": ["crm.*:read"]},
+               "tools": [{"ref": r_ds, "effect": "read"}, {"ref": r_open, "effect": "read"}],
+               "graph": {"vertices": [{"id": "start", "type": "reduce", "config": {"mode": "merge"}},
+                                      {"id": "q", "type": "tool", "config": {"tool": r_ds, "args": query}},
+                                      {"id": "n", "type": "tool", "config": {"tool": r_open, "args": {"email": "{{outputs.start.email}}"}}}],
+                         "edges": [{"from": "start", "to": "q"}, {"from": "q", "to": "n"}]}}),
+    );
+    let model = FakeModel::new(|_| text("unused"));
+    let ex = Arc::new(Arc::try_unwrap(h.executor(&model, "w1")).ok().unwrap().with_data_guard(Arc::new(EmailGuard)));
+    let v = run(&ex, "lookup", json!([{"email": "jane@example.com"}])).await;
+    assert_eq!(v.status, RunStatus::Succeeded, "{v:?}");
+    let seen = builtin.seen.lock()[0].clone();
+    assert_eq!(seen["query"]["ontology_version"], "cabinet-jane@example.com@5", "{seen}");
+    assert_eq!(seen["query"]["filters"][0]["value"]["v"], "jane@example.com", "{seen}");
+    assert_eq!(open.seen.lock().as_slice(), [json!({"email": "[EMAIL]"})], "the untrusted MCP tool is still guarded");
+}
+
 #[tokio::test]
 async fn a_cancelled_run_stops_at_its_next_step_and_its_model_call_is_not_repeated() {
     for j in journals().await {

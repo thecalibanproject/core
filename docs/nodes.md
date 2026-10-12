@@ -34,7 +34,7 @@ checked by `NodeSpec::validate` (`crates/caliban-nodes`). The parts the core enf
 | `exposure.chat_input` | Without an input schema: `"text"` (default) or `"messages"`, see [Chat shortcut](#the-chat-shortcut-model-nodename) |
 
 | `guardrails.answer` | `redact` (default), `refuse` or `off`: the [answer guard](#the-answer-guard) on the run's final output |
-| `guardrails.pii` | `off`, `mask` or `reversible`: a floor on the personal-data protection of the node's model calls, applied to every model class, sovereign models included (sent as `caliban.pii_floor`), and to the arguments of untrusted tools; with `mask`, tool results are masked as they enter the run too (irreversibly: the caller gets `[PHONE]`), while with `reversible` they enter as they are and the answer is restored for the caller ([tools.md](tools.md#personal-data)). It only strengthens the tenant's mode (`off` < `reversible` < `mask`). A subnode's calls use the subnode's own guardrail |
+| `guardrails.pii` | `off`, `mask` or `reversible`: a floor on the personal-data protection of the node's model calls, applied to every model class, sovereign models included (sent as `caliban.pii_floor`), and to the arguments of untrusted tools (never to built-in tools'); with `mask`, tool results are masked as they enter the run too (irreversibly: the caller gets `[PHONE]`), while with `reversible` they enter as they are and the answer is restored for the caller ([tools.md](tools.md#personal-data)). It only strengthens the tenant's mode (`off` < `reversible` < `mask`). A subnode's calls use the subnode's own guardrail |
 
 Other unknown sections (the rest of `guardrails` and `exposure`, `eval`, ...) are kept and hashed but
 not enforced yet.
@@ -97,7 +97,7 @@ a tool that cannot be resolved refuses the run before the first call.
 **Tools.** `node://name@vN` is handled by the executor. Other references go through the data
 plane's tool registry: `mcp://` resolves only to an approved manifest of a server the tenant
 registered, `builtin://datasource_query` and `builtin://rag_search` to the built-in query and
-retrieval tools; any other scheme is an unknown tool kind. A tool not trusted with personal data gets PII surrogates in its arguments; tool
+retrieval tools; any other scheme is an unknown tool kind. A tool not trusted with personal data gets PII surrogates in its arguments (a built-in tool never does: it runs inside Caliban); tool
 results enter the run as they are in `reversible` mode (model calls and untrusted tools get
 surrogates, and the answer is restored for the caller) and masked in `mask` mode; values carry taint labels, and a write with tainted
 arguments needs an allowlist entry or a human approval. All of this is in [tools.md](tools.md).

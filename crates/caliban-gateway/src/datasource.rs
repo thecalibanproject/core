@@ -230,6 +230,18 @@ impl Tool for DatasourceQuery {
         }
     }
 
+    /// In process, against the tenant's own datasource: its arguments (a CQIR query) do not leave
+    /// the boundary, so they are never pseudonymized (research note 05 §3: tool calls to customer
+    /// datasources run on real values inside the Caliban trust boundary). A surrogate in a filter
+    /// would match no row, and one in `ontology_version` fails the query.
+    fn trusted(&self) -> bool {
+        true
+    }
+
+    fn reaches_network(&self) -> bool {
+        false
+    }
+
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<Value, ToolError> {
         let (mut ds, q) = self.plan(ctx, &args)?;
         // Credentials are opened only for the connector, here.
@@ -355,6 +367,7 @@ mod tests {
     async fn queries_run_within_node_and_key_scopes() {
         let (b, fake, _) = setup(None);
         let tool = b.resolve("acme", "builtin://datasource_query").unwrap();
+        assert!(tool.trusted() && !tool.reaches_network(), "in process: its arguments are never disguised");
         let out = tool.call(&ctx(&["shop.orders:read"]), query("revenue")).await.unwrap();
         assert_eq!(out["rows"][0]["total"], 42);
         let (name, q, conn) = fake.0.lock().unwrap()[0].clone();
