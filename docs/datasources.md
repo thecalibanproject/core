@@ -37,6 +37,37 @@ Without a matching member, every query fails after the driver's server-selection
 with an error naming the read preference it looked for and these two fixes
 (`no MongoDB member matches the read preference secondary with tags {workload: analytics}: ...`).
 
+## Introspection (the ontology bootstrap)
+
+`POST /api/v1/datasources/{id}/introspect` (`datasources.write`) starts the bootstrap of note 08
+("Schema inference & ontology bootstrap") and answers `202` with the job (`409` while one runs for
+the datasource). The control plane opens the connection's credentials with the tenant's data key,
+checks the principal is read only, samples every collection (stratified: `$sample`, the newest
+and the oldest documents by `_id`, never natural order; `secondaryPreferred`), infers the paths,
+probes references against target `_id`s, and proposes elements: one entity per collection,
+embedded entities for arrays of documents, subtype entities for discriminators, attributes, and
+unverified reference relations. They are written as `proposed`, in one ontology version, for a
+human to review (below).
+
+`GET /api/v1/datasources/{id}/introspection` (`datasources.read`) shows the newest job:
+`status` (`running`, `succeeded`, `failed`), `objects`, `proposed`, `skipped`, `version`,
+`error`. The job is kept by the control plane that ran it (the last 100); the datasource's
+`status` (`introspecting`, then `ready` or `failed`) is stored and every replica sees it.
+
+**Re-runs** keep human decisions: element ids are deterministic, and a proposal whose element was
+already reviewed (approved, rejected, deprecated, stale) is skipped, as is one identical to the
+pending proposal. A re-run that finds nothing new makes no version.
+
+Only the MongoDB kind can be introspected (`422` for others). The LLM proposal pass (names,
+descriptions and PII classes from redacted samples) is not part of the job yet: names come from
+deterministic rules (`orders` becomes `Order`, `createdAt` becomes `created_at`).
+
+**Proposals made elsewhere** (an exported model, a curated file):
+`POST /api/v1/tenants/{t}/ontology/proposals` `{"elements": [...]}` (`ontology.review`) writes
+them as `proposed` in one version (whatever status they carry), skipping unchanged ones. Proposing
+over an approved element withdraws it until it is approved again: refused with `409` when that
+breaks a published node version, unless `acknowledge_breaking: true`.
+
 ## Ontology review
 
 Element ids belong to a tenant: two tenants may both have an element `Service` (introspection

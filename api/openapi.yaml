@@ -1609,6 +1609,10 @@ paths:
     post:
       tags: [ontology]
       summary: Introspect and profile a source, then propose ontology elements (all with status=proposed)
+      description: |
+        The ontology bootstrap (docs/datasources.md): connects with the datasource's credentials, checks the
+        principal is read only, samples every collection, and writes proposals in one ontology version.
+        Proposals for elements a human already reviewed, and unchanged ones, are skipped. MongoDB only.
       responses:
         '202':
           description: Bootstrap job accepted
@@ -1618,6 +1622,57 @@ paths:
                 type: object
                 properties:
                   job_id: { type: string }
+                  job: { $ref: '#/components/schemas/IntrospectionJob' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/datasources/{datasourceId}/introspection:
+    parameters:
+      - name: datasourceId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [ontology]
+      summary: The newest introspection job of the datasource (on the control plane that ran it)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IntrospectionJob' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/tenants/{tenantId}/ontology/proposals:
+    parameters: [ { $ref: '#/components/parameters/TenantId' } ]
+    post:
+      tags: [ontology]
+      summary: Propose ontology elements made outside Caliban (written as proposed, one version)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [elements]
+              additionalProperties: false
+              properties:
+                elements: { type: array, minItems: 1, maxItems: 5000, items: { $ref: '#/components/schemas/OntologyElement' } }
+                acknowledge_breaking: { type: boolean, default: false }
+      responses:
+        '201':
+          description: Written (unchanged elements skipped)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  version: { type: integer }
+                  proposed: { type: integer }
+                  skipped: { type: integer }
+        '409': { $ref: '#/components/responses/Error' }
 
   /api/v1/ontology:
     get:
@@ -3204,6 +3259,20 @@ components:
         confidence: { type: [number, 'null'] }
         spec: { type: object, additionalProperties: true, description: 'Kind-specific body; see schemas/ontology.schema.json' }
         changed_in: { type: integer, description: 'The ontology version its spec or status last changed in. A CQIR query written for an older version keeps compiling while nothing it touches changed after that version.' }
+    IntrospectionJob:
+      type: object
+      properties:
+        id: { type: string }
+        datasource_id: { type: string }
+        tenant_id: { type: string }
+        status: { type: string, enum: [running, succeeded, failed] }
+        objects: { type: integer, description: 'Collections the snapshot found' }
+        proposed: { type: integer }
+        skipped: { type: integer, description: 'Proposals for elements already reviewed, or unchanged' }
+        version: { type: [integer, 'null'], description: 'The ontology version the proposals were written in' }
+        error: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
     Ontology:
       type: object
       required: [tenant_id, version, elements]

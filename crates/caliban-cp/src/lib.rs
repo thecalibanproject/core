@@ -8,6 +8,7 @@
 
 pub mod auth;
 mod evals;
+pub mod introspect;
 pub mod keys;
 mod models;
 mod nodes;
@@ -64,6 +65,9 @@ pub struct ControlPlane {
     /// The retrieval document registry (shared with the workers that index it). `None`: the
     /// retrieval endpoints answer 503.
     rag: Option<Arc<dyn caliban_rag::store::RagStore>>,
+    /// Datasource introspection (the ontology bootstrap) and the jobs this process ran.
+    introspector: Arc<dyn introspect::Introspector>,
+    pub(crate) introspections: introspect::Jobs,
 }
 
 /// The last signed snapshot, re-served while the rendered config is unchanged.
@@ -89,7 +93,20 @@ impl ControlPlane {
             tools: None,
             journal: None,
             rag: None,
+            introspector: Arc::new(introspect::MongoIntrospector),
+            introspections: introspect::Jobs::default(),
         }
+    }
+
+    /// How datasources are introspected (default: the MongoDB connector).
+    #[must_use]
+    pub fn with_introspector(mut self, i: Arc<dyn introspect::Introspector>) -> Self {
+        self.introspector = i;
+        self
+    }
+
+    pub(crate) fn introspector(&self) -> Arc<dyn introspect::Introspector> {
+        Arc::clone(&self.introspector)
     }
 
     /// The retrieval document registry the admin API writes.
@@ -365,6 +382,8 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/ontology", get(get_ontology))
         .route("/ontology/elements/{id}/review", post(review_element))
         .route("/tenants/{tenant_id}/ontology", get(get_tenant_ontology))
+        .route("/tenants/{tenant_id}/ontology/proposals", post(propose_ontology))
+        .route("/datasources/{id}/introspection", get(get_introspection))
         .route("/tenants/{tenant_id}/ontology/review", post(review_batch))
         .route("/tenants/{tenant_id}/ontology/elements/{id}/review", post(review_tenant_element))
         .route("/nodes", get(nodes::list_nodes).post(nodes::create_node))
@@ -1047,15 +1066,138 @@ async fn delete_datasource(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /api/v1/datasources/{id}/introspect`: starts the ontology bootstrap (see [`introspect`]).
+/// `202` with the job; `409` while one runs for the datasource.
 async fn introspect_datasource(
     State(cp): State<Cp>,
     Extension(p): Extension<Principal>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    // TODO: run the bootstrap job (introspect → profile → mine query log → LLM proposals) via
-    // caliban-connect, writing `proposed` ontology elements (Mutation::ProposeOntology).
-    cp.store.apply(&p.actor, Mutation::SetDatasourceStatus { id, status: "introspecting".into() }).await?;
-    Ok((StatusCode::ACCEPTED, Json(json!({ "job_id": new_id("job") }))))
+    let ds = cp
+        .store
+        .state()
+        .datasources
+        .iter()
+        .find(|d| d.id == id && d.is_live())
+        .cloned()
+        .ok_or_else(|| not_found("datasource"))?;
+    if ds.kind != "mongodb" {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("datasource kind '{}' has no introspection yet (only mongodb)", ds.kind),
+        ));
+    }
+    if cp.introspections.running(&id) {
+        return Err(ApiError(StatusCode::CONFLICT, "an introspection of this datasource is running".into()));
+    }
+    // Credentials: sealed under the tenant's data key, opened here only for the connector.
+    let connection = if keys::needs_opening(&ds.connection) {
+        let keyring = cp.keyring("datasource credentials")?;
+        let dek = keys::tenant_dek(&cp.store, keyring, &ds.tenant_id, &p.actor).await?;
+        caliban_config::open_sealed_values(&ds.connection, &ds.tenant_id, &dek)
+            .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("the connection cannot be opened: {e}")))?
+    } else {
+        ds.connection.clone()
+    };
+    let connection = introspect::resolve_references(&connection)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("the connection's references: {e}")))?;
+    cp.store.apply(&p.actor, Mutation::SetDatasourceStatus { id: id.clone(), status: "introspecting".into() }).await?;
+    let job = introspect::Job {
+        id: new_id("job"),
+        datasource_id: id,
+        tenant_id: ds.tenant_id.clone(),
+        status: "running",
+        objects: 0,
+        proposed: 0,
+        skipped: 0,
+        version: None,
+        error: None,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+    };
+    cp.introspections.put(job.clone());
+    tokio::spawn(introspect::run(Arc::clone(&cp), job.clone(), connection, ds.kind));
+    Ok((StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "job": job}))))
+}
+
+/// `GET /api/v1/datasources/{id}/introspection`: the newest introspection job of the datasource
+/// run by this control plane (`404` when none).
+async fn get_introspection(State(cp): State<Cp>, Path(id): Path<String>) -> ApiResult<Json<introspect::Job>> {
+    cp.introspections.latest(&id).map(Json).ok_or_else(|| not_found("introspection job"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Proposals {
+    elements: Vec<caliban_ontology::Element>,
+    #[serde(default)]
+    acknowledge_breaking: bool,
+}
+
+/// `POST /api/v1/tenants/{t}/ontology/proposals` `{"elements": [...]}`: elements written as
+/// `proposed` (one version), for a human to review; for proposals made outside Caliban (an
+/// exported model, a curated file). Proposing over an approved element withdraws it until it is
+/// approved again: refused when that breaks a published node version, unless
+/// `acknowledge_breaking`. Unchanged elements are skipped.
+async fn propose_ontology(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path(tenant_id): Path<String>,
+    Json(b): Json<Proposals>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    ensure_tenant(&cp, &tenant_id)?;
+    if b.elements.is_empty() || b.elements.len() > 5000 {
+        return Err(bad("elements: 1 to 5000"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for e in &b.elements {
+        if e.id.is_empty() || e.id.len() > 200 || !seen.insert(e.id.clone()) {
+            return Err(bad(format!("element id '{}' is empty, too long or repeated", e.id)));
+        }
+    }
+    let elements: Vec<caliban_ontology::Element> = b
+        .elements
+        .into_iter()
+        .map(|e| caliban_ontology::Element { status: Status::Proposed, changed_in: None, ..e })
+        .collect();
+    let withdrawn: Vec<(String, Status)> = elements.iter().map(|e| (e.id.clone(), Status::Proposed)).collect();
+    let breaking = ontology::breaking(&cp.store.state(), &tenant_id, &withdrawn);
+    if !breaking.is_empty() && !b.acknowledge_breaking {
+        let list = breaking.iter().map(|b| format!("{}: {}", b.element, b.nodes.join(", ")));
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "proposing over approved elements that published node versions query withdraws them; send \
+                 acknowledge_breaking: true to go ahead: {}",
+                list.collect::<Vec<_>>().join("; ")
+            ),
+        ));
+    }
+    let st = cp.store.state();
+    let current = st.ontologies.get(&tenant_id);
+    let (write, skipped): (Vec<_>, Vec<_>) = elements.into_iter().partition(|e| {
+        current
+            .and_then(|o| o.elements.iter().find(|x| x.id == e.id))
+            .is_none_or(|x| x.definition_changes(e) || x.name != e.name || x.description != e.description)
+    });
+    let version = if write.is_empty() {
+        current.map_or(0, |o| o.version)
+    } else {
+        let n = write.len();
+        let st = cp
+            .store
+            .apply(&p.actor, Mutation::ProposeOntology { tenant_id: tenant_id.clone(), elements: write })
+            .await?;
+        tracing::debug!(tenant = %tenant_id, proposed = n, "ontology proposals written");
+        st.ontologies.get(&tenant_id).map_or(0, |o| o.version)
+    };
+    let proposed = seen.len() - skipped.len();
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            json!({"tenant_id": tenant_id, "version": version, "proposed": proposed, "skipped": skipped.len(), "breaking": breaking}),
+        ),
+    ))
 }
 
 async fn get_ontology(
@@ -2133,5 +2275,96 @@ mod tests {
         assert_eq!(s, StatusCode::NOT_FOUND);
         let (s, o) = call(&app, "GET", "/api/v1/tenants/globex/ontology", None, true).await;
         assert_eq!((s, o["version"].as_u64()), (StatusCode::OK, Some(2)));
+    }
+
+    /// e2e gap 1: introspection writes proposals reachable through the public API (no psql).
+    #[tokio::test]
+    async fn introspection_proposes_the_ontology_through_the_api() {
+        struct Fake(std::sync::Mutex<Vec<Value>>);
+        #[async_trait::async_trait]
+        impl introspect::Introspector for Fake {
+            async fn snapshot(
+                &self,
+                kind: &str,
+                ds: &str,
+                connection: Value,
+            ) -> Result<caliban_connect::SchemaSnapshot, String> {
+                assert_eq!(kind, "mongodb");
+                self.0.lock().unwrap().push(connection);
+                let f = |path: &str, ty: &str| json!({"path": path, "types": [ty], "presence": 1.0, "is_array": false});
+                serde_json::from_value(json!({"datasource": ds, "objects": [
+                    {"name": "services", "estimated_rows": 9, "kind": "collection", "sampled": 9, "indexes": [],
+                     "fields": [f("_id", "string"), f("name", "string"), f("specialty", "string"), f("price_usd", "double")]}
+                ]}))
+                .map_err(|e| e.to_string())
+            }
+        }
+        let fake = Arc::new(Fake(std::sync::Mutex::new(vec![])));
+        let base = cp();
+        let cfg = base.store.base().clone();
+        let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "boot"));
+        let c = Arc::new(
+            ControlPlane::new(Store::new(cfg, handle, RecentUsage::default()), "admin-secret".into(), "standalone")
+                .with_keyring(Some(Arc::new(test_ring())))
+                .with_introspector(fake.clone()),
+        );
+        let app = app(Arc::clone(&c), None);
+        let body = json!({"tenant_id": "acme", "kind": "mongodb", "name": "market",
+                          "connection": {"uri": "mongodb://reader:s3cret@db:27017", "database": "marketplace"}});
+        let (s, ds) = call(&app, "POST", "/api/v1/datasources", Some(body), true).await;
+        assert_eq!(s, StatusCode::CREATED, "{ds}");
+        let id = ds["id"].as_str().unwrap().to_owned();
+        let run = |app: Router, id: String| async move {
+            let (s, v) = call(&app, "POST", &format!("/api/v1/datasources/{id}/introspect"), None, true).await;
+            assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let (_, j) = call(&app, "GET", &format!("/api/v1/datasources/{id}/introspection"), None, true).await;
+                if j["status"] != "running" {
+                    return j;
+                }
+                assert!(std::time::Instant::now() < deadline, "the job did not end: {j}");
+                tokio::task::yield_now().await;
+            }
+        };
+        let j = run(app.clone(), id.clone()).await;
+        assert_eq!((j["status"].as_str(), j["objects"].as_u64()), (Some("succeeded"), Some(1)), "{j}");
+        assert!(j["proposed"].as_u64().unwrap() >= 4, "{j}");
+        // The connector got the credentials opened; the API never shows them.
+        assert_eq!(fake.0.lock().unwrap()[0]["uri"], "mongodb://reader:s3cret@db:27017");
+        let (_, d) = call(&app, "GET", "/api/v1/datasources?tenant_id=acme", None, true).await;
+        assert!(!d.to_string().contains("s3cret"));
+        assert_eq!(d.as_array().unwrap().iter().find(|x| x["id"] == id.as_str()).unwrap()["status"], "ready");
+        // The proposals, through the public API, then a review.
+        let (_, o) = call(&app, "GET", "/api/v1/tenants/acme/ontology", None, true).await;
+        let ids: Vec<&str> = o["elements"].as_array().unwrap().iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"Service") && ids.contains(&"Service.specialty"), "{ids:?}");
+        assert!(o["elements"].as_array().unwrap().iter().all(|e| e["status"] == "proposed"));
+        let v1 = o["version"].as_u64().unwrap();
+        let batch = json!({"decisions": [{"id": "Service", "decision": "approve"}]});
+        call(&app, "POST", "/api/v1/tenants/acme/ontology/review", Some(batch), true).await;
+        // A re-run finds nothing new and never overwrites a decision: no version.
+        let j = run(app.clone(), id.clone()).await;
+        assert_eq!((j["status"].as_str(), j["proposed"].as_u64()), (Some("succeeded"), Some(0)), "{j}");
+        let (_, o) = call(&app, "GET", "/api/v1/tenants/acme/ontology", None, true).await;
+        assert_eq!(o["version"].as_u64(), Some(v1 + 1), "only the review made a version");
+        let service = o["elements"].as_array().unwrap().iter().find(|e| e["id"] == "Service").unwrap().clone();
+        assert_eq!(service["status"], "approved");
+        // Proposals made elsewhere (an exported model) through the API too.
+        let el = json!({"id": "price_total", "name": "Total price", "description": null, "synonyms": [], "status": "approved",
+            "provenance": "human", "confidence": null, "kind": "glossary_term", "spec": {"phrase": "total price", "maps_to": "x"}});
+        let (s, v) =
+            call(&app, "POST", "/api/v1/tenants/acme/ontology/proposals", Some(json!({"elements": [el]})), true).await;
+        assert_eq!((s, v["proposed"].as_u64()), (StatusCode::CREATED, Some(1)), "{v}");
+        let (_, o) = call(&app, "GET", "/api/v1/tenants/acme/ontology", None, true).await;
+        let p = o["elements"].as_array().unwrap().iter().find(|e| e["id"] == "price_total").unwrap().clone();
+        assert_eq!(p["status"], "proposed", "a proposal is always proposed, whatever it says");
+        // Kinds without an introspection lane are refused.
+        let pg = json!({"tenant_id": "acme", "kind": "postgres", "name": "erp", "connection": {}});
+        let (_, ds) = call(&app, "POST", "/api/v1/datasources", Some(pg), true).await;
+        let (s, _) =
+            call(&app, "POST", &format!("/api/v1/datasources/{}/introspect", ds["id"].as_str().unwrap()), None, true)
+                .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

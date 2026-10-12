@@ -549,6 +549,8 @@ pub const ROUTES: &[RouteRule] = &[
     r("GET", "/datasources", Perm::DatasourcesRead, TenantFrom::QueryOrList),
     r("POST", "/datasources", Perm::DatasourcesWrite, TenantFrom::Body),
     r("POST", "/datasources/{id}/introspect", Perm::DatasourcesWrite, TenantFrom::Datasource),
+    r("GET", "/datasources/{id}/introspection", Perm::DatasourcesRead, TenantFrom::Datasource),
+    r("POST", "/tenants/{tenant_id}/ontology/proposals", Perm::OntologyReview, TenantFrom::Path),
     r("GET", "/ontology", Perm::OntologyRead, TenantFrom::QueryOrList),
     r("POST", "/ontology/elements/{id}/review", Perm::OntologyReview, TenantFrom::Body),
     r("GET", "/tenants/{tenant_id}/ontology", Perm::OntologyRead, TenantFrom::Path),

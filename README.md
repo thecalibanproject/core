@@ -596,7 +596,7 @@ Known gaps:
 Next, in order:
 
 1. Control plane: push (long-poll) instead of polling (faster revocation in split mode), tenant admins granting roles on their own tenant.
-2. MongoDB connector: wire `introspect` and `propose` into the control plane's introspection job; `$jsonSchema`-declared types; map and scalar-array attributes; per-shard sampling.
+2. MongoDB connector: the LLM proposal pass of the introspection job (names, descriptions, PII classes from redacted samples); `$jsonSchema`-declared types; map and scalar-array attributes; per-shard sampling.
 3. CDC replica and planner: connect the planner to the `explain` gate and replica lag in a query service; delta Parquet with compaction instead of whole-table rewrites; resume from the manifest after a restart (today it re-snapshots); parallel `_id`-range snapshots; arrays nested in arrays.
 4. PII: licence sign-off on the NER model's fine-tuning data (see `MODELS.md`); FF1 format-preserving encryption for structured IDs; coreference so a first name maps to the surrogate's first name.
 5. Gateway: tokenizer-based estimates, rate-limit headers on successful responses, the ONNX intent classifier (Stage 2), model health on the data plane, control-plane management of routing exemplars and floors, and for the semantic cache an async LLM judge, per-intent thresholds and per-tenant entry encryption.

@@ -1111,6 +1111,15 @@ fn cases() -> Vec<Case> {
             true,
             "owner admin tenant_admin",
         ),
+        c("GET", "/datasources/{id}/introspection", "/api/v1/datasources/ds_{t}/introspection", None, true, READERS),
+        c(
+            "POST",
+            "/tenants/{tenant_id}/ontology/proposals",
+            "/api/v1/tenants/{t}/ontology/proposals",
+            Some(json!({"elements": []})),
+            true,
+            "owner admin tenant_admin developer",
+        ),
         c("GET", "/ontology", "/api/v1/ontology?tenant_id={t}", None, true, READERS),
         c(
             "POST",

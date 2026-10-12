@@ -186,6 +186,16 @@ fn walk(v: &Value, key: Option<&str>, f: &mut dyn FnMut(&Value, Option<String>) 
     }
 }
 
+/// Whether a stored connection holds a sealed value (`{"$sealed": ...}`) to open.
+pub fn needs_opening(conn: &Value) -> bool {
+    match conn {
+        v if is_sealed(v) => true,
+        Value::Object(m) => m.values().any(needs_opening),
+        Value::Array(a) => a.iter().any(needs_opening),
+        _ => false,
+    }
+}
+
 /// True if `conn` has credentials in clear.
 pub fn needs_sealing(conn: &Value) -> bool {
     let mut n = 0;
