@@ -74,6 +74,7 @@ paths:
             x-caliban-request-id: { schema: { type: string } }
             x-caliban-routed-model: { schema: { type: string } }
             x-caliban-intent: { schema: { type: string }, description: 'Routing decision: `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` (timeout, embed_error, unavailable, no_text, abstain_oos, abstain_confidence, abstain_margin, abstain_empty) when kNN was on but did not decide. The intent is `pinned` for a named model.' }
+            Server-Timing: { $ref: '#/components/headers/ServerTiming' }
             x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] }, description: '`hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request.' }
             x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
@@ -127,6 +128,7 @@ paths:
             x-caliban-request-id: { schema: { type: string } }
             x-caliban-routed-model: { schema: { type: string } }
             x-caliban-intent: { schema: { type: string }, description: 'Routing decision: `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` (timeout, embed_error, unavailable, no_text, abstain_oos, abstain_confidence, abstain_margin, abstain_empty) when kNN was on but did not decide. The intent is `pinned` for a named model.' }
+            Server-Timing: { $ref: '#/components/headers/ServerTiming' }
             x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] }, description: '`hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request.' }
             x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
@@ -231,6 +233,7 @@ paths:
             x-caliban-request-id: { schema: { type: string } }
             x-caliban-routed-model: { schema: { type: string } }
             x-caliban-pii-entities: { schema: { type: integer }, description: 'Entities masked before an external provider' }
+            Server-Timing: { $ref: '#/components/headers/ServerTiming' }
           content:
             application/json:
               schema:
@@ -274,6 +277,7 @@ paths:
           headers:
             x-caliban-request-id: { schema: { type: string } }
             x-caliban-routed-model: { schema: { type: string } }
+            Server-Timing: { $ref: '#/components/headers/ServerTiming' }
           content:
             application/json:
               schema:
@@ -2849,6 +2853,22 @@ components:
       required: false
       schema: { type: string }
 
+  headers:
+    ServerTiming:
+      description: |
+        W3C Server-Timing: per-stage durations of this request in milliseconds, in pipeline order,
+        stages that did not run left out. `auth` (authentication and rate limit), `route`
+        (`desc`: the stage that decided, `pinned`, `rules`, `knn` or `keyword`), `embed` (the
+        routing embedder call, part of `route`), `pii`, `cache` (`desc`: `hit` or `miss`),
+        `upstream` (time to the upstream response headers), `upstream_total` (the whole upstream
+        call; non-streaming responses only, streams record it in the usage event's `timings`),
+        `node` (a node run that answered; `desc` is the run id, whose step durations are on
+        `GET /v1/runs/{id}`; no `dur` on streams, whose headers leave before the run ends), `total`.
+        Example: `auth;dur=0.210, route;dur=4.810;desc="knn", embed;dur=4.020, pii;dur=1.130,
+        cache;dur=0.040;desc="miss", upstream;dur=182.400, upstream_total;dur=611.900, total;dur=618.700`.
+        Absent when `[telemetry] server_timing = false`.
+      schema: { type: string }
+
   responses:
     Error:
       description: Error
@@ -4003,6 +4023,19 @@ components:
         route: { type: string, description: 'In transit only (never in reports): the path a caliban/auto request took' }
         route_fallback: { type: string, description: 'In transit only (never in reports): why a model answered rather than a node; counted in `by_route`' }
         purpose: { type: string, enum: [rag.ingest, rag.search], description: 'Work Caliban did on the tenant''s behalf: `rag.ingest` (embedding a collection''s documents), `rag.search` (a node''s retrieval query, its embedding and reranking). Absent for client calls and node model calls. Kept in reports (billing-class, not content-class).' }
+        timings: { $ref: '#/components/schemas/UsageTimings' }
+    UsageTimings:
+      type: object
+      description: 'Per-stage durations of the request in milliseconds (the `Server-Timing` header''s numbers; for streams `upstream_total_ms` and `total_ms` run to the end of the stream). A stage that did not run is absent. Durations only: the deciding routing stage is content-class and not kept. Absent on events written before this field existed (migration 0036).'
+      properties:
+        auth_ms: { type: number, description: 'Authentication and the rate-limit check.' }
+        route_ms: { type: number, description: 'Classification and model choice, `embed_ms` included.' }
+        embed_ms: { type: number, description: 'The routing embedder call (Stage-1 kNN).' }
+        pii_ms: { type: number, description: 'PII screening.' }
+        cache_ms: { type: number, description: 'Cache lookups (exact, then semantic).' }
+        upstream_ms: { type: number, description: 'Upstream model: time to its response headers (first byte).' }
+        upstream_total_ms: { type: number, description: 'Upstream model: the whole call, to the end of the body or stream.' }
+        total_ms: { type: number, description: 'Request start to the usage event.' }
     UsageReport:
       type: object
       required: [events, totals]

@@ -305,6 +305,13 @@ answers `x-caliban-pii-entities` (entities protected across the run's model call
 `caliban` object (`run_id`, `status`, `node`, `version`, `cost_usd`, `awaiting`, `stop_reason`)
 that the SDKs keep as an extra field (`completion.model_extra["caliban"]` in the OpenAI Python SDK).
 
+**Timings.** Node answers carry `Server-Timing` (README, "Stage timings"): `auth`, and for
+`caliban/auto` the routing stages (`route` with the deciding stage, `embed`), then
+`node;dur=<run time>;desc="<run id>"` and `total`. A streamed answer's headers leave before the run
+ends, so its `node` entry has the run id without a duration. Each step's duration is on
+`GET /v1/runs/{id}` (`steps[].started_at`, `steps[].duration_ms`) and in the `step.finished` event (`duration_ms`). The
+run's model calls time their own stages in their usage events (`timings`).
+
 **Human steps.** When the run stops at a human step, the question is the assistant message with
 `finish_reason` / `stop_reason` `input_required`, and `caliban.status` is `input_required`. To
 answer, send the next request with the header `Caliban-Run-Id: <run id>` and the answer as the last

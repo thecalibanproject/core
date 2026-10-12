@@ -60,8 +60,31 @@ Every chat response carries these headers (all exposed to browsers through CORS)
 | `x-caliban-cost-usd` | Cost in USD, on non-streaming responses when the model has prices (`0.00000000` on a cache hit); the same number as the usage event's `cost_usd`, prompt-cache prices included |
 | `x-caliban-route`, `x-caliban-route-fallback` | `caliban/auto` for a tenant that maps intents to nodes: the path taken (`node/<name>@v<N>` or `model:<id>`) and, on a model answer, why no node ran; see [`caliban/auto` picks a node](docs/nodes.md#calibanauto-picks-a-node) |
 | `caliban-run-id` | Node answers (the chat shortcut, `caliban/auto` handing to a node): the run, to continue it or follow it with the run API |
+| `Server-Timing` | Per-stage durations in milliseconds (W3C), in pipeline order; see [Stage timings](#stage-timings). Also on `/v1/embeddings` and `/v1/rerank` |
 
 Node answers carry the same headers: `x-caliban-routed-model` is `node/<name>@v<N>`, `x-caliban-cache` is `bypass`, and on non-streaming answers `x-caliban-pii-entities`, `x-caliban-cost-usd` (the routed models' real cost) and `x-caliban-billed-usd` (what the run is billed: the flat `caliban/auto` price when `caliban/auto` started it) cover the whole run.
+
+#### Stage timings
+
+The standard `Server-Timing` header says how long each stage of the request took, so browser dev tools, `curl -i` and APM agents show it without a Caliban client:
+
+```
+Server-Timing: auth;dur=0.210, route;dur=4.810;desc="knn", embed;dur=4.020, pii;dur=1.130, cache;dur=0.040;desc="miss", upstream;dur=182.400, upstream_total;dur=611.900, total;dur=618.700
+```
+
+| Metric | Stage |
+|---|---|
+| `auth` | Authentication and the rate-limit check |
+| `route` | Classification and model choice; `desc` is the stage that decided: `pinned` (a named model), `rules`, `knn` or `keyword` |
+| `embed` | The routing embedder call of Stage-1 kNN (part of `route`) |
+| `pii` | PII screening |
+| `cache` | Exact, then semantic cache lookup; `desc` is `hit` or `miss`. A hit has no `upstream` entries |
+| `upstream` | Upstream model, time to its response headers (first byte) |
+| `upstream_total` | Upstream model, the whole call (non-streaming responses) |
+| `node` | A node run that answered (the chat shortcut, `caliban/auto` handing to a node); `desc` is the run id, and `GET /v1/runs/{id}` has each step's duration |
+| `total` | Request start to the response headers |
+
+Stages that did not run are left out. Streams send their headers before the body, so they carry the stages known by then (`upstream` included, `upstream_total` not, and `node` with its run id but no duration); the stream itself is unchanged, since the OpenAI and Anthropic event formats have no place for Caliban metadata. Every usage event records the same durations as `timings` (`auth_ms`, `route_ms`, `embed_ms`, `pii_ms`, `cache_ms`, `upstream_ms`, `upstream_total_ms`, `total_ms`; for streams the upstream total and the total run to the end of the stream), stored in Postgres (`usage_event.timings`, migration 0036) and returned by `GET /api/v1/usage`. The deciding routing stage is not stored: like the intent it is content-class (see [Usage and routing records](#routing-calibanauto)). `[telemetry] server_timing = false` removes the header (the usage event keeps the durations); it only times the caller's own request, and caches are per tenant, so it gives no cross-tenant timing signal.
 
 `x-caliban-cache` stays `hit` for both cache tiers, so SDKs and dashboards that count `hit | miss | bypass` keep working (the Python SDK's usage model and the console's filters only accept those three values); usage events add `cache_tier` the same way.
 
@@ -217,6 +240,7 @@ Global flags: `--config` (`CALIBAN_CONFIG`, default `/etc/caliban/caliban.toml`)
 - `[cache.semantic]`: `enabled`, `store` (`qdrant` or `memory`), `qdrant_url`, `qdrant_api_key`, `collection_prefix`, `embedding_model`, `threshold`, `min_threshold`, `grey_band`, `max_error_rate`, `verify_rate`, `verify_answer_similarity`, `max_temperature`, `ttl_secs`, `lookup_budget_ms`, `embed_timeout_ms`, `query_prefix` (an instruction prepended before embedding; unset means the Qwen3-Embedding default `"Instruct: Given a user question, retrieve questions that ask exactly the same thing\nQuery: "` when the embedding model's catalogue `family` is `qwen3-embedding` (other embedders get no prefix: the instruction is written and calibrated for that model only), `""` turns it off, any other text replaces it; unless it equals `[routing] query_prefix`, a kNN-routed request embeds its prompt twice). `threshold` and `min_threshold` default to 0.91 with the default prefix (the second AWS run, end to end with the guards: 24 of 36 paraphrases hit, 0 of 38 near-misses; 14 of 36 without a prefix at 0.95 / 0.93) and to 0.95 / 0.93 with no prefix or a prefix of your own, which is not calibrated. Changing the prefix starts a cold cache: the prefix is part of the key, so entries embedded under another one are never compared (see [Cache](#request-pipeline) above and the annotated example). Caliban talks to Qdrant's REST port (6333), not gRPC (6334). The store and its URL are read at start-up; the switches, thresholds and budgets follow the live snapshot (split-mode routers get them from the control plane).
 - `[rag]`: `index` (`qdrant` or `memory`), `qdrant_url` (default `CALIBAN_QDRANT_URL`, then the semantic cache's), `qdrant_api_key`, `collection_prefix`, `index_concurrency`. Retrieval for the `builtin://rag_search` node tool; see [`docs/rag.md`](docs/rag.md).
 - `[pii]`: `default_mode` (`off`, `mask` or `reversible`).
+- `[telemetry]`: `server_timing` (default `true`): the `Server-Timing` response header (see [Stage timings](#stage-timings)).
 - `[limits]` and `[limits.tenants.<id>]`: `requests_per_minute`, `key_requests_per_minute`, `tokens_per_minute`, `tokens_per_day`, `usd_per_day`. Unset means unlimited. `[limits]` also takes `store` (`memory` or `valkey`), `valkey_key_prefix` and `valkey_timeout_ms` (see [Shared quotas](#shared-quotas-valkey)).
 - `[routing]` and `[routing.tenants.<id>]`: `caliban/auto` routing (embedder, kNN, floors, quality, flat price). See [Routing (`caliban/auto`)](#routing-calibanauto).
 - `[[providers]]`: deployment-wide model servers shared by tenants (see `open-models.example.toml`).
