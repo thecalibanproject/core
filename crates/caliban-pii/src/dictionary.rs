@@ -157,6 +157,16 @@ impl Detector for TenantDetectors {
 mod tests {
     use super::*;
 
+    /// Labels are case-insensitive: built-in names map to their types, custom ones are used
+    /// upper-cased (documented on `PiiPattern.label`).
+    #[test]
+    fn labels_are_case_insensitive() {
+        assert_eq!(entity_for_label("phone"), EntityType::Phone);
+        assert_eq!(entity_for_label(" Person "), EntityType::Person);
+        assert_eq!(entity_for_label("customer_id"), EntityType::Custom("CUSTOMER_ID".into()));
+        assert_eq!(entity_for_label("customer_id"), entity_for_label("CUSTOMER_ID"));
+    }
+
     #[test]
     fn matches_whole_words_case_insensitively() {
         let d = DictionaryDetector::new([

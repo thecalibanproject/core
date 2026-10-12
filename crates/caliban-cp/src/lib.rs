@@ -581,7 +581,7 @@ async fn list_tenants(
     State(cp): State<Cp>,
     Extension(p): Extension<Principal>,
     Query(q): Query<TenantList>,
-) -> Json<Vec<Tenant>> {
+) -> Json<Vec<Value>> {
     let visible = p.visible(Perm::TenantRead);
     Json(
         cp.store
@@ -589,9 +589,25 @@ async fn list_tenants(
             .tenants
             .iter()
             .filter(|t| (q.include_deleted || t.is_active()) && visible.contains(&t.id))
-            .cloned()
+            .map(|t| tenant_view(t, &p))
             .collect(),
     )
+}
+
+/// A tenant as `p` may see it. The PII detectors (`pii_patterns`, `pii_dictionary`, which may
+/// hold staff or customer names) are shown only to callers who may change them (`tenant.write`);
+/// everyone gets their counts (`pii_patterns_count`, `pii_dictionary_count`).
+fn tenant_view(t: &Tenant, p: &Principal) -> Value {
+    let mut v = serde_json::to_value(t).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("pii_patterns_count".into(), json!(t.pii_patterns.len()));
+        o.insert("pii_dictionary_count".into(), json!(t.pii_dictionary.len()));
+        if !p.allows(Perm::TenantWrite, Some(&t.id)) {
+            o.remove("pii_patterns");
+            o.remove("pii_dictionary");
+        }
+    }
+    v
 }
 
 #[derive(Deserialize)]
@@ -657,8 +673,12 @@ async fn create_tenant(
     Ok((StatusCode::CREATED, Json(t)))
 }
 
-async fn get_tenant(State(cp): State<Cp>, Path(tenant_id): Path<String>) -> ApiResult<Json<Tenant>> {
-    cp.store.state().tenant(&tenant_id).cloned().map(Json).ok_or_else(|| not_found("tenant"))
+async fn get_tenant(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path(tenant_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    cp.store.state().tenant(&tenant_id).map(|t| Json(tenant_view(t, &p))).ok_or_else(|| not_found("tenant"))
 }
 
 #[derive(Deserialize)]

@@ -3085,8 +3085,10 @@ components:
         region: { type: [string, 'null'] }
         pii_default: { type: string, enum: [off, mask, reversible] }
         semantic_cache: { type: string, enum: ['off', 'on'], default: 'off', description: 'T2 semantic cache for this tenant. `on`: eligible requests may be answered with the response to an earlier, semantically similar request of the same tenant (per-entry learned thresholds, deployment error budget). Entries never cross tenants. Also needs `[cache.semantic] enabled`.' }
-        pii_patterns: { type: array, items: { $ref: '#/components/schemas/PiiPattern' } }
-        pii_dictionary: { type: array, items: { $ref: '#/components/schemas/PiiTerm' } }
+        pii_patterns: { type: array, items: { $ref: '#/components/schemas/PiiPattern' }, description: 'Only for callers with `tenant.write` on the tenant (the dictionary may hold staff or customer names); others get `pii_patterns_count`.' }
+        pii_dictionary: { type: array, items: { $ref: '#/components/schemas/PiiTerm' }, description: 'Only for callers with `tenant.write` on the tenant; others get `pii_dictionary_count`.' }
+        pii_patterns_count: { type: integer, description: 'How many patterns the tenant has (every caller)' }
+        pii_dictionary_count: { type: integer, description: 'How many dictionary terms the tenant has (every caller)' }
         pii_on_sovereign: { type: boolean, default: false, description: 'The tenant''s PII mode also applies to models inside the trust boundary (`t0_sovereign`, `t1_attested`). Off by default: those models receive the text as is. External models always get the mode; a request''s `caliban.pii_floor` (a node''s `guardrails.pii`) applies to every model class.' }
         pii_surrogate_scope: { type: string, enum: [tenant, session], default: tenant, description: 'Surrogate consistency for reversible PII. `tenant`: the same value always gets the same surrogate in this tenant (keyed HMAC per tenant, derived from CALIBAN_KEK), so pseudonymised requests can hit the exact cache; sessions of the tenant become linkable through their surrogates. `session`: fresh surrogates per request. Surrogates never cross tenants.' }
         auto_cache_hit_fraction: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'Share of the flat `caliban/auto` price billed when a cache tier (exact or semantic) answers this tenant''s request: no model is called. `null`: the deployment''s `[routing] auto_cache_hit_fraction` (default 0.2) applies.' }
@@ -3101,15 +3103,15 @@ components:
       required: [label, pattern]
       additionalProperties: false
       properties:
-        label: { type: string, pattern: '^[A-Za-z0-9_]{1,40}$', description: 'NATIONAL_ID, PHONE, EMAIL, PERSON, ORG, LOCATION, IBAN or CARD use the built-in surrogates; other labels are custom (shape-preserving surrogates).' }
+        label: { type: string, pattern: '^[A-Za-z0-9_]{1,40}$', description: 'Case-insensitive (stored as sent, used upper-cased: `phone` is `PHONE`). NATIONAL_ID, PHONE, EMAIL, PERSON, ORG, LOCATION, IBAN or CARD (and the aliases ID, NATIONALID, NAME, ORGANIZATION, ADDRESS) use the built-in surrogates; other labels are custom (shape-preserving surrogates; masked as `[LABEL]` upper-cased).' }
         pattern: { type: string, maxLength: 500, description: 'A regex in the Rust regex crate''s syntax (linear time: no backreferences or lookaround); must not match the empty string.' }
     PiiTerm:
       type: object
       required: [term, label]
       additionalProperties: false
       properties:
-        term: { type: string, minLength: 2, maxLength: 200 }
-        label: { type: string, pattern: '^[A-Za-z0-9_]{1,40}$' }
+        term: { type: string, minLength: 2, maxLength: 200, description: 'Matched as a whole word, case-insensitively' }
+        label: { type: string, pattern: '^[A-Za-z0-9_]{1,40}$', description: 'Case-insensitive, as for `PiiPattern.label`' }
     TenantCreate:
       type: object
       required: [name]

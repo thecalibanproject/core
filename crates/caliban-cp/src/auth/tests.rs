@@ -1303,6 +1303,41 @@ async fn tenant_roles_only_see_their_tenants() {
     assert!(me["permissions"]["tenants"].get("globex").is_none());
 }
 
+/// The tenant's PII dictionary and patterns may hold staff or customer names: only callers who
+/// may change them (`tenant.write`) read them; `tenant.read` alone gets their counts.
+#[tokio::test]
+async fn pii_detectors_are_shown_only_to_tenant_writers() {
+    let cp = matrix_cp().await;
+    let app = app(Arc::clone(&cp), None);
+    let detectors = json!({"pii_patterns": [{"label": "NATIONAL_ID", "pattern": "\\bLB-\\d{4}\\b"}],
+                           "pii_dictionary": [{"term": "Rania Khoury", "label": "person"}]});
+    let r =
+        send(&app, "PATCH", "/api/v1/tenants/acme", &[("authorization", &bearer(BREAK_GLASS))], Some(detectors)).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    for (who, groups, sees) in [
+        ("viewer", &["acme-viewers"][..], false),
+        ("billing", &["acme-billing"][..], false),
+        ("auditor", &["caliban-auditors"][..], false),
+        ("tenant_admin", &["acme-admins"][..], true),
+        ("admin", &["caliban-admins"][..], true),
+    ] {
+        let cookie = format!("caliban_session={}", session_for(&cp, who, groups).await);
+        let one = send(&app, "GET", "/api/v1/tenants/acme", &[("cookie", &cookie)], None).await.body;
+        let list = send(&app, "GET", "/api/v1/tenants", &[("cookie", &cookie)], None).await.body;
+        let listed = list.as_array().unwrap().iter().find(|t| t["id"] == "acme").unwrap().clone();
+        for t in [&one, &listed] {
+            assert_eq!(
+                (t["pii_patterns_count"].as_u64(), t["pii_dictionary_count"].as_u64()),
+                (Some(1), Some(1)),
+                "{who}"
+            );
+            assert_eq!(t.get("pii_dictionary").is_some(), sees, "{who}: {t}");
+            assert_eq!(t.get("pii_patterns").is_some(), sees, "{who}: {t}");
+            assert_eq!(t.to_string().contains("Rania"), sees, "{who}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn role_bindings_take_effect_at_once_and_owner_is_guarded() {
     let cp = matrix_cp().await;
