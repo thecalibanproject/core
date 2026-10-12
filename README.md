@@ -544,7 +544,7 @@ CALIBAN_TEST_DATABASE_URL=postgres://postgres:x@127.0.0.1:55432/postgres CALIBAN
 cargo test -p caliban-rag --test eval -- --nocapture
 
 # Semantic cache against a real Qdrant (tenant isolation, TTL, learning, latency):
-docker run -d --rm -p 56333:6333 --name caliban-qdrant-test qdrant/qdrant:v1.19.1-unprivileged
+docker run -d --rm -p 56333:6333 --name caliban-qdrant-test qdrant/qdrant:v1.19.2-unprivileged
 CALIBAN_TEST_QDRANT_URL=http://127.0.0.1:56333 cargo test -p caliban-cache --test qdrant -- --nocapture
 CALIBAN_TEST_QDRANT_URL=http://127.0.0.1:56333 cargo test --release -p caliban-gateway semantic_miss_latency -- --nocapture
 # Routing latency report; CALIBAN_TEST_PERF=1 also enforces the 25 ms kNN p99 budget (plain

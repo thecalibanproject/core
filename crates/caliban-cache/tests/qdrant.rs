@@ -1,7 +1,7 @@
 //! T2 store against a real Qdrant. Skipped unless `CALIBAN_TEST_QDRANT_URL` is set, e.g.
 //!
 //! ```sh
-//! docker run -d --name caliban-qdrant-test -p 6333:6333 qdrant/qdrant:v1.19.1-unprivileged
+//! docker run -d --name caliban-qdrant-test -p 6333:6333 qdrant/qdrant:v1.19.2-unprivileged
 //! CALIBAN_TEST_QDRANT_URL=http://127.0.0.1:6333 cargo test -p caliban-cache --test qdrant -- --nocapture
 //! ```
 

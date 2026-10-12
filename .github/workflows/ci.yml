@@ -121,8 +121,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       qdrant:
-        # Same image as the deploy compose file.
-        image: qdrant/qdrant:v1.19.1-unprivileged
+        # 1.19.2: filtered HNSW search fix (every retrieval search is filtered, docs/rag.md).
+        image: qdrant/qdrant:v1.19.2-unprivileged
         env:
           QDRANT__TELEMETRY_DISABLED: "true"
         ports:

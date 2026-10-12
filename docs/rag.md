@@ -236,8 +236,8 @@ index_concurrency = 2             # documents one process indexes at once
   documents are not indexed and `rag_search` is unavailable (logged at start).
 - **Qdrant 1.19.2 or later** for production: every search is filtered (`state = ready`), and
   earlier versions could return no results when the HNSW entry point did not match the filter
-  (note 06). Small collections are searched exactly and are not affected. The CI service is
-  still 1.19.1, the image of the `deploy` compose file.
+  (note 06). Small collections are searched exactly and are not affected. The CI service and
+  the test commands use 1.19.2.
 - **Worker database role:** add `GRANT SELECT, UPDATE ON rag_collection, rag_document TO
   caliban_worker;` (see [nodes.md](nodes.md#where-runs-execute)). Workers never insert or delete
   registry rows.
