@@ -1725,15 +1725,21 @@ mod auto_routing {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
+    /// A batch holding a text with [`GATED`] waits for the test: the embedder sends a reply slot
+    /// here and answers the batch with vectors (`true`) or a `503` (`false`).
+    type Gate = tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<bool>>;
+    const GATED: &str = "zorblax";
+
     /// OpenAI-compatible `/v1/embeddings` returning `caliban_route::hash_embed` vectors after
     /// `delay_ms` (shared, so a test can slow the embedder down after warm-up). Every input text
     /// is recorded in `seen`.
-    async fn mock_embedder(delay_ms: Arc<AtomicU64>, seen: Arc<Mutex<Vec<String>>>) -> String {
+    async fn mock_embedder(delay_ms: Arc<AtomicU64>, seen: Arc<Mutex<Vec<String>>>, gate: Option<Gate>) -> String {
         let app = Router::new().route(
             "/v1/embeddings",
             post(move |Json(b): Json<Value>| {
                 let delay = Duration::from_millis(delay_ms.load(Ordering::SeqCst));
                 let seen = Arc::clone(&seen);
+                let gate = gate.clone();
                 async move {
                     tokio::time::sleep(delay).await;
                     let inputs: Vec<String> = match &b["input"] {
@@ -1741,10 +1747,17 @@ mod auto_routing {
                         Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
                         _ => vec![],
                     };
+                    if let Some(gate) = gate.filter(|_| inputs.len() > 1 && inputs.iter().any(|t| t.contains(GATED))) {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        gate.send(tx).unwrap();
+                        if !rx.await.unwrap_or(false) {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                    }
                     seen.lock().unwrap().extend(inputs.iter().cloned());
                     let data: Vec<Value> =
                         inputs.iter().enumerate().map(|(i, t)| json!({"object": "embedding", "index": i, "embedding": caliban_route::hash_embed(t, 256)})).collect();
-                    Json(json!({"object": "list", "data": data, "model": b["model"], "usage": {"prompt_tokens": 1, "total_tokens": 1}}))
+                    Json(json!({"object": "list", "data": data, "model": b["model"], "usage": {"prompt_tokens": 1, "total_tokens": 1}})).into_response()
                 }
             }),
         );
@@ -1766,10 +1779,17 @@ mod auto_routing {
     }
 
     async fn setup(routing: &str) -> Env {
+        setup_gated(routing, None).await
+    }
+
+    /// With a gate, exemplar batches holding [`GATED`] wait for the test, and a failed build is
+    /// due for a retry at once.
+    async fn setup_gated(routing: &str, gate: Option<Gate>) -> Env {
         let (base, _log) = mock_upstream().await;
         let delay = Arc::new(AtomicU64::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let emb = mock_embedder(delay.clone(), Arc::clone(&seen)).await;
+        let gated = gate.is_some();
+        let emb = mock_embedder(delay.clone(), Arc::clone(&seen), gate).await;
         let toml = format!(
             r#"
 [routing]
@@ -1839,13 +1859,15 @@ api_key_hashes = ["{acme}"]
         );
         let usage = RecentUsage::default();
         let store = Arc::new(MemoryStore::default());
-        let gw = Arc::new(
-            Gateway::new(
-                ConfigHandle::new(Snapshot::new(Config::from_toml_str(&toml).unwrap(), "test")),
-                Arc::new(usage.clone()),
-            )
-            .with_semantic_store(store.clone()),
-        );
+        let mut gw = Gateway::new(
+            ConfigHandle::new(Snapshot::new(Config::from_toml_str(&toml).unwrap(), "test")),
+            Arc::new(usage.clone()),
+        )
+        .with_semantic_store(store.clone());
+        if gated {
+            gw.router = caliban_route::Router::default().with_retry_after(Duration::ZERO);
+        }
+        let gw = Arc::new(gw);
         gw.warm_router().await;
         assert!(gw.router.knn_ready(), "kNN index built from the mock embedder");
         Env { app: app(Arc::clone(&gw)), gw, usage, delay, seen, store }
@@ -2098,6 +2120,109 @@ api_key_hashes = ["{acme}"]
         assert_eq!(hit.cost_usd, Some(0.0));
         assert!(close(hit.saved_usd, miss.cost_usd.unwrap()), "{:?} vs {:?}", hit.saved_usd, miss.cost_usd);
         assert!(hit.flat_price_usd.is_none() && hit.billed_usd.is_none() && hit.routed_model_cost_usd.is_none());
+    }
+
+    const ZORBLAX: [&str; 5] = [
+        "zorblax the quarterly frobnication widget",
+        "zorblax the frobnication widget for the quarter",
+        "please zorblax the quarterly frobnication widget",
+        "zorblax our frobnication widget this quarter",
+        "can you zorblax the quarterly frobnication widget",
+    ];
+
+    /// A guard against a hang (the test synchronizes on signals; this only bounds a failure).
+    async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(30), f).await.expect("signal within 30 s")
+    }
+
+    /// The intent `caliban/auto` picks for `text` (acme), through the request-path routing call.
+    async fn intent_of(env: &Env, text: &str) -> String {
+        let snap = env.gw.config.load();
+        let tenant = snap.tenant(&"acme".into()).unwrap().clone();
+        let req = caliban_ir::ChatRequest::from_openai_json(auto(text, false).to_string().as_bytes()).unwrap();
+        route_embed::route(&env.gw, &snap, &tenant, &req).await.0.unwrap().intent
+    }
+
+    async fn healthz(env: &Env) -> Value {
+        let req = Request::get("/healthz").body(Body::empty()).unwrap();
+        let resp = env.app.clone().oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Applies a snapshot that gives acme the `zorblax` intent (as `PUT /tenants/acme/intents`
+    /// does through the control plane).
+    fn apply_zorblax(env: &Env, version: &str) {
+        let mut cfg = env.gw.config.load().config.clone();
+        cfg.routing
+            .tenants
+            .entry("acme".into())
+            .or_default()
+            .exemplars
+            .insert("zorblax".into(), ZORBLAX.iter().map(|t| (*t).to_owned()).collect());
+        env.gw.config.store(Snapshot::new(cfg, version));
+    }
+
+    /// A snapshot with new exemplars starts the rebuild when it is applied, with no request; while
+    /// it is in flight requests route with the old index; once the status reports the new version,
+    /// the very next request uses the new index, and `/healthz` shows it.
+    #[tokio::test]
+    async fn applied_snapshot_rebuilds_the_index_eagerly_and_swaps_it_in() {
+        let (gate, mut calls) = tokio::sync::mpsc::unbounded_channel();
+        let env = setup_gated("", Some(gate)).await;
+        let before = env.gw.router.status();
+        assert_eq!(before.version.as_deref(), Some("test"));
+        let gw = Arc::clone(&env.gw);
+        let task = tokio::spawn(async move { gw.keep_router_fresh().await });
+        let mut status = env.gw.router.subscribe();
+
+        apply_zorblax(&env, "v2");
+        // The embedder sees the new exemplars without any request having been made.
+        let reply = within(calls.recv()).await.unwrap();
+        assert!(env.gw.router.status().building);
+        assert_ne!(intent_of(&env, ZORBLAX[0]).await, "zorblax", "old index while the build is in flight");
+        let h = healthz(&env).await;
+        assert_eq!((h["config_version"].as_str(), h["routing"]["version"].as_str()), (Some("v2"), Some("test")));
+        assert_eq!(
+            (h["routing"]["building"].as_bool(), h["routing"]["exemplars"].as_u64()),
+            (Some(true), Some(before.exemplars as u64))
+        );
+
+        reply.send(true).unwrap();
+        within(status.wait_for(|s| s.version.as_deref() == Some("v2"))).await.unwrap();
+        assert_eq!(intent_of(&env, ZORBLAX[0]).await, "zorblax");
+        let h = healthz(&env).await;
+        assert_eq!(h["routing"]["version"], "v2");
+        assert_eq!(h["routing"]["exemplars"].as_u64(), Some((before.exemplars + ZORBLAX.len()) as u64));
+        assert_eq!((h["routing"]["building"].as_bool(), h["routing"]["knn"].as_bool()), (Some(false), Some(true)));
+        assert!(h["routing"]["last_error"].is_null());
+        task.abort();
+    }
+
+    /// A failed embedder call during the rebuild keeps the old index (and reports the error); the
+    /// build is retried when due, without a request or a new snapshot, and then swapped in.
+    #[tokio::test]
+    async fn failed_rebuild_keeps_the_old_index_and_retries() {
+        let (gate, mut calls) = tokio::sync::mpsc::unbounded_channel();
+        let env = setup_gated("", Some(gate)).await;
+        let before = env.gw.router.status();
+        let gw = Arc::clone(&env.gw);
+        let task = tokio::spawn(async move { gw.keep_router_fresh().await });
+        let mut status = env.gw.router.subscribe();
+
+        apply_zorblax(&env, "v2");
+        within(calls.recv()).await.unwrap().send(false).unwrap();
+        within(status.wait_for(|s| s.last_error.is_some())).await.unwrap();
+        let st = env.gw.router.status();
+        assert_eq!((st.version.as_deref(), st.exemplars, st.knn), (Some("test"), before.exemplars, true));
+        assert_ne!(intent_of(&env, ZORBLAX[0]).await, "zorblax", "the old index still serves");
+        assert!(healthz(&env).await["routing"]["last_error"].as_str().is_some_and(|e| !e.is_empty()));
+
+        // The retry (due at once in this setup) reaches the embedder again.
+        within(calls.recv()).await.unwrap().send(true).unwrap();
+        within(status.wait_for(|s| s.version.as_deref() == Some("v2") && s.last_error.is_none())).await.unwrap();
+        assert_eq!(intent_of(&env, ZORBLAX[0]).await, "zorblax");
+        task.abort();
     }
 
     /// Added routing latency through the real adapter (HTTP to a local mock embedder) versus the
