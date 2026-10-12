@@ -124,6 +124,7 @@ async fn detail(cp: &Cp, j: &Arc<dyn Journal>, r: &RunRecord, content: bool) -> 
         "cancelled_by": r.cancelled_by,
         "budget": r.budget,
         "cost_usd": r.budget.usd,
+        "model_cost_usd": caliban_nodes::journal::usd_total(steps.iter().map(|s| s.model_cost_usd)),
         "usage": RunUsage::of(&steps),
         "claims": r.claims,
         "last_event": r.last_event,
@@ -133,6 +134,16 @@ async fn detail(cp: &Cp, j: &Arc<dyn Journal>, r: &RunRecord, content: bool) -> 
         "content_visible": content,
         "steps": steps.iter().map(StepView::of).collect::<Vec<_>>(),
     });
+    // The answer guard's check is metadata (labels, rules, pointers and the action, never text),
+    // sealed with the run's events: shown with `runs.read` when the data key opens it.
+    if let Some(ev) = j.event(&r.id, caliban_nodes::executor::answer::EVENT).await.map_err(journal_error)?
+        && let Some(check) = sealer(cp)
+            .ok()
+            .and_then(|s| ev.payload.as_deref().and_then(|x| s.open(&r.tenant_id, &r.id, x).ok()))
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    {
+        v["answer_check"] = check;
+    }
     if content {
         let s = sealer(cp)?;
         let open = |sealed: &Option<String>| -> Value {

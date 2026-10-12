@@ -3728,20 +3728,7 @@ components:
             fanout_used: { type: integer, description: 'Widest map reached' }
         cost_usd: { type: number, description: 'What the run spent on model calls so far (USD): the sum of `charged_usd` over its usage events. For a run `caliban/auto` started, the flat auto price.' }
         model_cost_usd: { type: number, description: 'The real cost of the models its calls were routed to; equals `cost_usd` unless the run is billed as `caliban/auto`.' }
-        answer_check:
-          type: object
-          description: 'The answer guard (docs/nodes.md): present when the final output carried untrusted labels.'
-          properties:
-            labels: { type: array, items: { type: string } }
-            findings:
-              type: array
-              items:
-                type: object
-                properties:
-                  rule: { type: string, enum: [untrusted_link, untrusted_contact, untrusted_reference, instruction_echo] }
-                  label: { type: string }
-                  at: { type: string, description: 'JSON pointer into the output' }
-            action: { type: string, enum: [passed, redacted, refused] }
+        answer_check: { $ref: '#/components/schemas/AnswerCheck' }
         usage: { $ref: '#/components/schemas/RunUsage' }
         steps:
           type: array
@@ -3843,6 +3830,20 @@ components:
           additionalProperties: true
           description: 'By type: step events `step`, `vertex`, `kind`, `labels`, and on finish `status`, `tokens`, `prompt_tokens`, `completion_tokens`, `usd`, `cost_usd`, `duration_ms`; `run.input_required` `step`, `question`; `run.input_received` `step`, `by`; `run.finished` `status`, `error`, `stop_reason`, `cost_usd`.'
         run: { $ref: '#/components/schemas/NodeRun', description: 'On the last event of a stream' }
+    AnswerCheck:
+      type: object
+      description: 'The answer guard (docs/nodes.md): present when the final output carried untrusted labels.'
+      properties:
+        labels: { type: array, items: { type: string } }
+        findings:
+          type: array
+          items:
+            type: object
+            properties:
+              rule: { type: string, enum: [untrusted_link, untrusted_contact, untrusted_reference, instruction_echo] }
+              label: { type: string }
+              at: { type: string, description: 'JSON pointer into the output' }
+        action: { type: string, enum: [passed, redacted, refused] }
     ConsoleRun:
       type: object
       required: [id, object, node, version, status, steps, budget, content_visible, created_at]
@@ -3868,7 +3869,9 @@ components:
         cancel_requested: { type: boolean }
         cancelled_by: { type: [string, 'null'] }
         budget: { type: object, additionalProperties: true }
-        cost_usd: { type: number }
+        cost_usd: { type: number, description: 'What the run is billed (the flat auto price for a run `caliban/auto` started)' }
+        model_cost_usd: { type: number, description: 'The real cost of the models its calls were routed to; equals `cost_usd` unless the run is billed as `caliban/auto`.' }
+        answer_check: { $ref: '#/components/schemas/AnswerCheck', description: 'With `runs.read` (metadata only: labels, rules, pointers, the action; never text). Absent when the output carried no untrusted labels or the data key cannot be opened.' }
         usage: { $ref: '#/components/schemas/RunUsage' }
         claims: { type: integer }
         last_event: { type: integer }

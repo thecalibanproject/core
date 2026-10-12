@@ -701,3 +701,53 @@ async fn an_injection_in_a_retrieved_document_cannot_drive_a_write() {
         }
     }
 }
+
+/// A catalogue row with a phone in its own field and another in its free text: the answer keeps
+/// the field's (quoted data) and loses the free text's (answer guard, rule 1). The console's run
+/// detail shows the check and the models' real cost, as the data plane's run does.
+#[tokio::test]
+async fn a_whole_field_contact_reaches_the_answer_and_the_console_shows_the_check() {
+    const FIELD: &str = "+33 1 42 68 53 00";
+    const LIFTED: &str = "+33 6 12 34 56 78";
+    let model = Responder::new(|body| {
+        let msgs = body["messages"].as_array()?;
+        if let Some(t) = msgs.iter().find(|m| m["role"] == "tool") {
+            let row: Value = serde_json::from_str(t["content"].as_str()?).ok()?;
+            let row = if row["phone"].is_null() { row["structuredContent"].clone() } else { row };
+            let text = format!("Call the clinic on {}. {}", row["phone"].as_str()?, row["description"].as_str()?);
+            return Some(json!({"role": "assistant", "content": text}));
+        }
+        Some(json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_0", "type": "function", "function": {"name": "catalogue", "arguments": "{}"}}]}))
+    });
+    let j = journal().await;
+    let e = env_from(Duration::ZERO, Some(Arc::clone(&j)), model, |url| config_with(url, "")).await;
+    // PII protection off: this test is about the answer guard (issue 2 of the e2e follow-ups:
+    // with `reversible` or `mask` the caller gets a surrogate or a mask instead).
+    let (s, v) =
+        send(&e.cp_app, "PATCH", "/api/v1/tenants/acme", ADMIN, Some(json!({"pii_default": "off"})), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let m = manifest("catalogue", "Finds clinics.");
+    let row = json!({"name": "Cardiology clinic", "phone": FIELD,
+                     "description": format!("Walk-ins welcome. For urgent cases call {LIFTED}.")});
+    let srv = TestMcpServer::start(vec![TestTool::new(m.clone(), move |_| Ok(row.clone()))], &[]).await;
+    let r = register(&e, "cat", &srv, &[&m], false).await;
+    let spec = json!({"kind": "agent", "prompt": {"system": "You find clinics."}, "model_policy": {},
+        "budgets": budgets(), "tools": [{"ref": r[0], "effect": "read"}]});
+    e.publish("finder", spec).await;
+    let w = worker(&e, &j, &idem(), None, "worker-1", Duration::from_secs(30));
+    let (s, run) =
+        send(&w.app, "POST", "/v1/nodes/finder/runs", KEY, Some(json!({"input": "find a cardiologist"})), &[]).await;
+    assert_eq!((s, run["status"].as_str()), (StatusCode::OK, Some("succeeded")), "{run}");
+    let out = run["output"].as_str().unwrap();
+    assert!(out.contains(FIELD), "the field's phone is quoted data: {out}");
+    assert!(!out.contains(LIFTED) && out.contains(caliban_nodes::executor::answer::REMOVED), "{out}");
+    assert_eq!(run["answer_check"]["action"], "redacted", "{run}");
+
+    let id = run["id"].as_str().unwrap();
+    let (s, c) = send(&e.cp_app, "GET", &format!("/api/v1/tenants/acme/runs/{id}"), ADMIN, None, &[]).await;
+    assert_eq!(s, StatusCode::OK, "{c}");
+    assert_eq!(c["answer_check"], run["answer_check"]);
+    assert!(c["model_cost_usd"].is_number(), "{c}");
+    assert_eq!(c["model_cost_usd"], run["model_cost_usd"]);
+}
