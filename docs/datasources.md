@@ -51,8 +51,12 @@ human to review (below).
 
 `GET /api/v1/datasources/{id}/introspection` (`datasources.read`) shows the newest job:
 `status` (`running`, `succeeded`, `failed`), `objects`, `proposed`, `skipped`, `version`,
-`error`. The job is kept by the control plane that ran it (the last 100); the datasource's
-`status` (`introspecting`, then `ready` or `failed`) is stored and every replica sees it.
+`error`, `started_at`, `finished_at`. The newest job of each datasource is stored, so every
+control-plane replica answers and refuses a second start (`409`) while one runs, wherever it
+runs; the datasource's `status` follows it (`introspecting`, then `ready` or `failed`). A job
+whose control plane stopped before it ended shows as `failed` once it is older than the job
+timeout (10 minutes) and a minute, and may be started again. Each start and end is audited as
+`datasource.introspection` (counts and outcome, never the error text).
 
 **Re-runs** keep human decisions: element ids are deterministic, and a proposal whose element was
 already reviewed (approved, rejected, deprecated, stale) is skipped, as is one identical to the

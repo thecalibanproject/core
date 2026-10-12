@@ -1630,7 +1630,7 @@ paths:
                   job_id: { type: string }
                   job: { $ref: '#/components/schemas/IntrospectionJob' }
         '404': { $ref: '#/components/responses/Error' }
-        '409': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error', description: 'A job of this datasource is running (on any replica)' }
         '422': { $ref: '#/components/responses/Error' }
 
   /api/v1/datasources/{datasourceId}/introspection:
@@ -1641,7 +1641,8 @@ paths:
         schema: { type: string }
     get:
       tags: [ontology]
-      summary: The newest introspection job of the datasource (on the control plane that ran it)
+      summary: The newest introspection job of the datasource (stored; every control-plane replica answers)
+      description: A job whose control plane stopped before it ended is shown `failed` once it is older than the job timeout (10 minutes) and a minute.
       responses:
         '200':
           description: OK
@@ -3375,6 +3376,7 @@ components:
         source: { type: string, enum: [api] }
     IntrospectionJob:
       type: object
+      required: [id, datasource_id, tenant_id, status, objects, proposed, skipped, version, started_at]
       properties:
         id: { type: string }
         datasource_id: { type: string }

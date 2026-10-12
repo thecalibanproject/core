@@ -67,7 +67,6 @@ pub struct ControlPlane {
     rag: Option<Arc<dyn caliban_rag::store::RagStore>>,
     /// Datasource introspection (the ontology bootstrap) and the jobs this process ran.
     introspector: Arc<dyn introspect::Introspector>,
-    pub(crate) introspections: introspect::Jobs,
 }
 
 /// The last signed snapshot, re-served while the rendered config is unchanged.
@@ -94,7 +93,6 @@ impl ControlPlane {
             journal: None,
             rag: None,
             introspector: Arc::new(introspect::MongoIntrospector),
-            introspections: introspect::Jobs::default(),
         }
     }
 
@@ -1110,7 +1108,7 @@ async fn introspect_datasource(
             format!("datasource kind '{}' has no introspection yet (only mongodb)", ds.kind),
         ));
     }
-    if cp.introspections.running(&id) {
+    if cp.store.state().introspections.get(&id).is_some_and(|j| j.running_at(chrono::Utc::now())) {
         return Err(ApiError(StatusCode::CONFLICT, "an introspection of this datasource is running".into()));
     }
     // Credentials: sealed under the tenant's data key, opened here only for the connector.
@@ -1124,12 +1122,11 @@ async fn introspect_datasource(
     };
     let connection = introspect::resolve_references(&connection)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("the connection's references: {e}")))?;
-    cp.store.apply(&p.actor, Mutation::SetDatasourceStatus { id: id.clone(), status: "introspecting".into() }).await?;
     let job = introspect::Job {
         id: new_id("job"),
         datasource_id: id,
         tenant_id: ds.tenant_id.clone(),
-        status: "running",
+        status: "running".into(),
         objects: 0,
         proposed: 0,
         skipped: 0,
@@ -1138,15 +1135,20 @@ async fn introspect_datasource(
         started_at: chrono::Utc::now(),
         finished_at: None,
     };
-    cp.introspections.put(job.clone());
+    // Stored: every replica sees it, and a second start (here or on another replica) is refused.
+    cp.store.apply(&p.actor, Mutation::RecordIntrospection(job.clone())).await?;
     tokio::spawn(introspect::run(Arc::clone(&cp), job.clone(), connection, ds.kind));
     Ok((StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "job": job}))))
 }
 
-/// `GET /api/v1/datasources/{id}/introspection`: the newest introspection job of the datasource
-/// run by this control plane (`404` when none).
+/// `GET /api/v1/datasources/{id}/introspection`: the newest introspection job of the datasource,
+/// whichever control plane ran it (`404` when none).
 async fn get_introspection(State(cp): State<Cp>, Path(id): Path<String>) -> ApiResult<Json<introspect::Job>> {
-    cp.introspections.latest(&id).map(Json).ok_or_else(|| not_found("introspection job"))
+    let st = cp.store.state();
+    st.introspections
+        .get(&id)
+        .map(|j| Json(j.clone().as_of(chrono::Utc::now())))
+        .ok_or_else(|| not_found("introspection job"))
 }
 
 #[derive(Deserialize)]

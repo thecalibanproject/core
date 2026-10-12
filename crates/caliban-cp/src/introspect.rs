@@ -15,9 +15,11 @@
 //! overwrites a human decision. A proposal identical to the pending one is skipped too, so a
 //! re-run that finds nothing new makes no version.
 //!
-//! **Jobs** are kept by the control plane that runs them (the last 100): `GET
-//! /api/v1/datasources/{id}/introspection` answers on that replica. The datasource's `status`
-//! (`introspecting`, then `ready` or `failed`) is stored and seen by every replica.
+//! **Jobs** are stored (the newest per datasource), so every control-plane replica answers `GET
+//! /api/v1/datasources/{id}/introspection` and refuses a second job while one runs. The
+//! datasource's `status` follows the job: `introspecting`, then `ready` or `failed`. A job whose
+//! control plane stopped before it ended is reported `failed` once it is older than the job
+//! timeout and a minute, and may be started again.
 //!
 //! The LLM proposal pass (names, descriptions, PII classes from redacted samples) is not part of
 //! this job yet: names come from the deterministic rules.
@@ -25,15 +27,12 @@
 use crate::store::{Mutation, State};
 use caliban_connect::SchemaSnapshot;
 use caliban_ontology::{Element, Status};
-use chrono::{DateTime, Utc};
-use serde::Serialize;
+use chrono::Utc;
 use serde_json::Value;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// How long one introspection may take.
 pub const JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-const KEEP_JOBS: usize = 100;
 
 /// Takes a schema snapshot of a datasource (MongoDB in production; a fixed one in tests).
 #[async_trait::async_trait]
@@ -60,54 +59,8 @@ impl Introspector for MongoIntrospector {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct Job {
-    pub id: String,
-    pub datasource_id: String,
-    pub tenant_id: String,
-    /// `running`, `succeeded` or `failed`.
-    pub status: &'static str,
-    /// Collections (objects) the snapshot found.
-    pub objects: usize,
-    /// Elements written as proposals.
-    pub proposed: usize,
-    /// Proposals skipped: already reviewed by a human, or unchanged.
-    pub skipped: usize,
-    /// The ontology version the proposals were written in (`None`: nothing new).
-    pub version: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub started_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<DateTime<Utc>>,
-}
-
-/// The jobs this control plane ran (newest last).
-#[derive(Default)]
-pub struct Jobs(parking_lot::Mutex<VecDeque<Job>>);
-
-impl Jobs {
-    pub fn put(&self, j: Job) {
-        let mut q = self.0.lock();
-        if let Some(x) = q.iter_mut().find(|x| x.id == j.id) {
-            *x = j;
-            return;
-        }
-        q.push_back(j);
-        while q.len() > KEEP_JOBS {
-            q.pop_front();
-        }
-    }
-
-    /// The newest job of a datasource.
-    pub fn latest(&self, datasource_id: &str) -> Option<Job> {
-        self.0.lock().iter().rev().find(|j| j.datasource_id == datasource_id).cloned()
-    }
-
-    pub fn running(&self, datasource_id: &str) -> bool {
-        self.0.lock().iter().any(|j| j.datasource_id == datasource_id && j.status == "running")
-    }
-}
+/// An introspection job (stored: [`crate::store::IntrospectionJob`]).
+pub type Job = crate::store::IntrospectionJob;
 
 /// Which proposals to write: not ones whose element a human already reviewed, not ones identical
 /// to the pending proposal. Returns `(to write, skipped)`.
@@ -172,19 +125,14 @@ pub async fn run(cp: Arc<crate::ControlPlane>, mut job: Job, connection: Value, 
             }
         }
     };
-    let ds_status = match &result {
-        Ok(()) => "ready",
-        Err(e) => {
-            tracing::warn!(datasource = %job.datasource_id, tenant = %job.tenant_id, error = %e, "introspection failed");
-            "failed"
-        }
-    };
-    job.status = if result.is_ok() { "succeeded" } else { "failed" };
+    if let Err(e) = &result {
+        tracing::warn!(datasource = %job.datasource_id, tenant = %job.tenant_id, error = %e, "introspection failed");
+    }
+    job.status = if result.is_ok() { "succeeded" } else { "failed" }.into();
     job.error = result.err();
     job.finished_at = Some(Utc::now());
-    let m = Mutation::SetDatasourceStatus { id: job.datasource_id.clone(), status: ds_status.into() };
-    if let Err(e) = cp.store.apply("introspection", m).await {
-        tracing::warn!(datasource = %job.datasource_id, error = %e, "recording the datasource's status failed");
+    let actor = format!("introspection:{}", job.id);
+    if let Err(e) = cp.store.apply(&actor, Mutation::RecordIntrospection(job.clone())).await {
+        tracing::warn!(datasource = %job.datasource_id, error = %e, "recording the introspection job failed");
     }
-    cp.introspections.put(job);
 }

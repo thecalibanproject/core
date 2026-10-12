@@ -448,6 +448,7 @@ async fn suite(s: &Store) {
         s.apply(A, Mutation::SetDatasourceStatus { id: "nope".into(), status: "x".into() }).await.unwrap_err(),
         StoreError::NotFound("datasource".into())
     );
+    introspection_jobs(s).await;
 
     // ── nodes: versions assigned by the store ──
     for id in ["node_1", "node_2"] {
@@ -1391,12 +1392,65 @@ fn normalize(st: &State) -> Value {
         "nodes": st.nodes.iter().map(|n| json!([n, n.sealed_spec.is_some()])).collect::<Vec<_>>(),
         "promotions": st.promotions,
         "ontologies": st.ontologies,
+        "introspections": st.introspections,
         "users": st.users,
         "role_bindings": st.role_bindings,
         "audit_head": st.audit_head,
     });
     strip(&mut v);
     v
+}
+
+/// Introspection jobs are stored (every replica answers): the newest per datasource, the
+/// datasource's status follows it, and a second job is refused while one runs (unless the running
+/// one is abandoned, judged at the new job's start).
+async fn introspection_jobs(s: &Store) {
+    let job = |id: &str, status: &str, started: DateTime<Utc>| IntrospectionJob {
+        id: id.into(),
+        datasource_id: "ds_1".into(),
+        tenant_id: "globex".into(),
+        status: status.into(),
+        objects: 0,
+        proposed: 0,
+        skipped: 0,
+        version: None,
+        error: None,
+        started_at: started,
+        finished_at: None,
+    };
+    let window = chrono::Duration::from_std(IntrospectionJob::ABANDONED_AFTER).unwrap();
+    s.apply(A, Mutation::RecordIntrospection(job("job_1", "running", ts()))).await.unwrap();
+    assert_eq!(s.state().datasources[0].status, "introspecting");
+    let second = job("job_2", "running", ts() + chrono::Duration::seconds(5));
+    assert!(matches!(s.apply(A, Mutation::RecordIntrospection(second)).await, Err(StoreError::Conflict(_))));
+    // Another tenant's id for the same datasource, or an unknown datasource: not found.
+    let foreign = IntrospectionJob { tenant_id: "acme".into(), ..job("job_x", "running", ts()) };
+    assert_eq!(
+        s.apply(A, Mutation::RecordIntrospection(foreign)).await.unwrap_err(),
+        StoreError::NotFound("datasource".into())
+    );
+    // The job ends: the datasource is ready.
+    let done = IntrospectionJob {
+        objects: 3,
+        proposed: 7,
+        version: Some(4),
+        finished_at: Some(ts() + chrono::Duration::seconds(9)),
+        ..job("job_1", "succeeded", ts())
+    };
+    s.apply(A, Mutation::RecordIntrospection(done.clone())).await.unwrap();
+    let st = s.state();
+    assert_eq!((st.datasources[0].status.as_str(), st.introspections.get("ds_1")), ("ready", Some(&done)));
+    // A job left running by a control plane that stopped: abandoned after the window, so a new
+    // job may start, and readers see it failed.
+    s.apply(A, Mutation::RecordIntrospection(job("job_3", "running", ts()))).await.unwrap();
+    let stuck = s.state().introspections["ds_1"].clone();
+    assert!(stuck.running_at(ts() + window - chrono::Duration::seconds(1)));
+    assert_eq!(stuck.clone().as_of(ts() + window).status, "failed");
+    s.apply(A, Mutation::RecordIntrospection(job("job_4", "running", ts() + window))).await.unwrap();
+    let failed = IntrospectionJob { error: Some("connection refused".into()), ..job("job_4", "failed", ts() + window) };
+    s.apply(A, Mutation::RecordIntrospection(failed)).await.unwrap();
+    let st = s.state();
+    assert_eq!((st.datasources[0].status.as_str(), st.introspections["ds_1"].id.as_str()), ("failed", "job_4"));
 }
 
 /// Router check-ins: upserted by id, newest first, an older check-in never overwrites a newer one,
@@ -1904,6 +1958,7 @@ async fn postgres_backend_matches_memory_and_persists() {
     let s2 = Store::open_postgres(pg2, other_file.clone(), handle(&other_file), RecentUsage::default()).await.unwrap();
     assert_eq!(s2.state().tenant("acme").unwrap().name, "Acme");
     assert_eq!(normalize(&s2.state()), normalize(&s.state()));
+    assert_eq!(s2.state().introspections["ds_1"].id, "job_4", "another replica reads the stored job");
     assert!(verify_chain(&s2.audit(1000).await.unwrap()).is_ok());
 
     // Another replica's commit is picked up by refresh().

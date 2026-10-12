@@ -8,9 +8,9 @@
 
 use super::audit::{AuditDraft, AuditEntry, now_micros};
 use super::{
-    ApiKeyRecord, Backend, Check, DatasourceRecord, DekRecord, Mutation, NodeRecord, NodeState, PendingLogin,
-    Promotion, ProviderKeyRecord, Rekey, RoleBinding, RouterStatus, SessionRecord, State, StoreError, StoredSecret,
-    SubjectKind, Tenant, TenantStatus, UserRecord,
+    ApiKeyRecord, Backend, Check, DatasourceRecord, DekRecord, IntrospectionJob, Mutation, NodeRecord, NodeState,
+    PendingLogin, Promotion, ProviderKeyRecord, Rekey, RoleBinding, RouterStatus, SessionRecord, State, StoreError,
+    StoredSecret, SubjectKind, Tenant, TenantStatus, UserRecord,
 };
 use crate::auth::rbac::Role;
 use base64::Engine;
@@ -69,6 +69,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (32, "node_step_metering", include_str!("../../../../migrations/0032_node_step_metering.sql")),
     (33, "tenant_pii_detectors", include_str!("../../../../migrations/0033_tenant_pii_detectors.sql")),
     (34, "tenant_intents", include_str!("../../../../migrations/0034_tenant_intents.sql")),
+    (35, "introspection_job", include_str!("../../../../migrations/0035_introspection_job.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
@@ -1045,6 +1046,18 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
         Mutation::SetDatasourceStatus { id, status } => {
             exec(c, sqlx::query("UPDATE datasource SET status = $2 WHERE id = $1").bind(id).bind(status)).await
         }
+        Mutation::RecordIntrospection(j) => {
+            exec(
+                c,
+                sqlx::query("UPDATE datasource SET status = $2 WHERE id = $1")
+                    .bind(&j.datasource_id)
+                    .bind(j.datasource_status()),
+            )
+            .await?;
+            let q = "INSERT INTO introspection_job (datasource_id, tenant_id, job, updated_at) VALUES ($1, $2, $3, now())
+                     ON CONFLICT (datasource_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, job = EXCLUDED.job, updated_at = now()";
+            exec(c, sqlx::query(q).bind(&j.datasource_id).bind(&j.tenant_id).bind(Json(json_of(j)))).await
+        }
         Mutation::DeleteDatasource { tenant_id, id, at } => {
             let q = "UPDATE datasource SET deleted_at = $3, connection = '{}' WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL";
             exec(c, sqlx::query(q).bind(tenant_id).bind(id).bind(at)).await
@@ -1939,6 +1952,12 @@ async fn load_state(c: &mut PgConnection) -> Result<State, StoreError> {
             connection: get::<Json<Value>>(&r, "connection")?.0,
             deleted_at: get(&r, "deleted_at")?,
         });
+    }
+
+    for r in rows(c, "SELECT datasource_id, job FROM introspection_job ORDER BY datasource_id").await? {
+        let job: IntrospectionJob = serde_json::from_value(get::<Json<Value>>(&r, "job")?.0)
+            .map_err(|e| StoreError::Backend(format!("introspection_job: {e}")))?;
+        st.introspections.insert(get(&r, "datasource_id")?, job);
     }
 
     for r in rows(

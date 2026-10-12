@@ -198,6 +198,61 @@ pub struct DatasourceRecord {
     pub deleted_at: Option<DateTime<Utc>>,
 }
 
+/// The newest introspection job of a datasource. Stored, so every control-plane replica answers
+/// `GET /api/v1/datasources/{id}/introspection` and refuses a second job while one runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntrospectionJob {
+    pub id: String,
+    pub datasource_id: String,
+    pub tenant_id: String,
+    /// `running`, `succeeded` or `failed`.
+    pub status: String,
+    /// Collections (objects) the snapshot found.
+    pub objects: usize,
+    /// Elements written as proposals.
+    pub proposed: usize,
+    /// Proposals skipped: already reviewed by a human, or unchanged.
+    pub skipped: usize,
+    /// The ontology version the proposals were written in (`None`: nothing new).
+    pub version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl IntrospectionJob {
+    /// How long after its start a `running` job counts as abandoned (its control plane stopped
+    /// before it ended): the job timeout and a minute.
+    pub const ABANDONED_AFTER: std::time::Duration =
+        std::time::Duration::from_secs(crate::introspect::JOB_TIMEOUT.as_secs() + 60);
+
+    /// Still running at `now`: `running` and not abandoned.
+    pub fn running_at(&self, now: DateTime<Utc>) -> bool {
+        self.status == "running"
+            && chrono::Duration::from_std(Self::ABANDONED_AFTER).is_ok_and(|d| now < self.started_at + d)
+    }
+
+    /// The job as seen at `now`: a `running` job past [`Self::ABANDONED_AFTER`] is `failed`.
+    pub fn as_of(mut self, now: DateTime<Utc>) -> Self {
+        if self.status == "running" && !self.running_at(now) {
+            self.status = "failed".into();
+            self.error = Some("the control plane running it stopped before it ended; start it again".into());
+        }
+        self
+    }
+
+    /// The datasource status the job stands for.
+    pub fn datasource_status(&self) -> &'static str {
+        match self.status.as_str() {
+            "running" => "introspecting",
+            "succeeded" => "ready",
+            _ => "failed",
+        }
+    }
+}
+
 /// Where a node version is in its lifecycle: `draft` -> `published` -> `retired`, never back.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -440,6 +495,8 @@ pub struct State {
     pub tool_servers: Vec<ToolServerRecord>,
     pub tool_manifests: Vec<ToolManifestRecord>,
     pub ontologies: BTreeMap<String, Ontology>,
+    /// Datasource id → its newest introspection job.
+    pub introspections: BTreeMap<String, IntrospectionJob>,
     /// Tenant → wrapped DEK. Created on the tenant's first secret, destroyed with the tenant.
     pub deks: BTreeMap<String, DekRecord>,
     /// Users known from the identity provider (created just in time).
@@ -986,6 +1043,10 @@ pub enum Mutation {
         id: String,
         status: String,
     },
+    /// Records a datasource's introspection job (started, then ended) and sets the datasource's
+    /// status from it. Starting one is refused (`Conflict`) while another job of the datasource
+    /// runs (abandoned ones aside, judged at the new job's start).
+    RecordIntrospection(IntrospectionJob),
     /// Soft delete; the stored `connection` is wiped.
     DeleteDatasource {
         tenant_id: String,
@@ -1347,6 +1408,14 @@ impl Mutation {
                 json!({"kind": ds.kind, "name": ds.name, "sealed_secrets": crate::keys::count_sealed(&ds.connection)}),
             ),
             Mutation::SetDatasourceStatus { id, status } => d(None, "datasource.status", id, json!({"status": status})),
+            // Counts and the outcome only: an error message may name hosts of the customer's network.
+            Mutation::RecordIntrospection(j) => d(
+                Some(&j.tenant_id),
+                "datasource.introspection",
+                &j.datasource_id,
+                json!({"job": j.id, "status": j.status, "objects": j.objects, "proposed": j.proposed,
+                       "skipped": j.skipped, "version": j.version}),
+            ),
             Mutation::DeleteDatasource { tenant_id, id, .. } => {
                 let ds = before.live_datasource(tenant_id, id);
                 d(

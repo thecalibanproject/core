@@ -426,6 +426,22 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 .ok_or_else(|| StoreError::NotFound("datasource".into()))?;
             ds.status.clone_from(status);
         }
+        Mutation::RecordIntrospection(j) => {
+            let ds = st
+                .datasources
+                .iter_mut()
+                .find(|d| d.id == j.datasource_id && d.tenant_id == j.tenant_id && d.is_live())
+                .ok_or_else(|| StoreError::NotFound("datasource".into()))?;
+            if let Some(other) = st.introspections.get(&j.datasource_id)
+                && other.id != j.id
+                && j.status == "running"
+                && other.running_at(j.started_at)
+            {
+                return Err(StoreError::Conflict("an introspection of this datasource is running".into()));
+            }
+            ds.status = j.datasource_status().into();
+            st.introspections.insert(j.datasource_id.clone(), j.clone());
+        }
         Mutation::DeleteDatasource { tenant_id, id, at } => {
             need_tenant(st, tenant_id)?;
             let ds = st
