@@ -3305,7 +3305,7 @@ components:
         tenant_id: { type: string }
         kind: { $ref: '#/components/schemas/DatasourceKind' }
         name: { type: string }
-        status: { type: string, enum: [pending, connected, error, introspecting] }
+        status: { type: string, enum: [pending, introspecting, ready, failed, connected, error], description: '`pending` when created; `introspecting` while an introspection job runs, then `ready` or `failed` (see the job''s `error`). `connected` and `error` are reserved: this release does not set them.' }
         epoch: { type: integer, description: 'Monotonic data version used for cache invalidation' }
         connection:
           type: object
