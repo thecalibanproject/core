@@ -138,6 +138,7 @@ fn element(
         provenance,
         confidence: Some((confidence * 100.0).round() / 100.0),
         spec,
+        changed_in: None,
     }
 }
 

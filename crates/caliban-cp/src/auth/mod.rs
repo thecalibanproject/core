@@ -409,17 +409,11 @@ async fn authorize_inner(cp: &Cp, req: Request) -> Result<Request, ApiError> {
             };
             (ok, Body::from(bytes))
         }
-        TenantFrom::Datasource | TenantFrom::OntologyElement => {
+        TenantFrom::Datasource => {
             let id = param("id").unwrap_or_default();
             let st = cp.store.state();
-            let tenant = if rule.tenant == TenantFrom::Datasource {
-                st.datasources.iter().find(|d| d.id == id && d.is_live()).map(|d| d.tenant_id.clone())
-            } else {
-                st.ontologies
-                    .values()
-                    .find(|o| st.has_tenant(&o.tenant_id) && o.elements.iter().any(|e| e.id == id))
-                    .map(|o| o.tenant_id.clone())
-            };
+            // Datasource ids are global (minted by the control plane), unlike ontology element ids.
+            let tenant = st.datasources.iter().find(|d| d.id == id && d.is_live()).map(|d| d.tenant_id.clone());
             match tenant {
                 Some(t) => (p.allows(rule.perm, Some(&t)), body),
                 // Unknown id: the handler answers 404 to anyone who could act on some tenant.

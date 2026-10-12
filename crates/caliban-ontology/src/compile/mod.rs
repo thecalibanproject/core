@@ -14,6 +14,12 @@ pub enum CompileError {
     Unknown(&'static str, String),
     #[error("query was built for ontology {got}, current is {want}")]
     VersionMismatch { got: String, want: String },
+    /// The query names an older version, and something it touches changed since (a breaking
+    /// change: its definition or its approval).
+    #[error(
+        "query was built for ontology {got}; '{id}' changed in version {changed} (current {want}): rebuild the query on the current version"
+    )]
+    Changed { got: String, want: String, id: String, changed: u64 },
     #[error("operator {op:?} is not valid for {attr} ({ty:?})")]
     OpType { op: Op, attr: String, ty: DataType },
     #[error("value for {0} does not match the operator/type")]
@@ -57,10 +63,66 @@ pub struct Plan {
 
 /// Validates the query against the model and injects metric and policy filters.
 /// `policy_filters` are row predicates already resolved for the calling principal.
+///
+/// **Versions.** A query names the ontology version it was written for (`<tenant>@<n>`). The
+/// current version always works. An older version of the same tenant works too, as long as
+/// nothing the query touches (its metrics, attributes, entities, and the relations it joins
+/// along) changed after it: approving new elements, or editing ones the query does not use, is
+/// a compatible change; changing or withdrawing one it uses is a breaking one
+/// ([`CompileError::Changed`]). Policies always apply as they are now.
 pub fn plan(model: &Model, q: &Query, policy_filters: &[Filter]) -> Result<Plan, CompileError> {
-    if q.ontology_version != model.version {
-        return Err(CompileError::VersionMismatch { got: q.ontology_version.clone(), want: model.version.clone() });
+    let pinned = pinned_version(model, &q.ontology_version)?;
+    let plan = plan_current(model, q, policy_filters)?;
+    if let Some(p) = pinned {
+        let changed = |id: &str| model.changed_in.get(id).copied().filter(|c| *c > p);
+        let mut ids: Vec<&str> = q.metrics.iter().map(|m| m.id.as_str()).collect();
+        ids.extend(plan.entities.iter().map(|(e, _)| e.as_str()));
+        ids.extend(q.dimensions.iter().map(|d| d.id.as_str()));
+        ids.extend(plan.filters.iter().map(|f| f.attr.as_str()));
+        for m in &q.metrics {
+            if let Some(def) = model.metrics.get(&m.id) {
+                collect_metric_attrs(&def.expr, &mut ids);
+            }
+        }
+        let err = |id: &str, c: u64| CompileError::Changed {
+            got: q.ontology_version.clone(),
+            want: model.version.clone(),
+            id: id.to_owned(),
+            changed: c,
+        };
+        if let Some((id, c)) = ids.iter().find_map(|id| changed(id).map(|c| (*id, c))) {
+            return Err(err(id, c));
+        }
+        for (_, role) in &plan.entities {
+            if let Role::Reference { via } = role
+                && let Some(c) = model
+                    .relations
+                    .iter()
+                    .position(|r| r == via)
+                    .and_then(|i| model.relation_changed_in.get(i).copied().flatten())
+                    .filter(|c| *c > p)
+            {
+                return Err(err(&format!("{}->{}", via.from, via.to), c));
+            }
+        }
     }
+    Ok(plan)
+}
+
+/// `None` for the current version, `Some(n)` for an older version `n` of the same tenant.
+fn pinned_version(model: &Model, got: &str) -> Result<Option<u64>, CompileError> {
+    if got == model.version {
+        return Ok(None);
+    }
+    let mismatch = || CompileError::VersionMismatch { got: got.to_owned(), want: model.version.clone() };
+    let split = |v: &str| v.rsplit_once('@').and_then(|(t, n)| Some((t.to_owned(), n.parse::<u64>().ok()?)));
+    match (split(got), split(&model.version)) {
+        (Some((t, n)), Some((wt, wn))) if t == wt && n < wn => Ok(Some(n)),
+        _ => Err(mismatch()),
+    }
+}
+
+fn plan_current(model: &Model, q: &Query, policy_filters: &[Filter]) -> Result<Plan, CompileError> {
     if q.metrics.is_empty() {
         return Err(CompileError::Empty);
     }
@@ -294,7 +356,15 @@ pub(crate) mod fixtures {
                 filters: vec![],
             },
         );
-        Model { version: "acme@42".into(), entities, attributes, relations, metrics, policies: vec![] }
+        Model {
+            version: "acme@42".into(),
+            entities,
+            attributes,
+            relations,
+            metrics,
+            policies: vec![],
+            ..Model::default()
+        }
     }
 
     pub fn query() -> Query {
@@ -335,10 +405,36 @@ mod tests {
     use crate::cqir::IdRef;
 
     #[test]
-    fn rejects_stale_ontology_version() {
+    fn older_versions_compile_until_something_they_touch_changes() {
+        // Nothing the query touches changed since 41: a compatible version.
         let mut q = query();
         q.ontology_version = "acme@41".into();
-        assert!(matches!(plan(&model(), &q, &[]), Err(CompileError::VersionMismatch { .. })));
+        let mut m = model();
+        plan(&m, &q, &[]).unwrap();
+        // A change to an element it does not touch keeps it working.
+        m.changed_in.insert("metric.unrelated".into(), 42);
+        plan(&m, &q, &[]).unwrap();
+        // A change to one it touches (an attribute of a filter) breaks it, and says which.
+        m.changed_in.insert("Customer.region".into(), 42);
+        match plan(&m, &q, &[]) {
+            Err(CompileError::Changed { id, changed, .. }) => {
+                assert_eq!((id.as_str(), changed), ("Customer.region", 42))
+            }
+            other => panic!("{other:?}"),
+        }
+        // Changed at or before the pinned version: fine.
+        q.ontology_version = "acme@42".into();
+        plan(&m, &q, &[]).unwrap();
+        // A relation it joins along.
+        let mut m = model();
+        m.relation_changed_in = vec![Some(42); m.relations.len()];
+        q.ontology_version = "acme@41".into();
+        assert!(matches!(plan(&m, &q, &[]), Err(CompileError::Changed { .. })));
+        // Newer than current, another tenant's, or malformed: refused.
+        for v in ["acme@43", "globex@41", "acme", "acme@x"] {
+            q.ontology_version = v.into();
+            assert!(matches!(plan(&model(), &q, &[]), Err(CompileError::VersionMismatch { .. })), "{v}");
+        }
     }
 
     #[test]

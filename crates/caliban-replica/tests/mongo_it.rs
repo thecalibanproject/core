@@ -139,6 +139,7 @@ fn metric_elements() -> Vec<Element> {
         provenance: Provenance::Human,
         confidence: None,
         spec: ElementSpec::Metric(def),
+        changed_in: None,
     };
     vec![
         el(

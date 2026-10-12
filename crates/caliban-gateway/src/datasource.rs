@@ -298,6 +298,9 @@ mod tests {
 
     fn ontology() -> Value {
         let el = |id: &str, kind: &str, spec: Value| json!({"id": id, "name": id, "status": "approved", "provenance": "human", "kind": kind, "spec": spec});
+        let mut patients =
+            el("patients", "metric", json!({"grain": "Patient", "aggregation": "count", "expr": {"op": "rows"}}));
+        patients["changed_in"] = json!(3);
         json!({"tenant_id": "acme", "version": 3, "elements": [
             el("Order", "entity", json!({"binding": {"type": "root", "datasource": "ds_shop", "collection": "orders"}, "keys": ["_id"]})),
             el("Order.total", "attribute", json!({"entity": "Order", "path": "total", "column": "total", "data_type": "number"})),
@@ -305,7 +308,7 @@ mod tests {
             el("revenue", "metric", json!({"grain": "Order", "aggregation": "sum", "expr": {"op": "attr", "id": "Order.total"}})),
             el("Patient", "entity", json!({"binding": {"type": "root", "datasource": "ds_shop", "collection": "patients"}, "keys": ["_id"]})),
             el("Patient.age", "attribute", json!({"entity": "Patient", "path": "age", "column": "age", "data_type": "number"})),
-            el("patients", "metric", json!({"grain": "Patient", "aggregation": "count", "expr": {"op": "rows"}})),
+            (patients),
         ]})
     }
 
@@ -365,10 +368,19 @@ mod tests {
         // Write scopes do not grant reads; a wildcard does.
         assert!(tool.call(&ctx(&["shop.orders:write"]), query("revenue")).await.is_err());
         tool.call(&ctx(&["shop.*:read"]), query("patients")).await.unwrap();
-        // A stale ontology version is refused by the compiler.
-        let mut stale = query("revenue");
-        stale["query"]["ontology_version"] = json!("acme@2");
-        assert!(tool.call(&ctx(&["shop.*:read"]), stale).await.unwrap_err().to_string().contains("ontology"));
+        // An older ontology version still compiles while nothing the query touches changed since
+        // (a compatible change); a newer one does not exist.
+        let mut older = query("revenue");
+        older["query"]["ontology_version"] = json!("acme@2");
+        tool.call(&ctx(&["shop.*:read"]), older.clone()).await.unwrap();
+        // A query touching an element that changed after its version is a breaking change.
+        let mut broken = query("patients");
+        broken["query"]["ontology_version"] = json!("acme@2");
+        let e = tool.call(&ctx(&["shop.*:read"]), broken).await.unwrap_err().to_string();
+        assert!(e.contains("'patients' changed in version 3"), "{e}");
+        let mut newer = query("revenue");
+        newer["query"]["ontology_version"] = json!("acme@4");
+        assert!(tool.call(&ctx(&["shop.*:read"]), newer).await.unwrap_err().to_string().contains("ontology"));
     }
 
     #[tokio::test]

@@ -719,26 +719,46 @@ pub(super) fn apply_to(st: &mut State, m: &Mutation) -> Result<(), StoreError> {
                 version: 0,
                 elements: vec![],
             });
+            let version = onto.version + 1;
             for e in elements {
+                let mut e = e.clone();
                 match onto.elements.iter_mut().find(|x| x.id == e.id) {
-                    Some(x) => *x = e.clone(),
-                    None => onto.elements.push(e.clone()),
+                    Some(x) => {
+                        // A definition (spec or status) that changes is a change in this version.
+                        e.changed_in = if x.definition_changes(&e) { Some(version) } else { x.changed_in };
+                        *x = e;
+                    }
+                    None => {
+                        e.changed_in = Some(version);
+                        onto.elements.push(e);
+                    }
                 }
             }
-            onto.version += 1;
+            onto.version = version;
         }
-        Mutation::ReviewOntologyElement { id, status } => {
-            let active: Vec<String> = st.tenants.iter().filter(|t| t.is_active()).map(|t| t.id.clone()).collect();
-            let onto = st
-                .ontologies
-                .values_mut()
-                .find(|o| active.contains(&o.tenant_id) && o.elements.iter().any(|e| &e.id == id))
-                .ok_or_else(|| StoreError::NotFound("ontology element".into()))?;
-            if let Some(e) = onto.elements.iter_mut().find(|e| &e.id == id) {
-                e.status = *status;
+        Mutation::ReviewOntology { tenant_id, decisions } => {
+            need_tenant(st, tenant_id)?;
+            let onto =
+                st.ontologies.get_mut(tenant_id).ok_or_else(|| StoreError::NotFound("ontology element".into()))?;
+            if let Some((id, _)) = decisions.iter().find(|(id, _)| !onto.elements.iter().any(|e| &e.id == id)) {
+                return Err(StoreError::NotFound(format!("ontology element '{id}'")));
             }
-            // Any reviewed change publishes a new ontology version (cache keys include it).
-            onto.version += 1;
+            // One version for the batch (cache keys and pinned queries name it); none when no
+            // decision changes anything.
+            let version = onto.version + 1;
+            let mut changed = false;
+            for (id, status) in decisions {
+                if let Some(e) = onto.elements.iter_mut().find(|e| &e.id == id)
+                    && e.status != *status
+                {
+                    e.status = *status;
+                    e.changed_in = Some(version);
+                    changed = true;
+                }
+            }
+            if changed {
+                onto.version = version;
+            }
         }
         Mutation::CreateDek { tenant_id, dek } => {
             need_tenant(st, tenant_id)?;

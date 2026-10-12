@@ -36,3 +36,45 @@ with the application on the primary. Introspection samples with `secondaryPrefer
 Without a matching member, every query fails after the driver's server-selection timeout (10 s)
 with an error naming the read preference it looked for and these two fixes
 (`no MongoDB member matches the read preference secondary with tags {workload: analytics}: ...`).
+
+## Ontology review
+
+Element ids belong to a tenant: two tenants may both have an element `Service` (introspection
+proposes entity names from collection names). Every review names the tenant:
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/v1/tenants/{t}/ontology` | The tenant's ontology: its version and elements (also `GET /api/v1/ontology?tenant_id=`) |
+| `POST /api/v1/tenants/{t}/ontology/review` `{"decisions": [{"id", "decision"}], "acknowledge_breaking"?}` | A batch of decisions (`approve`, `reject`, `deprecate`) as **one** new version |
+| `POST /api/v1/tenants/{t}/ontology/elements/{id}/review` `{"decision", "acknowledge_breaking"?}` | One decision (a batch of one) |
+| `POST /api/v1/ontology/elements/{id}/review` `{"tenant_id", "decision"}` | The same; `tenant_id` is required |
+
+A batch that changes nothing (re-approving an approved element) makes no version. Reviews need
+`ontology.review` on the tenant and are audited as `ontology.review` with the decisions.
+
+## Ontology versions and published nodes
+
+A CQIR query names the ontology version it was written for (`"ontology_version": "acme@52"`), and
+node specs often fix their queries (the reference triage node does). Each element records the
+version in which its definition (spec) or approval last changed (`changed_in`). The rules:
+
+1. **A version is a review batch, a proposal, or an introspection run**, never one element at a
+   time.
+2. **Compatible changes keep published nodes working.** A query written for version N compiles on
+   any later version of the same tenant as long as nothing it touches (its metrics and their
+   grains and attributes, its dimensions and filters and their entities, the relations it joins
+   along) changed after N. Approving new elements, rejecting proposals, or editing elements the
+   query does not use are compatible. Policies always apply as they are now.
+3. **Breaking changes are flagged at review time.** A decision that withdraws an approved element
+   that a published node version's fixed query touches is refused with `409`, naming the elements
+   and the node versions (`triage@v3`), unless the request says `acknowledge_breaking: true`. The
+   affected versions then fail on that query (`'Service.city' changed in version 53: rebuild the
+   query on the current version`) until a version written on the new ontology is published.
+4. **Publishing checks the version.** Every fixed CQIR query of a spec must name a version of the
+   tenant's ontology that exists and that the query still compiles on (`ontology_version`
+   problems, with the JSON pointer of the query). Values filled by templates are checked when the
+   node runs.
+5. A query names a version newer than the current one, another tenant's, or a malformed one: refused.
+
+This follows note 08's validation step 1 (every id exists in the published ontology version) and
+note 03's versioned, append-only ontology with publish as a pointer move.

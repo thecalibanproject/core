@@ -1066,9 +1066,11 @@ pub enum Mutation {
         tenant_id: String,
         elements: Vec<Element>,
     },
-    ReviewOntologyElement {
-        id: String,
-        status: Status,
+    /// Review decisions on the tenant's elements (looked up by tenant and id): one new ontology
+    /// version for the batch, none when nothing changes.
+    ReviewOntology {
+        tenant_id: String,
+        decisions: Vec<(String, Status)>,
     },
     /// Stores a tenant's first DEK (wrapped). Conflict if the tenant already has one.
     CreateDek {
@@ -1438,7 +1440,13 @@ impl Mutation {
                 tenant_id,
                 json!({"elements": elements.iter().map(|e| e.id.as_str()).collect::<Vec<_>>()}),
             ),
-            Mutation::ReviewOntologyElement { id, status } => d(None, "ontology.review", id, json!({"status": status})),
+            Mutation::ReviewOntology { tenant_id, decisions } => d(
+                Some(tenant_id),
+                "ontology.review",
+                tenant_id,
+                json!({"decisions": decisions.iter().map(|(id, s)| json!({"id": id, "status": s})).collect::<Vec<_>>(),
+                       "version": before.ontologies.get(tenant_id).map_or(0, |o| o.version) + 1}),
+            ),
             Mutation::CreateDek { tenant_id, dek } => {
                 d(Some(tenant_id), "tenant_key.create", tenant_id, json!({"kek_id": dek.wrapped.kek_id}))
             }

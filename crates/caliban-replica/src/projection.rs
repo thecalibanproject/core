@@ -365,7 +365,15 @@ pub(crate) mod tests {
             verified: true,
             foreign_indexed: true,
         }];
-        Model { version: "acme@42".into(), entities, attributes, relations, metrics: HashMap::new(), policies: vec![] }
+        Model {
+            version: "acme@42".into(),
+            entities,
+            attributes,
+            relations,
+            metrics: HashMap::new(),
+            policies: vec![],
+            ..Model::default()
+        }
     }
 
     #[test]

@@ -205,7 +205,9 @@ pub(crate) async fn publish(
     let evals = if promote { crate::evals::gate(&cp, &n).await? } else { None };
     // Document collections named in its scopes must exist (they live in the retrieval registry).
     let spec: NodeSpec = serde_json::from_value(n.spec.clone()).map_err(|e| bad(format!("invalid spec: {e}")))?;
-    let problems = crate::rag::scope_problems(&cp, &tenant_id, &spec).await;
+    let mut problems = crate::rag::scope_problems(&cp, &tenant_id, &spec).await;
+    // Fixed CQIR queries must name a version of this tenant's ontology they still compile on.
+    problems.extend(crate::ontology::publish_problems(&cp.store.state(), &tenant_id, &n.spec));
     if !problems.is_empty() {
         let e = caliban_nodes::publish::PublishError { action: "publish", name: name.clone(), version, problems };
         return Err(crate::StoreError::Rejected(e).into());

@@ -11,6 +11,7 @@ mod evals;
 pub mod keys;
 mod models;
 mod nodes;
+mod ontology;
 pub mod rag;
 mod runs;
 pub mod store;
@@ -363,6 +364,9 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         .route("/datasources/{id}/introspect", post(introspect_datasource))
         .route("/ontology", get(get_ontology))
         .route("/ontology/elements/{id}/review", post(review_element))
+        .route("/tenants/{tenant_id}/ontology", get(get_tenant_ontology))
+        .route("/tenants/{tenant_id}/ontology/review", post(review_batch))
+        .route("/tenants/{tenant_id}/ontology/elements/{id}/review", post(review_tenant_element))
         .route("/nodes", get(nodes::list_nodes).post(nodes::create_node))
         .route("/usage", get(usage))
         .route("/audit", get(audit))
@@ -1068,31 +1072,132 @@ async fn get_ontology(
     })))
 }
 
-#[derive(Deserialize)]
-struct Review {
-    decision: String,
-    #[allow(dead_code)]
-    note: Option<String>,
+/// `GET /api/v1/tenants/{t}/ontology`: the same as `GET /api/v1/ontology?tenant_id=`.
+async fn get_tenant_ontology(
+    State(cp): State<Cp>,
+    Path(tenant_id): Path<String>,
+) -> ApiResult<Json<caliban_ontology::Ontology>> {
+    get_ontology(State(cp), Query(TenantFilter { tenant_id: Some(tenant_id) })).await
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Review {
+    decision: String,
+    /// Required on `POST /api/v1/ontology/elements/{id}/review`: element ids are per tenant.
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    note: Option<String>,
+    /// Go ahead although published node versions query the element (see [`ontology`]).
+    #[serde(default)]
+    acknowledge_breaking: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewDecision {
+    id: String,
+    decision: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewBatch {
+    decisions: Vec<ReviewDecision>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    note: Option<String>,
+    #[serde(default)]
+    acknowledge_breaking: bool,
+}
+
+fn decision_status(d: &str) -> ApiResult<Status> {
+    match d {
+        "approve" => Ok(Status::Approved),
+        "reject" => Ok(Status::Rejected),
+        "deprecate" => Ok(Status::Deprecated),
+        _ => Err(bad("decision must be 'approve', 'reject' or 'deprecate'")),
+    }
+}
+
+/// Applies review decisions to the tenant's ontology as one version. Refused with `409` when they
+/// would break published node versions and `acknowledge_breaking` is not set.
+async fn review(
+    cp: &Cp,
+    p: &Principal,
+    tenant_id: &str,
+    decisions: Vec<(String, Status)>,
+    acknowledge_breaking: bool,
+) -> ApiResult<Json<Value>> {
+    ensure_tenant(cp, tenant_id)?;
+    if decisions.is_empty() || decisions.len() > 1000 {
+        return Err(bad("decisions: 1 to 1000"));
+    }
+    let breaking = ontology::breaking(&cp.store.state(), tenant_id, &decisions);
+    if !breaking.is_empty() && !acknowledge_breaking {
+        let list = breaking.iter().map(|b| format!("{} ({}): {}", b.element, b.change, b.nodes.join(", ")));
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "these decisions break published node versions that query the elements; publish versions written on \
+                 the new ontology, or send acknowledge_breaking: true: {}",
+                list.collect::<Vec<_>>().join("; ")
+            ),
+        ));
+    }
+    let ids: Vec<String> = decisions.iter().map(|(id, _)| id.clone()).collect();
+    let m = Mutation::ReviewOntology { tenant_id: tenant_id.to_owned(), decisions };
+    let st = cp.store.apply(&p.actor, m).await?;
+    let o = st.ontologies.get(tenant_id).ok_or_else(|| not_found("ontology element"))?;
+    let elements: Vec<&caliban_ontology::Element> = o.elements.iter().filter(|e| ids.contains(&e.id)).collect();
+    Ok(Json(json!({"tenant_id": tenant_id, "version": o.version, "elements": elements, "breaking": breaking})))
+}
+
+/// `POST /api/v1/tenants/{t}/ontology/review` `{"decisions": [{"id", "decision"}], "acknowledge_breaking"?}`.
+async fn review_batch(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path(tenant_id): Path<String>,
+    Json(b): Json<ReviewBatch>,
+) -> ApiResult<Json<Value>> {
+    let decisions =
+        b.decisions.iter().map(|d| Ok((d.id.clone(), decision_status(&d.decision)?))).collect::<ApiResult<Vec<_>>>()?;
+    review(&cp, &p, &tenant_id, decisions, b.acknowledge_breaking).await
+}
+
+/// One element's decision, as a batch of one; answers the element.
+async fn review_one(cp: &Cp, p: &Principal, tenant_id: &str, id: String, r: &Review) -> ApiResult<Json<Value>> {
+    let status = decision_status(&r.decision)?;
+    let out = review(cp, p, tenant_id, vec![(id.clone(), status)], r.acknowledge_breaking).await?;
+    let mut e = out.0["elements"].get(0).cloned().ok_or_else(|| not_found("ontology element"))?;
+    e["version"] = out.0["version"].clone();
+    e["breaking"] = out.0["breaking"].clone();
+    Ok(Json(e))
+}
+
+async fn review_tenant_element(
+    State(cp): State<Cp>,
+    Extension(p): Extension<Principal>,
+    Path((tenant_id, id)): Path<(String, String)>,
+    Json(r): Json<Review>,
+) -> ApiResult<Json<Value>> {
+    review_one(&cp, &p, &tenant_id, id, &r).await
+}
+
+/// `POST /api/v1/ontology/elements/{id}/review`: needs `tenant_id` in the body (element ids are
+/// per tenant; the permission check reads it there too).
 async fn review_element(
     State(cp): State<Cp>,
     Extension(p): Extension<Principal>,
     Path(id): Path<String>,
     Json(r): Json<Review>,
 ) -> ApiResult<Json<Value>> {
-    let status = match r.decision.as_str() {
-        "approve" => Status::Approved,
-        "reject" => Status::Rejected,
-        _ => return Err(bad("decision must be 'approve' or 'reject'")),
-    };
-    // Any reviewed change publishes a new ontology version (cache keys include it).
-    let st = cp.store.apply(&p.actor, Mutation::ReviewOntologyElement { id: id.clone(), status }).await?;
-    st.ontologies
-        .values()
-        .find_map(|o| o.elements.iter().find(|e| e.id == id))
-        .map(|e| Json(serde_json::to_value(e).unwrap_or_default()))
-        .ok_or_else(|| not_found("ontology element"))
+    let tenant_id = r.tenant_id.clone().ok_or_else(|| {
+        bad("tenant_id is required: element ids are per tenant (or use /api/v1/tenants/{tenant_id}/ontology/elements/{id}/review)")
+    })?;
+    review_one(&cp, &p, &tenant_id, id, &r).await
 }
 
 // ───────────────────────────── usage ─────────────────────────────
@@ -1971,5 +2076,62 @@ mod tests {
             at: chrono::Utc::now(),
         };
         assert_eq!(c.store.ingest_audit(vec![own]).await.unwrap().accepted, 1);
+    }
+
+    /// e2e gap 5: element ids are per tenant. Two tenants with an element `Service`: a review
+    /// names the tenant and touches only its element; a batch is one version.
+    #[tokio::test]
+    async fn ontology_reviews_are_scoped_to_the_tenant_and_batched() {
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        call(&app, "POST", "/api/v1/tenants", Some(json!({"name": "Globex"})), true).await;
+        let el = |id: &str| -> caliban_ontology::Element {
+            serde_json::from_value(
+                json!({"id": id, "name": id, "description": null, "synonyms": [], "status": "proposed",
+                "provenance": "introspect", "confidence": 0.9, "kind": "glossary_term",
+                "spec": {"phrase": id, "maps_to": "x"}}),
+            )
+            .unwrap()
+        };
+        for t in ["acme", "globex"] {
+            let m = Mutation::ProposeOntology { tenant_id: t.into(), elements: vec![el("Service"), el("Slot")] };
+            c.store.apply("test", m).await.unwrap();
+        }
+        // The legacy route needs the tenant.
+        let (s, v) =
+            call(&app, "POST", "/api/v1/ontology/elements/Service/review", Some(json!({"decision": "approve"})), true)
+                .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        let body = json!({"decision": "approve", "tenant_id": "globex"});
+        let (s, v) = call(&app, "POST", "/api/v1/ontology/elements/Service/review", Some(body), true).await;
+        assert_eq!(
+            (s, v["status"].as_str(), v["version"].as_u64()),
+            (StatusCode::OK, Some("approved"), Some(2)),
+            "{v}"
+        );
+        let status = |t: &str| {
+            let st = c.store.state();
+            st.ontologies[t].elements.iter().map(|e| (e.id.clone(), e.status)).collect::<Vec<_>>()
+        };
+        assert_eq!(status("acme")[0].1, Status::Proposed, "acme's Service is untouched");
+        // A batch on the tenant route: one version for both decisions.
+        let batch =
+            json!({"decisions": [{"id": "Service", "decision": "approve"}, {"id": "Slot", "decision": "reject"}]});
+        let (s, v) = call(&app, "POST", "/api/v1/tenants/acme/ontology/review", Some(batch), true).await;
+        assert_eq!((s, v["version"].as_u64()), (StatusCode::OK, Some(2)), "{v}");
+        assert_eq!(status("acme"), [("Service".into(), Status::Approved), ("Slot".into(), Status::Rejected)]);
+        assert_eq!(c.store.state().ontologies["globex"].version, 2);
+        // An id the tenant does not have is a 404, even if another tenant has it.
+        let (s, _) = call(
+            &app,
+            "POST",
+            "/api/v1/tenants/acme/ontology/elements/Other/review",
+            Some(json!({"decision": "approve"})),
+            true,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, o) = call(&app, "GET", "/api/v1/tenants/globex/ontology", None, true).await;
+        assert_eq!((s, o["version"].as_u64()), (StatusCode::OK, Some(2)));
     }
 }

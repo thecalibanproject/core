@@ -1135,15 +1135,29 @@ async fn persist(c: &mut PgConnection, m: &Mutation, next: &State) -> Result<(),
             Ok(())
         }
         Mutation::ProposeOntology { tenant_id, elements } => {
-            ontology_commit(c, tenant_id, "ontology.propose", elements).await
+            // As applied: with the version each element's definition last changed in.
+            let o = next.ontologies.get(tenant_id).ok_or_else(|| StoreError::NotFound("ontology".into()))?;
+            let applied: Vec<Element> =
+                o.elements.iter().filter(|e| elements.iter().any(|x| x.id == e.id)).cloned().collect();
+            ontology_commit(c, tenant_id, "ontology.propose", &applied).await
         }
-        Mutation::ReviewOntologyElement { id, status } => {
-            let (tenant, e) = next
-                .ontologies
+        Mutation::ReviewOntology { tenant_id, decisions } => {
+            let o = next.ontologies.get(tenant_id).ok_or_else(|| StoreError::NotFound("ontology element".into()))?;
+            // The elements this batch changed (they carry the new version); none: no commit.
+            let changed: Vec<Element> = o
+                .elements
                 .iter()
-                .find_map(|(t, o)| o.elements.iter().find(|e| &e.id == id).map(|e| (t.clone(), e.clone())))
-                .ok_or_else(|| StoreError::NotFound("ontology element".into()))?;
-            ontology_commit(c, &tenant, &format!("review {id}: {}", enum_str(status)), std::slice::from_ref(&e)).await
+                .filter(|e| decisions.iter().any(|(id, _)| id == &e.id) && e.changed_in == Some(o.version))
+                .cloned()
+                .collect();
+            if changed.is_empty() {
+                return Ok(());
+            }
+            let message = format!(
+                "review: {}",
+                decisions.iter().map(|(id, s)| format!("{id} {}", enum_str(s))).collect::<Vec<_>>().join(", ")
+            );
+            ontology_commit(c, tenant_id, &message, &changed).await
         }
         Mutation::CreateDek { tenant_id, dek } => insert_dek(c, tenant_id, dek).await,
         Mutation::Rekey(r) => rekey(c, r).await,

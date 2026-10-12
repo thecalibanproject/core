@@ -450,8 +450,6 @@ pub enum TenantFrom {
     Body,
     /// The tenant of the datasource `{id}`.
     Datasource,
-    /// The tenant of the ontology element `{id}`.
-    OntologyElement,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -552,7 +550,10 @@ pub const ROUTES: &[RouteRule] = &[
     r("POST", "/datasources", Perm::DatasourcesWrite, TenantFrom::Body),
     r("POST", "/datasources/{id}/introspect", Perm::DatasourcesWrite, TenantFrom::Datasource),
     r("GET", "/ontology", Perm::OntologyRead, TenantFrom::QueryOrList),
-    r("POST", "/ontology/elements/{id}/review", Perm::OntologyReview, TenantFrom::OntologyElement),
+    r("POST", "/ontology/elements/{id}/review", Perm::OntologyReview, TenantFrom::Body),
+    r("GET", "/tenants/{tenant_id}/ontology", Perm::OntologyRead, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/ontology/review", Perm::OntologyReview, TenantFrom::Path),
+    r("POST", "/tenants/{tenant_id}/ontology/elements/{id}/review", Perm::OntologyReview, TenantFrom::Path),
     r("GET", "/nodes", Perm::NodesRead, TenantFrom::QueryOrList),
     r("POST", "/nodes", Perm::NodesWrite, TenantFrom::Body),
     r("GET", "/usage", Perm::UsageRead, TenantFrom::QueryOrList),

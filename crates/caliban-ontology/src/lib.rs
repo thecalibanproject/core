@@ -51,9 +51,21 @@ pub struct Element {
     pub confidence: Option<f32>,
     #[serde(flatten)]
     pub spec: ElementSpec,
+    /// The ontology version in which this element's definition (its spec) or its status last
+    /// changed; set by the control plane. A query pinned to an older version stays valid as long
+    /// as nothing it touches changed after it (see [`compile::plan`]). `None` on elements written
+    /// before it was tracked: treated as unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_in: Option<u64>,
 }
 
 impl Element {
+    /// Whether going from `self` to `next` changes what a query touching the element means: its
+    /// spec or its status. Names, descriptions, synonyms and confidence do not.
+    pub fn definition_changes(&self, next: &Element) -> bool {
+        self.spec != next.spec || self.status != next.status
+    }
+
     /// Relations, metrics and policies always need a human; low-risk metadata may auto-approve.
     pub fn requires_human_review(&self) -> bool {
         matches!(self.spec, ElementSpec::Relation(_) | ElementSpec::Metric(_) | ElementSpec::Policy(_))

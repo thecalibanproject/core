@@ -163,12 +163,23 @@ pub struct Model {
     pub relations: Vec<RelationDef>,
     pub metrics: HashMap<String, MetricDef>,
     pub policies: Vec<PolicyDef>,
+    /// The version each approved element's definition last changed in (entities, attributes,
+    /// metrics by id); absent: unchanged since tracking began.
+    pub changed_in: HashMap<String, u64>,
+    /// The same for `relations`, by index.
+    pub relation_changed_in: Vec<Option<u64>>,
 }
 
 impl Model {
     pub fn from_ontology(o: &Ontology) -> Self {
         let mut m = Model { version: format!("{}@{}", o.tenant_id, o.version), ..Default::default() };
         for e in o.elements.iter().filter(|e| e.status == Status::Approved) {
+            if let Some(v) = e.changed_in {
+                m.changed_in.insert(e.id.clone(), v);
+            }
+            if matches!(e.spec, ElementSpec::Relation(_)) {
+                m.relation_changed_in.push(e.changed_in);
+            }
             match &e.spec {
                 ElementSpec::Entity(d) => {
                     m.entities.insert(e.id.clone(), d.clone());

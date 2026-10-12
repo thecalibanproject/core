@@ -449,18 +449,43 @@ async fn suite(s: &Store) {
     )
     .await
     .unwrap();
-    s.apply(A, Mutation::ReviewOntologyElement { id: "e_b".into(), status: Status::Approved }).await.unwrap();
+    // Another tenant with an element of the same id (e2e gap 5: ids are per tenant).
+    s.apply(A, Mutation::CreateTenant(tenant("initech"))).await.unwrap();
+    s.apply(A, Mutation::ProposeOntology { tenant_id: "initech".into(), elements: vec![element("e_b")] })
+        .await
+        .unwrap();
+    let review = |t: &str, d: Vec<(&str, Status)>| Mutation::ReviewOntology {
+        tenant_id: t.into(),
+        decisions: d.into_iter().map(|(id, s)| (id.to_owned(), s)).collect(),
+    };
+    s.apply(A, review("globex", vec![("e_b", Status::Approved)])).await.unwrap();
     assert_eq!(
-        s.apply(A, Mutation::ReviewOntologyElement { id: "zzz".into(), status: Status::Approved }).await.unwrap_err(),
-        StoreError::NotFound("ontology element".into())
+        s.apply(A, review("globex", vec![("zzz", Status::Approved)])).await.unwrap_err(),
+        StoreError::NotFound("ontology element 'zzz'".into())
     );
     let st = s.state();
     let o = &st.ontologies["globex"];
     assert_eq!(o.version, 2);
     assert_eq!(
-        o.elements.iter().map(|e| (e.id.as_str(), e.status)).collect::<Vec<_>>(),
-        [("e_b", Status::Approved), ("e_a", Status::Proposed)]
+        o.elements.iter().map(|e| (e.id.as_str(), e.status, e.changed_in)).collect::<Vec<_>>(),
+        [("e_b", Status::Approved, Some(2)), ("e_a", Status::Proposed, Some(1))]
     );
+    let i = &st.ontologies["initech"];
+    assert_eq!((i.version, i.elements[0].status), (1, Status::Proposed), "the other tenant's e_b is untouched");
+    // A batch is one version; a batch that changes nothing is none.
+    s.apply(A, review("initech", vec![("e_b", Status::Approved)])).await.unwrap();
+    s.apply(A, review("globex", vec![("e_b", Status::Approved), ("e_a", Status::Rejected)])).await.unwrap();
+    s.apply(A, review("globex", vec![("e_b", Status::Approved)])).await.unwrap();
+    let st = s.state();
+    assert_eq!((st.ontologies["globex"].version, st.ontologies["initech"].version), (3, 2));
+    assert_eq!(st.ontologies["globex"].elements[0].changed_in, Some(2), "re-approving changes nothing");
+    assert_eq!(st.ontologies["globex"].elements[1].changed_in, Some(3));
+    // A proposal that only renames an element keeps its version; one that changes its spec does not.
+    let mut renamed = element("e_b");
+    renamed.status = Status::Approved;
+    renamed.name = "Better name".into();
+    s.apply(A, Mutation::ProposeOntology { tenant_id: "globex".into(), elements: vec![renamed] }).await.unwrap();
+    assert_eq!(s.state().ontologies["globex"].elements[0].changed_in, Some(2));
 
     tenant_keys(s).await;
     node_lifecycle(s).await;
@@ -504,7 +529,7 @@ async fn suite(s: &Store) {
     assert_eq!(log[0].action, "store.seed");
     assert!(verify_chain(&log).is_ok());
     let actions: Vec<&str> = log.iter().map(|e| e.action.as_str()).collect();
-    assert_eq!(actions.iter().filter(|a| **a == "tenant.create").count(), 10);
+    assert_eq!(actions.iter().filter(|a| **a == "tenant.create").count(), 11);
     for a in [
         "api_key.revoke",
         "datasource.delete",
@@ -930,8 +955,13 @@ async fn deletes(s: &Store) {
     assert_eq!(s.apply(A, Mutation::CreateApiKey(k5)).await.unwrap_err(), not_found("tenant"));
     assert_eq!(s.apply(A, Mutation::CreateNode(node("node_x", "doomed", "x"))).await.unwrap_err(), not_found("tenant"));
     assert_eq!(
-        s.apply(A, Mutation::ReviewOntologyElement { id: "e_d".into(), status: Status::Approved }).await.unwrap_err(),
-        not_found("ontology element")
+        s.apply(
+            A,
+            Mutation::ReviewOntology { tenant_id: "doomed".into(), decisions: vec![("e_d".into(), Status::Approved)] }
+        )
+        .await
+        .unwrap_err(),
+        not_found("tenant")
     );
     assert_eq!(
         s.apply(A, Mutation::CreateTenant(tenant("doomed"))).await.unwrap_err(),
