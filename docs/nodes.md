@@ -308,7 +308,10 @@ that the SDKs keep as an extra field (`completion.model_extra["caliban"]` in the
 **Timings.** Node answers carry `Server-Timing` (README, "Stage timings"): `auth`, and for
 `caliban/auto` the routing stages (`route` with the deciding stage, `embed`), then
 `node;dur=<run time>;desc="<run id>"` and `total`. A streamed answer's headers leave before the run
-ends, so its `node` entry has the run id without a duration. Each step's duration is on
+ends, so its `node` entry has the run id without a duration. The run API does the same:
+`POST /v1/nodes/{name}/runs` answers with `auth`, `node` (the time it spent creating the run and,
+when sync, waiting for it; no duration with `"stream": true`) and `total`, and
+`POST /v1/runs/{id}/input` with `auth`, `node` (delivering the answer) and `total`. Each step's duration is on
 `GET /v1/runs/{id}` (`steps[].started_at`, `steps[].duration_ms`) and in the `step.finished` event (`duration_ms`). The
 run's model calls time their own stages in their usage events (`timings`).
 

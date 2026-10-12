@@ -2865,8 +2865,10 @@ components:
         routing embedder call, part of `route`), `pii`, `cache` (`desc`: `hit` or `miss`),
         `upstream` (time to the upstream response headers), `upstream_total` (the whole upstream
         call; non-streaming responses only, streams record it in the usage event's `timings`),
-        `node` (a node run that answered; `desc` is the run id, whose step durations are on
-        `GET /v1/runs/{id}`; no `dur` on streams, whose headers leave before the run ends), `total`.
+        `node` (a node run that answered, or the run of a run API request: creating it and, when
+        sync, waiting for it, or delivering an answer to it; `desc` is the run id, whose step
+        durations are on `GET /v1/runs/{id}`; no `dur` on streams, whose headers leave before the
+        run ends), `total`.
         Example: `auth;dur=0.210, route;dur=4.810;desc="knn", embed;dur=4.020, pii;dur=1.130,
         cache;dur=0.040;desc="miss", upstream;dur=182.400, upstream_total;dur=611.900, total;dur=618.700`.
         Absent when `[telemetry] server_timing = false`.

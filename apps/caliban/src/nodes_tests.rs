@@ -422,6 +422,93 @@ async fn the_reference_triage_node_runs_end_to_end() {
     assert_eq!(b.usage.snapshot(Some("acme"), 10).len(), 1);
 }
 
+/// A run API request: the status, the `Server-Timing` header and the JSON body (none for a stream).
+async fn run_timing(app: &Router, method: &str, uri: &str, body: Value) -> (StatusCode, Option<String>, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {KEY}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let st = resp.headers().get("server-timing").map(|v| v.to_str().unwrap().to_owned());
+    let stream = resp.headers().get("content-type").is_some_and(|c| c == "text/event-stream");
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 22).await.unwrap();
+    let v = if stream { Value::Null } else { serde_json::from_slice(&bytes).unwrap_or(Value::Null) };
+    (status, st, v)
+}
+
+/// Creating a run and answering its human step answer with `Server-Timing`: `auth`, the run
+/// (`node`, its id in `desc`) and `total`; a stream's `node` has no duration (its headers leave
+/// first). `[telemetry] server_timing = false` removes it.
+#[tokio::test]
+async fn run_creation_and_answers_carry_server_timing() {
+    let ask = json!({
+        "kind": "workflow", "model_policy": {}, "budgets": {"steps": 10, "tokens": 10000, "wall_clock_s": 60},
+        "graph": {"vertices": [{"id": "clarify", "type": "human", "config": {"question": "Since when?"}},
+                               {"id": "answer", "type": "llm", "config": {"prompt": "since {{input}}"}}],
+                  "edges": [{"from": "clarify", "to": "answer"}]}
+    });
+    let e = env(Duration::ZERO).await;
+    e.publish("ask", ask.clone()).await;
+    let j = journal().await;
+    let w = worker(&e, &j, &idem(), None, "worker-a", LONG);
+    let metrics = |st: &str| -> Vec<(String, bool, Option<String>)> {
+        st.split(", ")
+            .map(|m| {
+                let mut parts = m.split(';');
+                let name = parts.next().unwrap().to_owned();
+                let rest: Vec<&str> = parts.collect();
+                for p in &rest {
+                    if let Some(d) = p.strip_prefix("dur=") {
+                        assert!(d.parse::<f64>().unwrap() >= 0.0, "{st}");
+                    }
+                }
+                let desc = rest.iter().find_map(|p| p.strip_prefix("desc=")).map(|d| d.trim_matches('"').to_owned());
+                (name, rest.iter().any(|p| p.starts_with("dur=")), desc)
+            })
+            .collect()
+    };
+    for body in [json!({"input": "x"}), json!({"input": "x", "async": true})] {
+        let (s, st, v) = run_timing(&w.app, "POST", "/v1/nodes/ask/runs", body).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        let id = v["id"].as_str().unwrap().to_owned();
+        let m = metrics(&st.unwrap());
+        assert_eq!(
+            m,
+            [("auth".into(), true, None), ("node".into(), true, Some(id.clone())), ("total".into(), true, None)]
+        );
+        // Answering the human step continues the run: same metrics. (An async run waits for a
+        // worker's claim loop; this test has none, so it runs here.)
+        if v["status"] == "pending" {
+            w.ex.run_now(&id).await.unwrap();
+        }
+        until("the run to wait for its answer", async || {
+            w.ex.view("acme", &id).await.unwrap().is_some_and(|r| r.status == RunStatus::InputRequired)
+        })
+        .await;
+        let (s, st, v) =
+            run_timing(&w.app, "POST", &format!("/v1/runs/{id}/input"), json!({"answer": "two days"})).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        let m = metrics(&st.unwrap());
+        assert_eq!(m, [("auth".into(), true, None), ("node".into(), true, Some(id)), ("total".into(), true, None)]);
+    }
+    let (s, st, _) = run_timing(&w.app, "POST", "/v1/nodes/ask/runs", json!({"input": "x", "stream": true})).await;
+    assert_eq!(s, StatusCode::OK);
+    let m = metrics(&st.unwrap());
+    let names: Vec<&str> = m.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert_eq!(names, ["auth", "node", "total"]);
+    assert!(!m[1].1 && m[1].2.as_deref().is_some_and(|d| d.starts_with("run_")), "{m:?}");
+
+    let off = env_toml(Duration::ZERO, None, "[telemetry]\nserver_timing = false\n").await;
+    off.publish("ask", ask).await;
+    let w = worker(&off, &journal().await, &idem(), None, "worker-b", LONG);
+    let (s, st, v) = run_timing(&w.app, "POST", "/v1/nodes/ask/runs", json!({"input": "x"})).await;
+    assert_eq!((s, st), (StatusCode::ACCEPTED, None), "{v}");
+}
+
 #[tokio::test]
 async fn a_dead_worker_is_replaced_without_paying_twice() {
     // The model server answers after 300 ms, so worker a is surely still waiting when it dies.
