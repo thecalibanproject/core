@@ -1881,10 +1881,10 @@ async fn postgres_backend_matches_memory_and_persists() {
     assert!(verify_chain(&s2.audit(1000).await.unwrap()).is_ok());
 
     // Another replica's commit is picked up by refresh().
-    s2.apply("replica-2", Mutation::CreateTenant(tenant("initech"))).await.unwrap();
-    assert!(!s.state().has_tenant("initech"));
+    s2.apply("replica-2", Mutation::CreateTenant(tenant("umbrella"))).await.unwrap();
+    assert!(!s.state().has_tenant("umbrella"));
     assert!(s.refresh().await.unwrap());
-    assert!(s.state().has_tenant("initech"));
+    assert!(s.state().has_tenant("umbrella"));
     assert_eq!(s.config.load().version, s2.config.load().version);
 
     // The audit table is append-only at the database level.
