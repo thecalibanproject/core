@@ -872,6 +872,42 @@ paths:
         '409': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
 
+  /api/v1/tenants/{tenantId}/runs/{runId}/golden-case:
+    parameters:
+      - { $ref: '#/components/parameters/TenantId' }
+      - { name: runId, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [nodes]
+      summary: Turn a finished run into a golden case
+      description: |
+        Production feedback for the eval loop (research note 04, sections 6 and 7). Builds a case
+        from the run and appends it to the golden set of the run's version (or of `version`, a
+        version of the same node): the run's input, its human steps' answers as scripted
+        `answers`, a `json_schema` check when the version has an output schema; for `good`, an
+        `llm_judge` check with the run's output as `reference` and a `tool_call` check for each
+        write tool it called; for `bad`, an `llm_judge` check whose rubric is the `note`. The case
+        id is the run id. The set gets a new hash like an edit (a compare-and-set on the hash read,
+        so concurrent edits are not lost). A `mast_label` is stored on the run. Needs `nodes.write`
+        (what editing a golden set needs); the `case` is returned with `runs.data`. Audited as
+        `node.golden_set.capture` (ids, verdict, label, counts and hashes; never the note or
+        content). See docs/evals.md ("Cases from runs").
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GoldenCaseCapture' }
+      responses:
+        '201':
+          description: Appended
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CapturedGoldenCase' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { description: 'No such run in this tenant (another tenant''s run included), or no such version', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: 'The run has not finished, it is already in that golden set, or the set kept changing', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: '`good` on a run that did not succeed, `bad` without a note, a label on `good`, an unknown label, an injection-suite run, or a case that does not fit the set (problems of kind `golden_set`)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { $ref: '#/components/responses/Error' }
+
   /api/v1/tenants/{tenantId}/inbox:
     parameters: [ { $ref: '#/components/parameters/TenantId' } ]
     get:
@@ -1279,7 +1315,10 @@ paths:
         ordinary node runs on workers, through the request pipeline, as the tenant's eval key (created
         and managed by the control plane, see `GET .../eval-key`), or as the API key `api_key_id`
         when one is named (it must be active and allowed to run the node). The key's quotas apply and
-        its usage is metered.
+        its usage is metered. Trial runs (origin `eval:<eval>:<case>`) never reach a real write
+        tool: every call to a tool with effect `write` goes to the eval sandbox, which answers the
+        case's `tool_results` or a synthetic result marked `"sandbox": true`; reads call the real
+        tools unless scripted.
         `injection`: the built-in injection suite against sandboxed tools (`k` default 1); the run
         input is `input`, else the input of `input_case` (or the golden set's first case), whose
         checks then measure utility under attack. Needs `nodes.run`; audited as `node.eval.start`.
@@ -3465,7 +3504,11 @@ components:
           type: object
           additionalProperties: true
           description: 'Scripted answers to human steps, by step id (`clarify#0`, `write#0@approve`) or vertex id (`clarify`, `write@approve`). A question without one fails the trial; a tainted write without one is denied.'
-        tags: { type: array, items: { type: string } }
+        tool_results:
+          type: object
+          additionalProperties: true
+          description: 'Scripted tool results, by tool name (the manifest''s, e.g. `refund`) or reference. A trial never calls a write tool (effect `write`): the eval sandbox answers this script, else a synthetic result marked `"sandbox": true` (valid against the tool''s output schema when it declares one). A read tool named here answers the script too; other reads call the real tool.'
+        tags: { type: array, items: { type: string }, description: 'Free labels. A case captured from a run has `captured`, its verdict and `mast:<id>`.' }
     EvalCheck:
       description: 'A check of the run output. Text checks see the output as text (a string as is, other JSON compact).'
       oneOf:
@@ -3500,6 +3543,48 @@ components:
             rubric: { type: string }
             model: { type: string, description: 'Default: the eval''s judge_model, else caliban/auto. Called through the gateway as the eval''s API key.' }
             threshold: { type: number, minimum: 0, maximum: 1, default: 0.5 }
+            reference: { description: 'A reference answer shown to the judge (default: the case''s `expected`). A case captured from a good run holds the run''s output here.' }
+        - type: object
+          required: [type, tool]
+          properties:
+            type: { const: tool_call }
+            tool: { type: string, description: 'The tool: its manifest name (`refund`), its reference, or its reference without the pin (`mcp://bank/refund`)' }
+            args: { type: object, description: 'The call''s arguments must contain these (objects key by key, recursively; arrays and scalars equal), as the tool or the eval sandbox received them: after the PII guard, so a tool not trusted with personal data sees surrogates' }
+            must_not_call: { type: boolean, default: false, description: 'Passes when no such call happened' }
+    MastLabel:
+      type: string
+      description: 'A MAST failure mode (arXiv 2503.13657): FM-1.1 to FM-1.5 (specification), FM-2.1 to FM-2.6 (inter-agent misalignment), FM-3.1 to FM-3.3 (task verification)'
+      enum: [disobey_task_specification, disobey_role_specification, step_repetition, loss_of_conversation_history,
+             unaware_of_termination_conditions, conversation_reset, fail_to_ask_for_clarification, task_derailment,
+             information_withholding, ignored_other_agent_input, reasoning_action_mismatch, premature_termination,
+             no_or_incomplete_verification, incorrect_verification]
+    GoldenCaseCapture:
+      type: object
+      required: [verdict]
+      additionalProperties: false
+      properties:
+        verdict: { type: string, enum: [good, bad], description: '`good`: the run did the right thing (it must have succeeded). `bad`: it did not' }
+        note: { type: string, maxLength: 4000, description: 'What the right behaviour is. Required for `bad` (the judge''s rubric); added to the rubric for `good`' }
+        mast_label: { $ref: '#/components/schemas/MastLabel' }
+        version: { type: integer, minimum: 1, description: 'The version whose golden set receives the case (default: the run''s version)' }
+    CapturedGoldenCase:
+      type: object
+      required: [object, run_id, node, version, run_version, case_id, verdict, checks, golden_set, content_visible]
+      properties:
+        object: { type: string, enum: [node.golden_case] }
+        run_id: { type: string }
+        node: { type: string }
+        version: { type: integer, description: 'The version whose golden set holds the case' }
+        run_version: { type: integer }
+        case_id: { type: string, description: 'The run id' }
+        verdict: { type: string, enum: [good, bad] }
+        mast_label:
+          oneOf: [ { $ref: '#/components/schemas/MastLabel' }, { type: 'null' } ]
+        checks: { type: array, items: { type: string, enum: [json_schema, llm_judge, tool_call] }, description: 'The kinds of the checks derived from the run' }
+        previous_hash: { type: [string, 'null'], description: 'The set''s hash before the capture (`null`: it was created)' }
+        golden_set: { $ref: '#/components/schemas/GoldenSet' }
+        content_visible: { type: boolean, description: 'The caller holds runs.data: `case` is included' }
+        case: { $ref: '#/components/schemas/GoldenCase' }
     GoldenSet:
       type: object
       required: [object, node, version, hash, case_count, updated_at, updated_by, content_visible]
@@ -3671,10 +3756,12 @@ components:
             type: object
             required: [type, passed]
             properties:
-              type: { type: string, enum: [exact, contains, regex, json_schema, llm_judge] }
+              type: { type: string, enum: [exact, contains, regex, json_schema, llm_judge, tool_call] }
               passed: { type: boolean }
               score: { type: [number, 'null'], description: 'The judge''s score (llm_judge)' }
         judge_usd: { type: number }
+        tool_calls: { type: integer, description: 'Tool calls the trial''s run made (their arguments are in the sealed `detail.tool_calls`)' }
+        sandboxed_calls: { type: integer, description: 'Of them, the ones the eval sandbox answered (every write, and scripted reads): never sent to the tool' }
     InjectionVerdict:
       type: object
       required: [case, category, succeeded, attacked, defenses, tool_calls]
@@ -3854,6 +3941,7 @@ components:
         cost_usd: { type: number }
         origin: { type: string }
         invoker: { type: string, description: '`api_key:<hash prefix>`' }
+        mast_label: { $ref: '#/components/schemas/MastLabel' }
         created_at: { type: string, format: date-time }
         finished_at: { type: [string, 'null'], format: date-time }
     NodeRunList:
@@ -3906,6 +3994,9 @@ components:
         invoker: { type: string }
         origin: { type: [string, 'null'] }
         input_labels: { type: array, items: { type: string }, description: 'Taint labels the run input carries from the start (`caller`)' }
+        mast_label:
+          description: 'The MAST failure mode a reviewer labelled the run with when capturing it as `bad` (`POST .../runs/{runId}/golden-case`); `null` when unlabelled'
+          oneOf: [ { $ref: '#/components/schemas/MastLabel' }, { type: 'null' } ]
         error: { type: [string, 'null'] }
         stop_reason: { type: [string, 'null'] }
         partial: { type: boolean }

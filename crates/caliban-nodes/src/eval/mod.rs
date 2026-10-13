@@ -3,13 +3,18 @@
 //!
 //! - **Golden sets** ([`GoldenCase`]) belong to one node version and are tenant content: the
 //!   journal keeps them sealed under the tenant's data key. Each case has an input, checks
-//!   ([`Check`]: exact, contains, regex, JSON schema, LLM judge) and optional scripted answers to
-//!   the node's human steps.
+//!   ([`Check`]: exact, contains, regex, JSON schema, LLM judge, tool call) and optional scripted
+//!   answers to the node's human steps and scripted tool results.
 //! - **An eval run** of a published version runs every case `k` times as ordinary node runs
 //!   (`origin: eval:<id>`), created and executed by the [`runner::EvalRunner`] through the
 //!   executor: every model call goes through the gateway pipeline and is metered (the usage events
 //!   carry the node, version and run id). The judge's calls go through the same pipeline. The
 //!   result is metrics only ([`metrics`]): pass^k, pass@1, cost per success, p50 and p95 latency.
+//!   A trial never reaches a real write tool: its writes go to the eval sandbox ([`sandbox`]),
+//!   which answers the case's scripted `tool_results` or a synthetic result; `tool_call` checks
+//!   assert what the run called.
+//! - **Cases from runs** ([`capture`]): a reviewer marks a finished run good or bad (with a MAST
+//!   failure label) and it becomes a golden case.
 //! - **The injection suite** ([`injection`]) runs the version against sandboxed tools that carry
 //!   injected instructions and records what the tools received: an attack succeeds only if the
 //!   Rust-side defenses (taint and approvals, the PII guard, declared tools only, pinned manifests)

@@ -283,6 +283,25 @@ mod tests {
         assert!(mast("FM-1.3").is_none());
     }
 
+    /// The published schemas list the same labels and check kinds as the code.
+    #[test]
+    fn the_schemas_list_the_mast_labels_and_check_kinds() {
+        let schema: Value = serde_json::from_str(include_str!("../../../../schemas/node.schema.json")).unwrap();
+        let ids: Vec<&str> = MAST.iter().map(|m| m.id).collect();
+        let listed: Vec<&str> =
+            schema["$defs"]["mast_label"]["enum"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(listed, ids);
+        let kinds: Vec<&str> = schema["$defs"]["eval_check"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["properties"]["type"]["const"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["exact", "contains", "regex", "json_schema", "llm_judge", "tool_call"]);
+        let openapi = include_str!("../../../../api/openapi.yaml");
+        assert!(ids.iter().all(|id| openapi.contains(id)), "every label is in the OpenAPI document");
+    }
+
     #[test]
     fn a_good_run_becomes_a_reference_case_with_its_writes() {
         let review = Review { verdict: Verdict::Good, note: None, mast: None };
