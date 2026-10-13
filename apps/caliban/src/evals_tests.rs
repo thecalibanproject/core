@@ -4,7 +4,7 @@
 //! same pipeline, the metrics come back to the admin API, and the version is promoted only once
 //! its eval meets the bar. The journal is Postgres when `CALIBAN_TEST_DATABASE_URL` is set.
 
-use crate::nodes_tests::{ADMIN, Env, config_with, env_from, idem, journal, responder, send, worker};
+use crate::nodes_tests::{ADMIN, Env, KEY, config_with, env_from, idem, journal, responder, send, worker};
 use axum::http::StatusCode;
 use caliban_bench::mock::Responder;
 use caliban_nodes::eval::runner::{EvalOptions, EvalRunner};
@@ -322,4 +322,124 @@ async fn a_golden_eval_never_reaches_a_real_write_tool() {
         assert_eq!((call["sandboxed"].as_bool(), call["args"]["tx"].as_str()), (Some(true), Some("TX-30015")), "{t}");
     }
     assert_eq!(d["summary"]["pass_hat_k"].as_f64(), Some(0.5), "{d}");
+}
+
+// ───────────────────────── cases from runs ─────────────────────────
+
+/// Production feedback (research note 04 §7): a reviewer turns finished runs into golden cases.
+/// A good run of the refund desk becomes a case whose judge compares with its output and whose
+/// `tool_call` check asserts the refund it made; evaluating that case never refunds for real. A
+/// run waiting for a human cannot be captured until it ends; then its answers are scripted. A
+/// bad run needs a note, and its MAST label lands on the run.
+#[tokio::test]
+async fn finished_runs_become_golden_cases() {
+    let j = journal().await;
+    let e = env_from(Duration::ZERO, Some(Arc::clone(&j)), bank_model(), |url| config_with(url, "")).await;
+    let b = bank(&e).await;
+    let app = &e.cp_app;
+    let w = worker(&e, &j, &idem(), None, "worker-a", Duration::from_secs(30));
+    let capture = |run: &str| format!("/api/v1/tenants/acme/runs/{run}/golden-case");
+
+    // A production run refunds for real.
+    let (s, run) = send(
+        &w.app,
+        "POST",
+        "/v1/nodes/refunds/runs",
+        KEY,
+        Some(json!({"input": "Refund TX-30015", "version": 1})),
+        &[],
+    )
+    .await;
+    assert_eq!((s.is_success(), run["status"].as_str()), (true, Some("succeeded")), "{run}");
+    let refund_run = run["id"].as_str().unwrap().to_owned();
+    assert_eq!(refunds_to_the_server(&b), 1, "a production run writes for real");
+
+    // Refused: no such run, a bad verdict without a note, a label on a good run, an unknown label.
+    let good = json!({"verdict": "good"});
+    let (s, v) = send(app, "POST", &capture("run_nope"), ADMIN, Some(good.clone()), &[]).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
+    for body in [
+        json!({"verdict": "bad"}),
+        json!({"verdict": "bad", "note": "  "}),
+        json!({"verdict": "good", "mast_label": "step_repetition"}),
+        json!({"verdict": "bad", "note": "x", "mast_label": "FM-1.3"}),
+    ] {
+        let (s, v) = send(app, "POST", &capture(&refund_run), ADMIN, Some(body.clone()), &[]).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}: {v}");
+    }
+    let (s, v) =
+        send(app, "POST", &capture(&refund_run), ADMIN, Some(json!({"verdict": "good", "version": 9})), &[]).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
+
+    // Good: the output is the judge's reference, the refund is asserted.
+    let (s, c) = send(app, "POST", &capture(&refund_run), ADMIN, Some(good.clone()), &[]).await;
+    assert_eq!(s, StatusCode::CREATED, "{c}");
+    assert_eq!((c["object"].as_str(), c["case_id"].as_str()), (Some("node.golden_case"), Some(refund_run.as_str())));
+    assert_eq!(c["checks"], json!(["llm_judge", "tool_call"]), "{c}");
+    assert_eq!(c["case"]["checks"][1], json!({"type": "tool_call", "tool": "mcp://bank/refund"}));
+    assert!(c["case"]["checks"][0]["reference"].as_str().unwrap().contains("REAL REFUND ISSUED"), "{c}");
+    let (s, v) = send(app, "POST", &capture(&refund_run), ADMIN, Some(good.clone()), &[]).await;
+    assert_eq!(s, StatusCode::CONFLICT, "captured once per set: {v}");
+
+    // Its eval: the case passes, the refund goes to the sandbox, never to the bank.
+    let (s, ev) = send(
+        app,
+        "POST",
+        &format!("{N}/refunds/versions/1/evals"),
+        ADMIN,
+        Some(json!({"suite": "golden", "k": 2})),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{ev}");
+    assert!(EvalRunner::new(Arc::clone(&w.ex), opts()).run_once().await);
+    let (_, d) =
+        send(app, "GET", &format!("/api/v1/tenants/acme/evals/{}", ev["id"].as_str().unwrap()), ADMIN, None, &[]).await;
+    assert_eq!((d["status"].as_str(), d["summary"]["pass_hat_k"].as_f64()), (Some("succeeded"), Some(1.0)), "{d}");
+    assert_eq!(refunds_to_the_server(&b), 1, "the eval of the captured case refunded nothing");
+
+    // A run that waits for a human is in progress; once answered, its answer is scripted.
+    e.publish(
+        "ask",
+        json!({"kind": "workflow", "prompt": {"system": "You ask."}, "model_policy": {},
+               "budgets": {"steps": 5, "tokens": 1000, "wall_clock_s": 60},
+               "graph": {"vertices": [{"id": "clarify", "type": "human", "config": {"question": "Which transaction?"}}], "edges": []}}),
+    )
+    .await;
+    let (_, run) = send(&w.app, "POST", "/v1/nodes/ask/runs", KEY, Some(json!({"input": "refund"})), &[]).await;
+    assert_eq!(run["status"], "input_required", "{run}");
+    let ask_run = run["id"].as_str().unwrap().to_owned();
+    let (s, v) = send(app, "POST", &capture(&ask_run), ADMIN, Some(good.clone()), &[]).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    let (s, v) = send(
+        app,
+        "POST",
+        &format!("/api/v1/tenants/acme/runs/{ask_run}/input"),
+        ADMIN,
+        Some(json!({"answer": "TX-30015"})),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    w.ex.spawn_run(ask_run.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let done = w.ex.wait("acme", &ask_run, deadline).await.unwrap().unwrap();
+    assert!(done.status.is_terminal(), "{done:?}");
+
+    // Bad, with a note and a MAST label: the rubric is the note; the label is on the run.
+    let bad =
+        json!({"verdict": "bad", "note": "Ask for the amount too.", "mast_label": "fail_to_ask_for_clarification"});
+    let (s, c) = send(app, "POST", &capture(&ask_run), ADMIN, Some(bad), &[]).await;
+    assert_eq!(s, StatusCode::CREATED, "{c}");
+    assert_eq!(c["case"]["answers"], json!({"clarify#0": "TX-30015"}), "{c}");
+    assert!(c["case"]["checks"][0]["rubric"].as_str().unwrap().contains("Ask for the amount too."));
+    assert_eq!(c["case"]["tags"], json!(["captured", "bad", "mast:fail_to_ask_for_clarification"]));
+    let (_, r) = send(app, "GET", &format!("/api/v1/tenants/acme/runs/{ask_run}"), ADMIN, None, &[]).await;
+    assert_eq!(r["mast_label"], "fail_to_ask_for_clarification", "{r}");
+    // Audited without the note.
+    let (_, a) = send(app, "GET", "/api/v1/audit?limit=200", ADMIN, None, &[]).await;
+    let captures: Vec<&Value> =
+        a["entries"].as_array().unwrap().iter().filter(|x| x["action"] == "node.golden_set.capture").collect();
+    assert_eq!(captures.len(), 2, "{a}");
+    assert!(captures.iter().all(|x| !x.to_string().contains("amount too")));
 }

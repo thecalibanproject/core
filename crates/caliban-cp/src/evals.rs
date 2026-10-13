@@ -190,6 +190,161 @@ pub(crate) async fn delete_golden(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ───────────────────────────── cases from runs ─────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CaptureBody {
+    /// `good` or `bad`.
+    verdict: eval::capture::Verdict,
+    /// What the right behaviour is (required for `bad`).
+    note: Option<String>,
+    /// A MAST failure mode by id (`bad` only), stored on the run.
+    mast_label: Option<String>,
+    /// The version whose golden set receives the case (default: the run's version).
+    version: Option<u32>,
+}
+
+/// How many times a capture re-reads a golden set that changed under it before it gives up.
+const CAPTURE_ATTEMPTS: usize = 5;
+
+/// `POST /api/v1/tenants/{t}/runs/{id}/golden-case` (`nodes.write`, the permission that edits a
+/// golden set): appends a case built from a finished run to a golden set
+/// ([`eval::capture::case_from_run`]). The set is the run's version's unless `version` names
+/// another version of the same node: golden sets belong to a version (inputs follow its input
+/// schema), and the run's input, answers and output came from the run's version, so that is the
+/// default; naming a newer draft carries a regression case forward. The case is checked like a
+/// `PUT` (input against the target version's input schema). The write is a compare-and-set on
+/// the set's hash, so concurrent edits never lose a case. Audited as `node.golden_set.capture`
+/// (ids, counts, hashes, the verdict and the label, never the note or any content); a MAST label
+/// is stored on the run.
+pub(crate) async fn capture(
+    AxState(cp): AxState<Cp>,
+    Extension(p): Extension<Principal>,
+    Path((tenant_id, run_id)): Path<(String, String)>,
+    Json(body): Json<CaptureBody>,
+) -> Result<(StatusCode, Json<Value>), NodeError> {
+    use eval::capture::{self as cap, Refusal, Review};
+    crate::ensure_tenant(&cp, &tenant_id)?;
+    let j = journal(&cp)?;
+    // Another tenant's run is not found, like a run that does not exist.
+    let run = j.get_run(&tenant_id, &run_id).await.map_err(journal_error)?.ok_or_else(|| not_found("run"))?;
+    let mast = match body.mast_label.as_deref() {
+        None => None,
+        Some(id) => Some(cap::mast(id).ok_or_else(|| {
+            unprocessable(format!(
+                "unknown mast_label '{id}' (one of: {})",
+                cap::MAST.iter().map(|m| m.id).collect::<Vec<_>>().join(", ")
+            ))
+        })?),
+    };
+    let review = Review { verdict: body.verdict, note: body.note.as_deref(), mast };
+    match cap::admissible(&run, &review) {
+        Ok(()) => {}
+        Err(Refusal::InProgress) => {
+            return Err(conflict(format!(
+                "run {run_id} is {}: only a finished run can become a golden case",
+                run.status.as_str()
+            ))
+            .into());
+        }
+        Err(Refusal::Invalid(m)) => return Err(unprocessable(m).into()),
+    }
+    let version = body.version.unwrap_or(run.version);
+    let n = version_of(&cp.store.state(), &tenant_id, &run.node, version)?;
+    let spec = spec_of(&n)?;
+    let s = sealer_for(&cp, &p, &tenant_id).await?;
+    let material = cap::material(&j, &s, &run).await.map_err(|e| {
+        tracing::error!(run = %run_id, error = %e, "a run's content cannot be read for a golden case");
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "the run's content cannot be read".into())
+    })?;
+    let case = cap::case_from_run(&run.id, &material, &review, spec.output_schema());
+    let context = golden_context(&run.node, version);
+    let target = format!("{}@v{version}", run.node);
+    let mut attempt = 0;
+    let previous = loop {
+        attempt += 1;
+        let current = j.golden_set(&tenant_id, &run.node, version).await.map_err(journal_error)?;
+        let mut cases = match &current {
+            Some(g) => open_cases(&s, g)?,
+            None => vec![],
+        };
+        if cases.iter().any(|c| c.id == case.id) {
+            return Err(conflict(format!(
+                "run {run_id} is already in the golden set of {target} (case '{}')",
+                case.id
+            ))
+            .into());
+        }
+        cases.push(case.clone());
+        if let Err(problems) = eval::validate_cases(&cases, &spec) {
+            let list = problems.iter().map(|m| Problem::new("golden_set", m.clone(), None)).collect();
+            return Err(NodeError::Problems(
+                format!("the case does not fit the golden set of {target}: {}", problems.join("; ")),
+                list,
+            ));
+        }
+        let text = serde_json::to_string(&cases).map_err(|e| bad(e.to_string()))?;
+        let hash = eval::golden_hash(&cases);
+        let rec = GoldenSetRecord {
+            tenant_id: tenant_id.clone(),
+            node: run.node.clone(),
+            version,
+            cases: s.seal(&tenant_id, &context, &text).map_err(bad)?,
+            case_count: cases.len() as u32,
+            hash: hash.clone(),
+            updated_at: Utc::now(),
+            updated_by: p.actor.clone(),
+        };
+        let previous = current.as_ref().map(|g| g.hash.clone());
+        // Metadata only (research note 05): no note, no input, no output.
+        let detail = json!({
+            "node": run.node, "version": version, "run": run.id, "run_version": run.version, "case": case.id,
+            "verdict": review.verdict, "mast_label": mast.map(|m| m.id),
+            "checks": case.checks.iter().map(eval::Check::kind).collect::<Vec<_>>(),
+            "cases": cases.len(), "hash": hash, "previous_hash": previous,
+        });
+        let a = audit(&tenant_id, &p, once("golden_set"), "node.golden_set.capture", &target, detail);
+        if j.replace_golden_set_if(rec, previous.as_deref(), Some(a)).await.map_err(journal_error)? {
+            break previous;
+        }
+        if attempt >= CAPTURE_ATTEMPTS {
+            return Err(
+                conflict(format!("the golden set of {target} kept changing during the capture; try again")).into()
+            );
+        }
+    };
+    if mast.is_some() && !j.set_mast_label(&tenant_id, &run.id, mast.map(|m| m.id)).await.map_err(journal_error)? {
+        return Err(not_found("run").into());
+    }
+    drain_audit(&cp, &j).await?;
+    let set = j
+        .golden_set(&tenant_id, &run.node, version)
+        .await
+        .map_err(journal_error)?
+        .ok_or_else(|| not_found("golden set"))?;
+    let visible = p.allows(Perm::RunsData, Some(&tenant_id));
+    let mut v = json!({
+        "object": "node.golden_case",
+        "run_id": run.id,
+        "node": run.node,
+        "version": version,
+        "run_version": run.version,
+        "case_id": case.id,
+        "verdict": review.verdict,
+        "mast_label": mast.map(|m| m.id),
+        "checks": case.checks.iter().map(eval::Check::kind).collect::<Vec<_>>(),
+        "previous_hash": previous,
+        "golden_set": golden_view(&set, None),
+        "content_visible": visible,
+    });
+    // The case is the run's content: shown with `runs.data` only, like a set's cases.
+    if visible {
+        v["case"] = json!(case);
+    }
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
 // ───────────────────────────── the promotion bar ─────────────────────────────
 
 async fn policy_of(

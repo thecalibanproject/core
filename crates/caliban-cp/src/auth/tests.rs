@@ -1083,6 +1083,15 @@ fn cases() -> Vec<Case> {
             true,
             "owner admin tenant_admin",
         ),
+        // Capturing a run edits a golden set: who may edit one.
+        c(
+            "POST",
+            "/tenants/{tenant_id}/runs/{id}/golden-case",
+            "/api/v1/tenants/{t}/runs/run_nope/golden-case",
+            Some(json!({"verdict": "good"})),
+            true,
+            "owner admin tenant_admin developer",
+        ),
         c("GET", "/tenants/{tenant_id}/inbox", "/api/v1/tenants/{t}/inbox", None, true, RUN_READERS),
         c("GET", "/tenants/{tenant_id}/node-spend", "/api/v1/tenants/{t}/node-spend", None, true, EVERYONE),
         c("GET", "/models", "/api/v1/models", None, false, EVERYONE),
@@ -1711,4 +1720,122 @@ async fn run_content_and_answers_follow_the_roles() {
         (Some(1.0), Some(0.75))
     );
     assert_eq!((r.body["caps"]["monthly_usd"].clone(), r.body["capped"].as_bool()), (Value::Null, Some(false)));
+}
+
+/// Capturing a run into a golden set (`POST .../runs/{id}/golden-case`) needs what editing a
+/// golden set needs (`nodes.write`), stays inside the tenant (another tenant's run is not found,
+/// another tenant's path is forbidden), shows the case only with `runs.data`, and audits metadata
+/// only: never the note or the run's content.
+#[tokio::test]
+async fn capturing_a_run_follows_the_roles_and_the_tenant() {
+    use caliban_nodes::budget::BudgetState;
+    use caliban_nodes::journal::memory::MemoryJournal;
+    use caliban_nodes::journal::{Finish, Journal, NewRun, RunStatus};
+    use caliban_nodes::seal::{DekSealer, Sealer};
+    let journal: Arc<dyn Journal> = Arc::new(MemoryJournal::new());
+    let ring = Keyring::new([7; 32], []);
+    let cfg = base_config();
+    let handle = ConfigHandle::new(Snapshot::new(cfg.clone(), "boot"));
+    let cp: Cp = Arc::new(
+        ControlPlane::new(Store::new(cfg, handle, RecentUsage::default()), BREAK_GLASS.into(), "standalone")
+            .with_keyring(Some(Arc::new(ring.clone())))
+            .with_oidc(Some(Oidc::new(settings("http://127.0.0.1:9/never-contacted")).unwrap()))
+            .with_journal(Some(Arc::clone(&journal))),
+    );
+    let app = app(Arc::clone(&cp), None);
+    let admin = bearer(BREAK_GLASS);
+    let as_admin = async |method: &str, uri: &str, body: Option<Value>| {
+        send(&app, method, uri, &[("authorization", &admin)], body).await
+    };
+    let r = as_admin("POST", "/api/v1/tenants", Some(json!({"id": "globex", "name": "Globex"}))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let spec = json!({"kind": "agent", "prompt": {"system": "Triage.",
+        "output_schema": {"type": "object", "required": ["service"]}},
+        "model_policy": {}, "budgets": {"steps": 5, "tokens": 1000, "wall_clock_s": 30}});
+    let r = as_admin("POST", "/api/v1/tenants/acme/nodes/triage/versions", Some(json!({"spec": spec}))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    // A finished run in each tenant, sealed under its tenant's key.
+    for tenant in ["acme", "globex"] {
+        let (dek, rec) = crate::keys::new_dek(&ring, tenant);
+        cp.store.apply("setup", Mutation::CreateDek { tenant_id: tenant.into(), dek: rec }).await.unwrap();
+        let dek = Arc::new(dek);
+        let sealer = DekSealer::new(move |_: &str| Ok::<_, String>(Arc::clone(&dek)));
+        let id = format!("run_{tenant}");
+        let seal = |s: &str| sealer.seal(tenant, &id, s).unwrap();
+        journal
+            .create_run(NewRun {
+                id: id.clone(),
+                tenant_id: tenant.into(),
+                node: "triage".into(),
+                version: 1,
+                spec_hash: "sha256:00".into(),
+                invoker: "api_key:abc".into(),
+                invoker_key_hash: None,
+                input: seal(r#"{"case": "chest pain, jane@example.com"}"#),
+                budget: BudgetState::new(5, 100, 60),
+                idempotency: None,
+                specs: None,
+                origin: None,
+                input_labels: vec![],
+            })
+            .await
+            .unwrap();
+        journal.claim(&id, "w", Duration::from_secs(30)).await.unwrap().unwrap();
+        let fin = Finish {
+            status: RunStatus::Succeeded,
+            output: Some(seal(r#"{"service": "cardiology"}"#)),
+            error: None,
+            stop_reason: None,
+            budget: BudgetState::new(5, 100, 60),
+        };
+        assert!(journal.finish(&id, "w", fin).await.unwrap());
+    }
+    let as_role = async |groups: &[&str], uri: &str, body: Value| {
+        let token = session_for(&cp, groups[0], groups).await;
+        let (cookie, csrf) = (format!("caliban_session={token}"), csrf_token(&token));
+        send(&app, "POST", uri, &[("cookie", &cookie), ("x-csrf-token", &csrf)], Some(body)).await
+    };
+    let good = json!({"verdict": "good", "note": "Cardiology, jane@example.com was right."});
+    let capture = |tenant: &str, run: &str| format!("/api/v1/tenants/{tenant}/runs/{run}/golden-case");
+    // A viewer may not edit golden sets.
+    assert_eq!(
+        as_role(&["acme-viewers"], &capture("acme", "run_acme"), good.clone()).await.status,
+        StatusCode::FORBIDDEN
+    );
+    // Another tenant's run: not found from acme, forbidden on globex's path.
+    let r = as_role(&["acme-devs"], &capture("acme", "run_globex"), good.clone()).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.body);
+    let r = as_role(&["acme-devs"], &capture("globex", "run_globex"), good.clone()).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+    assert!(journal.golden_set("globex", "triage", 1).await.unwrap().is_none());
+    // A developer (nodes.write and runs.data) captures acme's run; the case is shown.
+    let r = as_role(&["acme-devs"], &capture("acme", "run_acme"), good.clone()).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    assert_eq!(
+        (r.body["case_id"].as_str(), r.body["version"].as_u64(), r.body["golden_set"]["case_count"].as_u64()),
+        (Some("run_acme"), Some(1), Some(1)),
+        "{}",
+        r.body
+    );
+    assert_eq!(r.body["checks"], json!(["json_schema", "llm_judge"]));
+    assert_eq!(r.body["case"]["checks"][1]["reference"]["service"], "cardiology");
+    assert_eq!(r.body["previous_hash"], Value::Null);
+    // The same run again: a conflict, the set unchanged.
+    let again = as_role(&["acme-admins"], &capture("acme", "run_acme"), good.clone()).await;
+    assert_eq!(again.status, StatusCode::CONFLICT, "{}", again.body);
+    let g = journal.golden_set("acme", "triage", 1).await.unwrap().unwrap();
+    assert_eq!((g.case_count, g.hash.as_str()), (1, r.body["golden_set"]["hash"].as_str().unwrap()));
+    // The audit entry: ids, the verdict, counts and hashes; nothing the run or the note said.
+    let log = cp.store.audit(50).await.unwrap();
+    let entry = log.iter().find(|a| a.action == "node.golden_set.capture").expect("audited");
+    assert_eq!(
+        (entry.target.as_deref(), entry.detail["run"].as_str(), entry.detail["verdict"].as_str()),
+        (Some("triage@v1"), Some("run_acme"), Some("good"))
+    );
+    let text = entry.detail.to_string();
+    assert!(
+        !text.contains("jane@example.com") && !text.contains("cardiology") && !text.contains("Cardiology"),
+        "{text}"
+    );
+    assert!(verify_chain(&log).is_ok());
 }

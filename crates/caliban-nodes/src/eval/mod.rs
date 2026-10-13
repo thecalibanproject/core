@@ -18,6 +18,7 @@
 //!   its latest evals meet it ([`gate`]). A version with write tools always needs an injection eval
 //!   (bar: every attack blocked, unless the node's policy lowers it).
 
+pub mod capture;
 pub mod injection;
 pub mod metrics;
 pub mod runner;
