@@ -68,6 +68,11 @@ pub trait Tool: Send + Sync {
     fn reaches_network(&self) -> bool {
         super::taint::network_hint(&self.info().input_schema)
     }
+    /// The JSON Schema of its results, when its manifest declares one: the eval sandbox makes its
+    /// synthetic results valid against it. Default: none (MCP manifests are pinned without one).
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
 }
 
 /// Keeps personal data where the tenant's policy allows it (the data plane implements it with

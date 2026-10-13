@@ -1794,13 +1794,104 @@ mod evals {
                 let r = j.get_run("acme", t.run_id.as_ref().unwrap()).await.unwrap().unwrap();
                 assert_eq!(
                     (r.origin.as_deref(), r.invoker.as_str()),
-                    (Some(format!("eval:{}", e.id).as_str()), format!("eval:{}", e.id).as_str())
+                    (Some(format!("eval:{}:{}", e.id, t.case_id).as_str()), format!("eval:{}", e.id).as_str())
                 );
             }
             // The judge ran once per trial of the good case, through the model client.
             assert_eq!(model.steps().iter().filter(|s| s.starts_with("judge:good:")).count(), 2);
             // Running it again does nothing: every trial is recorded.
             assert!(!runner.run_once().await);
+        }
+    }
+
+    /// A golden trial never reaches a real write tool (fintech demo, 2026-10-13: a golden trial
+    /// issued a real refund). Writes go to the eval sandbox, which answers the case's scripted
+    /// result or a synthetic one; reads still call the real tool; every call is recorded in the
+    /// trial detail, and `tool_call` checks assert what was (or must not be) called.
+    #[tokio::test]
+    async fn a_golden_eval_sandboxes_writes_and_checks_tool_calls() {
+        for j in journals().await {
+            let lookup = Recorder::new("lookup", false, json!({"tx": "TX-30015", "amount": 20}));
+            let refund = Recorder::new("refund", false, json!({"status": "REAL REFUND"}));
+            let (read, write) = (format!("mcp://bank/lookup#{PIN}"), format!("mcp://bank/refund#{PIN_W}"));
+            let tools = StaticTools::new()
+                .with(read.clone(), Arc::clone(&lookup) as Arc<dyn Tool>)
+                .with(write.clone(), Arc::clone(&refund) as Arc<dyn Tool>);
+            let h = Harness::new(Arc::clone(&j)).with_tools(tools);
+            h.nodes.add(
+                "refunds",
+                1,
+                json!({"kind": "agent", "model_policy": {}, "budgets": budgets(10, 100_000),
+                "tools": [{"ref": read, "effect": "read"}, {"ref": write, "effect": "write"}]}),
+            );
+            // Refunds the transaction and looks it up in one turn (the refund first, so its arguments
+            // carry no tool output and need no approval), then answers with what the refund said.
+            let model = FakeModel::new(|body| {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                match msgs.iter().find(|m| m["role"] == "tool") {
+                    Some(m) => text(&format!("Done: {}", m["content"].as_str().unwrap_or_default())),
+                    None => json!({"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "c0", "type": "function", "function": {"name": "refund", "arguments": "{\"tx\": \"TX-30015\", \"amount\": 20}"}},
+                        {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": "{\"tx\": \"TX-30015\"}"}}]}),
+                }
+            });
+            let ex = h.executor(&model, "w1");
+            let case = |v: Value| serde_json::from_value::<GoldenCase>(v).unwrap();
+            let cases = vec![
+                // Scripted: the refund answers the script, the intended write is asserted.
+                case(json!({"id": "scripted", "input": "refund TX-30015",
+                    "tool_results": {"refund": {"status": "refunded", "refund_id": "R-1"}},
+                    "checks": [{"type": "contains", "value": "R-1"},
+                               {"type": "tool_call", "tool": "refund", "args": {"tx": "TX-30015"}},
+                               {"type": "tool_call", "tool": "mcp://bank/lookup", "args": {"tx": "TX-1"}, "must_not_call": true}]})),
+                // No script: a synthetic result, marked; a must_not_call on the write fails.
+                case(json!({"id": "forbidden", "input": "refund TX-30015",
+                    "checks": [{"type": "contains", "value": "sandbox"},
+                               {"type": "tool_call", "tool": "refund", "must_not_call": true}]})),
+                // Arguments that do not match: the call check fails.
+                case(json!({"id": "other_tx", "input": "refund TX-30015",
+                    "checks": [{"type": "tool_call", "tool": "refund", "args": {"tx": "TX-99999"}}]})),
+            ];
+            let plan = Plan::Golden { golden_hash: crate::eval::golden_hash(&cases), cases, judge_model: None };
+            let e = start_eval(&h, "refunds", Suite::Golden, 1, &plan).await;
+            assert!(EvalRunner::new(Arc::clone(&ex), opts()).run_once().await);
+            let e = j.get_eval("acme", &e.id).await.unwrap().unwrap();
+            assert_eq!(e.status, EvalStatus::Succeeded, "{e:?}");
+            // The real write tool received nothing; the real read tool was called by every trial.
+            assert!(
+                refund.seen.lock().is_empty(),
+                "a golden trial reached the real write tool: {:?}",
+                refund.seen.lock()
+            );
+            assert_eq!(lookup.seen.lock().len(), 3);
+            let trials = j.trials(&e.id).await.unwrap();
+            let status = |id: &str| trials.iter().find(|t| t.case_id == id).unwrap().status;
+            assert_eq!(
+                (status("scripted"), status("forbidden"), status("other_tx")),
+                (TrialStatus::Passed, TrialStatus::Failed, TrialStatus::Failed),
+                "{trials:?}"
+            );
+            let forbidden = trials.iter().find(|t| t.case_id == "forbidden").unwrap();
+            assert_eq!(
+                forbidden.verdict["checks"][0]["passed"], true,
+                "the synthetic result is marked: {:?}",
+                forbidden.verdict
+            );
+            assert_eq!(forbidden.verdict["checks"][1]["type"], "tool_call");
+            assert_eq!(
+                (forbidden.verdict["tool_calls"].as_u64(), forbidden.verdict["sandboxed_calls"].as_u64()),
+                (Some(2), Some(1))
+            );
+            // Every call is in the sealed detail, as the tool (or the sandbox) received it.
+            let detail: Value =
+                serde_json::from_str(&h.sealer.open("acme", &e.id, forbidden.detail.as_ref().unwrap()).unwrap())
+                    .unwrap();
+            let calls = detail["tool_calls"].as_array().unwrap();
+            let refund_call = calls.iter().find(|c| c["name"] == "refund").unwrap();
+            assert_eq!((refund_call["sandboxed"].as_bool(), refund_call["write"].as_bool()), (Some(true), Some(true)));
+            assert_eq!(refund_call["args"], json!({"tx": "TX-30015", "amount": 20}));
+            assert_eq!(calls.iter().find(|c| c["name"] == "lookup").unwrap()["sandboxed"], false);
+            assert!(detail["checks"][1]["reason"].as_str().unwrap().contains("must not"), "{detail}");
         }
     }
 

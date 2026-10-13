@@ -19,7 +19,7 @@
 //!   injection verdict. A trial is written once it is final; the eval ends with its metrics.
 
 use super::injection::{self, Surface};
-use super::{Check, GoldenCase, Plan, check_output, judge_request, judge_verdict, metrics};
+use super::{Check, GoldenCase, Plan, check_calls, check_output, judge_request, judge_verdict, metrics};
 use crate::NodeSpec;
 use crate::executor::{CallCtx, ExecError, Executor, StartRun, idempotency_key, infrastructure_failure};
 use crate::journal::evals::{EvalFinish, EvalRecord, EvalStatus, TrialRecord, TrialStatus, TrialWrite};
@@ -440,7 +440,7 @@ impl EvalRunner {
                 t.verdict = serde_json::to_value(&v).unwrap_or_default();
                 return self.put(t).await;
             }
-            Job::Golden(c, n) => (c.id.clone(), *n, c.input.clone(), format!("eval:{}", e.id), vec![]),
+            Job::Golden(c, n) => (c.id.clone(), *n, c.input.clone(), golden_origin(&e.id, &c.id), vec![]),
             Job::Injection(c, n, input, marks) => {
                 (c.id.to_owned(), *n, input.clone(), injection::origin(&e.id, c.id), marks.clone())
             }
@@ -571,13 +571,22 @@ impl EvalRunner {
         let mut results = Vec::new();
         let mut judge_usd = 0.0;
         let mut judge_error = None;
-        if r.status == RunStatus::Succeeded {
+        // Every tool call of the run, as the tool (or the sandbox, for writes) received it.
+        let steps = self.journal().steps(&r.id).await.unwrap_or_default();
+        let calls = match super::sandbox::observations(self.journal(), self.ex.sealer().as_ref(), r, &steps).await {
+            Ok(calls) => calls,
+            Err(err) => {
+                judge_error = Some(format!("the run's tool calls cannot be read: {err}"));
+                vec![]
+            }
+        };
+        if r.status == RunStatus::Succeeded && judge_error.is_none() {
             for (i, check) in c.all_checks().iter().enumerate() {
-                if let Some(res) = check_output(check, &output) {
+                if let Some(res) = check_output(check, &output).or_else(|| check_calls(check, &calls)) {
                     results.push(res);
                     continue;
                 }
-                let Check::LlmJudge { rubric, model, threshold } = check else { continue };
+                let Check::LlmJudge { rubric, model, threshold, reference } = check else { continue };
                 let model = model.clone().or_else(|| judge_model.clone()).unwrap_or_else(|| "caliban/auto".into());
                 let step_id = format!("judge:{}:{n}:{i}", c.id);
                 let ctx = CallCtx {
@@ -590,7 +599,7 @@ impl EvalRunner {
                     step_id,
                     origin: Some(format!("eval:{}", e.id)),
                 };
-                let body = judge_request(&model, rubric, &c.input, c.expected.as_ref(), &output);
+                let body = judge_request(&model, rubric, &c.input, reference.as_ref().or(c.expected.as_ref()), &output);
                 let mut res = super::CheckResult { kind: "llm_judge", passed: false, reason: None, score: None };
                 // Retried like the node's own model calls (a 429 waits for its reset).
                 let stop = || cx.watch.check().is_err();
@@ -627,12 +636,22 @@ impl EvalRunner {
             "run_status": r.status,
             "checks": results.iter().map(|x| json!({"type": x.kind, "passed": x.passed, "score": x.score})).collect::<Vec<_>>(),
             "judge_usd": judge_usd,
+            // Counts only (metadata): the calls themselves are content, in the sealed detail.
+            "tool_calls": calls.len(),
+            "sandboxed_calls": calls.iter().filter(|o| o.sandboxed).count(),
         });
         if let Some(kind) = infra {
             t.verdict["error_kind"] = json!(kind);
         }
-        t.detail =
-            self.seal(e, &json!({"output": output, "checks": results, "error": r.error, "stop_reason": r.stop_reason}));
+        // Sealed like the output: the arguments as the tool received them (after the PII guard).
+        let tool_calls: Vec<Value> = calls
+            .iter()
+            .map(|o| json!({"tool": o.tool, "name": o.name, "write": o.write, "sandboxed": o.sandboxed, "args": o.args_value()}))
+            .collect();
+        t.detail = self.seal(
+            e,
+            &json!({"output": output, "checks": results, "tool_calls": tool_calls, "error": r.error, "stop_reason": r.stop_reason}),
+        );
         t
     }
 
@@ -704,6 +723,22 @@ impl EvalRunner {
 /// Why a case is not applicable when the version's input schema refuses its injected input.
 pub const INPUT_REFUSED: &str =
     "the version's input schema refuses the run input with the injection (its runs cannot be created)";
+
+/// The origin of a golden trial's run: `eval:<eval>:<case>`. The executor gives such a run the
+/// eval sandbox with the case's scripted tool results (see [`golden_of_origin`]).
+pub fn golden_origin(eval_id: &str, case_id: &str) -> String {
+    format!("eval:{eval_id}:{case_id}")
+}
+
+/// The eval and the case a golden run's origin names (`eval:<eval>` before the case was part of
+/// it: no case). `None` for any other run.
+pub fn golden_of_origin(origin: Option<&str>) -> Option<(&str, Option<&str>)> {
+    let rest = origin?.strip_prefix("eval:")?;
+    Some(match rest.split_once(':') {
+        Some((eval, case)) => (eval, Some(case)),
+        None => (rest, None),
+    })
+}
 
 /// Who an eval's runs and answers are by.
 fn by(e: &EvalRecord) -> String {

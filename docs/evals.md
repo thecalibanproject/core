@@ -9,12 +9,14 @@ themselves are in [nodes.md](nodes.md), their tools and the defenses the suite e
 ## What is measured, and how
 
 **Every eval run uses the normal path.** An eval of a published node version starts its trials
-as ordinary node runs: the worker's executor creates them (`origin: eval:<eval id>`, invoker
-`eval:<eval id>`) with the tenant's [eval key](#the-eval-key) (or the API key the eval names), so the input is checked against the input
+as ordinary node runs: the worker's executor creates them (`origin: eval:<eval id>:<case id>`,
+invoker `eval:<eval id>`) with the tenant's [eval key](#the-eval-key) (or the API key the eval names), so the input is checked against the input
 schema, budgets and tenant spend caps apply, and every model call goes through the gateway
 pipeline (PII, caches, routing, quotas, metering, tracing). Usage events carry `node`,
 `node_version` and `run_id` as for any run. The LLM judge's calls go through the same pipeline,
-metered under the node with the eval id as `run_id`, so they never count in a run's cost. They are
+metered under the node with the eval id as `run_id`, so they never count in a run's cost.
+One exception to the normal path: a trial never reaches a real write tool ([golden trials and
+write tools](#golden-trials-and-write-tools)). They are
 retried like a run's model calls: a transient failure with the same backoff (50 ms, doubled up to
 2 s, for the executor's model retry window, 60 s by default), a rate limit (`429`) after waiting
 for its `Retry-After` (within 10 ms and 5 minutes), at most 5 times, with one idempotency key for
@@ -32,7 +34,11 @@ content: sealed at rest under the tenant's data key, readable only with `runs.da
    "checks": [{"type": "json_schema", "schema": {"type": "object", "required": ["urgency"]}},
               {"type": "contains", "value": ["clinical"]},
               {"type": "llm_judge", "rubric": "Does the recommendation fit the case?", "threshold": 0.7}]},
-  {"id": "refund", "input": {"case": "Refund my invoice"}, "expected": "billing"}
+  {"id": "refund", "input": {"case": "Refund my invoice"}, "expected": "billing"},
+  {"id": "tx", "input": {"case": "Refund TX-30015"},
+   "tool_results": {"refund": {"status": "refunded", "refund_id": "R-1"}},
+   "checks": [{"type": "tool_call", "tool": "refund", "args": {"tx": "TX-30015"}},
+              {"type": "tool_call", "tool": "mcp://mail/send_email", "must_not_call": true}]}
 ]}
 ```
 
@@ -42,7 +48,8 @@ content: sealed at rest under the tenant's data key, readable only with `runs.da
 | `contains` | Every value is a substring of the output text |
 | `regex` | The pattern matches the output text (`flags`: `IGNORECASE`, `MULTILINE`, `DOTALL`) |
 | `json_schema` | The output (parsed when it is text) matches the schema (the subset node specs use) |
-| `llm_judge` | A model, called through the gateway, scores the output against the rubric (0 to 1) at or above `threshold` (default 0.5). Model: the check's `model`, else the eval's `judge_model`, else `caliban/auto`. The judge prompt treats the output as data, never as instructions |
+| `llm_judge` | A model, called through the gateway, scores the output against the rubric (0 to 1) at or above `threshold` (default 0.5). Model: the check's `model`, else the eval's `judge_model`, else `caliban/auto`. `reference` (optional, any JSON) is shown to the judge as the reference answer (default: the case's `expected`). The judge prompt treats the output as data, never as instructions |
+| `tool_call` | The run called `tool` (its manifest name, e.g. `refund`, its reference, or its reference without the pin, `mcp://bank/refund`) with arguments that contain `args` (optional; objects match key by key, recursively; arrays and scalars must be equal). With `"must_not_call": true` it passes when no such call happened. Arguments are compared as the tool (or the sandbox) received them, after the PII guard: a tool not trusted with personal data gets surrogates, so match on fields that are not personal (amounts, references, ids) |
 
 The output's text is the run output as is when it is a string, compact JSON otherwise. The format
 follows the SDK's golden sets (`caliban.evals`), so a set can move between the two.
@@ -50,6 +57,10 @@ follows the SDK's golden sets (`caliban.evals`), so a set can move between the t
 `answers` script the node's human steps, by step id (`clarify#0`, `write#0@approve`) or vertex id
 (`clarify`, `write@approve`). A question without an answer cancels the run and fails the trial; a
 tainted write without one is denied. Answers are journaled and audited as `eval:<id>`.
+
+`tool_results` script tool results, by tool name or reference, in the same spirit: what the
+sandbox answers for a write tool, and, when a read tool is named, what that read answers instead of
+the real tool (see below).
 
 **The metrics** (`summary` of a finished eval, metrics only, never content):
 
@@ -62,8 +73,105 @@ tainted write without one is denied. Answers are journaled and audited as `eval:
 | `judge_cost_usd` | What the judge's calls cost (not part of the node's cost) |
 | `latency_ms.p50`, `latency_ms.p95` | Nearest rank, over the runs' execution time (their wall clock: not time queued or waiting for a human) |
 | `by_case` | Per case: trials, passed, all passed |
-| `errors` | Trials that could not be scored: the run could not be created, a judge call failed, or the run failed for a reason outside the node (`error_kind` on the trial: `quota`, `provider`, `timeout`, see [errors](#errors)). They count as not passed |
+| `errors` | Trials that could not be scored: the run could not be created, a judge call failed, the run's tool calls could not be read, or the run failed for a reason outside the node (`error_kind` on the trial: `quota`, `provider`, `timeout`, see [errors](#errors)). They count as not passed |
 | `golden_hash`, `judge` | Which golden set ran, and the judge configuration (default model, prompt version and hash, temperature), so scores are compared under the same set and judge (swapping a simulated user or judge moves scores by many points: UserProxyBench, arXiv 2609.38043) |
+
+### Golden trials and write tools
+
+A golden trial runs the node for real, so before 2026-10-13 it also called its write tools for
+real: in the fintech demo a golden trial issued a real refund (TX-30015) on the bank's refund
+server. The injection suite already ran "the node's real allowlist and its own pinned tools behind
+a sandbox" (research note 04, section 7); golden trials now use the same sandboxed registry
+(`caliban_nodes::eval::sandbox`), in a golden mode:
+
+- **Writes never leave.** Every call to a tool whose declared effect is `write` (in the version or
+  any subnode it pins; an MCP tool, or any other tool declared `write`) goes to the sandbox. It
+  answers the case's `tool_results` entry for the tool, else a synthetic result marked as such:
+  valid against the tool's output schema when the tool declares one (`Tool::output_schema`;
+  `"sandbox": true` is added wherever the schema allows the key), else
+  `{"ok": true, "sandbox": true, "synthetic": true, "note": "Caliban eval sandbox: ..."}`. A schema
+  the generator cannot satisfy (a `pattern`) gets the marked default. MCP manifests are pinned
+  without an output schema today, so for them the marked default is what a trial sees.
+- **Reads behave as before.** A read tool (MCP, `builtin://datasource_query`,
+  `builtin://rag_search`) is called for real, with its real result, unless the case scripts it.
+  A version's reads are expected to be side-effect free; their effect is what the version
+  declares.
+- **The executor's defenses are unchanged**: taint, approvals (scripted with `answers`; a tainted
+  write without one is denied), declared tools only, the PII guard. The sandbox only replaces the
+  final call.
+- **Every call is recorded** before it is answered, as the tool would have received it (after the
+  PII guard), sealed in the run's journal (`sandbox:<step>`). The trial's `detail` lists them
+  (`tool_calls`: `tool`, `name`, `write`, `sandboxed`, `args`), sealed like the output and purged
+  with it; its `verdict` carries only the counts (`tool_calls`, `sandboxed_calls`).
+
+A run whose origin is `eval:<eval>` (created before origins named the case) gets the sandbox with
+no scripts. A trial whose eval plan cannot be read fails rather than guess.
+
+### Cases from runs
+
+Golden sets are hand-written JSON that real users will not write. Research note 04 wants the
+opposite flow: "Trace UI lets humans label failed runs with MAST categories. These labels feed the
+eval loop" (section 6), and its production feedback loop turns traces, MAST labels and user
+feedback into regression sets (section 7). So a reviewer marks a finished run `good` or `bad`, and the control plane turns it into a case
+(`caliban_nodes::eval::capture`):
+
+```http
+POST /api/v1/tenants/{t}/runs/{run_id}/golden-case
+{"verdict": "bad", "note": "Ask which transaction before refunding.", "mast_label": "fail_to_ask_for_clarification"}
+```
+
+| Field | |
+|---|---|
+| `verdict` | `good` (the run did the right thing) or `bad` (it did not). Required |
+| `note` | What the right behaviour is, in the reviewer's words, at most 4000 characters. Required for `bad` (it becomes the judge's rubric); optional for `good` (added to the rubric) |
+| `mast_label` | One of the 14 MAST failure modes (arXiv 2503.13657, the taxonomy note 04 adopts), by id, `bad` only. Stored on the run (`mast_label` in the run's views, migration 0037) |
+| `version` | The version whose golden set receives the case. Default: the run's version |
+
+**The case.** Its id is the run id; its `input` is the run's input; its `answers` are the answers
+the run's human steps received, by step id (who answered is left out); its checks:
+
+- `json_schema` with the version's `prompt.output_schema`, when it declares one;
+- `good`: `llm_judge` (threshold 0.7) with the run's output as its `reference`, and a `tool_call`
+  check for each write tool the run called (by its reference without the pin; arguments are not
+  asserted, since they change between trials and personal values reach an untrusted tool as
+  surrogates). The writes are known from the `write:<step>` marks the executor journals for every
+  write sent to a real tool (the tool and its name, no arguments), or the sandbox's records for an
+  eval run;
+- `bad`: `llm_judge` (threshold 0.7) whose rubric is the note, with the MAST mode when one was
+  given. The run's writes are not asserted: the reviewer did not say which one was the mistake.
+  Add `tool_call` checks (`must_not_call`) by hand when the mistake was a write.
+
+Tags say where it came from: `captured`, the verdict, `mast:<id>`. A captured case runs like any
+other: its writes go to the sandbox.
+
+**Which set.** Golden sets belong to a version and are sealed per version (`golden/<node>@v<n>`),
+because inputs follow the version's input schema and human steps are named after its vertices.
+The run's input, answers and output came from the run's version, so its set is the default. To
+carry a regression case to the next version, name it (`version`): the case is checked against
+that version's input schema like any edit. There is no "current set" of a node: each version has
+its own.
+
+**How it is written.** Like a `PUT` of the set with the case appended: validated (`422`, problems
+of kind `golden_set`, when the input does not fit the version or the set already holds 200 cases),
+sealed under the tenant's data key, a new `hash`. The write is a compare-and-set on the hash the
+capture read, retried up to 5 times, so a concurrent edit is never lost (`409` if the set keeps
+changing). It is audited as `node.golden_set.capture` with the node, version, run id, case id,
+verdict, MAST label, check kinds, case count and old and new hashes: never the note, the input or
+the output (research note 05: nothing personal in audit entries or logs).
+
+**Refused:** an unknown run, or another tenant's (`404`, the same answer); a run that has not
+finished (`409`); a run already in that set (`409`, the case id is the run id); a `good` run that
+did not succeed, a `bad` one without a note, a MAST label on a `good` run, an unknown label, an
+injection-suite run (its input carries an attack) (`422`); a version that does not exist (`404`).
+
+**Response** (`201`): `object: "node.golden_case"`, `run_id`, `node`, `version`, `run_version`,
+`case_id`, `verdict`, `mast_label`, `checks` (their kinds), `previous_hash` (`null` when the set
+was created), `golden_set` (the set's metadata: `hash`, `case_count`, ...), `content_visible`, and
+the `case` itself with `runs.data` (it is the run's content).
+
+**Retention.** A captured case is golden-set content: sealed, kept with the set, not purged with
+the run (golden sets are not purged). Deleting the case means editing the set (`PUT`) or deleting
+it.
 
 ## The injection suite
 
@@ -301,6 +409,7 @@ which is audited.
 | `GET .../nodes/{name}/versions/{v}/golden-set` | `nodes.read` (cases with `runs.data`) | |
 | `PUT .../nodes/{name}/versions/{v}/golden-set` `{"cases": [...]}` | `nodes.write` | `node.golden_set.update` |
 | `DELETE .../nodes/{name}/versions/{v}/golden-set` | `nodes.write` | `node.golden_set.delete` |
+| `POST /api/v1/tenants/{t}/runs/{id}/golden-case` `{"verdict", "note"?, "mast_label"?, "version"?}` ([cases from runs](#cases-from-runs)) | `nodes.write` | `node.golden_set.capture` |
 | `GET .../nodes/{name}/eval-policy` | `nodes.read` | |
 | `PUT .../nodes/{name}/eval-policy` | `nodes.publish` | `node.eval_policy.update` (old and new bar) |
 | `POST .../nodes/{name}/versions/{v}/evals` `{"suite", "api_key_id"?, "k"?, "concurrency"?, "cases"?, "judge_model"?, "input"?, "input_case"?}` | `nodes.run` | `node.eval.start` |
@@ -346,7 +455,7 @@ Eval summaries are kept: the metrics, the verdicts (metadata) and the trial rows
 so a node's history and the promotion gate's evidence stay readable (P3 decision 13). The sealed
 content goes with the run retention (`CALIBAN_NODE_RUN_RETENTION_DAYS`, default 30): the same hourly
 purge on the workers clears each trial's `detail` (what the scorers said, the output that failed a
-check) and the eval's sealed plan (its golden cases or injection input) once the eval finished
+check, the tool calls) and the eval's sealed plan (its golden cases or injection input) once the eval finished
 longer ago than that, in batches with `FOR UPDATE SKIP LOCKED`. The eval then shows
 `content_purged: true`. Golden sets themselves belong to a version and are not purged.
 

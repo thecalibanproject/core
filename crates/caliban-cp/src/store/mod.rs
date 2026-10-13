@@ -2054,6 +2054,7 @@ pub const DATA_PLANE_ACTIONS: &[&str] = &[
     "node.eval.cancel",
     "node.eval.finish",
     "node.golden_set.update",
+    "node.golden_set.capture",
     "node.golden_set.delete",
     "node.eval_policy.update",
 ];

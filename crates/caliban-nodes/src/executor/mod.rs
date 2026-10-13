@@ -405,6 +405,9 @@ pub struct RunSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     pub invoker: String,
+    /// The MAST failure mode a reviewer labelled the run with (`eval::capture::MAST`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mast_label: Option<String>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -421,6 +424,7 @@ impl RunSummary {
             cost_usd: r.budget.usd,
             origin: r.origin.clone(),
             invoker: r.invoker.clone(),
+            mast_label: r.mast_label.clone(),
             created_at: r.created_at,
             finished_at: r.finished_at,
         }
@@ -1256,17 +1260,33 @@ impl RunCx {
             .into_iter()
             .map(|s| (s.step_id.clone(), s))
             .collect();
-        // An injection-suite run gets sandboxed tools, never the real ones (an unknown case fails).
+        let children: Vec<&NodeSpec> = pinned
+            .iter()
+            .filter(|((n, v), _)| !(*n == root.name && *v == root.version))
+            .map(|(_, r)| r.spec.as_ref())
+            .collect();
+        // Eval runs get the eval sandbox, never the real write tools: an injection-suite run for
+        // every tool (an unknown case fails), a golden trial for every write (its case's scripted
+        // results, else synthetic ones), its reads calling the real tools.
+        let golden = crate::eval::runner::golden_of_origin(run.origin.as_deref());
         let (tools, sandboxed): (Arc<dyn ToolRegistry>, bool) =
             match crate::eval::injection::case_of_origin(run.origin.as_deref()) {
+                None if golden.is_some() => {
+                    let (eval_id, case_id) = golden.unwrap_or_default();
+                    let scripts = golden_scripts(&ex, &run.tenant_id, eval_id, case_id).await.map_err(Stop::Fail)?;
+                    let sandbox = crate::eval::sandbox::SandboxTools::golden(
+                        scripts,
+                        &root.spec,
+                        &children,
+                        Arc::clone(&ex.tools),
+                        Arc::clone(&ex.journal),
+                        Arc::clone(&ex.sealer),
+                    );
+                    (Arc::new(sandbox), true)
+                }
                 None => (Arc::clone(&ex.tools), false),
                 Some(Err(e)) => return Err(Stop::Fail(e)),
                 Some(Ok(case)) => {
-                    let children: Vec<&NodeSpec> = pinned
-                        .iter()
-                        .filter(|((n, v), _)| !(*n == root.name && *v == root.version))
-                        .map(|(_, r)| r.spec.as_ref())
-                        .collect();
                     let sandbox = crate::eval::injection::SandboxTools::new(
                         case,
                         &run.tenant_id,
@@ -1735,6 +1755,36 @@ fn pin_specs(nodes: &Arc<dyn NodeSource>, tenant: &str, root: &ResolvedNode) -> 
         out.insert(format!("{}@v{}", n.name, n.version), json!({"hash": n.hash, "spec": n.spec.as_ref()}));
     }
     Value::Object(out)
+}
+
+/// The scripted tool results of a golden trial's case, from its eval's sealed plan. An eval that
+/// cannot be read fails the run: it must not guess. No case named (a run created before origins
+/// named it), or a case without scripts: none, so every write answers synthetically.
+async fn golden_scripts(
+    ex: &Executor,
+    tenant: &str,
+    eval_id: &str,
+    case_id: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, Value>, String> {
+    let Some(case_id) = case_id else { return Ok(Default::default()) };
+    let e = ex
+        .journal
+        .get_eval(tenant, eval_id)
+        .await
+        .map_err(|e| format!("eval {eval_id}: {e}"))?
+        .ok_or_else(|| format!("eval {eval_id} not found: a golden trial needs its plan"))?;
+    let plan = ex
+        .sealer
+        .open(tenant, &e.id, &e.plan)
+        .map_err(|e| format!("eval {eval_id}: its plan cannot be opened: {e}"))?;
+    let plan: crate::eval::Plan =
+        serde_json::from_str(&plan).map_err(|e| format!("eval {eval_id}: its plan cannot be read: {e}"))?;
+    Ok(match plan {
+        crate::eval::Plan::Golden { cases, .. } => {
+            cases.into_iter().find(|c| c.id == case_id).map(|c| c.tool_results).unwrap_or_default()
+        }
+        crate::eval::Plan::Injection { .. } => Default::default(),
+    })
 }
 
 /// Parses what [`pin_specs`] stored.

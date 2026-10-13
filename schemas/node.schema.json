@@ -125,7 +125,40 @@
     },
     "eval": {
       "type": "object",
+      "description": "Informational. Golden sets are stored per version through the admin API (docs/evals.md); their cases follow $defs/golden_case.",
       "properties": { "suite": { "type": "string" }, "metrics": { "type": "array", "items": { "type": "string" } } }
+    }
+  },
+  "$defs": {
+    "golden_case": {
+      "description": "One case of a version's golden set (PUT .../versions/{v}/golden-set, or captured from a run with POST .../runs/{id}/golden-case). See docs/evals.md.",
+      "type": "object",
+      "required": ["id", "input"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
+        "input": { "description": "The run input (checked against prompt.input_schema)" },
+        "expected": { "description": "Shorthand for an exact check" },
+        "checks": { "type": "array", "items": { "$ref": "#/$defs/eval_check" } },
+        "answers": { "type": "object", "description": "Scripted answers to human steps, by step id (clarify#0, write#0@approve) or vertex id (clarify, write@approve)" },
+        "tool_results": { "type": "object", "description": "Scripted tool results, by tool name or reference. A golden trial never calls a write tool: the eval sandbox answers this script, else a synthetic result marked \"sandbox\": true. A read tool named here answers the script too; other reads call the real tool." },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "eval_check": {
+      "description": "A check of a golden trial. Text checks see the output as text (a string as is, other JSON compact).",
+      "oneOf": [
+        { "type": "object", "required": ["type", "value"], "properties": { "type": { "const": "exact" }, "value": {}, "strip": { "type": "boolean", "default": true }, "case_sensitive": { "type": "boolean", "default": true } } },
+        { "type": "object", "required": ["type", "value"], "properties": { "type": { "const": "contains" }, "value": { "oneOf": [ { "type": "string" }, { "type": "array", "items": { "type": "string" } } ] }, "case_sensitive": { "type": "boolean", "default": true } } },
+        { "type": "object", "required": ["type", "pattern"], "properties": { "type": { "const": "regex" }, "pattern": { "type": "string" }, "flags": { "type": "array", "items": { "enum": ["IGNORECASE", "MULTILINE", "DOTALL"] } } } },
+        { "type": "object", "required": ["type", "schema"], "properties": { "type": { "const": "json_schema" }, "schema": { "type": "object" } } },
+        { "type": "object", "required": ["type", "rubric"], "properties": { "type": { "const": "llm_judge" }, "rubric": { "type": "string" }, "model": { "type": "string" }, "threshold": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 }, "reference": { "description": "A reference answer shown to the judge (default: the case's expected)" } } },
+        { "type": "object", "required": ["type", "tool"], "properties": { "type": { "const": "tool_call" }, "tool": { "type": "string", "description": "Manifest name (refund), reference, or reference without the pin (mcp://bank/refund)" }, "args": { "type": "object", "description": "The call's arguments must contain these (objects key by key, recursively), as the tool or the eval sandbox received them (after the PII guard)" }, "must_not_call": { "type": "boolean", "default": false } } }
+      ]
+    },
+    "mast_label": {
+      "description": "A MAST failure mode (arXiv 2503.13657), the label a reviewer gives a bad run",
+      "enum": ["disobey_task_specification", "disobey_role_specification", "step_repetition", "loss_of_conversation_history", "unaware_of_termination_conditions", "conversation_reset", "fail_to_ask_for_clarification", "task_derailment", "information_withholding", "ignored_other_agent_input", "reasoning_action_mismatch", "premature_termination", "no_or_incomplete_verification", "incorrect_verification"]
     }
   }
 }
