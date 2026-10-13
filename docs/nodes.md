@@ -184,7 +184,8 @@ metadata, `runs.data` run content, `runs.answer` lets a user answer questions an
 tainted writes as themselves.
 
 Evals ([evals.md](evals.md#api)) use the same permissions: golden sets are written with
-`nodes.write` (their cases read with `runs.data`, like run content), the promotion bar is set with
+`nodes.write` (their cases read with `runs.data`, like run content), and so is capturing a run
+into one ([cases from runs](evals.md#cases-from-runs)), the promotion bar is set with
 `nodes.publish`, evals are started and cancelled with `nodes.run` (they run the node, as an API key
 the caller names), and evals and their metrics are read with `nodes.read`.
 
@@ -440,10 +441,11 @@ standalone has no runs to show and answers `503`.
 | Endpoint | Permission | Does |
 |---|---|---|
 | `GET /api/v1/tenants/{t}/runs` | `runs.read` | The tenant's runs, newest first (same filters and cursor as `GET /v1/runs`, plus `?version=`) |
-| `GET /api/v1/tenants/{t}/runs/{id}` | `runs.read` | The run: status, invoker, origin, budget, cost (`cost_usd` billed, `model_cost_usd` the routed models' real cost), usage, the answer guard's `answer_check` (metadata, never text), steps (vertex, kind, status, start, duration, tokens, cost, taint labels). With `runs.data` also the content: `input`, `output`, each step's `output`, the awaited `question` (`content_visible` says which) |
+| `GET /api/v1/tenants/{t}/runs/{id}` | `runs.read` | The run: status, invoker, origin, `mast_label` (a reviewer's MAST failure label, see [cases from runs](evals.md#cases-from-runs)), budget, cost (`cost_usd` billed, `model_cost_usd` the routed models' real cost), usage, the answer guard's `answer_check` (metadata, never text), steps (vertex, kind, status, start, duration, tokens, cost, taint labels). With `runs.data` also the content: `input`, `output`, each step's `output`, the awaited `question` (`content_visible` says which) |
 | `GET /api/v1/tenants/{t}/inbox` | `runs.read` | Runs waiting for a human, oldest wait first: `kind` `question` or `approval` (a gated call), `step`, `waiting_since`, `expires_at`; `question` with `runs.data`; for approvals `approval` with the `tool`, its `effect` and the taint `labels`, and its `arguments` with `runs.data` (the worker records them sealed with the question) |
 | `POST /api/v1/tenants/{t}/runs/{id}/input` `{"answer": ..., "step"?: id}` | `runs.answer` | Answers the question, or approves (`{"approve": true}`) or denies a tainted write, as the signed-in user; `202` with the run, `409` when it is not waiting |
 | `POST /api/v1/tenants/{t}/runs/{id}/cancel` | `runs.answer` | Cancels the run as the signed-in user (audited once as `node.run.cancel`): `200` when it ended at once or was already cancelled, `202` when a running run was asked to stop, `409` when it ended otherwise. `runs.answer` because whoever may deny a write, which fails the run, may stop it; a separate permission would only add a grant every console admin needs |
+| `POST /api/v1/tenants/{t}/runs/{id}/golden-case` `{"verdict": "good" \| "bad", "note"?, "mast_label"?, "version"?}` | `nodes.write` | Turns the finished run into a golden case, appended to its version's golden set (`201`), and stores a MAST label on the run. See [cases from runs](evals.md#cases-from-runs) |
 
 Who reads what: run **metadata** (`runs.read`) is for every role but `billing`. Run **content**
 (`runs.data`) is the tenant's data and may hold personal data, so only the roles that build and run
@@ -462,7 +464,7 @@ Decisions made on the data plane go into the control plane's hash-chained audit 
 | `node.run.answer` | A human step is answered (API key, chat continuation, MCP task, console) |
 | `node.write.approve`, `node.write.deny` | A tainted write is approved or denied |
 | `node.run.cancel` | A run is cancelled |
-| `node.eval.finish` | An eval ends (its worker), with its main metric. Golden sets, promotion bars, eval starts and cancellations are written by the control plane through the same outbox ([evals.md](evals.md#api)) |
+| `node.eval.finish` | An eval ends (its worker), with its main metric. Golden sets (and runs captured into them, `node.golden_set.capture`), promotion bars, eval starts and cancellations are written by the control plane through the same outbox ([evals.md](evals.md#api)) |
 | `tool.approve`, `tool.revoke` | A tool manifest is approved or revoked (on the control plane itself, see [tools.md](tools.md)) |
 
 The actor is who decided (`api_key:<hash prefix>`, or the console user); the target is the run;
@@ -585,7 +587,8 @@ runs against both. Tables (`migrations/0013_node_journal.sql`):
 | `node_run_event` (0021) | The run's [events](#streaming-run-events), numbered per run under the run row's lock (`node_run.event_seq`); `node_run` also has `cancel_requested_at`, `cancelled_by` and `origin`, and `node_step` the prompt and completion tokens and taint labels |
 | `node_audit` (0021) | The [audit outbox](#audit-of-run-decisions) |
 | `node_run.input_labels` (0025) | Taint labels the run input carries from the start (`caller`), fixed when the run is created |
-| `node_golden_set`, `node_eval_policy`, `node_eval`, `node_eval_trial` (0024) | [Evals](evals.md): golden sets (sealed), promotion bars, eval runs and their trials. `node_event` gains the kind `observation` (what a sandboxed tool of an injection run received) |
+| `node_golden_set`, `node_eval_policy`, `node_eval`, `node_eval_trial` (0024) | [Evals](evals.md): golden sets (sealed), promotion bars, eval runs and their trials. `node_event` gains the kind `observation`: what a tool of an eval run received (`sandbox:<step>`), and which write a run sent to a real tool (`write:<step>`: the tool and its name, no arguments), all sealed |
+| `node_run.mast_label` (0037) | The MAST failure mode a reviewer labelled the run with when [capturing it](evals.md#cases-from-runs) as `bad` (metadata) |
 
 - **Claims.** Workers claim the oldest runnable run with `UPDATE ... WHERE id = (SELECT ... FOR UPDATE
   SKIP LOCKED)`, so two workers never claim the same run. Runnable: `pending`; `sleeping` or

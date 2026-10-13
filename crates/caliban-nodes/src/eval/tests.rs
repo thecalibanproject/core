@@ -61,7 +61,10 @@ fn checks_score_text_and_json_outputs() {
     assert!(run(json!({"type": "regex", "pattern": "^URGENT", "flags": ["IGNORECASE"]}), json!("urgent: yes")));
     let schema = json!({"type": "json_schema", "schema": {"type": "object", "required": ["category"]}});
     assert!(run(schema.clone(), json!("{\"category\": \"x\"}")) && !run(schema, json!("not json")));
-    assert!(check_output(&Check::LlmJudge { rubric: "r".into(), model: None, threshold: 0.5 }, &json!(1)).is_none());
+    assert!(
+        check_output(&Check::LlmJudge { rubric: "r".into(), model: None, threshold: 0.5, reference: None }, &json!(1))
+            .is_none()
+    );
 }
 
 #[test]
@@ -203,4 +206,46 @@ fn an_injection_eval_with_errors_is_inconclusive() {
     let clean = eval(Suite::Injection, 1, json!({"pass_rate": 1.0, "blocked": 9, "trials": 9, "errors": 0}));
     let ev = gate(&none, &writer, "sha256:aa", None, Some(&clean)).unwrap();
     assert_eq!(ev["injection"]["errors"], 0);
+}
+
+#[test]
+fn tool_call_checks_match_the_calls_a_trial_made() {
+    let call = |name: &str, args: Value| sandbox::Observation {
+        tool: format!("mcp://bank/{name}#sha256:00"),
+        name: name.into(),
+        write: true,
+        trusted: false,
+        network: false,
+        sandboxed: true,
+        args: args.to_string(),
+    };
+    let calls = vec![call("refund", json!({"tx": "TX-1", "amount": 20, "meta": {"by": "desk", "n": 1}}))];
+    let run = |c: Value| check_calls(&serde_json::from_value(c).unwrap(), &calls).unwrap().passed;
+    assert!(run(json!({"type": "tool_call", "tool": "refund"})));
+    assert!(run(
+        json!({"type": "tool_call", "tool": "mcp://bank/refund", "args": {"tx": "TX-1", "meta": {"by": "desk"}}})
+    ));
+    assert!(!run(json!({"type": "tool_call", "tool": "refund", "args": {"tx": "TX-2"}})));
+    assert!(!run(json!({"type": "tool_call", "tool": "lookup"})));
+    assert!(!run(json!({"type": "tool_call", "tool": "refund", "must_not_call": true})));
+    assert!(run(json!({"type": "tool_call", "tool": "refund", "args": {"amount": 21}, "must_not_call": true})));
+    assert!(run(json!({"type": "tool_call", "tool": "lookup", "must_not_call": true})));
+    // Other checks are not call checks; tool_call is not an output check.
+    assert!(check_calls(&Check::JsonSchema { schema: json!({}) }, &calls).is_none());
+    let tc: Check = serde_json::from_value(json!({"type": "tool_call", "tool": "refund"})).unwrap();
+    assert!(check_output(&tc, &json!("x")).is_none());
+    // Validated with the set; scripts need a tool name.
+    let s = agent(json!([]));
+    let bad = vec![
+        case(json!({"id": "a", "input": {"case": "x"}, "checks": [{"type": "tool_call", "tool": " "}]})),
+        case(json!({"id": "b", "input": {"case": "x"}, "checks": [{"type": "tool_call", "tool": "t", "args": [1]}]})),
+        case(json!({"id": "c", "input": {"case": "x"}, "expected": "y", "tool_results": {"": {}}})),
+    ];
+    let joined = validate_cases(&bad, &s).unwrap_err().join("\n");
+    for want in ["tool is required", "args must be an object", "tool_results"] {
+        assert!(joined.contains(want), "{want} in {joined}");
+    }
+    // The judge's reference round-trips.
+    let j: Check = serde_json::from_value(json!({"type": "llm_judge", "rubric": "r", "reference": {"a": 1}})).unwrap();
+    assert!(matches!(&j, Check::LlmJudge { reference: Some(r), .. } if r["a"] == 1));
 }

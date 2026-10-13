@@ -875,3 +875,52 @@ async fn sandbox_observations_are_events_written_once() {
         assert_eq!((ev.kind, ev.payload.as_deref()), (EventKind::Observation, Some("a")), "{n}");
     }
 }
+
+/// A capture appends to a golden set it read: the write goes through only while the set is still
+/// the one it read (or still absent), so two captures never lose each other's case.
+#[tokio::test]
+async fn a_golden_set_is_replaced_only_if_it_is_the_one_read() {
+    for j in journals().await {
+        let n = j.name();
+        let g = |cases: &str| GoldenSetRecord {
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: 1,
+            cases: cases.into(),
+            case_count: 1,
+            hash: format!("sha256:{cases}"),
+            updated_at: Utc::now(),
+            updated_by: "user:jo".into(),
+        };
+        // None expected: only while there is no set.
+        assert!(
+            j.replace_golden_set_if(g("a"), None, Some(audit_event("c1", "node.golden_set.capture"))).await.unwrap()
+        );
+        assert!(!j.replace_golden_set_if(g("b"), None, Some(audit_event("c2", "x"))).await.unwrap(), "{n}");
+        // The hash read: written once; a second writer that read the same set loses.
+        assert!(j.replace_golden_set_if(g("b"), Some("sha256:a"), Some(audit_event("c3", "x"))).await.unwrap());
+        assert!(!j.replace_golden_set_if(g("c"), Some("sha256:a"), Some(audit_event("c4", "x"))).await.unwrap());
+        let got = j.golden_set("acme", "triage", 1).await.unwrap().expect(n);
+        assert_eq!(got.cases, "b", "{n}");
+        // Only the writes that went through recorded their audit event.
+        let mut ids: Vec<String> = j.claim_audit("cp", TTL, 100).await.unwrap().into_iter().map(|a| a.id).collect();
+        ids.sort();
+        assert_eq!(ids, ["c1", "c3"], "{n}");
+    }
+}
+
+#[tokio::test]
+async fn a_run_keeps_the_mast_label_a_human_gave_it() {
+    for j in journals().await {
+        let n = j.name();
+        j.create_run(new_run("run_m", "acme", None)).await.unwrap();
+        assert_eq!(j.get_run("acme", "run_m").await.unwrap().unwrap().mast_label, None, "{n}");
+        assert!(j.set_mast_label("acme", "run_m", Some("step_repetition")).await.unwrap());
+        assert!(!j.set_mast_label("globex", "run_m", Some("x")).await.unwrap(), "{n}: tenant-scoped");
+        assert!(!j.set_mast_label("acme", "run_none", Some("x")).await.unwrap(), "{n}");
+        let r = j.get_run("acme", "run_m").await.unwrap().unwrap();
+        assert_eq!(r.mast_label.as_deref(), Some("step_repetition"), "{n}");
+        assert!(j.set_mast_label("acme", "run_m", None).await.unwrap());
+        assert_eq!(j.get_run("acme", "run_m").await.unwrap().unwrap().mast_label, None, "{n}");
+    }
+}
