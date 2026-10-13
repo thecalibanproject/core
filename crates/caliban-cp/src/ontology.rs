@@ -15,7 +15,9 @@
 //! touch it. The review is refused (`409`, with the element and the node versions) unless it says
 //! `acknowledge_breaking: true`; those versions then fail on that query until a version written on
 //! the new ontology is published. **Publishing** checks every fixed CQIR query of the spec: its
-//! version must be the tenant's, not newer than the current one, and still compatible.
+//! version must be the tenant's, not newer than the current one, and still compatible, and its
+//! static parts must compile. Templates in filter values (`{"type": "string_list", "v":
+//! "{{outputs.assess.cities}}"}`) stand for a value of the declared type until the node runs.
 //!
 //! **Proposals** (`POST /api/v1/tenants/{t}/ontology/proposals`, [`proposals`]): an element whose
 //! spec, name and description are unchanged is skipped whatever status it is sent with, so posting
@@ -27,7 +29,7 @@ use caliban_ontology::compile::{CompileError, plan};
 use caliban_ontology::cqir::Query;
 use caliban_ontology::{Element, Model, Ontology, Status};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 /// Every fixed CQIR query of a spec: objects with `ontology_version` and `metrics`, with where
@@ -235,10 +237,86 @@ fn status_str(s: Status) -> &'static str {
     }
 }
 
+/// Is `s` exactly one `{{ expr }}` placeholder? Then the executor replaces it by the value itself,
+/// of any JSON type (`render_value` in `caliban_nodes::executor::template`).
+fn whole_template(s: &str) -> bool {
+    s.trim()
+        .strip_prefix("{{")
+        .and_then(|x| x.strip_suffix("}}"))
+        .is_some_and(|inner| !inner.contains("{{") && !inner.contains("}}"))
+}
+
+/// A value of the CQIR literal type `ty` (`v` of a filter value) standing for a template, and one
+/// for an element of it when it is a list or a range.
+fn placeholder(ty: &str) -> Option<(Value, Value)> {
+    const TS: &str = "1970-01-01T00:00:00Z";
+    Some(match ty {
+        "string" => (json!("x"), json!("x")),
+        "number" => (json!(0), json!(0)),
+        "bool" => (json!(false), json!(false)),
+        "timestamp" => (json!(TS), json!(TS)),
+        "string_list" => (json!(["x"]), json!("x")),
+        "number_list" => (json!([0]), json!(0)),
+        "timestamp_range" => (json!([TS, TS]), json!(TS)),
+        "number_range" => (json!([0, 0]), json!(0)),
+        _ => return None,
+    })
+}
+
+/// `q` with the templates of its template slots replaced by placeholders of the declared type, as
+/// the executor fills them before deserializing the query, and the attributes of the filters whose
+/// literal is still unknown (a whole-value template, or text around a placeholder): their literal
+/// checks wait for the run. A placeholder has the declared type, so a literal check that fails on
+/// it is a static mistake (a type that does not fit the operator or the attribute).
+///
+/// The template slots are filter values: the whole `value` (`"value": "{{outputs.x.value}}"`), its
+/// `v`, or an element of a list or range `v`. Anything else (ids, operators, `ontology_version`,
+/// `limit`) is static: a template there is checked as written, so it is refused.
+fn fill_templates(q: &Value) -> (Value, BTreeSet<String>) {
+    let mut q = q.clone();
+    let mut templated = BTreeSet::new();
+    let has_template = |v: &Value| v.to_string().contains("{{");
+    let Some(filters) = q.get_mut("filters").and_then(Value::as_array_mut) else { return (q, templated) };
+    for f in filters.iter_mut().filter_map(Value::as_object_mut) {
+        let attr = f.get("attr").and_then(Value::as_str).map(str::to_owned);
+        let Some(value) = f.get_mut("value") else { continue };
+        if !has_template(value) {
+            continue;
+        }
+        if value.as_str().is_some_and(whole_template) {
+            // The whole typed value comes from the run: its type is not known here.
+            *value = Value::Null;
+            templated.extend(attr);
+            continue;
+        }
+        if let Some(obj) = value.as_object_mut()
+            && let Some((whole, element)) = obj.get("type").and_then(Value::as_str).and_then(placeholder)
+            && let Some(v) = obj.get_mut("v")
+        {
+            match v {
+                Value::String(s) if whole_template(s) => *v = whole,
+                Value::Array(a) => {
+                    for x in a.iter_mut().filter(|x| x.as_str().is_some_and(whole_template)) {
+                        *x = element.clone();
+                    }
+                }
+                // Text around a placeholder renders to a string: deserialized as it is.
+                _ => {}
+            }
+        }
+        if has_template(value) {
+            templated.extend(attr);
+        }
+    }
+    (q, templated)
+}
+
 /// Publish-time check of a spec's fixed CQIR queries against the tenant's current ontology: the
-/// version they name must be the tenant's and not newer than the current one, and nothing they
-/// touch may have changed since (or be withdrawn). Values filled by templates are not checked
-/// here (they are known only when the node runs).
+/// version they name must be the tenant's and not newer than the current one, nothing they touch
+/// may have changed since (or be withdrawn), and the static parts (ids, operators, structure) must
+/// compile. Templates are accepted in template slots (filter values, see [`fill_templates`]): they
+/// are replaced by placeholders of the declared type, and the literal checks of those filters wait
+/// for the run, where the executor renders the templates and compiles the query again.
 pub(crate) fn publish_problems(st: &State, tenant: &str, spec: &Value) -> Vec<caliban_nodes::publish::Problem> {
     use caliban_nodes::publish::Problem;
     let queries = fixed_queries(spec);
@@ -251,7 +329,8 @@ pub(crate) fn publish_problems(st: &State, tenant: &str, spec: &Value) -> Vec<ca
     let mut out = Vec::new();
     for (path, q) in queries {
         let problem = |m: String| Problem::new("ontology_version", m, Some(path.clone()));
-        let query: Query = match serde_json::from_value(q.clone()) {
+        let (filled, templated) = fill_templates(&q);
+        let query: Query = match serde_json::from_value(filled) {
             Ok(q) => q,
             Err(e) => {
                 out.push(problem(format!("not a CQIR query: {e}")));
@@ -260,14 +339,14 @@ pub(crate) fn publish_problems(st: &State, tenant: &str, spec: &Value) -> Vec<ca
         };
         match plan(&model, &query, &[]) {
             Ok(_) => {}
-            Err(e @ (CompileError::VersionMismatch { .. } | CompileError::Changed { .. })) => {
-                out.push(problem(e.to_string()));
-            }
             Err(e @ (CompileError::Unknown(..) | CompileError::NoPath { .. })) => {
                 out.push(problem(format!("{e} in ontology {}", model.version)));
             }
-            // Type checks of literal values: templates fill them when the node runs.
-            Err(_) => {}
+            // Literals a template leaves unknown are checked when the node runs; policies apply
+            // as they are then.
+            Err(CompileError::BadValue(a)) if templated.contains(&a) => {}
+            Err(CompileError::Denied(_)) => {}
+            Err(e) => out.push(problem(e.to_string())),
         }
     }
     out
@@ -374,6 +453,103 @@ mod tests {
             let st = state(ontology(3, 1), node(v, NodeState::Draft));
             assert_eq!(publish_problems(&st, "acme", &st.nodes[0].spec).len(), 1, "{v}");
         }
+    }
+
+    /// The ontology of [`ontology`] with a number and a timestamp attribute, and a spec whose
+    /// one fixed query (on version 3) has `filters`.
+    fn with_filters(filters: Value) -> (State, Value) {
+        let mut o = ontology(3, 1);
+        for (id, ty) in [("Service.price", "number"), ("Service.updated", "timestamp")] {
+            let spec = json!({"entity": "Service", "path": id, "column": id, "data_type": ty});
+            o.elements.push(el(id, "attribute", spec, 1));
+        }
+        let mut st = State::default();
+        st.ontologies.insert("acme".into(), o);
+        let spec = json!({"kind": "workflow", "graph": {"vertices": [{"id": "q", "type": "tool", "config": {
+            "tool": "builtin://datasource_query",
+            "args": {"query": {"ir_version": "1", "ontology_version": "acme@3", "metrics": [{"id": "services"}],
+                     "dimensions": [{"id": "Service.specialty"}], "filters": filters}}}}]}});
+        (st, spec)
+    }
+
+    /// e2e follow-up: the triage node's `{"type": "string_list", "v": "{{outputs.assess.cities}}"}`
+    /// was refused at publish ("not a CQIR query: invalid type: string, expected a sequence"),
+    /// although the executor fills it with a list before it deserializes the query.
+    #[test]
+    fn templates_in_filter_values_publish() {
+        let (st, spec) = with_filters(json!([
+            {"attr": "Service.specialty", "op": "in",
+             "value": {"type": "string_list", "v": ["{{outputs.assess.specialty}}", "emergency_medicine"]}},
+            {"attr": "Service.city", "op": "in", "value": {"type": "string_list", "v": "{{outputs.assess.cities}}"}},
+            {"attr": "Service.city", "op": "eq", "value": {"type": "string", "v": "{{ outputs.assess.city }}"}},
+            {"attr": "Service.city", "op": "ne", "value": {"type": "string", "v": "near {{input.city}}"}},
+            {"attr": "Service.price", "op": "lte", "value": {"type": "number", "v": "{{input.budget}}"}},
+            {"attr": "Service.price", "op": "in", "value": {"type": "number_list", "v": [1, "{{input.price}}"]}},
+            {"attr": "Service.price", "op": "between", "value": {"type": "number_range", "v": "{{input.range}}"}},
+            {"attr": "Service.updated", "op": "gte", "value": {"type": "timestamp", "v": "{{input.since}}"}},
+            {"attr": "Service.updated", "op": "lt", "value": {"type": "timestamp", "v": "{{input.day}}T00:00:00Z"}},
+            {"attr": "Service.updated", "op": "between",
+             "value": {"type": "timestamp_range", "v": ["{{input.from}}", "2026-01-01T00:00:00Z"]}},
+            {"attr": "Service.specialty", "op": "eq", "value": "{{outputs.assess.filter}}"}
+        ]));
+        let p = publish_problems(&st, "acme", &spec);
+        assert!(p.is_empty(), "{p:?}");
+        // The query itself is left as written.
+        assert_eq!(fixed_queries(&spec)[0].1["filters"][1]["value"]["v"], "{{outputs.assess.cities}}");
+    }
+
+    /// A template in a filter value does not excuse what is static: ids, operators, the literal
+    /// type, the structure, and templates outside filter values.
+    #[test]
+    fn a_template_does_not_excuse_static_mistakes() {
+        let cities = json!({"type": "string_list", "v": "{{outputs.assess.cities}}"});
+        let refused = |filters: Value, want: &str| {
+            let (st, spec) = with_filters(filters);
+            let p = publish_problems(&st, "acme", &spec);
+            assert_eq!(p.len(), 1, "{want}: {p:?}");
+            assert!(p[0].message.contains(want), "{want}: {}", p[0].message);
+            assert_eq!(p[0].path.as_deref(), Some("/graph/vertices/0/config/args/query"));
+        };
+        refused(json!([{"attr": "Service.town", "op": "in", "value": cities}]), "unknown attribute 'Service.town'");
+        refused(json!([{"attr": "{{input.attr}}", "op": "in", "value": cities}]), "unknown attribute '{{input.attr}}'");
+        refused(
+            json!([{"attr": "Service.city", "op": "contains", "value": cities}]),
+            "not a CQIR query: unknown variant",
+        );
+        refused(json!([{"attr": "Service.city", "op": "{{input.op}}", "value": cities}]), "not a CQIR query");
+        refused(json!([{"attr": "Service.city", "op": "in", "value": cities, "extra": 1}]), "not a CQIR query");
+        refused(
+            json!([{"attr": "Service.city", "op": "in", "value": {"type": "text_list", "v": "{{input.x}}"}}]),
+            "not a CQIR query",
+        );
+        refused(json!([{"attr": "Service.city", "op": "gt", "value": cities}]), "operator Gt is not valid");
+        refused(
+            json!([{"attr": "Service.city", "op": "eq", "value": cities}]),
+            "value for Service.city does not match",
+        );
+        refused(
+            json!([{"attr": "Service.price", "op": "eq", "value": {"type": "string", "v": "{{input.p}}"}}]),
+            "value for Service.price does not match",
+        );
+        // A number slot cannot take text around a placeholder (it renders to a string).
+        refused(
+            json!([{"attr": "Service.price", "op": "eq", "value": {"type": "number", "v": "{{input.p}}0"}}]),
+            "not a CQIR query",
+        );
+        // Outside filter values, a template is checked as written.
+        let (st, mut spec) = with_filters(json!([{"attr": "Service.city", "op": "in", "value": cities}]));
+        let path = "/graph/vertices/0/config/args/query";
+        spec.pointer_mut(path).unwrap()["dimensions"] = json!([{"id": "{{input.dimension}}"}]);
+        let p = publish_problems(&st, "acme", &spec);
+        assert!(p.len() == 1 && p[0].message.contains("unknown"), "{p:?}");
+        spec.pointer_mut(path).unwrap()["dimensions"] = json!([]);
+        spec.pointer_mut(path).unwrap()["limit"] = json!("{{input.limit}}");
+        let p = publish_problems(&st, "acme", &spec);
+        assert!(p.len() == 1 && p[0].message.contains("not a CQIR query"), "{p:?}");
+        // And the version check still applies.
+        spec.pointer_mut(path).unwrap()["limit"] = json!(10);
+        spec.pointer_mut(path).unwrap()["ontology_version"] = json!("acme@4");
+        assert_eq!(publish_problems(&st, "acme", &spec).len(), 1);
     }
 
     #[test]

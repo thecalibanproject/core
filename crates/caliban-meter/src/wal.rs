@@ -417,6 +417,7 @@ mod tests {
             route: None,
             route_fallback: None,
             purpose: None,
+            timings: None,
         }
     }
 

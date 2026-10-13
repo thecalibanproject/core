@@ -19,6 +19,8 @@
 //! - **Continuing** a run that waits for a human: send the next request with header
 //!   `Caliban-Run-Id: <run id>` and the answer as the last user message (JSON objects, booleans and
 //!   numbers are passed as JSON, anything else as text). The response is the rest of the run.
+//! - **`Server-Timing`**: `auth`, the routing stages when `caliban/auto` chose the node, then
+//!   `node;dur=<run time>;desc="<run id>"` (no `dur` on streams, whose headers leave first).
 //! - **Usage** is the sum of the run's model calls so far.
 //! - **Streams** (`"stream": true`): a first chunk carrying the run id, comments (OpenAI) or
 //!   `ping` events (Anthropic) while steps run, then the answer as a content delta and the finish
@@ -30,6 +32,7 @@
 use crate::Gateway;
 use crate::error::Dialect;
 use crate::runs::{Caller, Events, RUN_ID_HEADER, RunError, Runs, Start, final_run};
+use crate::timing::{self, Timings};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -38,6 +41,7 @@ use caliban_nodes::chat::{answer_from_text, output_text};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Response header naming the path a request took: `node/<name>@v<N>`, or `model:<id>` when
 /// `caliban/auto` answered with a model.
@@ -130,7 +134,9 @@ async fn handle(
         return Err(bad("a node's model calls cannot run nodes: use a node:// tool or a subnode vertex"));
     }
     let target = target.map_err(bad)?;
+    let started = Instant::now();
     let caller = Caller::from_headers(gw, headers)?;
+    let timing = auth_timing(gw, started);
     if !caller.may_run(&target.name) {
         return Err(crate::runs::forbidden_node(&target.name));
     }
@@ -142,7 +148,7 @@ async fn handle(
         headers,
         &req,
         dialect,
-        NodeChat { target, origin: None, check_spend: false, headers: vec![] },
+        NodeChat { target, origin: None, check_spend: false, headers: vec![], timing },
     )
     .await
     .map_err(ChatError::error)
@@ -157,14 +163,23 @@ async fn continue_auto(
     dialect: Dialect,
     run_id: &str,
 ) -> Result<Response, RunError> {
+    let started = Instant::now();
     let caller = Caller::from_headers(gw, headers)?;
+    let timing = auth_timing(gw, started);
     let req = parse_chat(v, dialect)?;
     let runs = Runs::of(gw).ok_or_else(crate::runs::not_enabled)?;
     let run = runs.view(&caller, headers, run_id).await?;
     let name = run["node"].as_str().unwrap_or_default().to_owned();
     let target = Target { name, version: None };
-    let nc = NodeChat { target, origin: None, check_spend: false, headers: vec![] };
+    let nc = NodeChat { target, origin: None, check_spend: false, headers: vec![], timing };
     respond(&runs, &caller, headers, &req, dialect, nc).await.map_err(ChatError::error)
+}
+
+/// The `Server-Timing` start of a node request authenticated since `started`.
+fn auth_timing(gw: &Gateway, started: Instant) -> Option<(Timings, Instant)> {
+    let mut t = Timings::new(gw.config.load().config.telemetry.server_timing);
+    t.auth = Some(started.elapsed());
+    Some((t, started))
 }
 
 pub(crate) fn parse_chat(v: &Value, dialect: Dialect) -> Result<ChatRequest, RunError> {
@@ -186,6 +201,9 @@ pub(crate) struct NodeChat {
     pub check_spend: bool,
     /// Extra response headers (routing facts).
     pub headers: Vec<(HeaderName, String)>,
+    /// The stages timed so far and when the request started (`Server-Timing`, completed here
+    /// with `node;dur=<run time>;desc="<run id>"`).
+    pub timing: Option<(Timings, Instant)>,
 }
 
 /// Why a node chat request was not answered.
@@ -217,6 +235,7 @@ pub(crate) async fn respond(
 ) -> Result<Response, ChatError> {
     use ChatError::{NotStarted, Run};
     let continued = auth.get(RUN_ID_HEADER).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty());
+    let node_started = Instant::now();
     let (run_id, version, events) = match continued {
         Some(id) => {
             let text = req
@@ -257,7 +276,15 @@ pub(crate) async fn respond(
     if dialect == Dialect::Anthropic {
         extra.push((HeaderName::from_static("request-id"), request_id));
     }
+    // Streams: the headers leave before the run ends, so `node` carries only the run id.
+    let mut timing = nc.timing.map(|(mut t, started)| {
+        t.run_id = Some(run_id.clone());
+        (t, started)
+    });
     if req.stream {
+        if let Some(v) = timing.as_ref().and_then(|(t, started)| t.header(*started)) {
+            extra.push((HeaderName::from_static(timing::HEADER), v.to_str().unwrap_or_default().to_owned()));
+        }
         let usage = dialect == Dialect::Anthropic || crate::metering::client_wants_stream_usage(&req.extra);
         let label = format!("node/{}@v{version}", nc.target.name);
         return Ok(stream(events, dialect, run_id, label, usage, extra));
@@ -280,6 +307,12 @@ pub(crate) async fn respond(
         }
     };
     ended_badly(&run).map_err(Run)?;
+    if let Some((t, started)) = timing.as_mut() {
+        t.node = Some(node_started.elapsed());
+        if let Some(v) = t.header(*started) {
+            extra.push((HeaderName::from_static(timing::HEADER), v.to_str().unwrap_or_default().to_owned()));
+        }
+    }
     let body = match dialect {
         Dialect::OpenAi => openai_body(&run),
         Dialect::Anthropic => anthropic_body(&run),

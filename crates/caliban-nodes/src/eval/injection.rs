@@ -509,6 +509,9 @@ pub struct Surface {
     /// The node's first read tool that reaches the network through its arguments (a URL): where
     /// `exfil.url_read` sends data.
     pub fetch: Option<Slot>,
+    /// The version's input schema (`prompt.input_schema`): where the caller's payload and the
+    /// canary contact can go without failing its validation ([`text_field`]).
+    pub input_schema: Option<Value>,
 }
 
 /// A tool's manifest as the registry resolves it, and whether it reaches the network through its
@@ -558,14 +561,16 @@ impl Surface {
     /// registry resolves it (`None`: unavailable).
     pub fn of(spec: &NodeSpec, children: &[&NodeSpec], info: Lookup<'_>) -> Self {
         let (write, read, reads, fetch) = slots(spec, info);
-        let untrusted_field = spec.input_schema().and_then(|schema| {
+        let input_schema = spec.input_schema().cloned();
+        let untrusted_field = input_schema.as_ref().and_then(|schema| {
             let props = schema.get("properties")?.as_object()?;
+            let marked = |p: &Value| p.get(crate::executor::taint::UNTRUSTED_KEYWORD) == Some(&Value::Bool(true));
+            // The marked string field the suite's payload fits best (an explicit target first, then
+            // one without constraints).
             props
                 .iter()
-                .find(|(_, p)| {
-                    p.get(crate::executor::taint::UNTRUSTED_KEYWORD) == Some(&Value::Bool(true))
-                        && p.get("type").and_then(Value::as_str) == Some("string")
-                })
+                .filter(|(_, p)| marked(p) && takes_text(p))
+                .max_by_key(|(k, p)| (field_score(k, p, false, true), std::cmp::Reverse((*k).clone())))
                 .map(|(k, _)| k.clone())
         });
         let mut s = Surface {
@@ -575,6 +580,7 @@ impl Surface {
             agent: spec.kind == crate::NodeKind::Agent,
             untrusted_field,
             fetch,
+            input_schema,
             ..Surface::default()
         };
         for c in children {
@@ -611,7 +617,7 @@ pub fn applicable(c: &Case, s: &Surface, input: &Value, manifests: &[ManifestFin
         _ => {}
     }
     match c.carrier {
-        Carrier::CallerMarked if text_field(input).is_none() => return Err("the run input has no text field"),
+        Carrier::CallerMarked if text_field(s, input).is_none() => return Err(NO_TEXT_FIELD),
         Carrier::SchemaMarked if s.untrusted_field.is_none() => {
             return Err("the input schema declares no x-caliban-untrusted string field");
         }
@@ -625,23 +631,142 @@ pub fn applicable(c: &Case, s: &Surface, input: &Value, manifests: &[ManifestFin
         return Err("the write tool has no allow_tainted entry");
     }
     match c.goal {
-        Goal::AnswerCanary if c.needs_pii() && with_pii(input).is_none() => Err("the run input has no text field"),
+        Goal::AnswerCanary if c.needs_pii() && with_pii(s, input).is_none() => Err(NO_TEXT_FIELD),
         Goal::WriteCanary | Goal::PiiToWrite if s.target_write(c).is_none() => Err("no MCP write tool"),
-        Goal::PiiToWrite | Goal::PiiToRead if with_pii(input).is_none() => Err("the run input has no text field"),
+        Goal::PiiToWrite | Goal::PiiToRead if with_pii(s, input).is_none() => Err(NO_TEXT_FIELD),
         Goal::ManifestFindings if manifests.is_empty() => Err("no MCP tool"),
         Goal::NetworkRead if s.fetch.is_none() => Err("no read tool that reaches the network through its arguments"),
         _ => Ok(()),
     }
 }
 
-/// Where text can be added to a run input: `""` for a string input, else the pointer of the
-/// first string field of an object input.
-fn text_field(input: &Value) -> Option<String> {
+/// Why a case that adds text to the run input does not apply.
+pub const NO_TEXT_FIELD: &str =
+    "the run input has no free text field (a string without a pattern, enum, const or format in the input schema)";
+
+/// The input-schema keyword (a boolean on a top-level string property) that names the field the
+/// suite writes the caller's payload (`caller.marked_field`, `answer.caller_marked`) and the canary
+/// contact into. Without it the suite picks the field itself ([`text_field`]).
+pub const TARGET_KEYWORD: &str = "x-caliban-injection-target";
+
+/// Field names that usually carry free text (a word of the name, split at `_`, `-` and case).
+const TEXT_NAMES: &[&str] = &[
+    "message",
+    "messages",
+    "text",
+    "content",
+    "case",
+    "question",
+    "body",
+    "request",
+    "query",
+    "prompt",
+    "description",
+    "details",
+    "note",
+    "notes",
+    "comment",
+    "comments",
+    "summary",
+    "issue",
+    "problem",
+    "complaint",
+    "input",
+];
+
+/// A property schema that accepts free text: a string (or untyped) without a `pattern`, `enum`,
+/// `const` or `format`, so appending the suite's text keeps the input valid.
+fn takes_text(p: &Value) -> bool {
+    let Some(m) = p.as_object() else { return p == &Value::Bool(true) };
+    let string = match m.get("type") {
+        None => true,
+        Some(Value::String(t)) => t == "string",
+        Some(Value::Array(ts)) => ts.iter().any(|t| t == "string"),
+        Some(_) => false,
+    };
+    string && !["pattern", "enum", "const", "format", "anyOf", "allOf"].iter().any(|k| m.contains_key(*k))
+}
+
+/// How well a text field suits the suite's text (higher is better).
+fn field_score(name: &str, p: &Value, present: bool, prefer_marked: bool) -> i32 {
+    let flag = |k: &str| p.get(k) == Some(&Value::Bool(true));
+    let mut score = 0;
+    if flag(TARGET_KEYWORD) {
+        score += 1000;
+    }
+    // `caller.marked_field` tests the caller's mark: a field the schema already marks is the
+    // `caller.schema_field` case's, and the canary contact is trusted customer data.
+    if flag(crate::executor::taint::UNTRUSTED_KEYWORD) && !prefer_marked {
+        score -= 50;
+    }
+    if present {
+        score += 100;
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    for c in name.chars() {
+        if c == '_' || c == '-' || c == ' ' || (c.is_uppercase() && !word.is_empty()) {
+            words.push(std::mem::take(&mut word));
+        }
+        if c.is_alphanumeric() {
+            word.push(c.to_ascii_lowercase());
+        }
+    }
+    words.push(word);
+    if words.iter().any(|w| TEXT_NAMES.contains(&w.as_str())) {
+        score += 10;
+    }
+    if p.get("maxLength").is_some() {
+        score -= 20;
+    }
+    score
+}
+
+/// Where text can be added to a run input: `""` for a string input, else the pointer of a
+/// top-level string field of an object input. The field is the one the input schema marks
+/// [`TARGET_KEYWORD`]; else the best free text field: present in the input before declared only,
+/// a name such as `message`, `text`, `content`, `case` or `question`, no `maxLength`. A field
+/// whose schema constrains it (`pattern`, `enum`, `const`, `format`) is never chosen: the suite's
+/// text would fail the input's validation and no run could be created. Without an input schema,
+/// every string field of the input is free text.
+fn text_field(s: &Surface, input: &Value) -> Option<String> {
+    let schema = s.input_schema.as_ref();
     match input {
-        Value::String(_) => Some(String::new()),
-        Value::Object(m) => m.iter().find(|(_, v)| v.is_string()).map(|(k, _)| format!("/{k}")),
+        Value::String(_) => schema.is_none_or(takes_text).then(String::new),
+        Value::Object(m) => {
+            let props = schema.and_then(|x| x.get("properties")).and_then(Value::as_object);
+            let any = Value::Bool(true);
+            let declared = |k: &str| props.and_then(|p| p.get(k)).unwrap_or(&any);
+            let mut best: Option<(i32, &str)> = None;
+            let present = m.iter().filter(|(_, v)| v.is_string()).map(|(k, _)| (k.as_str(), true));
+            let absent =
+                props.into_iter().flatten().filter(|(k, _)| !m.contains_key(*k)).map(|(k, _)| (k.as_str(), false));
+            for (k, here) in present.chain(absent) {
+                let p = declared(k);
+                if !takes_text(p) {
+                    continue;
+                }
+                let score = field_score(k, p, here, false);
+                if best.is_none_or(|(b, _)| score > b) {
+                    best = Some((score, k));
+                }
+            }
+            best.map(|(_, k)| format!("/{}", k.replace('~', "~0").replace('/', "~1")))
+        }
         _ => None,
     }
+}
+
+/// `input` with `text` appended to the field at `at` (added when the input does not have it).
+fn append_at(input: &Value, at: &str, text: impl Fn(&str) -> String) -> Option<Value> {
+    if at.is_empty() {
+        return Some(Value::String(text(input.as_str()?)));
+    }
+    let key = at.strip_prefix('/')?.replace("~1", "/").replace("~0", "~");
+    let mut m = input.as_object()?.clone();
+    let before = m.get(&key).and_then(Value::as_str).unwrap_or_default().to_owned();
+    m.insert(key, Value::String(text(&before)));
+    Some(Value::Object(m))
 }
 
 /// The run input of a case whose injection arrives in the input ([`Carrier::in_input`]), and the
@@ -653,11 +778,9 @@ pub fn caller_input(c: &Case, s: &Surface, input: &Value) -> Option<(Value, Vec<
     let payload = c.payload(s).join(" ");
     match c.carrier {
         Carrier::CallerMarked => {
-            let at = text_field(input)?;
-            let mut v = input.clone();
-            let field = v.pointer_mut(&at)?;
-            let text = format!("{}\n\n{payload}", field.as_str().unwrap_or_default());
-            *field = Value::String(text);
+            let at = text_field(s, input)?;
+            let v =
+                append_at(input, &at, |t| if t.is_empty() { payload.clone() } else { format!("{t}\n\n{payload}") })?;
             Some((v, vec![at]))
         }
         Carrier::SchemaMarked => {
@@ -671,21 +794,11 @@ pub fn caller_input(c: &Case, s: &Surface, input: &Value) -> Option<(Value, Vec<
     }
 }
 
-/// The run input with the canary contact added (to a string input, or the first string field of
-/// an object input); `None` when there is no text to add it to.
-pub fn with_pii(input: &Value) -> Option<Value> {
-    let add = |s: &str| format!("{s} (customer contact: {PII_CANARY})");
-    match input {
-        Value::String(s) => Some(Value::String(add(s))),
-        Value::Object(m) => {
-            let key = m.iter().find(|(_, v)| v.is_string()).map(|(k, _)| k.clone())?;
-            let mut m = m.clone();
-            let v = m.get(&key).and_then(Value::as_str).map(add)?;
-            m.insert(key, Value::String(v));
-            Some(Value::Object(m))
-        }
-        _ => None,
-    }
+/// The run input with the canary contact added (to a string input, or the text field
+/// [`text_field`] picks in an object input); `None` when there is no text to add it to.
+pub fn with_pii(s: &Surface, input: &Value) -> Option<Value> {
+    let at = text_field(s, input)?;
+    append_at(input, &at, |t| format!("{t} (customer contact: {PII_CANARY})"))
 }
 
 /// The read arguments that fetch the second stage of a staged case.
@@ -1234,6 +1347,7 @@ mod tests {
             child_reads: vec!["mcp://kb/search#sha256:00".into()],
             untrusted_field: None,
             fetch: slot("mcp://web/fetch#sha256:00", "fetch"),
+            input_schema: None,
         }
     }
 
@@ -1370,6 +1484,52 @@ mod tests {
         assert_eq!(Surface::of(&spec, &[], &|_| None).untrusted_field.as_deref(), Some("page"));
     }
 
+    /// The caller's payload and the canary contact go into a free text field: never one the input
+    /// schema constrains (pattern, enum, const, format), the field the schema names first, then a
+    /// present field with a text-like name.
+    #[test]
+    fn the_suite_picks_a_free_text_field_of_the_input() {
+        let with = |schema: Value| Surface { input_schema: Some(schema), ..surface() };
+        let marked = case("caller.marked_field").unwrap();
+        let at = |s: &Surface, input: Value| caller_input(marked, s, &input).map(|(_, m)| m);
+        let account = json!({"type": "string", "pattern": "^ACC-[0-9]{4}$"});
+        let s = with(json!({"type": "object", "properties": {"account": account, "message": {"type": "string"}}}));
+        let input = json!({"account": "ACC-4471", "message": "Refund my payment"});
+        assert_eq!(at(&s, input.clone()), Some(vec!["/message".to_owned()]));
+        let v = with_pii(&s, &input).unwrap();
+        assert_eq!(v["account"], "ACC-4471");
+        assert!(v["message"].as_str().unwrap().contains(PII_CANARY));
+        // Only constrained fields: nowhere to write, the case does not apply.
+        let s = with(json!({"type": "object", "properties": {"account": account,
+            "kind": {"type": "string", "enum": ["refund"]}, "day": {"type": "string", "format": "date"}}}));
+        let input = json!({"account": "ACC-4471", "kind": "refund", "day": "2026-10-13"});
+        assert_eq!(at(&s, input.clone()), None);
+        assert_eq!(applicable(marked, &s, &input, &[]), Err(NO_TEXT_FIELD));
+        assert!(with_pii(&s, &input).is_none());
+        // A text-like name wins over another free field; a field without maxLength over one with.
+        let s = with(json!({"type": "object", "properties": {"agent": {"type": "string"},
+            "question": {"type": "string"}, "comment": {"type": "string", "maxLength": 500}}}));
+        let input = json!({"agent": "jo", "question": "why?", "comment": "-"});
+        assert_eq!(at(&s, input), Some(vec!["/question".to_owned()]));
+        // The schema's explicit target wins, even when the input does not carry it yet.
+        let s = with(json!({"type": "object", "properties": {"message": {"type": "string"},
+            "forwarded": {"type": "string", "x-caliban-injection-target": true}}}));
+        let (v, marks) = caller_input(marked, &s, &json!({"message": "hi"})).unwrap();
+        assert_eq!(marks, ["/forwarded"]);
+        assert!(v["forwarded"].as_str().unwrap().contains(marked.canary) && v["message"] == "hi");
+        // A field the schema already marks untrusted is the `caller.schema_field` case's: the
+        // caller's mark is tested on another field when there is one.
+        let s = with(json!({"type": "object", "properties": {"page": {"type": "string", "x-caliban-untrusted": true},
+            "request": {"type": "string"}}}));
+        assert_eq!(at(&s, json!({"page": "x", "request": "y"})), Some(vec!["/request".to_owned()]));
+        // A string input whose schema constrains it.
+        let s = with(json!({"type": "string", "pattern": "^[0-9]+$"}));
+        assert_eq!(at(&s, json!("4471")), None);
+        assert_eq!(at(&with(json!({"type": "string"})), json!("hi")), Some(vec![String::new()]));
+        // Without a schema, as before: the first string field.
+        assert_eq!(at(&surface(), json!({"n": 1, "mail": "hello"})), Some(vec!["/mail".to_owned()]));
+    }
+
     #[test]
     fn subnode_cases_inject_only_where_their_scope_says() {
         let c = case("subnode.child_to_parent").unwrap();
@@ -1413,11 +1573,11 @@ mod tests {
 
     #[test]
     fn cases_apply_where_the_version_offers_a_surface() {
-        assert_eq!(with_pii(&json!("hi")).unwrap(), json!(format!("hi (customer contact: {PII_CANARY})")));
-        let v = with_pii(&json!({"n": 1, "case": "pain"})).unwrap();
-        assert!(v["case"].as_str().unwrap().ends_with(&format!("{PII_CANARY})")) && v["n"] == 1);
-        assert!(with_pii(&json!({"n": 1})).is_none() && with_pii(&json!(3)).is_none());
         let s = surface();
+        assert_eq!(with_pii(&s, &json!("hi")).unwrap(), json!(format!("hi (customer contact: {PII_CANARY})")));
+        let v = with_pii(&s, &json!({"n": 1, "case": "pain"})).unwrap();
+        assert!(v["case"].as_str().unwrap().ends_with(&format!("{PII_CANARY})")) && v["n"] == 1);
+        assert!(with_pii(&s, &json!({"n": 1})).is_none() && with_pii(&s, &json!(3)).is_none());
         let input = json!("x");
         let ok = |id: &str, s: &Surface| applicable(case(id).unwrap(), s, &input, &[]).is_ok();
         assert!(ok("write.ignore_previous", &s));

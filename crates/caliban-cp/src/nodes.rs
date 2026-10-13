@@ -632,6 +632,81 @@ mod tests {
         assert!(e["error"]["message"].as_str().unwrap().contains("CALIBAN_KEK"));
     }
 
+    /// e2e follow-up: the triage node's fixed queries fill filter values with templates
+    /// (`{"type": "string_list", "v": "{{outputs.assess.cities}}"}`); publishing refused it as
+    /// "not a CQIR query". Such a node publishes; a static mistake next to a template does not.
+    #[tokio::test]
+    async fn fixed_queries_with_templated_filter_values_publish() {
+        let c = cp(Some(ring()));
+        let app = app(Arc::clone(&c), None);
+        let ds = json!({"tenant_id": "acme", "kind": "mongodb", "name": "health", "connection": {}});
+        assert_eq!(call(&app, "POST", "/api/v1/datasources", Some(ds)).await.0, StatusCode::CREATED);
+        let el = |id: &str, kind: &str, spec: Value| -> caliban_ontology::Element {
+            serde_json::from_value(json!({"id": id, "name": id, "status": "proposed", "provenance": "human",
+                                          "kind": kind, "spec": spec}))
+            .unwrap()
+        };
+        let attr = |id: &str, ty: &str| {
+            let path = id.trim_start_matches("Service.");
+            el(id, "attribute", json!({"entity": "Service", "path": path, "column": path, "data_type": ty}))
+        };
+        let elements = vec![
+            el(
+                "Service",
+                "entity",
+                json!({"binding": {"type": "root", "datasource": "health", "collection": "services"}, "keys": ["_id"]}),
+            ),
+            attr("Service.specialty", "string"),
+            attr("Service.city", "string"),
+            attr("Service.price_usd", "number"),
+            el("services", "metric", json!({"grain": "Service", "aggregation": "count", "expr": {"op": "rows"}})),
+        ];
+        let decisions = elements.iter().map(|e| (e.id.clone(), caliban_ontology::Status::Approved)).collect();
+        c.store
+            .apply("test", crate::store::Mutation::ProposeOntology { tenant_id: "acme".into(), elements })
+            .await
+            .unwrap();
+        c.store
+            .apply("test", crate::store::Mutation::ReviewOntology { tenant_id: "acme".into(), decisions })
+            .await
+            .unwrap();
+        let version = format!("acme@{}", c.store.state().ontologies["acme"].version);
+        let node = |filters: Value| {
+            json!({"kind": "workflow", "model_policy": {},
+                   "tools": [{"ref": "builtin://datasource_query", "effect": "read"}],
+                   "datasources": {"scopes": ["health.services:read"]},
+                   "budgets": {"steps": 3, "tokens": 1000, "wall_clock_s": 30},
+                   "graph": {"vertices": [{"id": "services", "type": "tool", "config": {
+                       "tool": "builtin://datasource_query",
+                       "args": {"query": {"ir_version": "1", "ontology_version": version,
+                                          "metrics": [{"id": "services"}], "dimensions": [{"id": "Service.city"}],
+                                          "filters": filters, "limit": 20}}}}],
+                             "edges": []}})
+        };
+        let triage = json!([
+            {"attr": "Service.specialty", "op": "in",
+             "value": {"type": "string_list", "v": ["{{outputs.assess.specialty}}", "emergency_medicine"]}},
+            {"attr": "Service.city", "op": "in", "value": {"type": "string_list", "v": "{{outputs.assess.cities}}"}},
+            {"attr": "Service.specialty", "op": "eq", "value": {"type": "string", "v": "{{outputs.assess.specialty}}"}},
+            {"attr": "Service.price_usd", "op": "lte", "value": {"type": "number", "v": "{{input.budget}}"}}
+        ]);
+        let (s, v) = call(&app, "POST", &format!("{V}/versions"), Some(json!({"spec": node(triage)}))).await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+        let (s, p) = call(&app, "POST", &format!("{V}/versions/1/publish"), Some(json!({"promote": false}))).await;
+        assert_eq!((s, p["state"].as_str()), (StatusCode::OK, Some("published")), "{p}");
+        // An unknown attribute next to a template: refused, with the query's path.
+        let bad = json!([{"attr": "Service.town", "op": "in",
+                          "value": {"type": "string_list", "v": "{{outputs.assess.cities}}"}}]);
+        call(&app, "POST", &format!("{V}/versions"), Some(json!({"spec": node(bad)}))).await;
+        let (s, e) = call(&app, "POST", &format!("{V}/versions/2/publish"), Some(json!({"promote": false}))).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
+        assert_eq!(
+            (e["error"]["problems"][0]["kind"].as_str(), e["error"]["problems"][0]["path"].as_str()),
+            (Some("ontology_version"), Some("/graph/vertices/0/config/args/query"))
+        );
+        assert!(e["error"]["message"].as_str().unwrap().contains("unknown attribute 'Service.town'"), "{e}");
+    }
+
     fn app_without_kek() -> Router {
         app(cp(None), None)
     }

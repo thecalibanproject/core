@@ -19,6 +19,12 @@
 //! - `POST /v1/runs/{id}/cancel`: cancels the run (durable: a running run stops at its next step
 //!   boundary on whichever worker runs it).
 //!
+//! **Timings.** Creating a run and answering its human step (`POST /v1/runs/{id}/input`) answer
+//! with `Server-Timing` (README, "Stage timings"): `auth`, `node;dur=<time this request spent on
+//! the run>;desc="<run id>"` (creating it and, when sync, waiting for it; delivering the answer),
+//! and `total`. A streamed run's headers leave before it ends: its `node` has the run id and no
+//! duration. Each step's duration is on `GET /v1/runs/{id}`.
+//!
 //! **Events.** Each SSE event is `id: <n>`, `event: <type>`, `data: {"id", "type", "run_id",
 //! "at", "data", "run"?}`. Types: `run.created`, `step.started`, `step.finished` (vertex, kind,
 //! status, tokens, cost so far, taint labels; never step content), `run.input_required` (the
@@ -28,6 +34,7 @@
 
 use crate::auth;
 use crate::nodes::{Forwarder, LocalRuns, NodeRuns};
+use crate::timing::{self, Timings};
 use crate::{Gateway, idempotency};
 use axum::Router;
 use axum::extract::{Path, Query, Request, State};
@@ -603,7 +610,27 @@ fn local(gw: &Gateway) -> Result<&LocalRuns, RunError> {
     }
 }
 
+/// Sets `Server-Timing` on a run API response: `auth`, `node` (`dur` when known, `desc` the run
+/// id) and `total` since `started`.
+fn run_timing(
+    gw: &Gateway,
+    resp: &mut Response,
+    started: Instant,
+    auth: Duration,
+    node: Option<Duration>,
+    run_id: &str,
+) {
+    let mut t = Timings::new(gw.config.load().config.telemetry.server_timing);
+    t.auth = Some(auth);
+    t.node = node;
+    t.run_id = Some(run_id.to_owned());
+    if let Some(v) = t.header(started) {
+        resp.headers_mut().insert(timing::HEADER, v);
+    }
+}
+
 async fn create_run(State(gw): State<Arc<Gateway>>, Path(name): Path<String>, req: Request) -> Response {
+    let started = Instant::now();
     let caller = match Caller::from_headers(&gw, req.headers()) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
@@ -611,6 +638,7 @@ async fn create_run(State(gw): State<Arc<Gateway>>, Path(name): Path<String>, re
     if !caller.may_run(&name) {
         return forbidden_node(&name).into_response();
     }
+    let auth = started.elapsed();
     let runs = match gw.nodes() {
         None => return not_enabled().into_response(),
         Some(NodeRuns::Forward(f)) => return f.forward(req).await,
@@ -658,6 +686,7 @@ async fn create_run(State(gw): State<Arc<Gateway>>, Path(name): Path<String>, re
         check_spend: internal && header(CHECK_SPEND_HEADER).as_deref() == Some("true"),
         untrusted,
     };
+    let node_started = Instant::now();
     let (run, new) = match runs.executor.create(start).await {
         Ok(x) => x,
         Err(e) => return exec_error(e).into_response(),
@@ -677,6 +706,7 @@ async fn create_run(State(gw): State<Arc<Gateway>>, Path(name): Path<String>, re
         if !new {
             resp.headers_mut().insert(idempotency::REPLAYED, HeaderValue::from_static("true"));
         }
+        run_timing(&gw, &mut resp, started, auth, None, &run.id);
         return resp;
     }
     if !rc.is_async {
@@ -689,7 +719,11 @@ async fn create_run(State(gw): State<Arc<Gateway>>, Path(name): Path<String>, re
         }
     }
     match runs.executor.view(&caller.tenant, &run.id).await {
-        Ok(Some(v)) => view_response(if rc.is_async { StatusCode::ACCEPTED } else { run_status(&v) }, &v, !new),
+        Ok(Some(v)) => {
+            let mut resp = view_response(if rc.is_async { StatusCode::ACCEPTED } else { run_status(&v) }, &v, !new);
+            run_timing(&gw, &mut resp, started, auth, Some(node_started.elapsed()), &v.id);
+            resp
+        }
         Ok(None) => exec_error(ExecError::Internal("the run vanished".into())).into_response(),
         Err(e) => exec_error(e).into_response(),
     }
@@ -724,10 +758,12 @@ async fn run_input(State(gw): State<Arc<Gateway>>, Path(id): Path<String>, req: 
     if let Some(NodeRuns::Forward(f)) = gw.nodes() {
         return forward_authenticated(&gw, f, req).await;
     }
+    let started = Instant::now();
     let (runs, _, caller) = match existing(&gw, req.headers(), &id).await {
         Ok(x) => x,
         Err(r) => return r.into_response(),
     };
+    let auth = started.elapsed();
     let Ok(body) = axum::body::to_bytes(req.into_body(), crate::MAX_BODY).await else {
         return error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", None, "request body too large");
     };
@@ -737,12 +773,17 @@ async fn run_input(State(gw): State<Arc<Gateway>>, Path(id): Path<String>, req: 
     };
     // Who answered: journaled with the answer and audited (approvals of tainted writes included).
     let by = caller.actor();
+    let node_started = Instant::now();
     match runs.executor.deliver_input(&caller.tenant, &id, input.step.as_deref(), &input.answer, Some(&by)).await {
         Ok(Delivered::Accepted) => {
             // Resumed here at once (another worker would pick it up at its next poll).
             runs.executor.spawn_run(id.clone());
             match runs.executor.view(&caller.tenant, &id).await {
-                Ok(Some(v)) => view_response(StatusCode::ACCEPTED, &v, false),
+                Ok(Some(v)) => {
+                    let mut resp = view_response(StatusCode::ACCEPTED, &v, false);
+                    run_timing(&gw, &mut resp, started, auth, Some(node_started.elapsed()), &v.id);
+                    resp
+                }
                 Ok(None) => run_not_found().into_response(),
                 Err(e) => exec_error(e).into_response(),
             }

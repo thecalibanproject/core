@@ -194,6 +194,16 @@ async fn auto_hands_a_classified_request_to_the_node_and_classifies_once() {
     assert_eq!(v["choices"][0]["message"]["content"], "Since when (clinical)?");
     assert_eq!(a.embedded(CHEST_ASK), 1, "the request was classified once");
     let run = v["caliban"]["run_id"].as_str().unwrap().to_owned();
+    // Server-Timing: the routing stages, then the node run (its id, to fetch the step durations).
+    let st = h["server-timing"].to_str().unwrap();
+    let names: Vec<&str> = st.split(", ").map(|m| m.split(';').next().unwrap()).collect();
+    assert_eq!(names, ["auth", "route", "embed", "node", "total"], "{st}");
+    assert!(st.contains("route;dur=") && st.contains(";desc=\"knn\""), "{st}");
+    assert!(st.contains("node;dur=") && st.contains(&format!(";desc=\"{run}\"")), "{st}");
+    for m in st.split(", ") {
+        let d: f64 = m.split(';').find_map(|p| p.strip_prefix("dur=")).unwrap().parse().unwrap();
+        assert!(d >= 0.0, "{st}");
+    }
     // Continued with caliban/auto and the run id: no new classification.
     let (s, h, body) = chat(&a.w.app, KEY, auto("two days", false), &[("caliban-run-id", &run)]).await;
     assert_eq!(s, StatusCode::OK, "{body}");
@@ -230,6 +240,9 @@ async fn auto_hands_a_classified_request_to_the_node_and_classifies_once() {
     assert_eq!((s, h["content-type"].to_str().unwrap()), (StatusCode::OK, "text/event-stream"));
     assert_eq!(h["x-caliban-route"], "node/flow@v1");
     assert!(body.contains("\"finish_reason\":\"input_required\""), "{body}");
+    // The headers leave before the run ends: the node entry names the run, without a duration.
+    let st = h["server-timing"].to_str().unwrap();
+    assert!(st.starts_with("auth;dur=") && st.contains(", node;desc=\"run_") && st.contains(", total;dur="), "{st}");
     assert_eq!(a.embedded(again), 1);
 }
 

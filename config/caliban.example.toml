@@ -41,6 +41,12 @@ admin_token = { env = "CALIBAN_ADMIN_TOKEN" }
 # role = "developer"
 # tenant = "acme"
 
+[telemetry]
+# W3C `Server-Timing` header on /v1/chat/completions, /v1/messages, /v1/embeddings and /v1/rerank:
+# per-stage durations (auth, route, embed, pii, cache, upstream, node, total). It times only the
+# caller's own request and caches are per tenant, so it gives no cross-tenant timing signal.
+server_timing = true
+
 [cache]
 exact_enabled = true
 exact_max_entries = 100000

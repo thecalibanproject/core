@@ -747,10 +747,11 @@ async fn healthcheck(addr: &str, path: &str) -> bool {
 const PURGE_EVERY: Duration = caliban_gateway::purge::PURGE_EVERY;
 
 /// Builds the `caliban/auto` routing assets (exemplar embeddings, kNN calibration, router profile)
-/// in the background; until they are ready, `caliban/auto` routes by the keyword rules.
+/// in the background, and rebuilds them whenever an applied snapshot changes them; until the
+/// first build is ready, `caliban/auto` routes by the keyword rules.
 fn spawn_router_warmup(gw: &Arc<caliban_gateway::Gateway>) {
     let gw = Arc::clone(gw);
-    tokio::spawn(async move { gw.warm_router().await });
+    tokio::spawn(async move { gw.keep_router_fresh().await });
 }
 
 /// Builds the data plane. With `CALIBAN_PII_NER_DIR` set, the L1 NER detector is loaded (and its

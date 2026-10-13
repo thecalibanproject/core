@@ -11,6 +11,9 @@
 //! - **L2** optional local LLM verifier for strict mode (TODO).
 //!
 //! Spans from all tiers are unioned by [`merge_spans`] (longest span wins, then higher risk).
+//! In a text segment that holds a JSON object or array (a tool result, tool-call arguments), only
+//! spans inside string values are rewritten: keys and numbers never are, nor the structure of a
+//! CQIR query ([`json`]).
 //! A detector that fails (e.g. ONNX inference error) makes [`PiiEngine::protect`] return
 //! [`PiiError::DetectorFailed`]: the request fails closed rather than going out half-scrubbed.
 //!
@@ -46,6 +49,7 @@
 //! it. Collision handling and its probabilities are documented in [`surrogate`].
 
 pub mod dictionary;
+pub mod json;
 pub mod ner;
 pub mod patterns;
 pub mod rehydrate;
@@ -397,6 +401,7 @@ impl PiiEngine {
                 err = Some(PiiError::SecretDetected(redact_preview(&s[sec.start..sec.end])));
                 return;
             }
+            let spans = json_values_only(s, spans);
             all_text.push_str(s);
             all_text.push('\n');
             values.extend(spans.iter().map(|sp| (sp.entity.clone(), s[sp.start..sp.end].to_owned())));
@@ -418,6 +423,22 @@ impl PiiEngine {
         });
         Ok(out)
     }
+}
+
+/// In a segment that holds a JSON object or array (a tool result, tool-call arguments), keeps the
+/// spans that lie inside a protectable string value ([`json::protectable_ranges`]): keys,
+/// numbers and a CQIR query's structure are never rewritten, so the JSON stays valid and means
+/// the same. A credential anywhere has already blocked the request.
+fn json_values_only(text: &str, mut spans: Vec<Span>) -> Vec<Span> {
+    if spans.is_empty() {
+        return spans;
+    }
+    let Some(ranges) = json::protectable_ranges(text) else { return spans };
+    spans.retain(|sp| {
+        let i = ranges.partition_point(|r| r.start <= sp.start);
+        i > 0 && sp.end <= ranges[i - 1].end
+    });
+    spans
 }
 
 fn rewrite(text: &str, spans: &[Span], mode: PiiMode, vault: &mut Vault) -> String {
@@ -650,6 +671,56 @@ mod tests {
         let (_, p2) = protect_with(&key, "b@y.io then a@x.io");
         let map = |p: &Protected| p.vault.pairs().iter().cloned().collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(map(&p1), map(&p2));
+    }
+
+    fn tool_chat(content: &str) -> ChatRequest {
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": "find the engagement letter"},
+            {"role": "tool", "tool_call_id": "c1", "content": content}
+        ]});
+        ChatRequest::from_openai_json(body.to_string().as_bytes()).unwrap()
+    }
+
+    fn tool_text(r: &ChatRequest) -> String {
+        r.messages[1].content.as_str().unwrap().to_owned()
+    }
+
+    /// The law-firm demo: a `rag_search` relevance score in a tool result was masked as
+    /// `0.[CARD]` (a Luhn-valid digit run after the decimal point), and the model got broken JSON.
+    #[test]
+    fn json_numbers_and_keys_in_a_tool_result_are_never_rewritten() {
+        let result = r#"{"results":[{"doc_id":"d1","score":0.0322580645161292,"chunk":"Card 4111 1111 1111 1111, mail jane@acme.com"}],"4111111111111111":1}"#;
+        for mode in [PiiMode::Mask, PiiMode::Reversible] {
+            let mut req = tool_chat(result);
+            let p = PiiEngine::default().protect(&mut req, mode, b"s").unwrap();
+            let sent = tool_text(&req);
+            let v: serde_json::Value = serde_json::from_str(&sent).expect("still JSON");
+            assert_eq!(v["results"][0]["score"], serde_json::json!(0.032_258_064_516_129_2), "{sent}");
+            assert_eq!(v["4111111111111111"], 1, "keys are left alone: {sent}");
+            let chunk = v["results"][0]["chunk"].as_str().unwrap();
+            assert!(
+                !chunk.contains("4111") && !chunk.contains("jane@acme.com"),
+                "string values are protected: {chunk}"
+            );
+            assert_eq!(p.entities, 2, "{mode:?}");
+        }
+        let mut req = tool_chat(result);
+        PiiEngine::default().protect(&mut req, PiiMode::Mask, b"s").unwrap();
+        assert!(tool_text(&req).contains(r#""chunk":"Card [CARD], mail [EMAIL]""#), "{}", tool_text(&req));
+        // Prose is scanned as a whole, as before.
+        let mut prose = tool_chat("the card is 4111111111111111.");
+        PiiEngine::default().protect(&mut prose, PiiMode::Mask, b"s").unwrap();
+        assert_eq!(tool_text(&prose), "the card is [CARD].");
+    }
+
+    /// Credentials block the request wherever they are, keys included.
+    #[test]
+    fn a_secret_in_json_still_blocks() {
+        let mut req = tool_chat(r#"{"sk-proj-abcdefghijklmnopqrstuvwxyz0123456789": 1}"#);
+        assert!(matches!(
+            PiiEngine::default().protect(&mut req, PiiMode::Mask, b"s"),
+            Err(PiiError::SecretDetected(_))
+        ));
     }
 
     #[test]

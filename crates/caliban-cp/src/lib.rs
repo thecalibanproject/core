@@ -1299,8 +1299,12 @@ async fn put_intent(
     }
     let m =
         Mutation::SetTenantIntent { tenant_id: tenant_id.clone(), intent: intent.clone(), exemplars: Some(ex.clone()) };
-    cp.store.apply(&p.actor, m).await?;
-    Ok(Json(json!({"tenant_id": tenant_id, "intent": intent, "exemplars": ex, "source": "api"})))
+    let st = cp.store.apply(&p.actor, m).await?;
+    // Routers serve the change once their `/healthz` `routing.version` reaches this version.
+    let version = format!("cp-{}", st.audit_head);
+    Ok(Json(
+        json!({"tenant_id": tenant_id, "intent": intent, "exemplars": ex, "source": "api", "config_version": version}),
+    ))
 }
 
 /// `DELETE /api/v1/tenants/{t}/intents/{intent}`: drops the tenant's own exemplars of the intent
@@ -1836,6 +1840,25 @@ mod tests {
         close("margin_usd", 1.7 - 0.5);
         close("auto_saved_usd", 0.8);
         close("saved_usd", 0.8 + 0.3);
+    }
+
+    #[tokio::test]
+    async fn usage_events_report_their_stage_timings() {
+        use caliban_meter::{UsageEvent, UsageSink};
+        let c = cp();
+        let app = app(Arc::clone(&c), None);
+        let timings = json!({"auth_ms": 0.1, "route_ms": 2.5, "embed_ms": 2.0, "pii_ms": 0.4, "cache_ms": 0.05,
+                             "upstream_ms": 80.0, "upstream_total_ms": 300.0, "total_ms": 304.0});
+        let ev: UsageEvent = serde_json::from_value(json!({
+            "request_id": "t1", "tenant_id": "acme", "model": "ext/gpt", "intent": "chat", "prompt_tokens": 1,
+            "completion_tokens": 1, "cached_prompt_tokens": 0, "tokens_saved": 0, "cache": "miss",
+            "pii_entities": 0, "cost_usd": 0.0, "latency_ms": 304, "ts": "2026-10-09T12:00:00Z", "timings": timings
+        }))
+        .unwrap();
+        c.store.usage.record(ev).await;
+        let (s, u) = call(&app, "GET", "/api/v1/usage", None, true).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(u["events"][0]["timings"], timings, "{u}");
     }
 
     #[tokio::test]
@@ -2529,6 +2552,8 @@ mod tests {
         let (s, v) = call(&app, "PUT", "/api/v1/tenants/acme/intents/triage", Some(body), true).await;
         assert_eq!((s, v["exemplars"].as_array().map(Vec::len)), (StatusCode::OK, Some(2)), "{v}");
         assert_eq!(ex(&handle, "triage").map(|v| v.len()), Some(2));
+        // The snapshot version that carries it (routers report it in `/healthz` `routing.version`).
+        assert_eq!(v["config_version"].as_str(), Some(handle.load().version.as_str()));
         // Overriding the file's intent, then removing it for this tenant, then back to the file's.
         let (s, _) =
             call(&app, "PUT", "/api/v1/tenants/acme/intents/legal.review", Some(json!({"exemplars": []})), true).await;

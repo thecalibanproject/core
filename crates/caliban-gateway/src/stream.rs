@@ -922,6 +922,7 @@ trust_tier = "t2_contracted"
             node: None,
             auto_fallback: None,
             purpose: None,
+            timings: Default::default(),
         }
     }
 

@@ -157,6 +157,19 @@ platform trust store (an internal CA can be added there, or through `SSL_CERT_FI
   (`reversible`, tenant-scoped surrogates), or masks (`mask`). A server registered with
   `trusted: true` receives the values. A tenant in PII mode `off` has asked for no protection. If
   the PII engine fails on the arguments, the call is refused: nothing leaves unchecked.
+- **Built-in tools** (`builtin://datasource_query`, `builtin://rag_search`) run inside Caliban
+  against the tenant's own data, so their arguments never leave the boundary and are never
+  disguised, in any PII mode (research note 05 §3: tool calls to customer datasources run on real
+  values inside the trust boundary). A surrogate in a datasource query would match no row, and one
+  in its `ontology_version` makes it fail. `rag_search` pseudonymises its query itself with the
+  tenant's surrogate key before embedding it, the same surrogates its indexed passages carry, so
+  retrieval matches; the guard disguising the query first would make it search for surrogates the
+  index does not hold.
+- **Only string values** are rewritten, in arguments and results alike, and in the tool messages
+  a later model call reads: keys and numbers never are (a `rag_search` score stays a number, and
+  the JSON stays valid). In a CQIR query only the filter literals (`filters[].value.v`) are data;
+  its `ir_version`, `ontology_version`, metric and dimension ids, attributes, operators, sort
+  fields and `limit` are never rewritten, by whatever path the query meets the PII engine.
 - **Results** enter the run as the tenant's PII mode (raised by the node's `guardrails.pii`)
   says:
   - `reversible`: as they are (research note 05 §3, P3 plan M4). Every model call is
@@ -172,6 +185,14 @@ platform trust store (an internal CA can be added there, or through `SSL_CERT_FI
 
   Run values are stored in the journal sealed under the tenant's data key. In the console, run
   content (step outputs included) needs `runs.data`.
+- **Reformatted values.** A structured value (IBAN, card, phone, US SSN, national id) is restored
+  whatever separators the model writes its surrogate with, in the model's reply and in the
+  arguments of its tool calls: an IBAN the caller sent spaced, with its surrogate written compact
+  in a refund tool's arguments, reaches a trusted tool as the real IBAN, compact. The value is
+  laid out in the format the model used (a tool schema that wants it compact gets it compact).
+  Only the exact separator-free form of a surrogate the request issued is restored, never inside a
+  longer number; see `crates/caliban-pii/src/rehydrate.rs`. Before this release such a surrogate
+  stayed as it was, so a made-up IBAN could reach a trusted tool.
 
 ## Taint (CaMeL-lite)
 
@@ -302,7 +323,9 @@ writes a query in CQIR (ontology ids only; never a collection, a path or an oper
 
 It runs on the native MongoDB lane through a connector that checks its principal is read only (a
 principal that can write is refused), with the compiler's `maxTimeMS`, at most 200 rows. Other
-datasource kinds are refused until their lane exists.
+datasource kinds are refused until their lane exists. Its arguments reach it as the model or the
+graph wrote them, never pseudonymised (it runs inside Caliban, see
+[Personal data](#personal-data)); its rows enter the run like any tool result.
 
 **Where the queries read.** A compiled query reads with `readPreference: secondary` and the tag
 `{workload: analytics}`, so analytics never load the primary (note 08: a tagged or hidden
@@ -321,7 +344,8 @@ document collections the node may read, narrowed to the invoking API key's datas
 the key has any, and returns the best passages as `context` with citations (document id, heading
 path, chunk id) under a token budget. Its result carries the `retrieved` label. It runs in process
 and pseudonymises the query itself before anything is embedded, so it is a trusted tool (its
-arguments are not pseudonymised by the guard); its result enters the run like any other tool
+arguments are not pseudonymised by the guard, like every built-in tool's, see
+[Personal data](#personal-data)); its result enters the run like any other tool
 result (masked in `mask` mode, see above). Collections, ingest, the poisoning controls and the search pipeline are described in
 [rag.md](rag.md).
 

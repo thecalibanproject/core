@@ -70,7 +70,16 @@ fn openai_reply(b: &Value) -> Response {
     }
     let message = if b.get("tools").and_then(Value::as_array).is_some_and(|t| !t.is_empty()) {
         let name = b["tools"][0]["function"]["name"].clone();
-        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": name, "arguments": "{\"city\":\"Paris\"}"}}]})
+        // A model that writes the IBAN it was given (up to the next period) without its spaces.
+        let user = last_user_text(b);
+        let arguments = match user.split_once("IBAN ") {
+            Some((_, rest)) => {
+                let iban: String = rest.split('.').next().unwrap_or_default().split_whitespace().collect();
+                json!({"iban": iban, "amount": 120}).to_string()
+            }
+            None => "{\"city\":\"Paris\"}".to_owned(),
+        };
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": name, "arguments": arguments}}]})
     } else {
         json!({"role": "assistant", "content": text})
     };
@@ -154,6 +163,11 @@ async fn setup_with_keys(keys: Option<SurrogateKeys>) -> (Router, Log, Arc<InMem
 
 /// [`setup_with_keys`], also returning the usage events.
 async fn setup_full(keys: Option<SurrogateKeys>) -> (Router, Log, Arc<InMemoryQuota>, RecentUsage) {
+    setup_extra(keys, "").await
+}
+
+/// [`setup_full`] with `extra` appended to the config file.
+async fn setup_extra(keys: Option<SurrogateKeys>, extra: &str) -> (Router, Log, Arc<InMemoryQuota>, RecentUsage) {
     let (base, log) = mock_upstream().await;
     let key_file = std::env::temp_dir().join(format!("caliban-gw-test-anthropic-{}", std::process::id()));
     std::fs::write(&key_file, "sk-ant-test").unwrap();
@@ -269,6 +283,7 @@ requests_per_minute = 1
 
 [limits.tenants.budget]
 tokens_per_day = 2000
+{extra}
 "#,
         acme = hash("cal_acme"),
         globex = hash("cal_globex"),
@@ -519,6 +534,27 @@ async fn earlier_tool_call_arguments_are_protected_on_both_paths() {
     assert_eq!(input["input"]["subject"], "plan");
     assert_eq!(input["input"]["to"], input["input"]["cc"][0], "one value, one surrogate");
     assert_eq!(h["x-caliban-pii-entities"], "2");
+}
+
+/// One IBAN in two formats gets one surrogate; the model writes it compact in a refund tool's
+/// arguments, and the caller gets the real IBAN back in that format (fintech demo: a made-up IBAN
+/// reached a trusted refund tool).
+#[tokio::test]
+async fn a_reformatted_iban_in_tool_arguments_is_restored() {
+    let (app, log, _) = setup().await;
+    let (spaced, compact) = ("FR76 3000 6000 0112 3456 7890 189", "FR7630006000011234567890189");
+    let body = json!({"model": "ext/mock",
+        "tools": [{"type": "function", "function": {"name": "refund", "parameters": {"type": "object"}}}],
+        "messages": [{"role": "user", "content": format!("Refund 120 EUR to IBAN {spaced}. The form says {compact}.")}]});
+    let (status, _, out) = call(&app, "/v1/chat/completions", BEARER, body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let sent = log.last().2.to_string();
+    assert!(!sent.contains("3000 6000") && !sent.contains(compact), "{sent}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let args: Value =
+        serde_json::from_str(v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(args, json!({"iban": compact, "amount": 120}));
 }
 
 /// Caliban sets prefix-cache salts itself, or none: a client's `cache_salt` never reaches an
@@ -1719,15 +1755,21 @@ mod auto_routing {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
+    /// A batch holding a text with [`GATED`] waits for the test: the embedder sends a reply slot
+    /// here and answers the batch with vectors (`true`) or a `503` (`false`).
+    type Gate = tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<bool>>;
+    const GATED: &str = "zorblax";
+
     /// OpenAI-compatible `/v1/embeddings` returning `caliban_route::hash_embed` vectors after
     /// `delay_ms` (shared, so a test can slow the embedder down after warm-up). Every input text
     /// is recorded in `seen`.
-    async fn mock_embedder(delay_ms: Arc<AtomicU64>, seen: Arc<Mutex<Vec<String>>>) -> String {
+    async fn mock_embedder(delay_ms: Arc<AtomicU64>, seen: Arc<Mutex<Vec<String>>>, gate: Option<Gate>) -> String {
         let app = Router::new().route(
             "/v1/embeddings",
             post(move |Json(b): Json<Value>| {
                 let delay = Duration::from_millis(delay_ms.load(Ordering::SeqCst));
                 let seen = Arc::clone(&seen);
+                let gate = gate.clone();
                 async move {
                     tokio::time::sleep(delay).await;
                     let inputs: Vec<String> = match &b["input"] {
@@ -1735,10 +1777,17 @@ mod auto_routing {
                         Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
                         _ => vec![],
                     };
+                    if let Some(gate) = gate.filter(|_| inputs.len() > 1 && inputs.iter().any(|t| t.contains(GATED))) {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        gate.send(tx).unwrap();
+                        if !rx.await.unwrap_or(false) {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                    }
                     seen.lock().unwrap().extend(inputs.iter().cloned());
                     let data: Vec<Value> =
                         inputs.iter().enumerate().map(|(i, t)| json!({"object": "embedding", "index": i, "embedding": caliban_route::hash_embed(t, 256)})).collect();
-                    Json(json!({"object": "list", "data": data, "model": b["model"], "usage": {"prompt_tokens": 1, "total_tokens": 1}}))
+                    Json(json!({"object": "list", "data": data, "model": b["model"], "usage": {"prompt_tokens": 1, "total_tokens": 1}})).into_response()
                 }
             }),
         );
@@ -1760,10 +1809,17 @@ mod auto_routing {
     }
 
     async fn setup(routing: &str) -> Env {
+        setup_gated(routing, None).await
+    }
+
+    /// With a gate, exemplar batches holding [`GATED`] wait for the test, and a failed build is
+    /// due for a retry at once.
+    async fn setup_gated(routing: &str, gate: Option<Gate>) -> Env {
         let (base, _log) = mock_upstream().await;
         let delay = Arc::new(AtomicU64::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let emb = mock_embedder(delay.clone(), Arc::clone(&seen)).await;
+        let gated = gate.is_some();
+        let emb = mock_embedder(delay.clone(), Arc::clone(&seen), gate).await;
         let toml = format!(
             r#"
 [routing]
@@ -1833,13 +1889,15 @@ api_key_hashes = ["{acme}"]
         );
         let usage = RecentUsage::default();
         let store = Arc::new(MemoryStore::default());
-        let gw = Arc::new(
-            Gateway::new(
-                ConfigHandle::new(Snapshot::new(Config::from_toml_str(&toml).unwrap(), "test")),
-                Arc::new(usage.clone()),
-            )
-            .with_semantic_store(store.clone()),
-        );
+        let mut gw = Gateway::new(
+            ConfigHandle::new(Snapshot::new(Config::from_toml_str(&toml).unwrap(), "test")),
+            Arc::new(usage.clone()),
+        )
+        .with_semantic_store(store.clone());
+        if gated {
+            gw.router = caliban_route::Router::default().with_retry_after(Duration::ZERO);
+        }
+        let gw = Arc::new(gw);
         gw.warm_router().await;
         assert!(gw.router.knn_ready(), "kNN index built from the mock embedder");
         Env { app: app(Arc::clone(&gw)), gw, usage, delay, seen, store }
@@ -2094,6 +2152,109 @@ api_key_hashes = ["{acme}"]
         assert!(hit.flat_price_usd.is_none() && hit.billed_usd.is_none() && hit.routed_model_cost_usd.is_none());
     }
 
+    const ZORBLAX: [&str; 5] = [
+        "zorblax the quarterly frobnication widget",
+        "zorblax the frobnication widget for the quarter",
+        "please zorblax the quarterly frobnication widget",
+        "zorblax our frobnication widget this quarter",
+        "can you zorblax the quarterly frobnication widget",
+    ];
+
+    /// A guard against a hang (the test synchronizes on signals; this only bounds a failure).
+    async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(30), f).await.expect("signal within 30 s")
+    }
+
+    /// The intent `caliban/auto` picks for `text` (acme), through the request-path routing call.
+    async fn intent_of(env: &Env, text: &str) -> String {
+        let snap = env.gw.config.load();
+        let tenant = snap.tenant(&"acme".into()).unwrap().clone();
+        let req = caliban_ir::ChatRequest::from_openai_json(auto(text, false).to_string().as_bytes()).unwrap();
+        route_embed::route(&env.gw, &snap, &tenant, &req).await.0.unwrap().intent
+    }
+
+    async fn healthz(env: &Env) -> Value {
+        let req = Request::get("/healthz").body(Body::empty()).unwrap();
+        let resp = env.app.clone().oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Applies a snapshot that gives acme the `zorblax` intent (as `PUT /tenants/acme/intents`
+    /// does through the control plane).
+    fn apply_zorblax(env: &Env, version: &str) {
+        let mut cfg = env.gw.config.load().config.clone();
+        cfg.routing
+            .tenants
+            .entry("acme".into())
+            .or_default()
+            .exemplars
+            .insert("zorblax".into(), ZORBLAX.iter().map(|t| (*t).to_owned()).collect());
+        env.gw.config.store(Snapshot::new(cfg, version));
+    }
+
+    /// A snapshot with new exemplars starts the rebuild when it is applied, with no request; while
+    /// it is in flight requests route with the old index; once the status reports the new version,
+    /// the very next request uses the new index, and `/healthz` shows it.
+    #[tokio::test]
+    async fn applied_snapshot_rebuilds_the_index_eagerly_and_swaps_it_in() {
+        let (gate, mut calls) = tokio::sync::mpsc::unbounded_channel();
+        let env = setup_gated("", Some(gate)).await;
+        let before = env.gw.router.status();
+        assert_eq!(before.version.as_deref(), Some("test"));
+        let gw = Arc::clone(&env.gw);
+        let task = tokio::spawn(async move { gw.keep_router_fresh().await });
+        let mut status = env.gw.router.subscribe();
+
+        apply_zorblax(&env, "v2");
+        // The embedder sees the new exemplars without any request having been made.
+        let reply = within(calls.recv()).await.unwrap();
+        assert!(env.gw.router.status().building);
+        assert_ne!(intent_of(&env, ZORBLAX[0]).await, "zorblax", "old index while the build is in flight");
+        let h = healthz(&env).await;
+        assert_eq!((h["config_version"].as_str(), h["routing"]["version"].as_str()), (Some("v2"), Some("test")));
+        assert_eq!(
+            (h["routing"]["building"].as_bool(), h["routing"]["exemplars"].as_u64()),
+            (Some(true), Some(before.exemplars as u64))
+        );
+
+        reply.send(true).unwrap();
+        within(status.wait_for(|s| s.version.as_deref() == Some("v2"))).await.unwrap();
+        assert_eq!(intent_of(&env, ZORBLAX[0]).await, "zorblax");
+        let h = healthz(&env).await;
+        assert_eq!(h["routing"]["version"], "v2");
+        assert_eq!(h["routing"]["exemplars"].as_u64(), Some((before.exemplars + ZORBLAX.len()) as u64));
+        assert_eq!((h["routing"]["building"].as_bool(), h["routing"]["knn"].as_bool()), (Some(false), Some(true)));
+        assert!(h["routing"]["last_error"].is_null());
+        task.abort();
+    }
+
+    /// A failed embedder call during the rebuild keeps the old index (and reports the error); the
+    /// build is retried when due, without a request or a new snapshot, and then swapped in.
+    #[tokio::test]
+    async fn failed_rebuild_keeps_the_old_index_and_retries() {
+        let (gate, mut calls) = tokio::sync::mpsc::unbounded_channel();
+        let env = setup_gated("", Some(gate)).await;
+        let before = env.gw.router.status();
+        let gw = Arc::clone(&env.gw);
+        let task = tokio::spawn(async move { gw.keep_router_fresh().await });
+        let mut status = env.gw.router.subscribe();
+
+        apply_zorblax(&env, "v2");
+        within(calls.recv()).await.unwrap().send(false).unwrap();
+        within(status.wait_for(|s| s.last_error.is_some())).await.unwrap();
+        let st = env.gw.router.status();
+        assert_eq!((st.version.as_deref(), st.exemplars, st.knn), (Some("test"), before.exemplars, true));
+        assert_ne!(intent_of(&env, ZORBLAX[0]).await, "zorblax", "the old index still serves");
+        assert!(healthz(&env).await["routing"]["last_error"].as_str().is_some_and(|e| !e.is_empty()));
+
+        // The retry (due at once in this setup) reaches the embedder again.
+        within(calls.recv()).await.unwrap().send(true).unwrap();
+        within(status.wait_for(|s| s.version.as_deref() == Some("v2") && s.last_error.is_none())).await.unwrap();
+        assert_eq!(intent_of(&env, ZORBLAX[0]).await, "zorblax");
+        task.abort();
+    }
+
     /// Added routing latency through the real adapter (HTTP to a local mock embedder) versus the
     /// keyword rules alone. `CALIBAN_TEST_PERF=1 cargo test --release -p caliban-gateway knn_latency -- --nocapture`
     /// also enforces the 25 ms p99 budget.
@@ -2120,7 +2281,7 @@ api_key_hashes = ["{acme}"]
                     .unwrap();
                     let started = Instant::now();
                     let d = if knn {
-                        route_embed::route(&gw, &snap, &tenant, &req).await.unwrap()
+                        route_embed::route(&gw, &snap, &tenant, &req).await.0.unwrap()
                     } else {
                         gw.router.route(&snap, &tenant, &req, caliban_route::Constraints::default()).unwrap()
                     };
@@ -2644,4 +2805,122 @@ api_key_hashes = ["{a}", "{b}"]
     let text = String::from_utf8(axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
     assert!(text.contains("caliban_escalations_total{outcome=\"admitted\"} 3"), "{text}");
     assert!(text.contains("caliban_escalations_total{outcome=\"denied\"} 1"), "{text}");
+}
+
+/// `Server-Timing` metrics: (name, dur, desc), in header order.
+fn server_timing(h: &HeaderMap) -> Vec<(String, Option<f64>, Option<String>)> {
+    let v = h.get("server-timing").expect("Server-Timing header").to_str().unwrap();
+    v.split(", ")
+        .map(|m| {
+            let mut parts = m.split(';');
+            let name = parts.next().unwrap().to_owned();
+            let (mut dur, mut desc) = (None, None);
+            for p in parts {
+                if let Some(d) = p.strip_prefix("dur=") {
+                    dur = Some(d.parse::<f64>().unwrap());
+                } else if let Some(d) = p.strip_prefix("desc=") {
+                    desc = Some(d.trim_matches('"').to_owned());
+                }
+            }
+            (name, dur, desc)
+        })
+        .collect()
+}
+
+fn names(m: &[(String, Option<f64>, Option<String>)]) -> Vec<&str> {
+    m.iter().map(|(n, _, _)| n.as_str()).collect()
+}
+
+fn dur(m: &[(String, Option<f64>, Option<String>)], name: &str) -> f64 {
+    m.iter().find(|(n, _, _)| n == name).and_then(|(_, d, _)| *d).unwrap_or_else(|| panic!("{name} has a dur"))
+}
+
+fn desc<'a>(m: &'a [(String, Option<f64>, Option<String>)], name: &str) -> Option<&'a str> {
+    m.iter().find(|(n, _, _)| n == name).and_then(|(_, _, d)| d.as_deref())
+}
+
+/// Every duration is non-negative and no stage outlasts the request (never absolute values).
+fn consistent(m: &[(String, Option<f64>, Option<String>)]) {
+    let total = dur(m, "total");
+    for (n, d, _) in m {
+        let d = d.unwrap_or(0.0);
+        assert!(d >= 0.0 && d <= total, "{n}: {d} (total {total})");
+    }
+}
+
+#[tokio::test]
+async fn server_timing_reports_each_stage_and_the_usage_event_keeps_it() {
+    let (app, log, _, usage) = setup_full(None).await;
+    // A miss: every stage up to the upstream's full call, in pipeline order.
+    let body = chat_body("timing please");
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let m = server_timing(&h);
+    assert_eq!(names(&m), ["auth", "route", "pii", "cache", "upstream", "upstream_total", "total"], "{m:?}");
+    assert_eq!(desc(&m, "route"), Some("pinned"));
+    assert_eq!(desc(&m, "cache"), Some("miss"));
+    consistent(&m);
+    assert!(dur(&m, "upstream") <= dur(&m, "upstream_total"));
+    let ev = usage.snapshot(Some("acme"), 1).pop().unwrap();
+    let t = ev.timings.expect("the usage event carries timings");
+    for d in [t.auth_ms, t.route_ms, t.pii_ms, t.cache_ms, t.upstream_ms, t.upstream_total_ms, t.total_ms] {
+        assert!(d.is_some_and(|d| d >= 0.0), "{t:?}");
+    }
+    assert!(t.upstream_ms <= t.upstream_total_ms && t.upstream_total_ms <= t.total_ms, "{t:?}");
+    assert!(t.embed_ms.is_none(), "no routing embedder for a pinned model");
+
+    // A cache hit: no upstream call, so no upstream entries.
+    let calls = upstream_calls(&log);
+    let (_, h, _) = call(&app, "/v1/chat/completions", BEARER, body).await;
+    assert_eq!(h["x-caliban-cache"], "hit");
+    assert_eq!(upstream_calls(&log), calls);
+    let m = server_timing(&h);
+    assert_eq!(names(&m), ["auth", "route", "pii", "cache", "total"], "{m:?}");
+    assert_eq!(desc(&m, "cache"), Some("hit"));
+    consistent(&m);
+    let t = usage.snapshot(Some("acme"), 1).pop().unwrap().timings.unwrap();
+    assert!(t.cache_ms.is_some() && t.upstream_ms.is_none() && t.upstream_total_ms.is_none(), "{t:?}");
+
+    // Streamed: the headers leave before the body, so the upstream's total is only in the usage
+    // event; the stream itself is unchanged OpenAI chunks.
+    let mut body = chat_body("stream the timing");
+    body["stream"] = json!(true);
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let m = server_timing(&h);
+    assert_eq!(names(&m), ["auth", "route", "pii", "upstream", "total"], "{m:?}");
+    consistent(&m);
+    assert!(!out.contains("timings") && !out.contains("server_timing"), "{out}");
+    let mut t = None;
+    for _ in 0..200 {
+        if let Some(e) =
+            usage.snapshot(Some("acme"), 1).pop().filter(|e| e.timings.is_some_and(|t| t.cache_ms.is_none()))
+        {
+            t = e.timings;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let t = t.expect("the stream's usage event");
+    assert!(
+        t.upstream_ms.is_some() && t.upstream_ms <= t.upstream_total_ms && t.upstream_total_ms <= t.total_ms,
+        "{t:?}"
+    );
+
+    // Anthropic clients get the same header.
+    let msg = json!({"model": "ext/mock", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]});
+    let (status, h, out) = call(&app, "/v1/messages", ANTH, msg).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(names(&server_timing(&h))[..2], ["auth", "route"]);
+}
+
+#[tokio::test]
+async fn server_timing_can_be_turned_off() {
+    let (app, _, _, usage) = setup_extra(None, "[telemetry]\nserver_timing = false").await;
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, chat_body("no timing")).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(h.get("server-timing").is_none(), "{h:?}");
+    assert!(h.get("x-caliban-intent").is_some(), "the other headers stay");
+    // The usage event keeps the durations.
+    assert!(usage.snapshot(Some("acme"), 1).pop().unwrap().timings.is_some_and(|t| t.total_ms.is_some()));
 }
