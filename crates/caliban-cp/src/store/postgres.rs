@@ -71,6 +71,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (34, "tenant_intents", include_str!("../../../../migrations/0034_tenant_intents.sql")),
     (35, "introspection_job", include_str!("../../../../migrations/0035_introspection_job.sql")),
     (36, "usage_timings", include_str!("../../../../migrations/0036_usage_timings.sql")),
+    (37, "node_run_mast_label", include_str!("../../../../migrations/0037_node_run_mast_label.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.

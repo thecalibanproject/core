@@ -179,6 +179,7 @@ impl Journal for MemoryJournal {
             origin: run.origin,
             input_labels: run.input_labels,
             last_event: 0,
+            mast_label: None,
         };
         let data = serde_json::json!({"node": rec.node, "version": rec.version});
         t.runs.push(rec.clone());
@@ -421,6 +422,13 @@ impl Journal for MemoryJournal {
         Ok(self.t.lock().runs.iter().any(|r| r.id == run_id && r.cancel_requested_at.is_some()))
     }
 
+    async fn set_mast_label(&self, tenant: &str, run_id: &str, label: Option<&str>) -> JResult<bool> {
+        let mut t = self.t.lock();
+        let Some(r) = t.runs.iter_mut().find(|r| r.id == run_id && r.tenant_id == tenant) else { return Ok(false) };
+        r.mast_label = label.map(str::to_owned);
+        Ok(true)
+    }
+
     async fn cancel(&self, tenant: &str, run_id: &str, by: &str, audit: Option<AuditEvent>) -> JResult<Cancelled> {
         let mut t = self.t.lock();
         let now = Utc::now();
@@ -507,6 +515,22 @@ impl EvalStore for MemoryJournal {
         t.golden.insert(key, GoldenSetRecord { updated_at: Utc::now(), ..g });
         t.push_audit(audit);
         Ok(())
+    }
+
+    async fn replace_golden_set_if(
+        &self,
+        g: GoldenSetRecord,
+        expected: Option<&str>,
+        audit: Option<AuditEvent>,
+    ) -> JResult<bool> {
+        let mut t = self.t.lock();
+        let key = (g.tenant_id.clone(), g.node.clone(), g.version);
+        if t.golden.get(&key).map(|x| x.hash.as_str()) != expected {
+            return Ok(false);
+        }
+        t.golden.insert(key, GoldenSetRecord { updated_at: Utc::now(), ..g });
+        t.push_audit(audit);
+        Ok(true)
     }
 
     async fn golden_set(&self, tenant: &str, node: &str, version: u32) -> JResult<Option<GoldenSetRecord>> {

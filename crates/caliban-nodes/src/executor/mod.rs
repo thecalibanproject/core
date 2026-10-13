@@ -405,6 +405,9 @@ pub struct RunSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     pub invoker: String,
+    /// The MAST failure mode a reviewer labelled the run with (`eval::capture::MAST`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mast_label: Option<String>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -421,6 +424,7 @@ impl RunSummary {
             cost_usd: r.budget.usd,
             origin: r.origin.clone(),
             invoker: r.invoker.clone(),
+            mast_label: r.mast_label.clone(),
             created_at: r.created_at,
             finished_at: r.finished_at,
         }

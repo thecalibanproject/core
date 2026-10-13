@@ -179,6 +179,9 @@ pub struct RunRecord {
     pub input_labels: Vec<String>,
     /// The number of the run's last event (0: none yet).
     pub last_event: u64,
+    /// The MAST failure mode a human labelled the run with (`crate::eval::capture::MAST`), when
+    /// it was captured into a golden set as `bad`. Metadata, not content.
+    pub mast_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,7 +227,8 @@ pub struct StepRecord {
 pub enum EventKind {
     Input,
     Timer,
-    /// What a sandboxed tool of an injection-suite run received (`sandbox:<step>`, sealed), and
+    /// What a sandboxed tool of an eval run received (`sandbox:<step>`, sealed), a write a run sent
+    /// to a real tool ([`WRITE_EVENT`]), and
     /// what a gated call waiting for approval would do (`<step>@approve:approval`, sealed: the tool,
     /// its effect, the taint labels and the arguments), for the console's inbox.
     Observation,
@@ -431,6 +435,11 @@ pub fn decode_cursor(c: &str) -> Option<(DateTime<Utc>, String)> {
     Some((DateTime::from_timestamp_nanos(ns.parse().ok()?), id.to_owned()))
 }
 
+/// The prefix of the event that marks a write a run sent to a real tool (`write:<step>`, sealed:
+/// the tool's reference and name, never its arguments). The eval sandbox records its calls as
+/// `sandbox:<step>` instead.
+pub const WRITE_EVENT: &str = "write:";
+
 /// The name of the event that holds what an approval step is about (see [`EventKind::Observation`]).
 pub fn approval_event(step: &str) -> String {
     format!("{step}:approval")
@@ -546,6 +555,9 @@ pub trait Journal: evals::EvalStore + Send + Sync {
     async fn cancel_requested(&self, run_id: &str) -> JResult<bool>;
     /// Cancels a run of `tenant` (see [`Cancelled`]); `audit` is recorded with it.
     async fn cancel(&self, tenant: &str, run_id: &str, by: &str, audit: Option<AuditEvent>) -> JResult<Cancelled>;
+    /// Labels a run of `tenant` with a MAST failure mode (`None` clears it). Returns whether the
+    /// run exists. Metadata only: the caller audits it.
+    async fn set_mast_label(&self, tenant: &str, run_id: &str, label: Option<&str>) -> JResult<bool>;
     /// The run's events after `after`, in order, at most `limit`.
     async fn events(&self, tenant: &str, run_id: &str, after: u64, limit: usize) -> JResult<Vec<RunEvent>>;
     /// Runs matching the query, newest first (`created_at`, then `id`, descending).

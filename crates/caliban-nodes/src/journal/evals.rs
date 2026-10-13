@@ -314,6 +314,15 @@ pub(crate) fn bad_finish(f: &EvalFinish) -> JResult<()> {
 pub trait EvalStore: Send + Sync {
     /// Creates or replaces the golden set of a version; `audit` is recorded with it.
     async fn put_golden_set(&self, g: GoldenSetRecord, audit: Option<AuditEvent>) -> JResult<()>;
+    /// Replaces the golden set of a version only if it is still the one the caller read: its hash
+    /// is `expected` (`None`: there is no set yet). Returns whether it wrote (`false`: another write
+    /// came first; read again). `audit` is recorded with it.
+    async fn replace_golden_set_if(
+        &self,
+        g: GoldenSetRecord,
+        expected: Option<&str>,
+        audit: Option<AuditEvent>,
+    ) -> JResult<bool>;
     async fn golden_set(&self, tenant: &str, node: &str, version: u32) -> JResult<Option<GoldenSetRecord>>;
     /// The golden sets of a node's versions, by version.
     async fn golden_sets(&self, tenant: &str, node: &str) -> JResult<Vec<GoldenSetRecord>>;

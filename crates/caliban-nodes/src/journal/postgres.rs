@@ -23,6 +23,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../../../migrations/0024_node_evals.sql"),
     include_str!("../../../../migrations/0025_node_run_input_labels.sql"),
     include_str!("../../../../migrations/0032_node_step_metering.sql"),
+    include_str!("../../../../migrations/0037_node_run_mast_label.sql"),
 ];
 
 /// Columns of `node_step` rows ([`step_row`]).
@@ -38,7 +39,7 @@ macro_rules! run_columns {
         "id, tenant_id, node, version, spec_hash, invoker, invoker_key_hash, input, specs, output, status, wake_at, awaiting, \
          prompt, budget, lease_owner, lease_expires_at, claims, error, stop_reason, idempotency_key, \
          idempotency_fingerprint, created_at, updated_at, started_at, finished_at, cancel_requested_at, \
-         cancelled_by, origin, event_seq, input_labels"
+         cancelled_by, origin, event_seq, input_labels, mast_label"
     };
 }
 
@@ -119,6 +120,7 @@ fn run_row(r: &PgRow) -> JResult<RunRecord> {
         input_labels: serde_json::from_value(get::<Json<serde_json::Value>>(r, "input_labels")?.0)
             .map_err(|e| JournalError(format!("input_labels: {e}")))?,
         last_event: u64::try_from(get::<i64>(r, "event_seq")?).unwrap_or_default(),
+        mast_label: get(r, "mast_label")?,
     })
 }
 
@@ -718,6 +720,18 @@ impl Journal for PgJournal {
         Ok(r.unwrap_or(false))
     }
 
+    async fn set_mast_label(&self, tenant: &str, run_id: &str, label: Option<&str>) -> JResult<bool> {
+        let n = sqlx::query("UPDATE node_run SET mast_label = $3 WHERE id = $1 AND tenant_id = $2")
+            .bind(run_id)
+            .bind(tenant)
+            .bind(label)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
     async fn cancel(&self, tenant: &str, run_id: &str, by: &str, audit: Option<AuditEvent>) -> JResult<Cancelled> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         let row: Option<(String, Option<DateTime<Utc>>, Json<serde_json::Value>)> = sqlx::query_as(
@@ -960,6 +974,54 @@ impl EvalStore for PgJournal {
         .map_err(db)?;
         push_audit(&mut tx, audit.as_ref()).await?;
         tx.commit().await.map_err(db)
+    }
+
+    async fn replace_golden_set_if(
+        &self,
+        g: GoldenSetRecord,
+        expected: Option<&str>,
+        audit: Option<AuditEvent>,
+    ) -> JResult<bool> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT hash FROM node_golden_set WHERE tenant_id = $1 AND node = $2 AND version = $3 FOR UPDATE",
+        )
+        .bind(&g.tenant_id)
+        .bind(&g.node)
+        .bind(i32_of(g.version))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if current.as_deref() != expected {
+            return Ok(false);
+        }
+        // No row yet: two writers can both see none, and the unique key lets one insert.
+        let written = sqlx::query(
+            "INSERT INTO node_golden_set (tenant_id, node, version, cases, case_count, hash, updated_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (tenant_id, node, version) DO UPDATE
+             SET cases = EXCLUDED.cases, case_count = EXCLUDED.case_count, hash = EXCLUDED.hash,
+                 updated_by = EXCLUDED.updated_by, updated_at = clock_timestamp()
+             WHERE node_golden_set.hash IS NOT DISTINCT FROM $8",
+        )
+        .bind(&g.tenant_id)
+        .bind(&g.node)
+        .bind(i32_of(g.version))
+        .bind(&g.cases)
+        .bind(i32_of(g.case_count))
+        .bind(&g.hash)
+        .bind(&g.updated_by)
+        .bind(expected)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if written == 0 {
+            return Ok(false);
+        }
+        push_audit(&mut tx, audit.as_ref()).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
     }
 
     async fn golden_set(&self, tenant: &str, node: &str, version: u32) -> JResult<Option<GoldenSetRecord>> {

@@ -443,6 +443,24 @@ pub(super) async fn call_tool(
                     step_id: step_id.to_owned(),
                     idempotency_key: idempotency_key(&cx.run.id, step_id),
                 };
+                // A write that leaves Caliban is marked in the journal (the tool and its name, no
+                // arguments), so a run captured as a golden case knows which writes it made. The
+                // eval sandbox records its own calls.
+                if !cx.sandboxed && declared.is_some_and(|t| t.effect == Effect::Write) {
+                    let mark = json!({"tool": reference, "name": tool.info().name, "effect": "write"});
+                    let sealed = cx.ex.sealer.seal(cx.tenant(), &cx.run.id, &mark.to_string()).map_err(Stop::Fail)?;
+                    cx.ex
+                        .journal
+                        .put_event(
+                            cx.tenant(),
+                            &cx.run.id,
+                            &format!("{}{step_id}", crate::journal::WRITE_EVENT),
+                            crate::journal::EventKind::Observation,
+                            Some(sealed),
+                        )
+                        .await
+                        .map_err(|e| Stop::Fail(e.to_string()))?;
+                }
                 let out = guarded_call(cx, reference, tool.as_ref(), &ctx, args, node.spec.pii_guardrail()).await?;
                 out_taint.extend(taint::label_for(reference));
                 out
