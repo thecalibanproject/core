@@ -660,7 +660,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "caliban-bench",
  "caliban-cache",
@@ -696,7 +696,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "futures",
@@ -735,7 +735,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "caliban-types",
  "ed25519-dalek 3.0.0",
@@ -770,7 +770,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "caliban-config",
  "caliban-connect",
  "caliban-mcp",
@@ -864,7 +864,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "caliban-config",
  "caliban-mcp",
  "chrono",
