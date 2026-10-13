@@ -21,6 +21,7 @@
 pub mod injection;
 pub mod metrics;
 pub mod runner;
+pub mod sandbox;
 
 use crate::journal::evals::{EvalRecord, EvalStatus, Suite};
 use crate::{Effect, NodeSpec};
@@ -53,6 +54,12 @@ pub struct GoldenCase {
     /// without one is denied.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub answers: BTreeMap<String, Value>,
+    /// Scripted tool results, by tool name (the manifest's, e.g. `refund_payment`) or full
+    /// reference. A trial never calls a write tool (effect `write`): it answers this script, else a
+    /// synthetic result marked `"sandbox": true` ([`sandbox::synthetic_result`]). A read tool
+    /// named here answers the script too; the others call the real tool. See [`sandbox`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_results: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
@@ -103,6 +110,24 @@ pub enum Check {
         model: Option<String>,
         #[serde(default = "half")]
         threshold: f64,
+        /// A reference answer the judge compares the output with (default: the case's
+        /// `expected`). A case captured from a good run carries the run's output here.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<Value>,
+    },
+    /// What the run did with a tool (golden trials record every call, writes sandboxed): it called
+    /// `tool` (its manifest name, its reference, or its reference without the pin) with
+    /// arguments that contain `args` (a subset: objects match key by key, recursively; arrays and
+    /// scalars must be equal). With `must_not_call: true`, it passes when no such call happened.
+    /// The arguments are compared as the tool received them, after the PII guard: a tool not
+    /// trusted with personal data receives surrogates, so match on fields that are not personal
+    /// (amounts, references, ids).
+    ToolCall {
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<Value>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        must_not_call: bool,
     },
 }
 
@@ -130,6 +155,7 @@ impl Check {
             Self::Regex { .. } => "regex",
             Self::JsonSchema { .. } => "json_schema",
             Self::LlmJudge { .. } => "llm_judge",
+            Self::ToolCall { .. } => "tool_call",
         }
     }
 
@@ -146,7 +172,16 @@ impl Check {
             Self::JsonSchema { schema } => {
                 crate::schema::check_supported(schema).map_err(|e| format!("json_schema: {e}"))
             }
-            Self::LlmJudge { rubric, threshold, model } => {
+            Self::ToolCall { tool, args, .. } => {
+                if tool.trim().is_empty() {
+                    return Err("tool_call: tool is required (a tool name or reference)".into());
+                }
+                if args.as_ref().is_some_and(|a| !a.is_object()) {
+                    return Err("tool_call: args must be an object (the arguments the call must contain)".into());
+                }
+                Ok(())
+            }
+            Self::LlmJudge { rubric, threshold, model, .. } => {
                 if rubric.trim().is_empty() {
                     return Err("llm_judge: rubric is required".into());
                 }
@@ -229,6 +264,9 @@ pub fn validate_cases(cases: &[GoldenCase], spec: &NodeSpec) -> Result<(), Vec<S
             if let Err(e) = ch.validate() {
                 problems.push(format!("{at} ({}): checks[{n}]: {e}", c.id));
             }
+        }
+        if c.tool_results.keys().any(|k| k.trim().is_empty()) {
+            problems.push(format!("{at} ({}): tool_results: a tool name is empty", c.id));
         }
         if let Some(s) = spec.input_schema()
             && let Err(e) = crate::schema::validate(s, &c.input)
@@ -517,7 +555,31 @@ pub struct CheckResult {
     pub score: Option<f64>,
 }
 
-/// Runs a check that needs no model (`None` for `llm_judge`).
+/// Whether `got` contains `want`: objects key by key (recursively), anything else equal.
+pub fn json_contains(got: &Value, want: &Value) -> bool {
+    match (got, want) {
+        (Value::Object(g), Value::Object(w)) => w.iter().all(|(k, v)| g.get(k).is_some_and(|x| json_contains(x, v))),
+        _ => got == want,
+    }
+}
+
+/// Runs a `tool_call` check against the calls a trial's run made (`None` for any other check).
+pub fn check_calls(check: &Check, calls: &[sandbox::Observation]) -> Option<CheckResult> {
+    let Check::ToolCall { tool, args, must_not_call } = check else { return None };
+    let matching = calls
+        .iter()
+        .filter(|c| c.is_tool(tool) && args.as_ref().is_none_or(|a| json_contains(&c.args_value(), a)))
+        .count();
+    let with = if args.is_some() { " with the given arguments" } else { "" };
+    let (passed, reason) = if *must_not_call {
+        (matching == 0, format!("{tool} was called{with} {matching} time(s); the case says it must not be"))
+    } else {
+        (matching > 0, format!("no call to {tool}{with}"))
+    };
+    Some(CheckResult { kind: "tool_call", passed, reason: (!passed).then_some(reason), score: None })
+}
+
+/// Runs a check that needs no model and no tool calls (`None` for `llm_judge` and `tool_call`).
 pub fn check_output(check: &Check, output: &Value) -> Option<CheckResult> {
     let r = |passed: bool, reason: String| {
         Some(CheckResult { kind: check.kind(), passed, reason: (!passed).then_some(reason), score: None })
@@ -561,7 +623,7 @@ pub fn check_output(check: &Check, output: &Value) -> Option<CheckResult> {
                 Err(e) => r(false, format!("json_schema: {e}")),
             }
         }
-        Check::LlmJudge { .. } => None,
+        Check::LlmJudge { .. } | Check::ToolCall { .. } => None,
     }
 }
 
