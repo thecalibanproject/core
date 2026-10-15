@@ -164,10 +164,16 @@ finished (`409`); a run already in that set (`409`, the case id is the run id); 
 did not succeed, a `bad` one without a note, a MAST label on a `good` run, an unknown label, an
 injection-suite run (its input carries an attack) (`422`); a version that does not exist (`404`).
 
+**Who may capture.** `nodes.write` (it edits a golden set) and `runs.data` (the case copies the
+run's content, its input, answers and output, into the set: a caller who may not read a run's
+content must not be able to move it elsewhere). A caller missing either gets a `403` naming it,
+before the run is looked up. The built-in roles that have `nodes.write` (`developer`, `tenant_admin`, `admin`,
+`owner`) all have `runs.data`.
+
 **Response** (`201`): `object: "node.golden_case"`, `run_id`, `node`, `version`, `run_version`,
 `case_id`, `verdict`, `mast_label`, `checks` (their kinds), `previous_hash` (`null` when the set
-was created), `golden_set` (the set's metadata: `hash`, `case_count`, ...), `content_visible`, and
-the `case` itself with `runs.data` (it is the run's content).
+was created), `golden_set` (the set's metadata: `hash`, `case_count`, ...), `content_visible`
+(always `true`), and the `case` itself.
 
 **Retention.** A captured case is golden-set content: sealed, kept with the set, not purged with
 the run (golden sets are not purged). Deleting the case means editing the set (`PUT`) or deleting

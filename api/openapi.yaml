@@ -890,7 +890,9 @@ paths:
         write tool it called; for `bad`, an `llm_judge` check whose rubric is the `note`. The case
         id is the run id. The set gets a new hash like an edit (a compare-and-set on the hash read,
         so concurrent edits are not lost). A `mast_label` is stored on the run. Needs `nodes.write`
-        (what editing a golden set needs); the `case` is returned with `runs.data`. Audited as
+        (what editing a golden set needs) and `runs.data` (the case copies the run's content: its
+        input, answers and output); a caller without either gets a `403` naming the missing
+        permission, before the run is looked up. The `case` is returned. Audited as
         `node.golden_set.capture` (ids, verdict, label, counts and hashes; never the note or
         content). See docs/evals.md ("Cases from runs").
       requestBody:
@@ -904,7 +906,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CapturedGoldenCase' }
-        '403': { $ref: '#/components/responses/Error' }
+        '403': { description: 'Missing `nodes.write` or `runs.data` on the tenant', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '404': { description: 'No such run in this tenant (another tenant''s run included), or no such version', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '409': { description: 'The run has not finished, it is already in that golden set, or the set kept changing', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '422': { description: '`good` on a run that did not succeed, `bad` without a note, a label on `good`, an unknown label, an injection-suite run, or a case that does not fit the set (problems of kind `golden_set`)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }

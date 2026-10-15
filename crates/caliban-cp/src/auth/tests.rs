@@ -1722,10 +1722,37 @@ async fn run_content_and_answers_follow_the_roles() {
     assert_eq!((r.body["caps"]["monthly_usd"].clone(), r.body["capped"].as_bool()), (Value::Null, Some(false)));
 }
 
-/// Capturing a run into a golden set (`POST .../runs/{id}/golden-case`) needs what editing a
-/// golden set needs (`nodes.write`), stays inside the tenant (another tenant's run is not found,
-/// another tenant's path is forbidden), shows the case only with `runs.data`, and audits metadata
-/// only: never the note or the run's content.
+/// Capturing a run copies its content into a golden set, so it needs `runs.data` on top of what
+/// editing a golden set needs (`nodes.write`): a principal with `nodes.write` alone gets a `403`
+/// that names the missing permission, before the run is even looked up. Every built-in role that
+/// has `nodes.write` has `runs.data` today, so the check is exercised on the permission set
+/// itself; the route test below covers a role with neither.
+#[test]
+fn capturing_a_run_needs_runs_data_as_well_as_nodes_write() {
+    use super::rbac::{Perm, Role};
+    use crate::evals::{CAPTURE_PERMS, may_capture};
+    assert_eq!(CAPTURE_PERMS, [Perm::NodesWrite, Perm::RunsData]);
+    let err = may_capture(|p| p == Perm::NodesWrite).unwrap_err();
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+    assert!(err.1.contains("runs.data"), "{}", err.1);
+    let err = may_capture(|p| p == Perm::RunsData).unwrap_err();
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+    assert!(err.1.contains("missing nodes.write"), "{}", err.1);
+    assert_eq!(may_capture(|_| false).unwrap_err().0, StatusCode::FORBIDDEN);
+    assert!(may_capture(|p| CAPTURE_PERMS.contains(&p)).is_ok());
+    // The roles that capture in practice hold both.
+    for role in [Role::Developer, Role::TenantAdmin, Role::Admin, Role::Owner] {
+        assert!(may_capture(|p| role.grants(p)).is_ok(), "{role:?}");
+    }
+    for role in [Role::Viewer, Role::Auditor, Role::Billing] {
+        assert!(may_capture(|p| role.grants(p)).is_err(), "{role:?}");
+    }
+}
+
+/// Capturing a run into a golden set (`POST .../runs/{id}/golden-case`) needs `nodes.write` and
+/// `runs.data`, stays inside the tenant (another tenant's run is not found, another tenant's path
+/// is forbidden), returns the case, and audits metadata only: never the note or the run's
+/// content.
 #[tokio::test]
 async fn capturing_a_run_follows_the_roles_and_the_tenant() {
     use caliban_nodes::budget::BudgetState;

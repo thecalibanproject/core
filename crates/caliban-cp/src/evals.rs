@@ -12,6 +12,7 @@
 //! |---|---|
 //! | `nodes.read` | golden-set metadata, the promotion bar, evals and their metrics, the gate |
 //! | `nodes.write` | create, replace or delete a golden set |
+//! | `nodes.write` and `runs.data` | capture a run into a golden set (it copies the run's content) |
 //! | `nodes.publish` | set the promotion bar (it decides what may be promoted) |
 //! | `nodes.run` | start and cancel evals (they run the node, as an API key the caller names) |
 
@@ -208,8 +209,26 @@ pub(crate) struct CaptureBody {
 /// How many times a capture re-reads a golden set that changed under it before it gives up.
 const CAPTURE_ATTEMPTS: usize = 5;
 
+/// What capturing a run needs: `nodes.write`, since it edits a golden set (the route checks it),
+/// and `runs.data`, since it copies the run's content (input, answers, output) into the set: a
+/// caller who may not read a run's content must not be able to move it somewhere else.
+pub(crate) const CAPTURE_PERMS: [Perm; 2] = [Perm::NodesWrite, Perm::RunsData];
+
+/// `403` unless `allows` grants every permission of [`CAPTURE_PERMS`].
+pub(crate) fn may_capture(allows: impl Fn(Perm) -> bool) -> ApiResult<()> {
+    match CAPTURE_PERMS.into_iter().find(|p| !allows(*p)) {
+        None => Ok(()),
+        Some(missing) => Err(crate::auth::forbidden(format!(
+            "capturing a run into a golden set copies the run's content: it needs nodes.write and runs.data \
+             (missing {})",
+            missing.as_str()
+        ))),
+    }
+}
+
 /// `POST /api/v1/tenants/{t}/runs/{id}/golden-case` (`nodes.write`, the permission that edits a
-/// golden set): appends a case built from a finished run to a golden set
+/// golden set, and `runs.data`, since the case is the run's content: [`CAPTURE_PERMS`]): appends
+/// a case built from a finished run to a golden set
 /// ([`eval::capture::case_from_run`]). The set is the run's version's unless `version` names
 /// another version of the same node: golden sets belong to a version (inputs follow its input
 /// schema), and the run's input, answers and output came from the run's version, so that is the
@@ -226,6 +245,8 @@ pub(crate) async fn capture(
 ) -> Result<(StatusCode, Json<Value>), NodeError> {
     use eval::capture::{self as cap, Refusal, Review};
     crate::ensure_tenant(&cp, &tenant_id)?;
+    // Before the run is looked up: a caller without runs.data learns nothing about it.
+    may_capture(|perm| p.allows(perm, Some(&tenant_id)))?;
     let j = journal(&cp)?;
     // Another tenant's run is not found, like a run that does not exist.
     let run = j.get_run(&tenant_id, &run_id).await.map_err(journal_error)?.ok_or_else(|| not_found("run"))?;
@@ -323,8 +344,7 @@ pub(crate) async fn capture(
         .await
         .map_err(journal_error)?
         .ok_or_else(|| not_found("golden set"))?;
-    let visible = p.allows(Perm::RunsData, Some(&tenant_id));
-    let mut v = json!({
+    let v = json!({
         "object": "node.golden_case",
         "run_id": run.id,
         "node": run.node,
@@ -336,12 +356,10 @@ pub(crate) async fn capture(
         "checks": case.checks.iter().map(eval::Check::kind).collect::<Vec<_>>(),
         "previous_hash": previous,
         "golden_set": golden_view(&set, None),
-        "content_visible": visible,
+        // The case is the run's content; the caller has `runs.data` (required above).
+        "content_visible": true,
+        "case": case,
     });
-    // The case is the run's content: shown with `runs.data` only, like a set's cases.
-    if visible {
-        v["case"] = json!(case);
-    }
     Ok((StatusCode::CREATED, Json(v)))
 }
 
