@@ -13,9 +13,11 @@
 //! Number boundaries: a card, IBAN, SSN, phone or NIR candidate that is part of a longer number
 //! is not one. A digit right next to it, or a decimal point joining it to digits (the fraction of
 //! `0.4111111111111111`, a relevance score), or an exponent (`1.5e-4111111111111111`), rejects
-//! it. Cards also need a major industry identifier of 2 to 6 (Mastercard 2 and 5, Amex, JCB and
-//! Diners 3, Visa 4, Discover and UnionPay 6): runs starting with 0, 1 (Unix timestamps in
-//! milliseconds or microseconds), 7, 8 or 9 are ids and amounts, not cards.
+//! it. Cards also need a major industry identifier of 1 to 6 (UATP 1, Mastercard 2 and 5, Amex,
+//! JCB and Diners 3, Visa 4, Discover and UnionPay 6): runs starting with 0, 7, 8 or 9 are ids and
+//! amounts, not cards. A run starting with 1 is a card only at UATP's length, 15 digits: Unix
+//! timestamps also start with 1, in milliseconds (13 digits), microseconds (16) or nanoseconds
+//! (19), and none of those is 15 digits long.
 
 use crate::{Detector, EntityType, Span};
 use regex::Regex;
@@ -127,9 +129,18 @@ fn inside_number(text: &str, start: usize, end: usize) -> bool {
             && (digit(before(3)) || before(3) == Some(b'.')))
 }
 
-/// A payment card: a major industry identifier of 2 to 6 and a valid Luhn check digit.
+/// UATP (airline) cards: major industry identifier 1, 15 digits.
+const UATP_LEN: usize = 15;
+
+/// A payment card: a major industry identifier of 1 to 6 and a valid Luhn check digit. The
+/// identifier 1 (UATP) only at UATP's length, so Unix timestamps (13, 16 or 19 digits) stay out.
 fn card_valid(s: &str) -> bool {
-    s.bytes().next().is_some_and(|c| (b'2'..=b'6').contains(&c)) && luhn_valid(s)
+    let prefix_ok = match s.bytes().find(u8::is_ascii_digit) {
+        Some(b'1') => digits(s).len() == UATP_LEN,
+        Some(c) => (b'2'..=b'6').contains(&c),
+        None => false,
+    };
+    prefix_ok && luhn_valid(s)
 }
 
 /// The NIR (French social security number) key: `97 - (the first 13 characters mod 97)`, with
@@ -335,6 +346,8 @@ mod tests {
             "(4111111111111111)",
             "carte n°4111111111111111",
             "Mastercard 2221000000000009",
+            "UATP 135410014004955",
+            "UATP 1354 100140 04955",
         ] {
             assert_eq!(kinds(t), vec![EntityType::CreditCard], "{t}");
         }
@@ -348,6 +361,10 @@ mod tests {
     #[test]
     fn validators_reject_lookalikes() {
         assert!(kinds("order 4111 1111 1111 1112").is_empty(), "bad Luhn");
+        assert!(kinds("UATP 135410014004956").is_empty(), "bad Luhn on a UATP number");
+        // Prefix 1 is a card at UATP's length only: Luhn-valid runs of other lengths are not.
+        assert!(luhn_valid("1000000000009") && luhn_valid("1000000000000008"));
+        assert!(kinds("ts 1000000000009 and 1000000000000008").is_empty());
         assert!(kinds("ssn 666-45-6789").is_empty());
         assert!(kinds("version 1.2.3").is_empty());
     }
