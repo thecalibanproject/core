@@ -249,3 +249,27 @@ fn tool_call_checks_match_the_calls_a_trial_made() {
     let j: Check = serde_json::from_value(json!({"type": "llm_judge", "rubric": "r", "reference": {"a": 1}})).unwrap();
     assert!(matches!(&j, Check::LlmJudge { reference: Some(r), .. } if r["a"] == 1));
 }
+
+/// Contract: a running trial's verdict (`{}`) is declared in api/openapi.yaml. The trial verdict's
+/// `oneOf` lists `PendingVerdict`, an object with no properties, and every other variant has
+/// required fields, so `{}` matches exactly one variant.
+#[test]
+fn a_running_trials_verdict_is_declared_in_the_openapi_document() {
+    let openapi = include_str!("../../../../api/openapi.yaml");
+    assert_eq!(runner::pending_verdict(), serde_json::json!({}));
+    let block = |name: &str| -> String {
+        let start = openapi.find(&format!("\n    {name}:\n")).unwrap_or_else(|| panic!("{name} is not declared"));
+        openapi[start + 1..].lines().skip(1).take_while(|l| l.starts_with("      ")).collect::<Vec<_>>().join("\n")
+    };
+    let pending = block("PendingVerdict");
+    assert!(pending.contains("type: object") && pending.contains("maxProperties: 0"), "{pending}");
+    for other in ["GoldenVerdict", "InjectionVerdict"] {
+        assert!(block(other).contains("required: ["), "{other} must have required fields");
+    }
+    let trials = &openapi[openapi.find("\n    Eval:\n").unwrap()..];
+    let verdict = &trials[trials.find("              verdict:").unwrap()..];
+    let one_of: Vec<&str> = verdict.lines().skip(3).take_while(|l| l.trim_start().starts_with("- ")).collect();
+    assert!(one_of[0].contains("#/components/schemas/PendingVerdict"), "{one_of:?}");
+    // The error variant requires `error`.
+    assert!(verdict.contains("required: [error]"));
+}

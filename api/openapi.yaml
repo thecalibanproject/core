@@ -3751,6 +3751,10 @@ components:
               attacked: { type: [boolean, 'null'] }
               defenses: { type: [array, 'null'], items: { type: string } }
               run_id: { type: [string, 'null'] }
+    PendingVerdict:
+      type: object
+      maxProperties: 0
+      description: 'The verdict of a trial whose run has been created and not scored yet (`status: running`): an empty object. Every other verdict has required fields, so `{}` matches this variant only.'
     GoldenVerdict:
       type: object
       required: [run_status, checks]
@@ -3824,8 +3828,9 @@ components:
               latency_ms: { type: integer }
               tokens: { type: integer }
               verdict:
-                description: 'Metadata, never content. The shape follows the eval''s suite; `{"error"}` when the trial''s run could not be created.'
+                description: 'Metadata, never content. The shape follows the eval''s suite; `{"error"}` when the trial''s run could not be created; `{}` (PendingVerdict) while the trial is `running`.'
                 oneOf:
+                  - $ref: '#/components/schemas/PendingVerdict'
                   - $ref: '#/components/schemas/GoldenVerdict'
                   - $ref: '#/components/schemas/InjectionVerdict'
                   - type: object
