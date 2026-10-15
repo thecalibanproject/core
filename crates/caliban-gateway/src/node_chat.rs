@@ -21,6 +21,10 @@
 //!   numbers are passed as JSON, anything else as text). The response is the rest of the run.
 //! - **`Server-Timing`**: `auth`, the routing stages when `caliban/auto` chose the node, then
 //!   `node;dur=<run time>;desc="<run id>"` (no `dur` on streams, whose headers leave first).
+//! - **Personal data**: the run's model calls are protected by the tenant's mode raised to the
+//!   version's `guardrails.pii`, a policy fixed by the published version. A request's own
+//!   `caliban.pii` does not change it (it never weakens a policy, research note 05 section 4) and
+//!   is reported as ignored: `x-caliban-pii-override: ignored;requested=<mode>;applied=node`.
 //! - **Usage** is the sum of the run's model calls so far.
 //! - **Streams** (`"stream": true`): a first chunk carrying the run id, comments (OpenAI) or
 //!   `ping` events (Anthropic) while steps run, then the answer as a content delta and the finish
@@ -267,6 +271,16 @@ pub(crate) async fn respond(
         }
     };
     let mut extra = nc.headers;
+    // A node run's PII policy is the tenant's mode and the version's `guardrails.pii`; the
+    // request's `caliban.pii` never reaches its model calls. Say so, and record it.
+    if let Some(requested) = req.caliban.as_ref().and_then(|c| c.pii) {
+        tracing::info!(target: "caliban::audit", tenant = %caller.tenant, run = %run_id, requested = requested.as_str(),
+            "caliban.pii on a node run: ignored (the node's PII policy applies)");
+        extra.push((
+            HeaderName::from_static(crate::pipeline::PII_OVERRIDE_HEADER),
+            format!("ignored;requested={};applied=node", requested.as_str()),
+        ));
+    }
     if let Ok(v) = HeaderValue::from_str(&run_id) {
         extra.push((HeaderName::from_static(RUN_ID_HEADER), v.to_str().unwrap_or_default().to_owned()));
     }

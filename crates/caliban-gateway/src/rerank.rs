@@ -161,6 +161,7 @@ async fn run(
         node: internal.and_then(|i| i.node),
         auto_fallback: None,
         timings,
+        pii_ignored: None,
     };
     let model_id = outcome.model.id.to_string();
     finish(&gw, &outcome, usage, 0, settlement).await;

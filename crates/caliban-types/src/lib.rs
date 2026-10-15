@@ -99,6 +99,29 @@ pub enum PiiMode {
     Reversible,
 }
 
+/// Modes are ordered by [`PiiMode::strictness`], explicitly: `off` < `reversible` < `mask`. The
+/// derived order would follow the declaration order, which is not the strictness order.
+impl PartialOrd for PiiMode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PiiMode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.strictness().cmp(&other.strictness())
+    }
+}
+
+/// What a request's own PII mode (`caliban.pii`) does to the policy it runs under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestedPii {
+    /// The mode the request is protected with: the stricter of the policy and the request's.
+    pub mode: PiiMode,
+    /// The request asked for a weaker mode than the policy's: this one, ignored.
+    pub ignored: Option<PiiMode>,
+}
+
 impl PiiMode {
     /// How much the mode hides from a model: `off` < `reversible` < `mask` (masking keeps no way
     /// back to the originals, so a masked answer can never carry them).
@@ -113,8 +136,26 @@ impl PiiMode {
     /// The stricter of `self` and `other` (a floor only ever strengthens protection).
     pub fn at_least(self, other: Option<PiiMode>) -> PiiMode {
         match other {
-            Some(o) if o.strictness() > self.strictness() => o,
+            Some(o) if o > self => o,
             _ => self,
+        }
+    }
+
+    /// A request's own mode against this policy (the tenant's mode raised to any floor): a
+    /// per-request setting only ever makes the policy stricter. A stricter request wins; a weaker
+    /// one is ignored and reported in [`RequestedPii::ignored`], so the caller can record it.
+    pub fn with_request(self, requested: Option<PiiMode>) -> RequestedPii {
+        match requested {
+            Some(r) if r < self => RequestedPii { mode: self, ignored: Some(r) },
+            r => RequestedPii { mode: self.at_least(r), ignored: None },
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PiiMode::Off => "off",
+            PiiMode::Mask => "mask",
+            PiiMode::Reversible => "reversible",
         }
     }
 }
@@ -287,6 +328,28 @@ mod tests {
     fn trust_tier_serde_matches_openapi() {
         let s = serde_json::to_string(&TrustTier::T0Sovereign).unwrap();
         assert_eq!(s, "\"t0_sovereign\"");
+    }
+
+    /// The PII order is explicit (`off` < `reversible` < `mask`), and a request's own mode only
+    /// ever makes the policy stricter: a weaker one is ignored and reported.
+    #[test]
+    fn a_request_can_only_make_the_pii_policy_stricter() {
+        use PiiMode::{Mask, Off, Reversible};
+        assert!(Off < Reversible && Reversible < Mask && Off < Mask);
+        assert_eq!([Mask, Off, Reversible].iter().max(), Some(&Mask));
+        for policy in [Off, Reversible, Mask] {
+            assert_eq!(policy.with_request(None), RequestedPii { mode: policy, ignored: None });
+            for requested in [Off, Reversible, Mask] {
+                let r = policy.with_request(Some(requested));
+                assert!(r.mode >= policy, "{policy:?} weakened by {requested:?}");
+                assert_eq!(r.mode, policy.max(requested));
+                assert_eq!(r.ignored, (requested < policy).then_some(requested), "{policy:?} {requested:?}");
+            }
+        }
+        // The case of the bug: `off` against a masking or reversible policy is ignored.
+        assert_eq!(Mask.with_request(Some(Off)), RequestedPii { mode: Mask, ignored: Some(Off) });
+        assert_eq!(Reversible.with_request(Some(Off)), RequestedPii { mode: Reversible, ignored: Some(Off) });
+        assert_eq!(Off.with_request(Some(Mask)), RequestedPii { mode: Mask, ignored: None });
     }
 
     #[test]

@@ -1663,8 +1663,10 @@ impl Snapshot {
     }
 
     /// The PII mode a request to a model gets, or `None` when the model receives the text as is.
-    /// `requested`: the request's own mode (`caliban.pii`), else the tenant's. `floor`: a minimum
-    /// that applies to every model class (`caliban.pii_floor`, a node's `guardrails.pii`).
+    /// The mode is the strictest of the tenant's mode, `requested` (the request's own mode,
+    /// `caliban.pii`) and `floor` (a minimum that applies to every model class: `caliban.pii_floor`,
+    /// a node's `guardrails.pii`). A request can only make it stricter: `caliban.pii: "off"` on a
+    /// tenant that masks is ignored (see [`PiiMode::with_request`]).
     /// `external`: the model or its provider is outside the trust boundary (t2, t3).
     ///
     /// External models always get the mode. Models inside the boundary (t0, t1) get it only when
@@ -1676,7 +1678,7 @@ impl Snapshot {
         floor: Option<PiiMode>,
         external: bool,
     ) -> Option<PiiMode> {
-        let mode = requested.unwrap_or_else(|| self.pii_mode_for(tenant)).at_least(floor);
+        let mode = self.pii_mode_for(tenant).at_least(floor).with_request(requested).mode;
         let applies = external || tenant.pii_on_sovereign || floor.is_some_and(|f| f != PiiMode::Off);
         (mode != PiiMode::Off && applies).then_some(mode)
     }

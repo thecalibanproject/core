@@ -923,6 +923,7 @@ trust_tier = "t2_contracted"
             auto_fallback: None,
             purpose: None,
             timings: Default::default(),
+            pii_ignored: None,
         }
     }
 

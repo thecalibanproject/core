@@ -306,6 +306,13 @@ answers `x-caliban-pii-entities` (entities protected across the run's model call
 `caliban` object (`run_id`, `status`, `node`, `version`, `cost_usd`, `awaiting`, `stop_reason`)
 that the SDKs keep as an extra field (`completion.model_extra["caliban"]` in the OpenAI Python SDK).
 
+**Personal data.** A run's PII policy is the tenant's mode raised to the version's `guardrails.pii`,
+fixed by the published version. A request's `caliban.pii` does not change it (on the model APIs it
+can only make the policy stricter; a node run takes no per-request mode at all): it is ignored and
+reported, `x-caliban-pii-override: ignored;requested=<mode>;applied=node`, and logged on the
+`caliban::audit` target with the run id. The run API (`POST /v1/nodes/{name}/runs`) has no such
+field (`400`).
+
 **Timings.** Node answers carry `Server-Timing` (README, "Stage timings"): `auth`, and for
 `caliban/auto` the routing stages (`route` with the deciding stage, `embed`), then
 `node;dur=<run time>;desc="<run id>"` and `total`. A streamed answer's headers leave before the run

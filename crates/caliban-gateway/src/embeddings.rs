@@ -134,6 +134,7 @@ async fn run(
         node: internal.and_then(|i| i.node),
         auto_fallback: None,
         timings,
+        pii_ignored: None,
     };
     finish(&gw, &outcome, usage, 0, settlement).await;
     let mut resp = axum::Json(out).into_response();

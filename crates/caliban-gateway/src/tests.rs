@@ -166,9 +166,10 @@ async fn setup_full(keys: Option<SurrogateKeys>) -> (Router, Log, Arc<InMemoryQu
     setup_extra(keys, "").await
 }
 
-/// [`setup_full`] with `extra` appended to the config file.
+/// [`setup_full`] with `extra` appended to the config file (`@BASE@` in it: the mock upstream).
 async fn setup_extra(keys: Option<SurrogateKeys>, extra: &str) -> (Router, Log, Arc<InMemoryQuota>, RecentUsage) {
     let (base, log) = mock_upstream().await;
+    let extra = extra.replace("@BASE@", &base);
     let key_file = std::env::temp_dir().join(format!("caliban-gw-test-anthropic-{}", std::process::id()));
     std::fs::write(&key_file, "sk-ant-test").unwrap();
     let toml = format!(
@@ -396,6 +397,127 @@ async fn sovereign_models_get_pii_protection_when_the_tenant_or_a_floor_asks() {
     assert_eq!(status, StatusCode::OK, "{out}");
     assert!(!log.last().2.to_string().contains(EMAIL), "the tenant opted in");
     assert_eq!(h["x-caliban-pii-entities"], "1");
+}
+
+/// A tenant whose policy masks (for the per-request override tests).
+const STRICT_TENANT: &str = r#"
+[[tenants]]
+id = "strict"
+name = "Strict"
+pii_mode = "mask"
+api_key_hashes = ["STRICT_HASH"]
+  [[tenants.providers]]
+  id = "mockext"
+  kind = "openai_compatible"
+  base_url = "@BASE@"
+  trust_tier = "t2_contracted"
+"#;
+
+/// The SSE `data:` text deltas of an OpenAI stream.
+fn openai_streamed_text(out: &str) -> String {
+    out.lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Security fix (2026-10-15): a request's `caliban.pii` could replace the tenant's mode, so
+/// `"off"` sent personal data to an external model in clear. A per-request mode now only makes
+/// the policy stricter (`off` < `reversible` < `mask`): a weaker one is ignored, reported in
+/// `x-caliban-pii-override` and recorded on the usage event (`pii_override_ignored`). Checked on
+/// every chat path: Chat Completions (JSON and streamed), Messages on an OpenAI-compatible
+/// upstream (JSON and streamed) and on the native Anthropic path (JSON and streamed).
+#[tokio::test]
+async fn a_request_cannot_weaken_the_tenants_pii_policy() {
+    let (app, log, _, usage) = setup_extra(None, "").await;
+    let override_of = |h: &HeaderMap| h.get("x-caliban-pii-override").map(|v| v.to_str().unwrap().to_owned());
+    let ignored = Some("ignored;requested=off;applied=reversible".to_owned());
+    let chat = |stream: bool| {
+        json!({"model": "ext/mock", "stream": stream, "caliban": {"pii": "off"},
+               "messages": [{"role": "user", "content": PII}]})
+    };
+    // Chat Completions, JSON: protected all the same, restored for the caller, reported.
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, chat(false)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(!log.last().2.to_string().contains(EMAIL), "pii: off was obeyed: {}", log.last().2);
+    assert_eq!(h["x-caliban-pii-entities"], "1");
+    assert_eq!(override_of(&h), ignored);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], format!("You said: {PII}"));
+    let ev = usage.snapshot(Some("acme"), 1).remove(0);
+    assert_eq!((ev.pii_override_ignored.as_deref(), ev.pii_entities), (Some("off"), 1));
+    // Chat Completions, streamed.
+    let (status, h, out) = call(&app, "/v1/chat/completions", BEARER, chat(true)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(!log.last().2.to_string().contains(EMAIL), "{}", log.last().2);
+    assert_eq!(override_of(&h), ignored);
+    assert_eq!(openai_streamed_text(&out), format!("You said: {PII}"));
+    // Messages on the OpenAI-compatible upstream, and on the native Anthropic path, JSON and
+    // streamed.
+    for (model, path) in [("ext/mock", "chat"), ("anth/claude", "messages")] {
+        for stream in [false, true] {
+            let body = json!({"model": model, "max_tokens": 50, "stream": stream, "caliban": {"pii": "off"},
+                              "messages": [{"role": "user", "content": [{"type": "text", "text": PII}]}]});
+            let (status, h, out) = call(&app, "/v1/messages", ANTH, body).await;
+            assert_eq!(status, StatusCode::OK, "{model} {stream}: {out}");
+            let (p, _, sent) = log.last();
+            assert_eq!(p, path);
+            assert!(!sent.to_string().contains(EMAIL), "{model} {stream}: {sent}");
+            assert_eq!(override_of(&h), ignored, "{model} {stream}");
+            let text = if stream {
+                streamed_text(&events(&out))
+            } else {
+                serde_json::from_str::<Value>(&out).unwrap()["content"][0]["text"].as_str().unwrap().to_owned()
+            };
+            assert_eq!(text, format!("You said: {PII}"), "{model} {stream}");
+        }
+    }
+    // Asking for the tenant's own mode, or none: nothing to report.
+    for ext in [json!({"pii": "reversible"}), json!({})] {
+        let body = json!({"model": "ext/mock", "caliban": ext, "messages": [{"role": "user", "content": PII}]});
+        let (_, h, _) = call(&app, "/v1/chat/completions", BEARER, body).await;
+        assert_eq!(override_of(&h), None);
+        assert_eq!(usage.snapshot(Some("acme"), 1)[0].pii_override_ignored, None);
+    }
+    // Stricter is allowed: `mask` on a reversible tenant masks, and the answer keeps the mask.
+    let body = json!({"model": "ext/mock", "caliban": {"pii": "mask"}, "messages": [{"role": "user", "content": PII}]});
+    let (_, h, out) = call(&app, "/v1/chat/completions", BEARER, body).await;
+    assert_eq!(override_of(&h), None);
+    assert!(log.last().2.to_string().contains("[EMAIL]"), "{}", log.last().2);
+    assert!(!out.contains(EMAIL), "masked answers carry no original: {out}");
+}
+
+/// The same rule against a tenant that masks: `reversible` and `off` are both weaker, so both are
+/// ignored and the model sees the mask; a floor (`caliban.pii_floor`) cannot lower it either.
+#[tokio::test]
+async fn a_request_cannot_turn_a_masking_policy_reversible_or_off() {
+    let extra = STRICT_TENANT.replace("STRICT_HASH", &hash("cal_strict"));
+    let (app, log, _, usage) = setup_extra(None, &extra).await;
+    let strict = ("authorization", "Bearer cal_strict");
+    for (ext, header) in [
+        (json!({"pii": "off"}), Some("ignored;requested=off;applied=mask")),
+        (json!({"pii": "reversible"}), Some("ignored;requested=reversible;applied=mask")),
+        (json!({"pii": "off", "pii_floor": "off"}), Some("ignored;requested=off;applied=mask")),
+        (json!({"pii_floor": "off"}), None),
+    ] {
+        for stream in [false, true] {
+            let body = json!({"model": "ext/mock", "stream": stream, "caliban": ext,
+                              "messages": [{"role": "user", "content": PII}]});
+            let (status, h, out) = call(&app, "/v1/chat/completions", strict, body).await;
+            assert_eq!(status, StatusCode::OK, "{out}");
+            let sent = log.last().2.to_string();
+            assert!(!sent.contains(EMAIL) && sent.contains("[EMAIL]"), "{ext} {stream}: {sent}");
+            assert_eq!(h.get("x-caliban-pii-override").map(|v| v.to_str().unwrap()), header, "{ext} {stream}");
+            assert!(!out.contains(EMAIL), "{ext} {stream}: {out}");
+        }
+    }
+    // The JSON request's usage event names what was asked for (streamed events land at the end of
+    // the stream; the last JSON one is checked).
+    let body =
+        json!({"model": "ext/mock", "caliban": {"pii": "reversible"}, "messages": [{"role": "user", "content": PII}]});
+    call(&app, "/v1/chat/completions", strict, body).await;
+    assert_eq!(usage.snapshot(Some("strict"), 1)[0].pii_override_ignored.as_deref(), Some("reversible"));
 }
 
 /// The reference market's identifiers (e2e health triage): French and Lebanese phones and a French

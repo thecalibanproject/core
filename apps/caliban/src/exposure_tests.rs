@@ -420,6 +420,56 @@ async fn chat_completions_and_messages_run_nodes_with_a_human_step() {
     assert_eq!(request(&w.app, "POST", "/v1/chat/completions", KEY, Some(empty), &[]).await.0, StatusCode::BAD_REQUEST);
 }
 
+/// Security fix (2026-10-15): a request's `caliban.pii` never weakens a node run's PII policy (the
+/// tenant's mode, `mask` here, raised to the version's `guardrails.pii`). On `node/<name>`, JSON
+/// and streamed, in both dialects, `caliban.pii: "off"` is ignored and reported in
+/// `x-caliban-pii-override`; the node's model calls still get masked text. The run API takes no
+/// PII setting at all (an unknown field is a 400).
+#[tokio::test]
+async fn a_request_cannot_weaken_a_node_runs_pii_policy() {
+    use crate::nodes_tests::EMAIL;
+    let e = env(Duration::ZERO).await;
+    let spec = json!({"kind": "workflow", "model_policy": {}, "budgets": {"steps": 3, "tokens": 10000, "wall_clock_s": 60},
+                      "graph": {"vertices": [{"id": "a", "type": "llm", "config": {"prompt": "Reply to {{input}}"}}], "edges": []}});
+    e.publish("reply", spec).await;
+    let j = journal().await;
+    let w = worker(&e, &j, &idem(), None, "worker-a", LONG);
+    let ignored = "ignored;requested=off;applied=node";
+    for (i, (path, stream)) in [
+        ("/v1/chat/completions", false),
+        ("/v1/chat/completions", true),
+        ("/v1/messages", false),
+        ("/v1/messages", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A different text each time: an identical model call would be an exact-cache hit.
+        let text = format!("Write to {EMAIL} today, request {i}");
+        e.mock.clear_log();
+        let mut body = if path == "/v1/messages" {
+            messages("node/reply", &text, stream)
+        } else {
+            chat("node/reply", &text, stream)
+        };
+        body["caliban"] = json!({"pii": "off"});
+        let (s, h, out) = request(&w.app, "POST", path, KEY, Some(body), &[]).await;
+        assert_eq!(s, StatusCode::OK, "{path} {stream}: {out}");
+        assert_eq!(h["x-caliban-pii-override"], ignored, "{path} {stream}");
+        let calls = e.mock.log();
+        assert!(!calls.is_empty(), "{path} {stream}: the node called its model");
+        for c in calls {
+            let sent = c.body.to_string();
+            assert!(!sent.contains(EMAIL) && sent.contains("[EMAIL]"), "{path} {stream}: {sent}");
+        }
+        assert!(!out.contains(EMAIL), "{path} {stream}: masked, never restored: {out}");
+    }
+    // The run API has no per-request PII setting.
+    let body = json!({"input": format!("Write to {EMAIL}"), "caliban": {"pii": "off"}});
+    let (s, v) = send(&w.app, "POST", "/v1/nodes/reply/runs", KEY, Some(body), &[]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+}
+
 /// A worker serving the run API over HTTP, and a router (no journal) forwarding to it.
 pub(crate) async fn split(
     e: &crate::nodes_tests::Env,

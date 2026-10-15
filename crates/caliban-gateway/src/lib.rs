@@ -278,6 +278,7 @@ fn cors() -> CorsLayer {
             HeaderName::from_static("x-caliban-cache"),
             HeaderName::from_static("x-caliban-cache-tier"),
             HeaderName::from_static("x-caliban-pii-entities"),
+            HeaderName::from_static(pipeline::PII_OVERRIDE_HEADER),
             HeaderName::from_static("x-caliban-cost-usd"),
             HeaderName::from_static("x-caliban-billed-usd"),
             HeaderName::from_static(idempotency::REPLAYED),
