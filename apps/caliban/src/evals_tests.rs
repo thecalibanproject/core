@@ -269,8 +269,9 @@ pub(crate) fn refunds_to_the_server(b: &Bank) -> usize {
 
 /// Fintech demo, 2026-10-13: a golden trial issued a real refund (TX-30015) on the bank's server.
 /// A golden trial's writes now go to the eval sandbox: the real server receives no refund, the
-/// case's scripted result answers instead, the read still reaches the real server, and the
-/// `tool_call` check asserts the intended write.
+/// case's scripted result answers instead, and the `tool_call` check asserts the intended write.
+/// Since 2026-10-15 every MCP tool is sandboxed in golden trials, reads included: the lookup
+/// reaches the server only in a version that opts it in with `eval_live: true`.
 #[tokio::test]
 async fn a_golden_eval_never_reaches_a_real_write_tool() {
     let j = journal().await;
@@ -311,17 +312,43 @@ async fn a_golden_eval_never_reaches_a_real_write_tool() {
             .await;
     assert_eq!(d["status"], "succeeded", "{d}");
     assert_eq!(refunds_to_the_server(&b), 0, "a golden trial reached the real refund tool");
-    assert_eq!(b.server.calls().iter().filter(|c| c.tool == "lookup").count(), 4, "reads still reach the server");
+    let lookups = || b.server.calls().iter().filter(|c| c.tool == "lookup").count();
+    assert_eq!(lookups(), 0, "reads are sandboxed too unless the spec opts in");
     let trials = d["trials"].as_array().unwrap();
     for t in trials {
         let want = if t["case"] == "refund" { "passed" } else { "failed" };
         assert_eq!(t["status"], want, "{t}");
-        assert_eq!(t["verdict"]["sandboxed_calls"], 1, "{t}");
-        let call =
-            t["detail"]["tool_calls"].as_array().unwrap().iter().find(|c| c["name"] == "refund").cloned().unwrap();
+        assert_eq!(t["verdict"]["sandboxed_calls"], 2, "{t}");
+        let calls = t["detail"]["tool_calls"].as_array().unwrap();
+        let call = calls.iter().find(|c| c["name"] == "refund").cloned().unwrap();
         assert_eq!((call["sandboxed"].as_bool(), call["args"]["tx"].as_str()), (Some(true), Some("TX-30015")), "{t}");
+        let read = calls.iter().find(|c| c["name"] == "lookup").cloned().unwrap();
+        assert_eq!((read["sandboxed"].as_bool(), read["write"].as_bool()), (Some(true), Some(false)), "{t}");
     }
     assert_eq!(d["summary"]["pass_hat_k"].as_f64(), Some(0.5), "{d}");
+
+    // A version that opts the lookup in (`eval_live: true`): its trials call the real read tool,
+    // and still never the write.
+    let spec = json!({"kind": "agent", "prompt": {"system": "You process refunds."}, "model_policy": {},
+        "budgets": {"steps": 10, "tokens": 20000, "wall_clock_s": 60},
+        "tools": [{"ref": b.lookup, "effect": "read", "eval_live": true}, {"ref": b.refund, "effect": "write"}]});
+    let v2 = e.publish_with("refunds", spec, false).await;
+    let uri = format!("{N}/refunds/versions/{v2}/golden-set");
+    let (s, v) = send(&e.cp_app, "PUT", &uri, ADMIN, Some(json!({"cases": cases})), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let uri = format!("{N}/refunds/versions/{v2}/evals");
+    let (s, ev) = send(&e.cp_app, "POST", &uri, ADMIN, Some(json!({"suite": "golden", "k": 1})), &[]).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{ev}");
+    assert!(EvalRunner::new(Arc::clone(&w.ex), opts()).run_once().await);
+    let (_, d) =
+        send(&e.cp_app, "GET", &format!("/api/v1/tenants/acme/evals/{}", ev["id"].as_str().unwrap()), ADMIN, None, &[])
+            .await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    assert_eq!(lookups(), 2, "the opted-in read reaches the server once per trial");
+    assert_eq!(refunds_to_the_server(&b), 0);
+    for t in d["trials"].as_array().unwrap() {
+        assert_eq!(t["verdict"]["sandboxed_calls"], 1, "{t}");
+    }
 }
 
 // ───────────────────────── cases from runs ─────────────────────────

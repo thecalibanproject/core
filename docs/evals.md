@@ -15,8 +15,8 @@ schema, budgets and tenant spend caps apply, and every model call goes through t
 pipeline (PII, caches, routing, quotas, metering, tracing). Usage events carry `node`,
 `node_version` and `run_id` as for any run. The LLM judge's calls go through the same pipeline,
 metered under the node with the eval id as `run_id`, so they never count in a run's cost.
-One exception to the normal path: a trial never reaches a real write tool ([golden trials and
-write tools](#golden-trials-and-write-tools)). They are
+One exception to the normal path: a trial never reaches a real write tool, nor by default any
+MCP tool ([golden trials and tools](#golden-trials-and-tools)). They are
 retried like a run's model calls: a transient failure with the same backoff (50 ms, doubled up to
 2 s, for the executor's model retry window, 60 s by default), a rate limit (`429`) after waiting
 for its `Retry-After` (within 10 ms and 5 minutes), at most 5 times, with one idempotency key for
@@ -76,7 +76,7 @@ the real tool (see below).
 | `errors` | Trials that could not be scored: the run could not be created, a judge call failed, the run's tool calls could not be read, or the run failed for a reason outside the node (`error_kind` on the trial: `quota`, `provider`, `timeout`, see [errors](#errors)). They count as not passed |
 | `golden_hash`, `judge` | Which golden set ran, and the judge configuration (default model, prompt version and hash, temperature), so scores are compared under the same set and judge (swapping a simulated user or judge moves scores by many points: UserProxyBench, arXiv 2609.38043) |
 
-### Golden trials and write tools
+### Golden trials and tools
 
 A golden trial runs the node for real, so before 2026-10-13 it also called its write tools for
 real: in the fintech demo a golden trial issued a real refund (TX-30015) on the bank's refund
@@ -92,10 +92,26 @@ a sandbox" (research note 04, section 7); golden trials now use the same sandbox
   `{"ok": true, "sandbox": true, "synthetic": true, "note": "Caliban eval sandbox: ..."}`. A schema
   the generator cannot satisfy (a `pattern`) gets the marked default. MCP manifests are pinned
   without an output schema today, so for them the marked default is what a trial sees.
-- **Reads behave as before.** A read tool (MCP, `builtin://datasource_query`,
-  `builtin://rag_search`) is called for real, with its real result, unless the case scripts it.
-  A version's reads are expected to be side-effect free; their effect is what the version
-  declares.
+- **MCP reads are sandboxed too, unless the spec opts in** (since 2026-10-15). A declared
+  `effect: read` is the author's claim, not a guarantee: AgentDojo-style tools diverge from their
+  advertised surface (research note 04, section 7), a "read" may still log, bill or rate-limit on
+  the customer's system, and a trial that depends on live data is not repeatable. So every call to
+  an `mcp://` tool goes to the sandbox, which answers the case's `tool_results` entry, else the
+  same marked synthetic result as a write. A read tool the version declares with
+  `"eval_live": true` calls the real server (unless the case scripts it):
+
+  ```json
+  {"ref": "mcp://bank/lookup#sha256:...", "effect": "read", "eval_live": true}
+  ```
+
+  `eval_live` is accepted on `mcp://` tools with `effect: read` only (a version that sets it on a
+  write, a built-in or a `node://` reference is refused, kind `spec`). It is part of the spec, so
+  of its hash, and reviewed at publish like the rest. Across the versions a run reaches (its
+  pinned subnodes), a tool runs live only when every declaration of it opts in and none declares
+  it a write.
+- **Built-in tools run live.** `builtin://datasource_query` and `builtin://rag_search` are
+  Caliban's own read-only tools (the query compiler refuses writes; retrieval only reads the
+  index), so they are called for real unless the case scripts them.
 - **The executor's defenses are unchanged**: taint, approvals (scripted with `answers`; a tainted
   write without one is denied), declared tools only, the PII guard. The sandbox only replaces the
   final call.

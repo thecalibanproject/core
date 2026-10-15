@@ -1320,9 +1320,11 @@ paths:
         and managed by the control plane, see `GET .../eval-key`), or as the API key `api_key_id`
         when one is named (it must be active and allowed to run the node). The key's quotas apply and
         its usage is metered. Trial runs (origin `eval:<eval>:<case>`) never reach a real write
-        tool: every call to a tool with effect `write` goes to the eval sandbox, which answers the
-        case's `tool_results` or a synthetic result marked `"sandbox": true`; reads call the real
-        tools unless scripted.
+        tool, and by default no MCP tool at all: every call to an `mcp://` tool goes to the eval
+        sandbox, which answers the case's `tool_results` or a synthetic result marked
+        `"sandbox": true`. A read tool the version's spec declares with `eval_live: true` calls the
+        real tool (unless the case scripts it); built-in tools (`builtin://datasource_query`,
+        `builtin://rag_search`) call the real tool unless scripted.
         `injection`: the built-in injection suite against sandboxed tools (`k` default 1); the run
         input is `input`, else the input of `input_case` (or the golden set's first case), whose
         checks then measure utility under attack. Needs `nodes.run`; audited as `node.eval.start`.
@@ -3511,7 +3513,7 @@ components:
         tool_results:
           type: object
           additionalProperties: true
-          description: 'Scripted tool results, by tool name (the manifest''s, e.g. `refund`) or reference. A trial never calls a write tool (effect `write`): the eval sandbox answers this script, else a synthetic result marked `"sandbox": true` (valid against the tool''s output schema when it declares one). A read tool named here answers the script too; other reads call the real tool.'
+          description: 'Scripted tool results, by tool name (the manifest''s, e.g. `refund`) or reference. A trial never calls a write tool (effect `write`), nor an `mcp://` read tool the version does not declare with `eval_live: true`: the eval sandbox answers this script, else a synthetic result marked `"sandbox": true` (valid against the tool''s output schema when it declares one). An opted-in read or a built-in tool named here answers the script too; other opted-in reads and built-in tools call the real tool.'
         tags: { type: array, items: { type: string }, description: 'Free labels. A case captured from a run has `captured`, its verdict and `mast:<id>`.' }
     EvalCheck:
       description: 'A check of the run output. Text checks see the output as text (a string as is, other JSON compact).'

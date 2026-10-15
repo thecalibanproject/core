@@ -1266,8 +1266,9 @@ impl RunCx {
             .map(|(_, r)| r.spec.as_ref())
             .collect();
         // Eval runs get the eval sandbox, never the real write tools: an injection-suite run for
-        // every tool (an unknown case fails), a golden trial for every write (its case's scripted
-        // results, else synthetic ones), its reads calling the real tools.
+        // every tool (an unknown case fails), a golden trial for every `mcp://` tool (its case's
+        // scripted results, else synthetic ones) except the reads its spec opts in with
+        // `eval_live`, which call the real tools like built-in tools do.
         let golden = crate::eval::runner::golden_of_origin(run.origin.as_deref());
         let (tools, sandboxed): (Arc<dyn ToolRegistry>, bool) =
             match crate::eval::injection::case_of_origin(run.origin.as_deref()) {

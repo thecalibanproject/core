@@ -8,10 +8,13 @@
 //!   injected instruction; write tools answer `ok`.
 //! - **Golden runs** (origin `eval:<eval>[:<case>]`): a golden set calls the node for real, so
 //!   before this sandbox a golden trial of a node with a write tool sent real writes (a fintech
-//!   golden trial issued a real refund, TX-30015, in the 2026-10-13 demo). Now every call to a tool
-//!   whose effect is `write` is sandboxed: it answers the case's scripted result for that tool
-//!   (`tool_results`), else a synthetic result marked as such ([`synthetic_result`]). Read tools
-//!   still call the real server, unless the case scripts them too.
+//!   golden trial issued a real refund, TX-30015, in the 2026-10-13 demo). Now every call to an
+//!   `mcp://` tool is sandboxed, reads included (2026-10-15: a declared read is a claim, and
+//!   AgentDojo-style tools diverge from their advertised surface, research note 04 §7): it answers
+//!   the case's scripted result for that tool (`tool_results`), else a synthetic result marked as
+//!   such ([`synthetic_result`]). A read tool the spec opts in with `eval_live: true` calls the
+//!   real server (unless the case scripts it); a write never does. Built-in tools (Caliban's own,
+//!   read-only by construction) call the real tool.
 //!
 //! In both, every call is recorded first, as the tool would have received it (after the
 //! executor's PII guard), sealed in the run's journal (`sandbox:<step>` observation events), so a
@@ -25,13 +28,13 @@ use crate::journal::{EventKind, Journal, RunRecord, StepRecord};
 use crate::seal::Sealer;
 use crate::{Effect, NodeSpec};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// The prefix of observation events.
 pub const OBSERVATION: &str = "sandbox:";
 
-/// What a sandboxed write of a golden run answers without a script (and without an output schema
+/// What a sandboxed call of a golden run answers without a script (and without an output schema
 /// to follow), so nobody mistakes it for the tool's answer.
 pub const SYNTHETIC_NOTE: &str = "Caliban eval sandbox: this call was not sent to the tool; the result is synthetic.";
 
@@ -57,6 +60,9 @@ pub struct SandboxTools {
     sealer: Arc<dyn Sealer>,
     /// Reference to its declared effect (every version the run can reach).
     effects: HashMap<String, Effect>,
+    /// Golden runs: the `mcp://` read tools every reachable version opts in to live calls
+    /// (`eval_live`), never a write.
+    live: HashSet<String>,
 }
 
 /// `fail_safe` (golden runs): a tool any reachable version declares a write is a write everywhere
@@ -74,7 +80,30 @@ fn effects_of(root: &NodeSpec, children: &[&NodeSpec], fail_safe: bool) -> HashM
     effects
 }
 
+/// The `mcp://` tools a golden trial may call for real: every declaration of the reference in the
+/// versions the run can reach says `eval_live: true`, and none of them (nor the fail-safe effect)
+/// makes it a write.
+fn live_of(root: &NodeSpec, children: &[&NodeSpec], effects: &HashMap<String, Effect>) -> HashSet<String> {
+    let mut opted: HashMap<&str, bool> = HashMap::new();
+    for spec in std::iter::once(root).chain(children.iter().copied()) {
+        for t in &spec.tools {
+            let e = opted.entry(t.reference.as_str()).or_insert(true);
+            *e = *e && t.eval_live && t.effect == Effect::Read && t.reference.starts_with("mcp://");
+        }
+    }
+    opted
+        .into_iter()
+        .filter(|(r, live)| *live && effects.get(*r) == Some(&Effect::Read))
+        .map(|(r, _)| r.to_owned())
+        .collect()
+}
+
 impl SandboxTools {
+    /// The `mcp://` tools a golden trial of `root` (reaching `children`) calls for real.
+    pub fn live_tools(root: &NodeSpec, children: &[&NodeSpec]) -> HashSet<String> {
+        live_of(root, children, &effects_of(root, children, true))
+    }
+
     /// The sandbox of an injection case's run: `root` is the run's node, `children` the subnodes
     /// it can reach; `real` resolves the tools (manifests and trust) as production does.
     pub fn new(
@@ -96,11 +125,13 @@ impl SandboxTools {
             Scope::ParentToChild => Some(surface.reads.clone()),
         };
         let mode = Mode::Injection { case, parts: case.payload(&surface), inject_at };
-        Self { mode: Arc::new(mode), real, journal, sealer, effects: effects_of(root, children, false) }
+        let effects = effects_of(root, children, false);
+        Self { mode: Arc::new(mode), real, journal, sealer, effects, live: HashSet::new() }
     }
 
-    /// The sandbox of a golden trial's run: writes are sandboxed (answered from `scripts`, else
-    /// synthetic), reads call the real tool unless `scripts` names them.
+    /// The sandbox of a golden trial's run: every `mcp://` tool is sandboxed (answered from
+    /// `scripts`, else synthetic), except reads the spec opts in with `eval_live`, which call the
+    /// real tool unless `scripts` names them. Built-in tools call the real tool unless scripted.
     pub fn golden(
         scripts: BTreeMap<String, Value>,
         root: &NodeSpec,
@@ -110,7 +141,9 @@ impl SandboxTools {
         sealer: Arc<dyn Sealer>,
     ) -> Self {
         let mode = Mode::Golden { scripts: Arc::new(scripts) };
-        Self { mode: Arc::new(mode), real, journal, sealer, effects: effects_of(root, children, true) }
+        let effects = effects_of(root, children, true);
+        let live = live_of(root, children, &effects);
+        Self { mode: Arc::new(mode), real, journal, sealer, effects, live }
     }
 }
 
@@ -131,6 +164,8 @@ impl ToolRegistry for SandboxTools {
             // Undeclared tools never reach a registry (the executor refuses them). In a golden run
             // an unknown effect counts as a write, so nothing with an effect leaves the sandbox.
             write: self.effects.get(reference).map_or(golden, |e| *e == Effect::Write),
+            // Golden runs: an `mcp://` tool not opted in to live calls never reaches its server.
+            sandbox_reads: golden && reference.starts_with("mcp://") && !self.live.contains(reference),
             injected,
             mode: Arc::clone(&self.mode),
             journal: Arc::clone(&self.journal),
@@ -143,6 +178,8 @@ struct SandboxTool {
     inner: Arc<dyn Tool>,
     reference: String,
     write: bool,
+    /// Golden runs: a read is answered by the sandbox too (an `mcp://` tool without `eval_live`).
+    sandbox_reads: bool,
     injected: bool,
     mode: Arc<Mode>,
     journal: Arc<dyn Journal>,
@@ -178,7 +215,7 @@ impl Tool for SandboxTool {
         let golden = match &*self.mode {
             Mode::Golden { scripts } => Some(match script_for(scripts, &self.reference, &info.name) {
                 Some(s) => Answer::Scripted(s.clone()),
-                None if self.write => Answer::Synthetic,
+                None if self.write || self.sandbox_reads => Answer::Synthetic,
                 None => Answer::Real,
             }),
             Mode::Injection { .. } => None,
@@ -223,7 +260,8 @@ enum Answer {
 
 // ───────────────────────────── synthetic results ─────────────────────────────
 
-/// The result of a sandboxed write that has no script: valid against the tool's output schema
+/// The result of a sandboxed call that has no script (a write, or an `mcp://` read without
+/// `eval_live`): valid against the tool's output schema
 /// when it has one (and the schema can be satisfied without guessing a `pattern`), marked
 /// `"sandbox": true` wherever the schema allows the key; without a schema,
 /// `{"ok": true, "sandbox": true, "synthetic": true, "note": ...}`.
@@ -343,8 +381,9 @@ pub struct Observation {
     pub trusted: bool,
     /// A read tool that reaches the network through its arguments.
     pub network: bool,
-    /// The call was answered by the sandbox (every call of an injection run; writes and scripted
-    /// reads of a golden run), not by the tool.
+    /// The call was answered by the sandbox (every call of an injection run; in a golden run,
+    /// every `mcp://` call but the reads opted in with `eval_live`, and scripted calls), not by
+    /// the tool.
     pub sandboxed: bool,
     /// The arguments as compact JSON.
     pub args: String,
