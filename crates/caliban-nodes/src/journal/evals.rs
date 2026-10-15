@@ -107,6 +107,37 @@ pub fn golden_context(node: &str, version: u32) -> String {
     format!("golden/{node}@v{version}")
 }
 
+/// Where a captured golden case came from (`migrations/0039_golden_case_source.sql`): the case
+/// copies the run's content, so it follows the run's retention and erasure. Ids and times only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoldenCaseSource {
+    pub tenant_id: String,
+    pub node: String,
+    /// The version whose golden set holds the case.
+    pub version: u32,
+    pub case_id: String,
+    pub run_id: String,
+    /// When the run finished: the case is purged with the run, on the run's retention clock.
+    pub run_finished_at: DateTime<Utc>,
+}
+
+/// Result of [`EvalStore::erase_run`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunErasure {
+    /// The run and the finished runs derived from it are gone (`runs` rows).
+    Erased {
+        runs: u64,
+    },
+    NotFound,
+    /// This run (the run itself or one derived from it) has not finished: nothing was deleted.
+    InProgress(String),
+}
+
+/// Whether a run's origin is one of `origins`: an exact origin, or a prefix ending in `:`.
+pub fn origin_matches(origin: &str, origins: &[String]) -> bool {
+    origins.iter().any(|o| origin == o || (o.ends_with(':') && origin.starts_with(o.as_str())))
+}
+
 /// The promotion bar of a node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalPolicyRecord {
@@ -312,17 +343,46 @@ pub(crate) fn bad_finish(f: &EvalFinish) -> JResult<()> {
 /// Golden sets, promotion bars, eval runs and trials. Every [`super::Journal`] implements it.
 #[async_trait::async_trait]
 pub trait EvalStore: Send + Sync {
-    /// Creates or replaces the golden set of a version; `audit` is recorded with it.
-    async fn put_golden_set(&self, g: GoldenSetRecord, audit: Option<AuditEvent>) -> JResult<()>;
+    /// Creates or replaces the golden set of a version; `sources` become the provenance rows of
+    /// its captured cases (replacing the set's previous rows); `audit` is recorded with it.
+    async fn put_golden_set(
+        &self,
+        g: GoldenSetRecord,
+        sources: &[GoldenCaseSource],
+        audit: Option<AuditEvent>,
+    ) -> JResult<()>;
     /// Replaces the golden set of a version only if it is still the one the caller read: its hash
     /// is `expected` (`None`: there is no set yet). Returns whether it wrote (`false`: another write
-    /// came first; read again). `audit` is recorded with it.
+    /// came first; read again). `sources` replace the set's provenance rows; `audit` is recorded
+    /// with it.
     async fn replace_golden_set_if(
         &self,
         g: GoldenSetRecord,
         expected: Option<&str>,
+        sources: &[GoldenCaseSource],
         audit: Option<AuditEvent>,
     ) -> JResult<bool>;
+    /// The provenance rows of a version's golden set, by case id.
+    async fn golden_sources(&self, tenant: &str, node: &str, version: u32) -> JResult<Vec<GoldenCaseSource>>;
+    /// The golden cases captured from a run, in every set of the tenant.
+    async fn golden_sources_of_run(&self, tenant: &str, run_id: &str) -> JResult<Vec<GoldenCaseSource>>;
+    /// Retention: at most `batch` cases (every tenant) whose run finished more than `older_than`
+    /// ago, oldest first.
+    async fn expired_golden_sources(&self, older_than: Duration, batch: usize) -> JResult<Vec<GoldenCaseSource>>;
+    /// Erasure: clears the sealed content of these evals of `tenant` (their plan and every
+    /// trial's `detail`), whatever their age. Returns how many rows it cleared.
+    async fn clear_eval_content(&self, tenant: &str, eval_ids: &[String]) -> JResult<u64>;
+    /// Erasure: deletes a finished run of `tenant` with its steps and events, and the finished
+    /// runs of the tenant whose origin is one of `derived` ([`origin_matches`]: eval trial runs
+    /// that carried the run's input). Nothing is deleted when one of them has not finished.
+    /// `audit` is recorded with it.
+    async fn erase_run(
+        &self,
+        tenant: &str,
+        run_id: &str,
+        derived: &[String],
+        audit: Option<AuditEvent>,
+    ) -> JResult<RunErasure>;
     async fn golden_set(&self, tenant: &str, node: &str, version: u32) -> JResult<Option<GoldenSetRecord>>;
     /// The golden sets of a node's versions, by version.
     async fn golden_sets(&self, tenant: &str, node: &str) -> JResult<Vec<GoldenSetRecord>>;

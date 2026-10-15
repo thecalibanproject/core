@@ -810,6 +810,47 @@ paths:
         '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [nodes]
+      summary: Erase a finished run and everything derived from it
+      description: |
+        For a data subject's erasure request, or any reason to purge a run's data before its
+        retention. In order: the golden cases captured from the run leave every golden set that
+        holds them (a copy carried to another version by a `PUT` included; each set is rewritten,
+        resealed and audited as `node.golden_set.scrub` with `reason: erasure`); the evals of the
+        node whose sealed plan carries the run's content (a golden plan holding its case, an
+        injection plan whose input is the run's input) lose that content (plan and trial details;
+        summaries and verdicts stay, the eval shows `content_purged: true`); then the run, its
+        steps and events, and the eval runs made with its content are deleted, audited as
+        `node.run.erase` (ids and counts, never content). Caliban keeps no index of data
+        subjects: erase each run that holds the subject's data. Needs `runs.data` and
+        `nodes.write` (it rewrites golden sets). See core/docs/evals.md ("Retention").
+      responses:
+        '200':
+          description: Erased
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, run_id, node, version, golden_cases, cases_removed, evals_cleared, runs_deleted]
+                properties:
+                  object: { type: string, enum: [node.run.erasure] }
+                  run_id: { type: string }
+                  node: { type: string }
+                  version: { type: integer }
+                  golden_cases:
+                    type: array
+                    description: 'The captured cases that named the run'
+                    items:
+                      type: object
+                      properties: { node: { type: string }, version: { type: integer }, case_id: { type: string } }
+                  cases_removed: { type: integer, description: 'Cases that left a golden set' }
+                  evals_cleared: { type: array, items: { type: string }, description: 'Evals whose sealed content was cleared' }
+                  runs_deleted: { type: integer, description: 'The run and the eval runs made with its content' }
+        '403': { description: 'Missing `runs.data` or `nodes.write` on the tenant', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: 'No such run in this tenant', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: 'The run, an eval using its content, or a run made with its content has not finished (cancel it or wait, then erase again; erasing again is safe)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/runs/{runId}/input:
     parameters:
@@ -1255,7 +1296,9 @@ paths:
         At most 200 cases, unique ids, at least one check each; inputs are checked against the
         version's `prompt.input_schema` (422 listing every problem, kind `golden_set`). Sealed under
         the tenant's data key. Needs `nodes.write`; audited as `node.golden_set.update` (counts and
-        hashes, never cases).
+        hashes, never cases). A case that keeps the id of a case captured from a run, or a case
+        tagged `captured` whose id is a finished run of the node, keeps following that run's
+        retention and erasure (see `DELETE .../runs/{runId}`).
       requestBody:
         required: true
         content:
@@ -2762,7 +2805,7 @@ paths:
         (`node.run.answer`, `node.write.approve`, `node.write.deny`, `node.run.cancel`,
         `node.eval.finish`) at least once; each event id is recorded once in the hash-chained audit
         log, so a retry appends nothing. Every other action, including the control plane's own
-        (`rag.*`, `node.golden_set.*`, `node.eval_policy.update`, `node.eval.start`,
+        (`rag.*`, `node.golden_set.*` (`scrub` included), `node.run.erase`, `node.eval_policy.update`, `node.eval.start`,
         `node.eval.cancel`), is counted as `rejected` and not recorded.
       requestBody:
         required: true

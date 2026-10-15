@@ -2297,7 +2297,9 @@ async fn postgres_worker_grants_are_enough() {
          GRANT SELECT, INSERT, UPDATE ON node_spend TO {role};
          GRANT SELECT, UPDATE ON node_eval TO {role};
          GRANT SELECT, INSERT, UPDATE ON node_eval_trial TO {role};
-         GRANT SELECT, UPDATE ON rag_collection, rag_document TO {role};"
+         GRANT SELECT, UPDATE ON rag_collection, rag_document TO {role};
+         GRANT SELECT, INSERT, UPDATE ON node_golden_set TO {role};
+         GRANT SELECT, INSERT, DELETE ON node_golden_case_source TO {role};"
     );
     sqlx::raw_sql(AssertSqlSafe(grants)).execute(pg.pool()).await.unwrap();
     // A document collection and documents the control plane created (the worker role cannot).
@@ -2358,6 +2360,26 @@ async fn postgres_worker_grants_are_enough() {
             case_count: 1,
         };
         admin.create_eval(e, None).await.unwrap();
+        // A golden set with a case captured from a run long past retention.
+        let g = caliban_nodes::journal::evals::GoldenSetRecord {
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: 1,
+            cases: "sealed".into(),
+            case_count: 1,
+            hash: "sha256:g1".into(),
+            updated_at: Utc::now(),
+            updated_by: "user:jo".into(),
+        };
+        let src = caliban_nodes::journal::evals::GoldenCaseSource {
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: 1,
+            case_id: "run_old".into(),
+            run_id: "run_old".into(),
+            run_finished_at: Utc::now() - chrono::Duration::days(400),
+        };
+        admin.put_golden_set(g, &[src], None).await.unwrap();
     }
     let opts: PgConnectOptions = url
         .parse::<PgConnectOptions>()
@@ -2469,6 +2491,24 @@ async fn postgres_worker_grants_are_enough() {
             j.trials(&e.id).await.map_err(|e| e.to_string())?;
             let f = EvalFinish { status: EvalStatus::Succeeded, summary: None, error: None };
             j.finish_eval(&e.id, "w", f, None).await.map_err(|e| e.to_string())?;
+        }
+        // What the retention purge does to captured golden cases (scrub_cases, minus the sealing).
+        {
+            use caliban_nodes::journal::evals::EvalStore;
+            let expired = j.expired_golden_sources(Duration::from_secs(86_400), 10).await.map_err(|e| e.to_string())?;
+            let x = expired.first().ok_or("no expired golden case")?;
+            j.golden_sources(&x.tenant_id, &x.node, x.version).await.map_err(|e| e.to_string())?;
+            let g = j.golden_set(&x.tenant_id, &x.node, x.version).await.map_err(|e| e.to_string())?.ok_or("no set")?;
+            let previous = g.hash.clone();
+            let rewritten = caliban_nodes::journal::evals::GoldenSetRecord {
+                case_count: 0,
+                hash: "sha256:g2".into(),
+                updated_by: "caliban:retention".into(),
+                ..g
+            };
+            if !j.replace_golden_set_if(rewritten, Some(&previous), &[], None).await.map_err(|e| e.to_string())? {
+                return Err("rewriting a golden set".to_owned());
+            }
         }
         // What the indexing loop and retrieval do.
         {

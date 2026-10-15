@@ -4,7 +4,7 @@
 //! same pipeline, the metrics come back to the admin API, and the version is promoted only once
 //! its eval meets the bar. The journal is Postgres when `CALIBAN_TEST_DATABASE_URL` is set.
 
-use crate::nodes_tests::{ADMIN, Env, KEY, config_with, env_from, idem, journal, responder, send, worker};
+use crate::nodes_tests::{ADMIN, Env, KEY, config_with, env_from, idem, journal, responder, send, until, worker};
 use axum::http::StatusCode;
 use caliban_bench::mock::Responder;
 use caliban_nodes::eval::runner::{EvalOptions, EvalRunner};
@@ -469,4 +469,144 @@ async fn finished_runs_become_golden_cases() {
         a["entries"].as_array().unwrap().iter().filter(|x| x["action"] == "node.golden_set.capture").collect();
     assert_eq!(captures.len(), 2, "{a}");
     assert!(captures.iter().all(|x| !x.to_string().contains("amount too")));
+}
+
+/// Captured golden cases follow their run (migration 0039): a case copies the run's content, so
+/// erasing the run (`DELETE /api/v1/tenants/{t}/runs/{id}`) removes it from every golden set at
+/// once (also a copy carried to another version by a `PUT`), clears the evals that carried it and
+/// deletes the eval runs made with it; and the workers' retention purge removes a case once its
+/// run is past the run retention. Other cases, sets and runs stay.
+#[tokio::test]
+async fn captured_cases_follow_their_runs_retention_and_erasure() {
+    use caliban_nodes::eval::capture::purge_expired_cases;
+    let j = journal().await;
+    let e = env_from(Duration::ZERO, Some(Arc::clone(&j)), bank_model(), |url| config_with(url, "")).await;
+    let b = bank(&e).await;
+    let app = &e.cp_app;
+    let w = worker(&e, &j, &idem(), None, "worker-a", Duration::from_secs(30));
+    let good = json!({"verdict": "good"});
+    let mut runs = vec![];
+    for _ in 0..2 {
+        let body = json!({"input": "Refund TX-30015", "version": 1});
+        let (s, run) = send(&w.app, "POST", "/v1/nodes/refunds/runs", KEY, Some(body), &[]).await;
+        assert_eq!((s.is_success(), run["status"].as_str()), (true, Some("succeeded")), "{run}");
+        let id = run["id"].as_str().unwrap().to_owned();
+        let (s, c) =
+            send(app, "POST", &format!("/api/v1/tenants/acme/runs/{id}/golden-case"), ADMIN, Some(good.clone()), &[])
+                .await;
+        assert_eq!(s, StatusCode::CREATED, "{c}");
+        runs.push(id);
+    }
+    let (erased, expiring) = (runs[0].clone(), runs[1].clone());
+    let set = async |v: u64| -> Vec<String> {
+        let (s, g) = send(app, "GET", &format!("{N}/refunds/versions/{v}/golden-set"), ADMIN, None, &[]).await;
+        assert_eq!(s, StatusCode::OK, "{g}");
+        g["cases"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().to_owned()).collect()
+    };
+    assert_eq!(set(1).await, runs);
+
+    // The first case carried to v2 by a PUT, next to a hand-written one: it keeps its provenance.
+    let (_, g1) = send(app, "GET", &format!("{N}/refunds/versions/1/golden-set"), ADMIN, None, &[]).await;
+    let spec = json!({"kind": "agent", "prompt": {"system": "You process refunds."}, "model_policy": {},
+        "budgets": {"steps": 10, "tokens": 20000, "wall_clock_s": 60},
+        "tools": [{"ref": b.lookup, "effect": "read"}, {"ref": b.refund, "effect": "write"}]});
+    let v2 = e.publish_with("refunds", spec, false).await;
+    let manual = json!({"id": "manual", "input": "Refund TX-1", "expected": "x"});
+    let cases = json!([g1["cases"][0].clone(), manual]);
+    let (s, v) =
+        send(app, "PUT", &format!("{N}/refunds/versions/{v2}/golden-set"), ADMIN, Some(json!({"cases": cases})), &[])
+            .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(j.golden_sources_of_run("acme", &erased).await.unwrap().len(), 2, "both copies are tracked");
+
+    // An eval of v1 carries both cases in its plan and makes a trial run of each.
+    let (s, ev) = send(
+        app,
+        "POST",
+        &format!("{N}/refunds/versions/1/evals"),
+        ADMIN,
+        Some(json!({"suite": "golden", "k": 1})),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{ev}");
+    let eval_id = ev["id"].as_str().unwrap().to_owned();
+    assert!(EvalRunner::new(Arc::clone(&w.ex), opts()).run_once().await);
+    let (_, d) = send(app, "GET", &format!("/api/v1/tenants/acme/evals/{eval_id}"), ADMIN, None, &[]).await;
+    let trial_run = |case: &str| {
+        let t = d["trials"].as_array().unwrap().iter().find(|t| t["case"] == case).cloned().unwrap();
+        t["run_id"].as_str().unwrap().to_owned()
+    };
+    let (erased_trial, kept_trial) = (trial_run(&erased), trial_run(&expiring));
+
+    // Refused: a run that is not finished, an unknown run, a principal without both permissions.
+    e.publish(
+        "ask",
+        json!({"kind": "workflow", "prompt": {"system": "You ask."}, "model_policy": {},
+               "budgets": {"steps": 5, "tokens": 1000, "wall_clock_s": 60},
+               "graph": {"vertices": [{"id": "clarify", "type": "human", "config": {"question": "Which?"}}], "edges": []}}),
+    )
+    .await;
+    let (_, waiting) = send(&w.app, "POST", "/v1/nodes/ask/runs", KEY, Some(json!({"input": "refund"})), &[]).await;
+    let uri = |id: &str| format!("/api/v1/tenants/acme/runs/{id}");
+    let (s, v) = send(app, "DELETE", &uri(waiting["id"].as_str().unwrap()), ADMIN, None, &[]).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(send(app, "DELETE", &uri("run_nope"), ADMIN, None, &[]).await.0, StatusCode::NOT_FOUND);
+
+    // Erasure: the case leaves both sets, the eval loses its content, the runs made with the
+    // erased run's content go, everything else stays.
+    let (s, r) = send(app, "DELETE", &uri(&erased), ADMIN, None, &[]).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    assert_eq!((r["object"].as_str(), r["cases_removed"].as_u64()), (Some("node.run.erasure"), Some(2)), "{r}");
+    assert_eq!(r["evals_cleared"], json!([ev["id"]]), "{r}");
+    assert_eq!(r["runs_deleted"], 2, "the run and its eval trial run: {r}");
+    assert_eq!(set(1).await, vec![expiring.clone()]);
+    assert_eq!(set(v2).await, ["manual"]);
+    for (id, kept) in [(&erased, false), (&erased_trial, false), (&expiring, true), (&kept_trial, true)] {
+        assert_eq!(j.get_run("acme", id).await.unwrap().is_some(), kept, "{id}");
+    }
+    let (_, d) =
+        send(app, "GET", &format!("/api/v1/tenants/acme/evals/{}", ev["id"].as_str().unwrap()), ADMIN, None, &[]).await;
+    assert_eq!((d["content_purged"].as_bool(), d["summary"]["trials"].as_u64()), (Some(true), Some(2)), "{d}");
+    assert!(j.golden_sources_of_run("acme", &erased).await.unwrap().is_empty());
+    // Audited, ids and counts only (the journal's outbox reaches the audit chain through the
+    // control plane or a worker's shipper, whichever claims it first).
+    let audit = async || -> Vec<Value> {
+        let (_, a) = send(app, "GET", "/api/v1/audit?limit=500", ADMIN, None, &[]).await;
+        a["entries"].as_array().unwrap().clone()
+    };
+    let of = |entries: &[Value], action: &str, reason: &str| {
+        entries
+            .iter()
+            .filter(|x| x["action"] == action && (reason.is_empty() || x["detail"]["reason"] == reason))
+            .count()
+    };
+    until("the erasure in the audit chain", async || {
+        let entries = audit().await;
+        of(&entries, "node.run.erase", "") == 1 && of(&entries, "node.golden_set.scrub", "erasure") == 2
+    })
+    .await;
+    assert!(audit().await.iter().all(|x| !x.to_string().contains("REAL REFUND")), "no content in the audit log");
+    // Erasing again: the run is gone.
+    assert_eq!(send(app, "DELETE", &uri(&erased), ADMIN, None, &[]).await.0, StatusCode::NOT_FOUND);
+
+    // Retention: with a zero retention every finished run is past it, so its case goes.
+    let (rows, removed) = purge_expired_cases(&j, w.ex.sealer().as_ref(), Duration::ZERO, 500).await.unwrap();
+    assert_eq!((rows, removed), (1, 1));
+    assert!(set(1).await.is_empty());
+    assert_eq!(set(v2).await, ["manual"], "a hand-written case has no run to follow");
+    assert_eq!(purge_expired_cases(&j, w.ex.sealer().as_ref(), Duration::ZERO, 500).await.unwrap(), (0, 0));
+    // The worker's purge leaves its audit event in the journal outbox, for the worker's shipper.
+    let scrubs: Vec<_> = j
+        .claim_audit("test", Duration::from_secs(60), 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|x| x.action == "node.golden_set.scrub")
+        .collect();
+    assert_eq!(scrubs.len(), 1, "{scrubs:?}");
+    assert_eq!(
+        (scrubs[0].actor.as_str(), scrubs[0].detail["reason"].as_str()),
+        ("caliban:retention", Some("retention"))
+    );
 }

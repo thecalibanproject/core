@@ -191,9 +191,31 @@ before the run is looked up. The built-in roles that have `nodes.write` (`develo
 was created), `golden_set` (the set's metadata: `hash`, `case_count`, ...), `content_visible`
 (always `true`), and the `case` itself.
 
-**Retention.** A captured case is golden-set content: sealed, kept with the set, not purged with
-the run (golden sets are not purged). Deleting the case means editing the set (`PUT`) or deleting
-it.
+**Retention and erasure.** A captured case copies the run's content (its input, answers and
+output), so it may not outlive the run (research note 05: retention and erasure cover every copy
+of personal data; note 04, "Risks & failure modes": memory "deletable via a TTL/erasure API", and open question 6, right to erasure across derived data).
+Each captured case gets a provenance row (`node_golden_case_source`, migration 0039: tenant, node,
+version, case id, run id, the run's finish time; ids and times only), written in the transaction
+of the set's write. A `PUT` keeps the row of a case that keeps a captured case's id (editing it
+does not free it from its run), adds one for a case tagged `captured` whose id is a finished run of
+the node (a captured case carried to another version), and drops the rows of cases that left the
+set. Deleting the set deletes its rows.
+
+- **Retention.** The workers' hourly purge (`CALIBAN_NODE_RUN_RETENTION_DAYS`, the run retention)
+  removes a captured case from its set once its run finished longer ago than that: the set is
+  opened, rewritten without it, resealed (a new hash; a compare-and-set like every write) and the
+  change audited as `node.golden_set.scrub` (`reason: retention`, actor `caliban:retention`; node,
+  version, case and run ids, counts and hashes). Hand-written cases have no run and are kept.
+- **Erasure.** `DELETE /api/v1/tenants/{t}/runs/{id}` (`runs.data` and `nodes.write`) erases a
+  finished run at once: its captured cases leave every set (`node.golden_set.scrub`,
+  `reason: erasure`); the evals of the node whose sealed plan carries the run's content (a golden
+  plan holding its case, an injection plan whose input is the run's input) lose that content (plan
+  and trial details; summaries and verdicts stay, `content_purged: true`); then the run, its steps
+  and events, and the eval runs made with its content (`eval:<eval>:<case>`, and every run of such
+  an injection eval) are deleted, audited as `node.run.erase`. A run that has not finished, or an
+  eval using its content that has not, is a `409`; erasing again is safe. Caliban keeps no index
+  of data subjects: a data subject's erasure is the erasure of each run that holds their data.
+  Usage events of the run's model calls are billing-class (no content) and are kept.
 
 ## The injection suite
 
@@ -431,7 +453,8 @@ which is audited.
 | `GET .../nodes/{name}/versions/{v}/golden-set` | `nodes.read` (cases with `runs.data`) | |
 | `PUT .../nodes/{name}/versions/{v}/golden-set` `{"cases": [...]}` | `nodes.write` | `node.golden_set.update` |
 | `DELETE .../nodes/{name}/versions/{v}/golden-set` | `nodes.write` | `node.golden_set.delete` |
-| `POST /api/v1/tenants/{t}/runs/{id}/golden-case` `{"verdict", "note"?, "mast_label"?, "version"?}` ([cases from runs](#cases-from-runs)) | `nodes.write` | `node.golden_set.capture` |
+| `POST /api/v1/tenants/{t}/runs/{id}/golden-case` `{"verdict", "note"?, "mast_label"?, "version"?}` ([cases from runs](#cases-from-runs)) | `nodes.write` and `runs.data` | `node.golden_set.capture` |
+| `DELETE /api/v1/tenants/{t}/runs/{id}` (erase a run and what was derived from it, [retention and erasure](#cases-from-runs)) | `runs.data` and `nodes.write` | `node.golden_set.scrub`, `node.run.erase` |
 | `GET .../nodes/{name}/eval-policy` | `nodes.read` | |
 | `PUT .../nodes/{name}/eval-policy` | `nodes.publish` | `node.eval_policy.update` (old and new bar) |
 | `POST .../nodes/{name}/versions/{v}/evals` `{"suite", "api_key_id"?, "k"?, "concurrency"?, "cases"?, "judge_model"?, "input"?, "input_case"?}` | `nodes.run` | `node.eval.start` |
@@ -479,7 +502,9 @@ content goes with the run retention (`CALIBAN_NODE_RUN_RETENTION_DAYS`, default 
 purge on the workers clears each trial's `detail` (what the scorers said, the output that failed a
 check, the tool calls) and the eval's sealed plan (its golden cases or injection input) once the eval finished
 longer ago than that, in batches with `FOR UPDATE SKIP LOCKED`. The eval then shows
-`content_purged: true`. Golden sets themselves belong to a version and are not purged.
+`content_purged: true`. Golden sets themselves belong to a version and are not purged, but the
+cases captured from runs leave them on the same clock as their runs ([cases from
+runs](#cases-from-runs)), in the same hourly purge.
 
 ## Where evals run
 

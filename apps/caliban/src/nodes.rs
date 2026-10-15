@@ -174,7 +174,12 @@ impl NodeArgs {
         ));
         if self.node_run_retention_days > 0 {
             let keep = Duration::from_secs(self.node_run_retention_days.saturating_mul(86_400));
-            tokio::spawn(purge_runs(Arc::clone(executor.journal()), keep, Arc::clone(&stop)));
+            tokio::spawn(purge_runs(
+                Arc::clone(executor.journal()),
+                Arc::clone(executor.sealer()),
+                keep,
+                Arc::clone(&stop),
+            ));
         }
         gw.set_nodes(NodeRuns::Local(LocalRuns { executor, sync_wait: self.sync_wait() }));
         Ok(stop)
@@ -285,10 +290,36 @@ pub async fn ship_audit(
     }
 }
 
-/// Retention of finished runs: hourly, in batches (several workers may purge at once).
-async fn purge_runs(journal: Arc<dyn Journal>, keep: Duration, stop: Arc<Notify>) {
+/// Retention of finished runs: hourly, in batches (several workers may purge at once). Golden
+/// cases captured from runs go on the same clock (they copy the run's content).
+async fn purge_runs(
+    journal: Arc<dyn Journal>,
+    sealer: Arc<dyn caliban_nodes::seal::Sealer>,
+    keep: Duration,
+    stop: Arc<Notify>,
+) {
     const BATCH: usize = 500;
     loop {
+        // Captured golden cases first: their provenance names the run's finish time, whether or
+        // not the run row is still there.
+        let mut scrubbed = 0;
+        for _ in 0..100 {
+            match caliban_nodes::eval::capture::purge_expired_cases(&journal, sealer.as_ref(), keep, BATCH).await {
+                Ok((rows, removed)) => {
+                    scrubbed += removed;
+                    if rows < BATCH {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "removing captured golden cases past retention failed; retrying next hour");
+                    break;
+                }
+            }
+        }
+        if scrubbed > 0 {
+            tracing::info!(cases = scrubbed, "removed captured golden cases whose runs passed retention");
+        }
         let mut total = 0;
         loop {
             match journal.purge_finished(keep, BATCH).await {

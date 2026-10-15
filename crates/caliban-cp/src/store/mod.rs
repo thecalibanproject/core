@@ -2056,6 +2056,8 @@ pub const DATA_PLANE_ACTIONS: &[&str] = &[
     "node.golden_set.update",
     "node.golden_set.capture",
     "node.golden_set.delete",
+    "node.golden_set.scrub",
+    "node.run.erase",
     "node.eval_policy.update",
 ];
 

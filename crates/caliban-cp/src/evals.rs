@@ -29,7 +29,8 @@ use axum::http::StatusCode;
 use caliban_nodes::NodeSpec;
 use caliban_nodes::eval::{self, EvalPolicy, GoldenCase, ManifestFindings, Plan};
 use caliban_nodes::journal::evals::{
-    EvalCancel, EvalPolicyRecord, EvalQuery, EvalRecord, EvalStatus, GoldenSetRecord, NewEval, Suite, golden_context,
+    EvalCancel, EvalPolicyRecord, EvalQuery, EvalRecord, EvalStatus, GoldenCaseSource, GoldenSetRecord, NewEval, Suite,
+    golden_context,
 };
 use caliban_nodes::journal::{AuditEvent, Journal, decode_cursor, encode_cursor};
 use caliban_nodes::publish::Problem;
@@ -151,6 +152,7 @@ pub(crate) async fn put_golden(
     let sealed = s.seal(&tenant_id, &golden_context(&name, version), &text).map_err(bad)?;
     let hash = eval::golden_hash(&body.cases);
     let previous = j.golden_set(&tenant_id, &name, version).await.map_err(journal_error)?;
+    let sources = sources_after_put(&j, &tenant_id, &name, version, &body.cases).await?;
     let rec = GoldenSetRecord {
         tenant_id: tenant_id.clone(),
         node: name.clone(),
@@ -164,7 +166,7 @@ pub(crate) async fn put_golden(
     let detail = json!({"node": name, "version": version, "cases": body.cases.len(), "hash": hash,
                         "previous_hash": previous.map(|g| g.hash)});
     let a = audit(&tenant_id, &p, once("golden_set"), "node.golden_set.update", &format!("{name}@v{version}"), detail);
-    j.put_golden_set(rec, Some(a)).await.map_err(journal_error)?;
+    j.put_golden_set(rec, &sources, Some(a)).await.map_err(journal_error)?;
     drain_audit(&cp, &j).await?;
     let g = j
         .golden_set(&tenant_id, &name, version)
@@ -172,6 +174,52 @@ pub(crate) async fn put_golden(
         .map_err(journal_error)?
         .ok_or_else(|| not_found("golden set"))?;
     Ok(Json(golden_view(&g, Some(body.cases))))
+}
+
+/// The provenance rows of a set after a `PUT` of `cases` (migration 0039): a case that keeps the id
+/// of a captured case keeps its row (editing a captured case does not free it from its run's
+/// retention), and a case tagged `captured` whose id is a finished run of the same node (a
+/// captured case copied to another version) gets one. Cases that left the set lose theirs.
+async fn sources_after_put(
+    j: &Arc<dyn Journal>,
+    tenant: &str,
+    node: &str,
+    version: u32,
+    cases: &[GoldenCase],
+) -> ApiResult<Vec<GoldenCaseSource>> {
+    let existing = j.golden_sources(tenant, node, version).await.map_err(journal_error)?;
+    let mut out = Vec::new();
+    for c in cases {
+        if let Some(x) = existing.iter().find(|x| x.case_id == c.id) {
+            out.push(x.clone());
+            continue;
+        }
+        if !c.tags.iter().any(|t| t == "captured") {
+            continue;
+        }
+        // The copy of a captured case: the same run's other provenance rows say when it finished.
+        let known = j.golden_sources_of_run(tenant, &c.id).await.map_err(journal_error)?;
+        let finished = match known.first() {
+            Some(x) => Some(x.run_finished_at),
+            None => j
+                .get_run(tenant, &c.id)
+                .await
+                .map_err(journal_error)?
+                .filter(|r| r.node == node && r.status.is_terminal())
+                .and_then(|r| r.finished_at),
+        };
+        if let Some(run_finished_at) = finished {
+            out.push(GoldenCaseSource {
+                tenant_id: tenant.to_owned(),
+                node: node.to_owned(),
+                version,
+                case_id: c.id.clone(),
+                run_id: c.id.clone(),
+                run_finished_at,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// `DELETE .../nodes/{name}/versions/{v}/golden-set` (`nodes.write`), audited.
@@ -213,6 +261,21 @@ const CAPTURE_ATTEMPTS: usize = 5;
 /// and `runs.data`, since it copies the run's content (input, answers, output) into the set: a
 /// caller who may not read a run's content must not be able to move it somewhere else.
 pub(crate) const CAPTURE_PERMS: [Perm; 2] = [Perm::NodesWrite, Perm::RunsData];
+
+/// What erasing a run needs: `runs.data` (it is about the run's content; the route checks it) and
+/// `nodes.write`, since it rewrites the golden sets holding cases captured from the run.
+pub(crate) const ERASE_PERMS: [Perm; 2] = [Perm::RunsData, Perm::NodesWrite];
+
+/// `403` unless `allows` grants every permission of [`ERASE_PERMS`].
+pub(crate) fn may_erase(allows: impl Fn(Perm) -> bool) -> ApiResult<()> {
+    match ERASE_PERMS.into_iter().find(|p| !allows(*p)) {
+        None => Ok(()),
+        Some(missing) => Err(crate::auth::forbidden(format!(
+            "erasing a run rewrites the golden sets built from it: it needs runs.data and nodes.write (missing {})",
+            missing.as_str()
+        ))),
+    }
+}
 
 /// `403` unless `allows` grants every permission of [`CAPTURE_PERMS`].
 pub(crate) fn may_capture(allows: impl Fn(Perm) -> bool) -> ApiResult<()> {
@@ -318,6 +381,22 @@ pub(crate) async fn capture(
             updated_by: p.actor.clone(),
         };
         let previous = current.as_ref().map(|g| g.hash.clone());
+        // The case follows its run's retention and erasure (migration 0039).
+        let mut sources: Vec<GoldenCaseSource> = j
+            .golden_sources(&tenant_id, &run.node, version)
+            .await
+            .map_err(journal_error)?
+            .into_iter()
+            .filter(|x| cases.iter().any(|c| c.id == x.case_id))
+            .collect();
+        sources.push(GoldenCaseSource {
+            tenant_id: tenant_id.clone(),
+            node: run.node.clone(),
+            version,
+            case_id: case.id.clone(),
+            run_id: run.id.clone(),
+            run_finished_at: run.finished_at.unwrap_or(run.updated_at),
+        });
         // Metadata only (research note 05): no note, no input, no output.
         let detail = json!({
             "node": run.node, "version": version, "run": run.id, "run_version": run.version, "case": case.id,
@@ -326,7 +405,7 @@ pub(crate) async fn capture(
             "cases": cases.len(), "hash": hash, "previous_hash": previous,
         });
         let a = audit(&tenant_id, &p, once("golden_set"), "node.golden_set.capture", &target, detail);
-        if j.replace_golden_set_if(rec, previous.as_deref(), Some(a)).await.map_err(journal_error)? {
+        if j.replace_golden_set_if(rec, previous.as_deref(), &sources, Some(a)).await.map_err(journal_error)? {
             break previous;
         }
         if attempt >= CAPTURE_ATTEMPTS {
@@ -361,6 +440,124 @@ pub(crate) async fn capture(
         "case": case,
     });
     Ok((StatusCode::CREATED, Json(v)))
+}
+
+// ───────────────────────────── erasure ─────────────────────────────
+
+/// Evals of a node whose sealed plan carries a run's content, and the origins of the runs they
+/// made with it: a golden plan holding the case captured from the run (its trial runs for that
+/// case), or an injection plan whose input is the run's input (all of its runs). `409` when such
+/// an eval has not finished.
+async fn evals_with_run_content(
+    j: &Arc<dyn Journal>,
+    s: &impl Sealer,
+    run: &caliban_nodes::journal::RunRecord,
+    input: &Value,
+) -> ApiResult<(Vec<String>, Vec<String>)> {
+    let (mut evals, mut derived) = (vec![], vec![]);
+    let mut before = None;
+    loop {
+        let q = EvalQuery {
+            tenant: run.tenant_id.clone(),
+            node: Some(run.node.clone()),
+            before: before.clone(),
+            limit: 200,
+            ..EvalQuery::default()
+        };
+        let page = j.list_evals(&q).await.map_err(journal_error)?;
+        for e in &page {
+            if e.plan.is_empty() {
+                continue; // retention cleared its content already
+            }
+            let text = s
+                .open(&e.tenant_id, &e.id, &e.plan)
+                .map_err(|m| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("eval plan: {m}")))?;
+            let plan: Plan = serde_json::from_str(&text).map_err(|m| bad(format!("eval plan: {m}")))?;
+            let origin = match &plan {
+                Plan::Golden { cases, .. } if cases.iter().any(|c| c.id == run.id) => {
+                    format!("eval:{}:{}", e.id, run.id)
+                }
+                Plan::Injection { input: i, .. } if i == input => format!("injection:{}:", e.id),
+                _ => continue,
+            };
+            if !e.status.is_terminal() {
+                return Err(conflict(format!(
+                    "eval {} uses this run's content and has not finished: cancel it or wait, then erase again",
+                    e.id
+                )));
+            }
+            evals.push(e.id.clone());
+            derived.push(origin);
+        }
+        match page.last() {
+            Some(last) if page.len() == 200 => before = Some((last.created_at, last.id.clone())),
+            _ => break,
+        }
+    }
+    Ok((evals, derived))
+}
+
+/// `DELETE /api/v1/tenants/{t}/runs/{id}` (`runs.data` and `nodes.write`, [`ERASE_PERMS`]): erases
+/// a finished run, for a data subject's erasure request or any reason to purge a run's data
+/// before its retention. In order: the golden cases captured from it leave every set
+/// ([`eval::capture::scrub_cases`], audited `node.golden_set.scrub`); the evals whose sealed
+/// plan carries its content lose that content (plan and trial details; summaries stay); then
+/// the run, its steps and events, and the eval runs made with its content are deleted, audited as
+/// `node.run.erase` (ids and counts only). A run that has not finished, or an eval using its
+/// content that has not, is a `409` (nothing is deleted on the run side; erasing again is safe).
+pub(crate) async fn erase(
+    AxState(cp): AxState<Cp>,
+    Extension(p): Extension<Principal>,
+    Path((tenant_id, run_id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    use caliban_nodes::journal::evals::RunErasure;
+    crate::ensure_tenant(&cp, &tenant_id)?;
+    may_erase(|perm| p.allows(perm, Some(&tenant_id)))?;
+    let j = journal(&cp)?;
+    let run = j.get_run(&tenant_id, &run_id).await.map_err(journal_error)?.ok_or_else(|| not_found("run"))?;
+    if !run.status.is_terminal() {
+        return Err(conflict(format!(
+            "run {run_id} is {}: cancel it (or let it finish) before erasing it",
+            run.status.as_str()
+        )));
+    }
+    let s = sealer(&cp)?;
+    let input =
+        s.open(&tenant_id, &run.id, &run.input).map(|t| serde_json::from_str(&t).unwrap_or(Value::String(t))).map_err(
+            |m| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("the run's input cannot be opened: {m}")),
+        )?;
+    let (evals, derived) = evals_with_run_content(&j, &s, &run, &input).await?;
+    let sources = j.golden_sources_of_run(&tenant_id, &run.id).await.map_err(journal_error)?;
+    let removed = eval::capture::scrub_cases(&j, &s, &sources, eval::capture::ScrubReason::Erasure, &p.actor)
+        .await
+        .map_err(|m| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("scrubbing golden sets: {m}")))?;
+    let cleared =
+        if evals.is_empty() { 0 } else { j.clear_eval_content(&tenant_id, &evals).await.map_err(journal_error)? };
+    let sets: Vec<Value> =
+        sources.iter().map(|x| json!({"node": x.node, "version": x.version, "case_id": x.case_id})).collect();
+    let detail = json!({"run": run.id, "node": run.node, "version": run.version, "golden_cases": sets,
+                        "cases_removed": removed, "evals": evals, "eval_rows_cleared": cleared});
+    let a = audit(&tenant_id, &p, once("run_erase"), "node.run.erase", &run.id, detail);
+    let runs = match j.erase_run(&tenant_id, &run.id, &derived, Some(a)).await.map_err(journal_error)? {
+        RunErasure::Erased { runs } => runs,
+        RunErasure::NotFound => return Err(not_found("run")),
+        RunErasure::InProgress(id) => {
+            return Err(conflict(format!(
+                "run {id} (made with this run's content) has not finished: erase again later"
+            )));
+        }
+    };
+    drain_audit(&cp, &j).await?;
+    Ok(Json(json!({
+        "object": "node.run.erasure",
+        "run_id": run.id,
+        "node": run.node,
+        "version": run.version,
+        "golden_cases": sets,
+        "cases_removed": removed,
+        "evals_cleared": evals,
+        "runs_deleted": runs,
+    })))
 }
 
 // ───────────────────────────── the promotion bar ─────────────────────────────

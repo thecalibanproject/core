@@ -472,6 +472,8 @@ Decisions made on the data plane go into the control plane's hash-chained audit 
 | `node.write.approve`, `node.write.deny` | A tainted write is approved or denied |
 | `node.run.cancel` | A run is cancelled |
 | `node.eval.finish` | An eval ends (its worker), with its main metric. Golden sets (and runs captured into them, `node.golden_set.capture`), promotion bars, eval starts and cancellations are written by the control plane through the same outbox ([evals.md](evals.md#api)) |
+| `node.golden_set.scrub` | A captured golden case leaves its set: its run passed retention (a worker's purge, actor `caliban:retention`) or was erased |
+| `node.run.erase` | A run is erased (`DELETE /api/v1/tenants/{t}/runs/{id}`), with the cases, evals and runs that went with it |
 | `tool.approve`, `tool.revoke` | A tool manifest is approved or revoked (on the control plane itself, see [tools.md](tools.md)) |
 
 The actor is who decided (`api_key:<hash prefix>`, or the console user); the target is the run;
@@ -529,11 +531,14 @@ GRANT SELECT, INSERT, UPDATE ON node_spend TO caliban_worker;
 GRANT SELECT, UPDATE ON node_eval TO caliban_worker;                -- evals (0024): claims, results
 GRANT SELECT, INSERT, UPDATE ON node_eval_trial TO caliban_worker;
 GRANT SELECT, UPDATE ON rag_collection, rag_document TO caliban_worker;  -- retrieval (0029): indexing, purges
+GRANT SELECT, INSERT, UPDATE ON node_golden_set TO caliban_worker;          -- retention of captured golden cases (0039)
+GRANT SELECT, INSERT, DELETE ON node_golden_case_source TO caliban_worker;
 ALTER ROLE caliban_worker BYPASSRLS;  -- the journal tables have per-tenant row-level security; a worker serves every tenant
 ```
 
 (`DELETE` on `node_run` is for the retention purge, which removes a finished run's steps and
-events with it; `DELETE` on `node_audit` empties the audit outbox once the control plane has it; `node_spend` holds the tenants' spend per day, see [Budgets](#budgets). No
+events with it; the golden-set grants are for the same purge, which removes golden cases captured
+from runs past retention and rewrites their sets ([evals.md](evals.md#retention)); `DELETE` on `node_audit` empties the audit outbox once the control plane has it; `node_spend` holds the tenants' spend per day, see [Budgets](#budgets). No
 sequence grants are needed: `node_step.seq` is an identity column. Workers write nothing else
 but the indexing state of retrieval documents ([rag.md](rag.md)): usage goes to the control plane
 over HTTP, and tools reach them in the snapshot. The test `postgres_worker_grants_are_enough` runs
@@ -679,6 +684,10 @@ root node: the run pays for them). `GET /api/v1/usage` takes `node` and `run_id`
 per node version) next to `totals`. `charged_usd`
 is what the customer is charged (the billed `caliban/auto` price, discounted on cache hits; the
 model's cost otherwise): over a run's events it equals the run's `cost_usd`.
+
+**Erasure.** `DELETE /api/v1/tenants/{t}/runs/{id}` erases a finished run before its retention,
+with the golden cases captured from it and the eval content and runs made with its content
+([evals.md](evals.md#cases-from-runs)).
 
 **Retention of finished runs.** Every worker (and a standalone process) deletes runs that finished
 more than `CALIBAN_NODE_RUN_RETENTION_DAYS` ago (default 30; 0 keeps them), with their steps and

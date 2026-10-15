@@ -1092,6 +1092,15 @@ fn cases() -> Vec<Case> {
             true,
             "owner admin tenant_admin developer",
         ),
+        // Erasing a run: runs.data and nodes.write (it rewrites golden sets).
+        c(
+            "DELETE",
+            "/tenants/{tenant_id}/runs/{id}",
+            "/api/v1/tenants/{t}/runs/run_nope",
+            None,
+            true,
+            "owner admin tenant_admin developer",
+        ),
         c("GET", "/tenants/{tenant_id}/inbox", "/api/v1/tenants/{t}/inbox", None, true, RUN_READERS),
         c("GET", "/tenants/{tenant_id}/node-spend", "/api/v1/tenants/{t}/node-spend", None, true, EVERYONE),
         c("GET", "/models", "/api/v1/models", None, false, EVERYONE),
@@ -1746,6 +1755,24 @@ fn capturing_a_run_needs_runs_data_as_well_as_nodes_write() {
     }
     for role in [Role::Viewer, Role::Auditor, Role::Billing] {
         assert!(may_capture(|p| role.grants(p)).is_err(), "{role:?}");
+    }
+}
+
+/// Erasing a run (`DELETE .../runs/{id}`) rewrites the golden sets built from it: `runs.data` (the
+/// route) and `nodes.write` (the handler), each refused alone with a 403 naming the other.
+#[test]
+fn erasing_a_run_needs_runs_data_and_nodes_write() {
+    use super::rbac::{Perm, Role};
+    use crate::evals::may_erase;
+    let err = may_erase(|p| p == Perm::RunsData).unwrap_err();
+    assert_eq!((err.0, err.1.contains("missing nodes.write")), (StatusCode::FORBIDDEN, true), "{}", err.1);
+    let err = may_erase(|p| p == Perm::NodesWrite).unwrap_err();
+    assert_eq!((err.0, err.1.contains("missing runs.data")), (StatusCode::FORBIDDEN, true), "{}", err.1);
+    for role in [Role::Developer, Role::TenantAdmin, Role::Admin, Role::Owner] {
+        assert!(may_erase(|p| role.grants(p)).is_ok(), "{role:?}");
+    }
+    for role in [Role::Viewer, Role::Auditor, Role::Billing] {
+        assert!(may_erase(|p| role.grants(p)).is_err(), "{role:?}");
     }
 }
 

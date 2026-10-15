@@ -24,6 +24,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../../../migrations/0025_node_run_input_labels.sql"),
     include_str!("../../../../migrations/0032_node_step_metering.sql"),
     include_str!("../../../../migrations/0037_node_run_mast_label.sql"),
+    include_str!("../../../../migrations/0039_golden_case_source.sql"),
 ];
 
 /// Columns of `node_step` rows ([`step_row`]).
@@ -951,9 +952,56 @@ fn golden_row(r: &PgRow) -> JResult<GoldenSetRecord> {
 
 const GOLDEN_COLUMNS: &str = "tenant_id, node, version, cases, case_count, hash, updated_at, updated_by";
 
+const SOURCE_COLUMNS: &str = "tenant_id, node, version, case_id, run_id, run_finished_at";
+
+fn source_row(r: &PgRow) -> JResult<GoldenCaseSource> {
+    Ok(GoldenCaseSource {
+        tenant_id: get(r, "tenant_id")?,
+        node: get(r, "node")?,
+        version: u32_of(r, "version")?,
+        case_id: get(r, "case_id")?,
+        run_id: get(r, "run_id")?,
+        run_finished_at: get(r, "run_finished_at")?,
+    })
+}
+
+/// Replaces the provenance rows of one golden set, in the transaction of its write.
+async fn write_sources(tx: &mut sqlx::PgConnection, g: &GoldenSetRecord, sources: &[GoldenCaseSource]) -> JResult<()> {
+    sqlx::query("DELETE FROM node_golden_case_source WHERE tenant_id = $1 AND node = $2 AND version = $3")
+        .bind(&g.tenant_id)
+        .bind(&g.node)
+        .bind(i32_of(g.version))
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    if sources.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO node_golden_case_source (tenant_id, node, version, case_id, run_id, run_finished_at)
+         SELECT $1, $2, $3, c, r, f FROM UNNEST($4::TEXT[], $5::TEXT[], $6::TIMESTAMPTZ[]) AS s(c, r, f)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&g.tenant_id)
+    .bind(&g.node)
+    .bind(i32_of(g.version))
+    .bind(sources.iter().map(|x| x.case_id.clone()).collect::<Vec<_>>())
+    .bind(sources.iter().map(|x| x.run_id.clone()).collect::<Vec<_>>())
+    .bind(sources.iter().map(|x| x.run_finished_at).collect::<Vec<_>>())
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl EvalStore for PgJournal {
-    async fn put_golden_set(&self, g: GoldenSetRecord, audit: Option<AuditEvent>) -> JResult<()> {
+    async fn put_golden_set(
+        &self,
+        g: GoldenSetRecord,
+        sources: &[GoldenCaseSource],
+        audit: Option<AuditEvent>,
+    ) -> JResult<()> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query(
             "INSERT INTO node_golden_set (tenant_id, node, version, cases, case_count, hash, updated_by)
@@ -972,6 +1020,7 @@ impl EvalStore for PgJournal {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+        write_sources(&mut tx, &g, sources).await?;
         push_audit(&mut tx, audit.as_ref()).await?;
         tx.commit().await.map_err(db)
     }
@@ -980,6 +1029,7 @@ impl EvalStore for PgJournal {
         &self,
         g: GoldenSetRecord,
         expected: Option<&str>,
+        sources: &[GoldenCaseSource],
         audit: Option<AuditEvent>,
     ) -> JResult<bool> {
         let mut tx = self.pool.begin().await.map_err(db)?;
@@ -1019,6 +1069,7 @@ impl EvalStore for PgJournal {
         if written == 0 {
             return Ok(false);
         }
+        write_sources(&mut tx, &g, sources).await?;
         push_audit(&mut tx, audit.as_ref()).await?;
         tx.commit().await.map_err(db)?;
         Ok(true)
@@ -1064,10 +1115,129 @@ impl EvalStore for PgJournal {
             .map_err(db)?;
         let gone = r.rows_affected() == 1;
         if gone {
+            sqlx::query("DELETE FROM node_golden_case_source WHERE tenant_id = $1 AND node = $2 AND version = $3")
+                .bind(tenant)
+                .bind(node)
+                .bind(i32_of(version))
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        if gone {
             push_audit(&mut tx, audit.as_ref()).await?;
         }
         tx.commit().await.map_err(db)?;
         Ok(gone)
+    }
+
+    async fn golden_sources(&self, tenant: &str, node: &str, version: u32) -> JResult<Vec<GoldenCaseSource>> {
+        let q = format!(
+            "SELECT {SOURCE_COLUMNS} FROM node_golden_case_source
+             WHERE tenant_id = $1 AND node = $2 AND version = $3 ORDER BY case_id"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(q))
+            .bind(tenant)
+            .bind(node)
+            .bind(i32_of(version))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        rows.iter().map(source_row).collect()
+    }
+
+    async fn golden_sources_of_run(&self, tenant: &str, run_id: &str) -> JResult<Vec<GoldenCaseSource>> {
+        let q = format!(
+            "SELECT {SOURCE_COLUMNS} FROM node_golden_case_source
+             WHERE tenant_id = $1 AND run_id = $2 ORDER BY node, version, case_id"
+        );
+        let rows =
+            sqlx::query(sqlx::AssertSqlSafe(q)).bind(tenant).bind(run_id).fetch_all(&self.pool).await.map_err(db)?;
+        rows.iter().map(source_row).collect()
+    }
+
+    async fn expired_golden_sources(&self, older_than: Duration, batch: usize) -> JResult<Vec<GoldenCaseSource>> {
+        let q = format!(
+            "SELECT {SOURCE_COLUMNS} FROM node_golden_case_source
+             WHERE run_finished_at < now() - make_interval(secs => $1) ORDER BY run_finished_at LIMIT $2"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(q))
+            .bind(secs(older_than))
+            .bind(i64::try_from(batch).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        rows.iter().map(source_row).collect()
+    }
+
+    async fn clear_eval_content(&self, tenant: &str, eval_ids: &[String]) -> JResult<u64> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let trials = sqlx::query(
+            "UPDATE node_eval_trial SET detail = NULL
+             WHERE tenant_id = $1 AND eval_id = ANY($2) AND detail IS NOT NULL",
+        )
+        .bind(tenant)
+        .bind(eval_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        let evals = sqlx::query("UPDATE node_eval SET plan = '' WHERE tenant_id = $1 AND id = ANY($2) AND plan <> ''")
+            .bind(tenant)
+            .bind(eval_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(trials.rows_affected() + evals.rows_affected())
+    }
+
+    async fn erase_run(
+        &self,
+        tenant: &str,
+        run_id: &str,
+        derived: &[String],
+        audit: Option<AuditEvent>,
+    ) -> JResult<RunErasure> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM node_run WHERE tenant_id = $1 AND id = $2 FOR UPDATE")
+                .bind(tenant)
+                .bind(run_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?;
+        let Some(status) = status else { return Ok(RunErasure::NotFound) };
+        if !RunStatus::parse(&status).is_some_and(RunStatus::is_terminal) {
+            return Ok(RunErasure::InProgress(run_id.to_owned()));
+        }
+        // Derived runs by origin: exact origins, or prefixes ending in ':' (compared with
+        // left(), never LIKE, since ids may hold '_').
+        let (exact, prefixes): (Vec<String>, Vec<String>) = derived.iter().cloned().partition(|o| !o.ends_with(':'));
+        let others: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, status FROM node_run
+             WHERE tenant_id = $1 AND id <> $2 AND origin IS NOT NULL
+                   AND (origin = ANY($3) OR EXISTS (SELECT 1 FROM UNNEST($4::TEXT[]) p WHERE left(origin, length(p)) = p))
+             FOR UPDATE",
+        )
+        .bind(tenant)
+        .bind(run_id)
+        .bind(&exact)
+        .bind(&prefixes)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        if let Some((id, _)) = others.iter().find(|(_, s)| !RunStatus::parse(s).is_some_and(RunStatus::is_terminal)) {
+            return Ok(RunErasure::InProgress(id.clone()));
+        }
+        let ids: Vec<String> = std::iter::once(run_id.to_owned()).chain(others.into_iter().map(|(id, _)| id)).collect();
+        let r = sqlx::query("DELETE FROM node_run WHERE tenant_id = $1 AND id = ANY($2)")
+            .bind(tenant)
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        push_audit(&mut tx, audit.as_ref()).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(RunErasure::Erased { runs: r.rows_affected() })
     }
 
     async fn put_eval_policy(&self, p: EvalPolicyRecord, audit: Option<AuditEvent>) -> JResult<()> {

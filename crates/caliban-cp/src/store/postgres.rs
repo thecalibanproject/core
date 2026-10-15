@@ -73,6 +73,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (36, "usage_timings", include_str!("../../../../migrations/0036_usage_timings.sql")),
     (37, "node_run_mast_label", include_str!("../../../../migrations/0037_node_run_mast_label.sql")),
     (38, "usage_pii_override", include_str!("../../../../migrations/0038_usage_pii_override.sql")),
+    (39, "golden_case_source", include_str!("../../../../migrations/0039_golden_case_source.sql")),
 ];
 
 /// The schema version this build expects: its last embedded migration.
