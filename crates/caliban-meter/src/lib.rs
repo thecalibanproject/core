@@ -134,6 +134,11 @@ pub struct UsageEvent {
     /// numbers). Durations only: which classifier stage decided is content-class and stays out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timings: Option<UsageTimings>,
+    /// The request's `caliban.pii` (`off`, `reversible`), when it asked for weaker personal-data
+    /// protection than the tenant's policy and was ignored: a per-request mode only ever makes the
+    /// policy stricter. Policy-class, not content-class: it says what the caller asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii_override_ignored: Option<String>,
 }
 
 /// Per-stage durations of one request, in milliseconds (microsecond precision). A stage that did

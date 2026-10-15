@@ -19,10 +19,18 @@
 //! Tags record where it came from (`captured`, the verdict, the MAST label). The case id is the
 //! run id, so a run is captured at most once into a set. Everything here is tenant content: the
 //! case goes into the sealed golden set, never into an audit entry or a log (note 05).
+//!
+//! **Retention and erasure.** A case copies its run's content, so it may not outlive the run.
+//! Each captured case has a provenance row ([`GoldenCaseSource`], migration 0039) written with the
+//! set. [`purge_expired_cases`] (the workers' hourly retention purge) removes a case once its run
+//! finished longer ago than the run retention, and erasing a run removes its cases at once
+//! ([`scrub_cases`]): the set is rewritten without them (resealed, new hash, a compare-and-set
+//! like every write) and the change audited as `node.golden_set.scrub` (ids and counts only).
 
 use super::sandbox::OBSERVATION;
 use super::{Check, GoldenCase};
-use crate::journal::{Journal, RunRecord, RunStatus, WRITE_EVENT};
+use crate::journal::evals::{GoldenCaseSource, GoldenSetRecord, golden_context};
+use crate::journal::{AuditEvent, Journal, RunRecord, RunStatus, WRITE_EVENT};
 use crate::seal::Sealer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -258,6 +266,124 @@ pub fn case_from_run(run_id: &str, m: &RunMaterial, review: &Review<'_>, output_
         tool_results: BTreeMap::new(),
         tags,
     }
+}
+
+/// Why captured cases leave their golden sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubReason {
+    /// Their run finished longer ago than the run retention.
+    Retention,
+    /// Their run was erased.
+    Erasure,
+}
+
+impl ScrubReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retention => "retention",
+            Self::Erasure => "erasure",
+        }
+    }
+}
+
+/// How many times a scrub re-reads a set that changed under it before it leaves it for later.
+const SCRUB_ATTEMPTS: usize = 5;
+
+/// The audit actor of the retention purge.
+pub const RETENTION_ACTOR: &str = "caliban:retention";
+
+/// Removes the captured cases `sources` names from their golden sets: each set is opened,
+/// rewritten without them and resealed (a compare-and-set on its hash, retried), its provenance
+/// rows updated in the same write, and the change audited as `node.golden_set.scrub` by `actor`
+/// (node, version, case and run ids, counts, hashes, the reason; never content). A set that no
+/// longer holds a case only loses the case's provenance row. Returns how many cases left a set.
+pub async fn scrub_cases(
+    journal: &Arc<dyn Journal>,
+    sealer: &dyn Sealer,
+    sources: &[GoldenCaseSource],
+    reason: ScrubReason,
+    actor: &str,
+) -> Result<u64, String> {
+    let mut sets: BTreeMap<(String, String, u32), Vec<&GoldenCaseSource>> = BTreeMap::new();
+    for x in sources {
+        sets.entry((x.tenant_id.clone(), x.node.clone(), x.version)).or_default().push(x);
+    }
+    let mut removed = 0u64;
+    for ((tenant, node, version), group) in sets {
+        let ids: Vec<&str> = group.iter().map(|x| x.case_id.as_str()).collect();
+        let context = golden_context(&node, version);
+        for attempt in 1..=SCRUB_ATTEMPTS {
+            let Some(current) = journal.golden_set(&tenant, &node, version).await.map_err(|e| e.to_string())? else {
+                // The set is gone, and its provenance rows went with it.
+                break;
+            };
+            let text = sealer.open(&tenant, &context, &current.cases)?;
+            let mut cases: Vec<GoldenCase> = serde_json::from_str(&text).map_err(|e| format!("golden set: {e}"))?;
+            let before = cases.len();
+            cases.retain(|c| !ids.contains(&c.id.as_str()));
+            let gone = before - cases.len();
+            let remaining: Vec<GoldenCaseSource> = journal
+                .golden_sources(&tenant, &node, version)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|x| !ids.contains(&x.case_id.as_str()))
+                .collect();
+            let hash = super::golden_hash(&cases);
+            let rec = GoldenSetRecord {
+                tenant_id: tenant.clone(),
+                node: node.clone(),
+                version,
+                cases: sealer.seal(&tenant, &context, &serde_json::to_string(&cases).map_err(|e| e.to_string())?)?,
+                case_count: cases.len() as u32,
+                hash: hash.clone(),
+                updated_at: chrono::Utc::now(),
+                updated_by: actor.to_owned(),
+            };
+            let audit = (gone > 0).then(|| AuditEvent {
+                id: format!("golden_set/scrub/{}", uuid::Uuid::now_v7().simple()),
+                tenant_id: tenant.clone(),
+                actor: actor.to_owned(),
+                action: "node.golden_set.scrub".into(),
+                target: Some(format!("{node}@v{version}")),
+                detail: serde_json::json!({
+                    "node": node, "version": version, "reason": reason.as_str(),
+                    "cases": ids, "runs": group.iter().map(|x| x.run_id.as_str()).collect::<Vec<_>>(),
+                    "removed": gone, "case_count": cases.len(), "hash": hash, "previous_hash": current.hash,
+                }),
+                at: chrono::Utc::now(),
+            });
+            if journal
+                .replace_golden_set_if(rec, Some(&current.hash), &remaining, audit)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                removed += gone as u64;
+                break;
+            }
+            if attempt == SCRUB_ATTEMPTS {
+                return Err(format!("the golden set of {node}@v{version} kept changing; scrub it again"));
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Retention: removes from their golden sets at most `batch` captured cases whose run finished
+/// more than `older_than` ago (the run retention). Returns `(provenance rows handled, cases
+/// removed)`; fewer rows than `batch` means none is left.
+pub async fn purge_expired_cases(
+    journal: &Arc<dyn Journal>,
+    sealer: &dyn Sealer,
+    older_than: std::time::Duration,
+    batch: usize,
+) -> Result<(usize, u64), String> {
+    let expired = journal.expired_golden_sources(older_than, batch).await.map_err(|e| e.to_string())?;
+    if expired.is_empty() {
+        return Ok((0, 0));
+    }
+    let removed = scrub_cases(journal, sealer, &expired, ScrubReason::Retention, RETENTION_ACTOR).await?;
+    Ok((expired.len(), removed))
 }
 
 #[cfg(test)]

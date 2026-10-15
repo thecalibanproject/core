@@ -418,6 +418,7 @@ mod tests {
             route_fallback: None,
             purpose: None,
             timings: None,
+            pii_override_ignored: None,
         }
     }
 

@@ -364,7 +364,7 @@ pub fn app(cp: Cp, web_dir: Option<&str>) -> Router {
         )
         .route("/tenants/{tenant_id}/rag/collections/{collection}/documents/{doc_id}/release", post(rag::release))
         .route("/tenants/{tenant_id}/runs", get(runs::list))
-        .route("/tenants/{tenant_id}/runs/{id}", get(runs::get))
+        .route("/tenants/{tenant_id}/runs/{id}", get(runs::get).delete(evals::erase))
         .route("/tenants/{tenant_id}/runs/{id}/input", post(runs::answer))
         .route("/tenants/{tenant_id}/runs/{id}/cancel", post(runs::cancel))
         .route("/tenants/{tenant_id}/runs/{id}/golden-case", post(evals::capture))

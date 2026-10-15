@@ -21,6 +21,8 @@ struct Tables {
     audit: Vec<(AuditEvent, Option<Hold>)>,
     /// (tenant, node, version) to its golden set.
     golden: HashMap<(String, String, u32), GoldenSetRecord>,
+    /// Provenance of captured golden cases.
+    sources: Vec<GoldenCaseSource>,
     /// (tenant, node) to its promotion bar.
     policies: HashMap<(String, String), EvalPolicyRecord>,
     /// In creation order.
@@ -33,6 +35,22 @@ struct Tables {
 type Hold = (String, DateTime<Utc>);
 
 impl Tables {
+    /// Replaces the provenance rows of one golden set.
+    fn set_sources(&mut self, g: &GoldenSetRecord, sources: &[GoldenCaseSource]) {
+        self.sources.retain(|x| !(x.tenant_id == g.tenant_id && x.node == g.node && x.version == g.version));
+        let mut seen = std::collections::HashSet::new();
+        for x in sources {
+            if seen.insert(x.case_id.clone()) {
+                self.sources.push(GoldenCaseSource {
+                    tenant_id: g.tenant_id.clone(),
+                    node: g.node.clone(),
+                    version: g.version,
+                    ..x.clone()
+                });
+            }
+        }
+    }
+
     /// Appends an event to a run (numbered after its last one).
     fn push_event(&mut self, run_id: &str, kind: &str, data: serde_json::Value) {
         let Some(r) = self.runs.iter_mut().find(|r| r.id == run_id) else { return };
@@ -509,9 +527,15 @@ fn holds_eval(e: &EvalRecord, worker: &str) -> bool {
 
 #[async_trait::async_trait]
 impl EvalStore for MemoryJournal {
-    async fn put_golden_set(&self, g: GoldenSetRecord, audit: Option<AuditEvent>) -> JResult<()> {
+    async fn put_golden_set(
+        &self,
+        g: GoldenSetRecord,
+        sources: &[GoldenCaseSource],
+        audit: Option<AuditEvent>,
+    ) -> JResult<()> {
         let mut t = self.t.lock();
         let key = (g.tenant_id.clone(), g.node.clone(), g.version);
+        t.set_sources(&g, sources);
         t.golden.insert(key, GoldenSetRecord { updated_at: Utc::now(), ..g });
         t.push_audit(audit);
         Ok(())
@@ -521,6 +545,7 @@ impl EvalStore for MemoryJournal {
         &self,
         g: GoldenSetRecord,
         expected: Option<&str>,
+        sources: &[GoldenCaseSource],
         audit: Option<AuditEvent>,
     ) -> JResult<bool> {
         let mut t = self.t.lock();
@@ -528,6 +553,7 @@ impl EvalStore for MemoryJournal {
         if t.golden.get(&key).map(|x| x.hash.as_str()) != expected {
             return Ok(false);
         }
+        t.set_sources(&g, sources);
         t.golden.insert(key, GoldenSetRecord { updated_at: Utc::now(), ..g });
         t.push_audit(audit);
         Ok(true)
@@ -555,9 +581,94 @@ impl EvalStore for MemoryJournal {
         let mut t = self.t.lock();
         let gone = t.golden.remove(&(tenant.to_owned(), node.to_owned(), version)).is_some();
         if gone {
+            t.sources.retain(|x| !(x.tenant_id == tenant && x.node == node && x.version == version));
             t.push_audit(audit);
         }
         Ok(gone)
+    }
+
+    async fn golden_sources(&self, tenant: &str, node: &str, version: u32) -> JResult<Vec<GoldenCaseSource>> {
+        let t = self.t.lock();
+        let mut v: Vec<GoldenCaseSource> = t
+            .sources
+            .iter()
+            .filter(|x| x.tenant_id == tenant && x.node == node && x.version == version)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.case_id.cmp(&b.case_id));
+        Ok(v)
+    }
+
+    async fn golden_sources_of_run(&self, tenant: &str, run_id: &str) -> JResult<Vec<GoldenCaseSource>> {
+        let t = self.t.lock();
+        let mut v: Vec<GoldenCaseSource> =
+            t.sources.iter().filter(|x| x.tenant_id == tenant && x.run_id == run_id).cloned().collect();
+        v.sort_by(|a, b| (&a.node, a.version, &a.case_id).cmp(&(&b.node, b.version, &b.case_id)));
+        Ok(v)
+    }
+
+    async fn expired_golden_sources(&self, older_than: Duration, batch: usize) -> JResult<Vec<GoldenCaseSource>> {
+        let cutoff = Utc::now() - lease(older_than);
+        let t = self.t.lock();
+        let mut v: Vec<GoldenCaseSource> = t.sources.iter().filter(|x| x.run_finished_at < cutoff).cloned().collect();
+        v.sort_by_key(|x| x.run_finished_at);
+        v.truncate(batch);
+        Ok(v)
+    }
+
+    async fn clear_eval_content(&self, tenant: &str, eval_ids: &[String]) -> JResult<u64> {
+        let mut t = self.t.lock();
+        let mut n = 0u64;
+        for e in t.evals.iter_mut().filter(|e| e.tenant_id == tenant && eval_ids.contains(&e.id)) {
+            if !e.plan.is_empty() {
+                e.plan.clear();
+                n += 1;
+            }
+        }
+        for (id, trials) in t.trials.iter_mut() {
+            if !eval_ids.contains(id) {
+                continue;
+            }
+            for tr in trials.iter_mut().filter(|tr| tr.tenant_id == tenant && tr.detail.is_some()) {
+                tr.detail = None;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    async fn erase_run(
+        &self,
+        tenant: &str,
+        run_id: &str,
+        derived: &[String],
+        audit: Option<AuditEvent>,
+    ) -> JResult<RunErasure> {
+        let mut t = self.t.lock();
+        let Some(run) = t.runs.iter().find(|r| r.tenant_id == tenant && r.id == run_id) else {
+            return Ok(RunErasure::NotFound);
+        };
+        if !run.status.is_terminal() {
+            return Ok(RunErasure::InProgress(run.id.clone()));
+        }
+        let others: Vec<&RunRecord> = t
+            .runs
+            .iter()
+            .filter(|r| r.tenant_id == tenant && r.id != run_id)
+            .filter(|r| r.origin.as_deref().is_some_and(|o| origin_matches(o, derived)))
+            .collect();
+        if let Some(r) = others.iter().find(|r| !r.status.is_terminal()) {
+            return Ok(RunErasure::InProgress(r.id.clone()));
+        }
+        let gone: Vec<String> = std::iter::once(run_id.to_owned()).chain(others.iter().map(|r| r.id.clone())).collect();
+        t.runs.retain(|r| !gone.contains(&r.id));
+        for id in &gone {
+            t.steps.remove(id);
+            t.run_events.remove(id);
+        }
+        t.events.retain(|(run, _), _| !gone.contains(run));
+        t.push_audit(audit);
+        Ok(RunErasure::Erased { runs: gone.len() as u64 })
     }
 
     async fn put_eval_policy(&self, p: EvalPolicyRecord, audit: Option<AuditEvent>) -> JResult<()> {

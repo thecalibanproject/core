@@ -2232,6 +2232,37 @@ async fn postgres_usage_events_keep_stage_timings() {
     assert_eq!(rows, vec![("t_1".into(), Some(timings)), ("t_2".into(), None)]);
 }
 
+/// A request's ignored `caliban.pii` (weaker than its tenant's policy) is kept on its usage event
+/// (migration 0038), and read back with it.
+#[tokio::test]
+async fn postgres_usage_events_keep_an_ignored_pii_override() {
+    let Some(pg) = pg_backend().await else { return };
+    pg.migrate().await.unwrap();
+    let ev = |id: &str, ignored: Option<&str>| -> caliban_meter::UsageEvent {
+        let mut v = json!({
+            "request_id": id, "tenant_id": "acme", "model": "ext/gpt", "intent": "chat", "prompt_tokens": 1,
+            "completion_tokens": 1, "cached_prompt_tokens": 0, "tokens_saved": 0, "cache": "miss",
+            "pii_entities": 1, "cost_usd": 0.0, "latency_ms": 9, "ts": "2026-10-15T12:00:00Z"
+        });
+        if let Some(i) = ignored {
+            v["pii_override_ignored"] = json!(i);
+        }
+        serde_json::from_value(v).unwrap()
+    };
+    let (a, b) = (format!("pii_{}", uuid::Uuid::now_v7().simple()), format!("pii_{}", uuid::Uuid::now_v7().simple()));
+    assert_eq!(pg.insert_usage_events(&[ev(&a, Some("off")), ev(&b, None)]).await.unwrap(), 2);
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT request_id, pii_override_ignored FROM usage_event WHERE request_id = ANY($1) ORDER BY request_id",
+    )
+    .bind(vec![a.clone(), b.clone()])
+    .fetch_all(pg.pool())
+    .await
+    .unwrap();
+    let mut want = vec![(a, Some("off".to_owned())), (b, None)];
+    want.sort();
+    assert_eq!(rows, want);
+}
+
 #[tokio::test]
 async fn postgres_rejects_edited_migrations() {
     let Some(pg) = pg_backend().await else { return };
@@ -2266,7 +2297,9 @@ async fn postgres_worker_grants_are_enough() {
          GRANT SELECT, INSERT, UPDATE ON node_spend TO {role};
          GRANT SELECT, UPDATE ON node_eval TO {role};
          GRANT SELECT, INSERT, UPDATE ON node_eval_trial TO {role};
-         GRANT SELECT, UPDATE ON rag_collection, rag_document TO {role};"
+         GRANT SELECT, UPDATE ON rag_collection, rag_document TO {role};
+         GRANT SELECT, INSERT, UPDATE ON node_golden_set TO {role};
+         GRANT SELECT, INSERT, DELETE ON node_golden_case_source TO {role};"
     );
     sqlx::raw_sql(AssertSqlSafe(grants)).execute(pg.pool()).await.unwrap();
     // A document collection and documents the control plane created (the worker role cannot).
@@ -2327,6 +2360,26 @@ async fn postgres_worker_grants_are_enough() {
             case_count: 1,
         };
         admin.create_eval(e, None).await.unwrap();
+        // A golden set with a case captured from a run long past retention.
+        let g = caliban_nodes::journal::evals::GoldenSetRecord {
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: 1,
+            cases: "sealed".into(),
+            case_count: 1,
+            hash: "sha256:g1".into(),
+            updated_at: Utc::now(),
+            updated_by: "user:jo".into(),
+        };
+        let src = caliban_nodes::journal::evals::GoldenCaseSource {
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: 1,
+            case_id: "run_old".into(),
+            run_id: "run_old".into(),
+            run_finished_at: Utc::now() - chrono::Duration::days(400),
+        };
+        admin.put_golden_set(g, &[src], None).await.unwrap();
     }
     let opts: PgConnectOptions = url
         .parse::<PgConnectOptions>()
@@ -2438,6 +2491,24 @@ async fn postgres_worker_grants_are_enough() {
             j.trials(&e.id).await.map_err(|e| e.to_string())?;
             let f = EvalFinish { status: EvalStatus::Succeeded, summary: None, error: None };
             j.finish_eval(&e.id, "w", f, None).await.map_err(|e| e.to_string())?;
+        }
+        // What the retention purge does to captured golden cases (scrub_cases, minus the sealing).
+        {
+            use caliban_nodes::journal::evals::EvalStore;
+            let expired = j.expired_golden_sources(Duration::from_secs(86_400), 10).await.map_err(|e| e.to_string())?;
+            let x = expired.first().ok_or("no expired golden case")?;
+            j.golden_sources(&x.tenant_id, &x.node, x.version).await.map_err(|e| e.to_string())?;
+            let g = j.golden_set(&x.tenant_id, &x.node, x.version).await.map_err(|e| e.to_string())?.ok_or("no set")?;
+            let previous = g.hash.clone();
+            let rewritten = caliban_nodes::journal::evals::GoldenSetRecord {
+                case_count: 0,
+                hash: "sha256:g2".into(),
+                updated_by: "caliban:retention".into(),
+                ..g
+            };
+            if !j.replace_golden_set_if(rewritten, Some(&previous), &[], None).await.map_err(|e| e.to_string())? {
+                return Err("rewriting a golden set".to_owned());
+            }
         }
         // What the indexing loop and retrieval do.
         {

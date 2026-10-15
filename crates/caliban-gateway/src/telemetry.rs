@@ -145,6 +145,7 @@ pub(crate) fn request_span(op: &'static str, dialect: Dialect, request_id: &Requ
         caliban.tenant = Empty,
         caliban.cache = Empty,
         caliban.pii.entities = Empty,
+        caliban.pii.override_ignored = Empty,
         caliban.route.stage = Empty,
         caliban.route.fallback = Empty,
         caliban.fallbacks = Empty,

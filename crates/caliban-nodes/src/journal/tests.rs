@@ -687,10 +687,10 @@ async fn golden_sets_and_promotion_bars_are_stored_per_version_with_their_audit(
             updated_at: Utc::now(),
             updated_by: "user:jo".into(),
         };
-        j.put_golden_set(g(2, "sealed-a", 2), Some(audit_event("g1", "node.golden_set.update"))).await.unwrap();
-        j.put_golden_set(g(1, "sealed-b", 1), None).await.unwrap();
+        j.put_golden_set(g(2, "sealed-a", 2), &[], Some(audit_event("g1", "node.golden_set.update"))).await.unwrap();
+        j.put_golden_set(g(1, "sealed-b", 1), &[], None).await.unwrap();
         // Replaced in place.
-        j.put_golden_set(g(2, "sealed-c", 3), Some(audit_event("g2", "node.golden_set.update"))).await.unwrap();
+        j.put_golden_set(g(2, "sealed-c", 3), &[], Some(audit_event("g2", "node.golden_set.update"))).await.unwrap();
         let got = j.golden_set("acme", "triage", 2).await.unwrap().expect(n);
         assert_eq!((got.cases.as_str(), got.case_count, got.updated_by.as_str()), ("sealed-c", 3, "user:jo"), "{n}");
         assert!(j.golden_set("globex", "triage", 2).await.unwrap().is_none(), "{n}: tenant-scoped");
@@ -894,12 +894,14 @@ async fn a_golden_set_is_replaced_only_if_it_is_the_one_read() {
         };
         // None expected: only while there is no set.
         assert!(
-            j.replace_golden_set_if(g("a"), None, Some(audit_event("c1", "node.golden_set.capture"))).await.unwrap()
+            j.replace_golden_set_if(g("a"), None, &[], Some(audit_event("c1", "node.golden_set.capture")))
+                .await
+                .unwrap()
         );
-        assert!(!j.replace_golden_set_if(g("b"), None, Some(audit_event("c2", "x"))).await.unwrap(), "{n}");
+        assert!(!j.replace_golden_set_if(g("b"), None, &[], Some(audit_event("c2", "x"))).await.unwrap(), "{n}");
         // The hash read: written once; a second writer that read the same set loses.
-        assert!(j.replace_golden_set_if(g("b"), Some("sha256:a"), Some(audit_event("c3", "x"))).await.unwrap());
-        assert!(!j.replace_golden_set_if(g("c"), Some("sha256:a"), Some(audit_event("c4", "x"))).await.unwrap());
+        assert!(j.replace_golden_set_if(g("b"), Some("sha256:a"), &[], Some(audit_event("c3", "x"))).await.unwrap());
+        assert!(!j.replace_golden_set_if(g("c"), Some("sha256:a"), &[], Some(audit_event("c4", "x"))).await.unwrap());
         let got = j.golden_set("acme", "triage", 1).await.unwrap().expect(n);
         assert_eq!(got.cases, "b", "{n}");
         // Only the writes that went through recorded their audit event.
@@ -922,5 +924,134 @@ async fn a_run_keeps_the_mast_label_a_human_gave_it() {
         assert_eq!(r.mast_label.as_deref(), Some("step_repetition"), "{n}");
         assert!(j.set_mast_label("acme", "run_m", None).await.unwrap());
         assert_eq!(j.get_run("acme", "run_m").await.unwrap().unwrap().mast_label, None, "{n}");
+    }
+}
+
+/// Finishes a created run (claimed by `w`, then succeeded).
+async fn finish_run(j: &Arc<dyn Journal>, id: &str) {
+    j.claim(id, "w", TTL).await.unwrap().expect("claimable");
+    let f = Finish {
+        status: RunStatus::Succeeded,
+        output: None,
+        error: None,
+        stop_reason: None,
+        budget: BudgetState::new(10, 1000, 60),
+    };
+    assert!(j.finish(id, "w", f).await.unwrap());
+}
+
+/// Provenance of captured golden cases (migration 0039): rows are replaced with every write of
+/// their set and go with the set; they are found by run and, for retention, by the run's finish
+/// time.
+#[tokio::test]
+async fn captured_case_provenance_follows_its_golden_set() {
+    for j in journals().await {
+        let n = j.name();
+        let g = |v: u32, hash: &str| GoldenSetRecord {
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: v,
+            cases: "sealed".into(),
+            case_count: 1,
+            hash: hash.into(),
+            updated_at: Utc::now(),
+            updated_by: "user:jo".into(),
+        };
+        let src = |v: u32, run: &str, days_ago: i64| GoldenCaseSource {
+            tenant_id: "acme".into(),
+            node: "triage".into(),
+            version: v,
+            case_id: run.into(),
+            run_id: run.into(),
+            run_finished_at: Utc::now() - chrono::Duration::days(days_ago),
+        };
+        j.put_golden_set(g(1, "h1"), &[src(1, "run_old", 40), src(1, "run_new", 1)], None).await.unwrap();
+        assert!(j.replace_golden_set_if(g(2, "h2"), None, &[src(2, "run_old", 40)], None).await.unwrap());
+        let ids = |v: Vec<GoldenCaseSource>| v.into_iter().map(|x| (x.version, x.case_id)).collect::<Vec<_>>();
+        assert_eq!(
+            ids(j.golden_sources("acme", "triage", 1).await.unwrap()),
+            [(1, "run_new".to_owned()), (1, "run_old".to_owned())],
+            "{n}"
+        );
+        assert_eq!(
+            ids(j.golden_sources_of_run("acme", "run_old").await.unwrap()),
+            [(1, "run_old".to_owned()), (2, "run_old".to_owned())],
+            "{n}"
+        );
+        assert!(j.golden_sources_of_run("globex", "run_old").await.unwrap().is_empty(), "{n}: per tenant");
+        // Retention: by the run's finish time.
+        let month = Duration::from_secs(30 * 86_400);
+        assert_eq!(ids(j.expired_golden_sources(month, 10).await.unwrap()).len(), 2, "{n}");
+        assert_eq!(j.expired_golden_sources(month, 1).await.unwrap().len(), 1, "{n}: batched");
+        // A write replaces the set's rows; a failed compare-and-set changes nothing.
+        assert!(!j.replace_golden_set_if(g(1, "h9"), Some("nope"), &[], None).await.unwrap());
+        assert_eq!(j.golden_sources("acme", "triage", 1).await.unwrap().len(), 2, "{n}");
+        assert!(j.replace_golden_set_if(g(1, "h1b"), Some("h1"), &[src(1, "run_new", 1)], None).await.unwrap());
+        assert_eq!(ids(j.golden_sources("acme", "triage", 1).await.unwrap()), [(1, "run_new".to_owned())], "{n}");
+        // Deleting the set deletes its rows.
+        assert!(j.delete_golden_set("acme", "triage", 2, None).await.unwrap());
+        assert!(j.golden_sources_of_run("acme", "run_old").await.unwrap().is_empty(), "{n}");
+    }
+}
+
+/// Erasing a run deletes it with the finished runs made with its content (by exact origin, or by
+/// an origin prefix ending in ':', where '_' is no wildcard), refuses while one of them runs, and
+/// clears the sealed content of the evals named.
+#[tokio::test]
+async fn erasing_a_run_deletes_it_and_the_runs_made_with_its_content() {
+    for j in journals().await {
+        let n = j.name();
+        let with_origin = |id: &str, origin: &str| NewRun { origin: Some(origin.into()), ..new_run(id, "acme", None) };
+        j.create_run(new_run("run_src", "acme", None)).await.unwrap();
+        j.create_run(with_origin("run_trial", "eval:ev_1:run_src")).await.unwrap();
+        j.create_run(with_origin("run_other_case", "eval:ev_1:run_xyz")).await.unwrap();
+        j.create_run(with_origin("run_inj", "injection:ev_2:tainted_write")).await.unwrap();
+        // '_' in a prefix is literal: this origin must not match "injection:ev_2:".
+        j.create_run(with_origin("run_lookalike", "injection:evX2:tainted_write")).await.unwrap();
+        let derived = vec!["eval:ev_1:run_src".to_owned(), "injection:ev_2:".to_owned()];
+        assert_eq!(j.erase_run("acme", "run_nope", &derived, None).await.unwrap(), RunErasure::NotFound, "{n}");
+        assert_eq!(
+            j.erase_run("acme", "run_src", &derived, None).await.unwrap(),
+            RunErasure::InProgress("run_src".into()),
+            "{n}"
+        );
+        for id in ["run_src", "run_other_case", "run_lookalike"] {
+            finish_run(&j, id).await;
+        }
+        // A derived run still going: nothing is deleted.
+        assert!(matches!(j.erase_run("acme", "run_src", &derived, None).await.unwrap(), RunErasure::InProgress(_)));
+        assert!(j.get_run("acme", "run_src").await.unwrap().is_some(), "{n}");
+        finish_run(&j, "run_trial").await;
+        finish_run(&j, "run_inj").await;
+        assert_eq!(j.erase_run("globex", "run_src", &derived, None).await.unwrap(), RunErasure::NotFound, "{n}");
+        let a = Some(audit_event("erase_1", "node.run.erase"));
+        assert_eq!(j.erase_run("acme", "run_src", &derived, a).await.unwrap(), RunErasure::Erased { runs: 3 }, "{n}");
+        for (id, kept) in [
+            ("run_src", false),
+            ("run_trial", false),
+            ("run_inj", false),
+            ("run_other_case", true),
+            ("run_lookalike", true),
+        ] {
+            assert_eq!(j.get_run("acme", id).await.unwrap().is_some(), kept, "{n}: {id}");
+        }
+        let ids: Vec<String> = j.claim_audit("cp", TTL, 10).await.unwrap().into_iter().map(|a| a.id).collect();
+        assert!(ids.contains(&"erase_1".to_owned()), "{n}: {ids:?}");
+
+        // The evals' sealed content: their plan and every trial's detail, whatever their age.
+        j.create_eval(new_eval("ev_1", "acme", Suite::Golden), None).await.unwrap();
+        j.create_eval(new_eval("ev_keep", "acme", Suite::Golden), None).await.unwrap();
+        let claimed = j.claim_eval("w1", TTL).await.unwrap().expect(n);
+        assert!(matches!(
+            j.put_trial("w1", trial(&claimed.id, "run_src", 0, TrialStatus::Passed)).await.unwrap(),
+            TrialWrite::Written
+        ));
+        assert_eq!(j.clear_eval_content("globex", &["ev_1".into()]).await.unwrap(), 0, "{n}: per tenant");
+        let cleared = j.clear_eval_content("acme", std::slice::from_ref(&claimed.id)).await.unwrap();
+        assert_eq!(cleared, 2, "{n}: the plan and one trial");
+        assert!(j.get_eval("acme", &claimed.id).await.unwrap().unwrap().plan.is_empty());
+        assert!(j.trials(&claimed.id).await.unwrap()[0].detail.is_none());
+        let other = if claimed.id == "ev_1" { "ev_keep" } else { "ev_1" };
+        assert_eq!(j.get_eval("acme", other).await.unwrap().unwrap().plan, "sealed-plan", "{n}");
     }
 }

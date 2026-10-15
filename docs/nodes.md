@@ -24,7 +24,7 @@ checked by `NodeSpec::validate` (`crates/caliban-nodes`). The parts the core enf
 | `prompt.input_schema`, `prompt.output_schema` | Checked against the run input and the run output; the input schema is also the MCP tool's input schema and decides how chat messages become the input ([Chat shortcut](#the-chat-shortcut-model-nodename)) |
 | `model_policy.model` | The model the calls ask for; default: the first `candidates` entry that is a model id (not `tier:...`), else `caliban/auto` |
 | `model_policy.reasoning` | `off`, `low`, `medium` or `high`: the default reasoning effort of the node's model calls (a vertex's `config.reasoning` overrides it) |
-| `tools` | `{"ref", "effect": "read"\|"write", "allow_tainted"?: [label patterns]}`. `ref`: `mcp://server/tool#sha256:<hash>` (an approved, pinned manifest of a registered server; see [tools.md](tools.md)), `node://name@vN` (another node of the tenant, pinned to a version), `builtin://datasource_query` or `builtin://rag_search` (both read only) |
+| `tools` | `{"ref", "effect": "read"\|"write", "allow_tainted"?: [label patterns], "eval_live"?: bool}`. `eval_live: true` lets golden eval trials call an `mcp://` read tool for real; by default trials answer every MCP tool from the eval sandbox ([evals.md](evals.md#golden-trials-and-tools)). `ref`: `mcp://server/tool#sha256:<hash>` (an approved, pinned manifest of a registered server; see [tools.md](tools.md)), `node://name@vN` (another node of the tenant, pinned to a version), `builtin://datasource_query` or `builtin://rag_search` (both read only) |
 | `datasources.scopes` | `<datasource>.<object>:<read\|write>`; `rag.<collection or *>:read` names document collections for `builtin://rag_search` ([rag.md](rag.md)) |
 | `budgets` | `steps`, `tokens`, `wall_clock_s`, optional `usd`; `depth` (subnode nesting, default 3) and `fanout` (map concurrency, default 8). See [Budgets](#budgets) |
 | `guards` | `max_repeats` (loop guard, default 3), `tool_retries` (default 2). See [Guards](#guards) |
@@ -306,6 +306,13 @@ answers `x-caliban-pii-entities` (entities protected across the run's model call
 `caliban` object (`run_id`, `status`, `node`, `version`, `cost_usd`, `awaiting`, `stop_reason`)
 that the SDKs keep as an extra field (`completion.model_extra["caliban"]` in the OpenAI Python SDK).
 
+**Personal data.** A run's PII policy is the tenant's mode raised to the version's `guardrails.pii`,
+fixed by the published version. A request's `caliban.pii` does not change it (on the model APIs it
+can only make the policy stricter; a node run takes no per-request mode at all): it is ignored and
+reported, `x-caliban-pii-override: ignored;requested=<mode>;applied=node`, and logged on the
+`caliban::audit` target with the run id. The run API (`POST /v1/nodes/{name}/runs`) has no such
+field (`400`).
+
 **Timings.** Node answers carry `Server-Timing` (README, "Stage timings"): `auth`, and for
 `caliban/auto` the routing stages (`route` with the deciding stage, `embed`), then
 `node;dur=<run time>;desc="<run id>"` and `total`. A streamed answer's headers leave before the run
@@ -465,6 +472,8 @@ Decisions made on the data plane go into the control plane's hash-chained audit 
 | `node.write.approve`, `node.write.deny` | A tainted write is approved or denied |
 | `node.run.cancel` | A run is cancelled |
 | `node.eval.finish` | An eval ends (its worker), with its main metric. Golden sets (and runs captured into them, `node.golden_set.capture`), promotion bars, eval starts and cancellations are written by the control plane through the same outbox ([evals.md](evals.md#api)) |
+| `node.golden_set.scrub` | A captured golden case leaves its set: its run passed retention (a worker's purge, actor `caliban:retention`) or was erased |
+| `node.run.erase` | A run is erased (`DELETE /api/v1/tenants/{t}/runs/{id}`), with the cases, evals and runs that went with it |
 | `tool.approve`, `tool.revoke` | A tool manifest is approved or revoked (on the control plane itself, see [tools.md](tools.md)) |
 
 The actor is who decided (`api_key:<hash prefix>`, or the console user); the target is the run;
@@ -522,11 +531,14 @@ GRANT SELECT, INSERT, UPDATE ON node_spend TO caliban_worker;
 GRANT SELECT, UPDATE ON node_eval TO caliban_worker;                -- evals (0024): claims, results
 GRANT SELECT, INSERT, UPDATE ON node_eval_trial TO caliban_worker;
 GRANT SELECT, UPDATE ON rag_collection, rag_document TO caliban_worker;  -- retrieval (0029): indexing, purges
+GRANT SELECT, INSERT, UPDATE ON node_golden_set TO caliban_worker;          -- retention of captured golden cases (0039)
+GRANT SELECT, INSERT, DELETE ON node_golden_case_source TO caliban_worker;
 ALTER ROLE caliban_worker BYPASSRLS;  -- the journal tables have per-tenant row-level security; a worker serves every tenant
 ```
 
 (`DELETE` on `node_run` is for the retention purge, which removes a finished run's steps and
-events with it; `DELETE` on `node_audit` empties the audit outbox once the control plane has it; `node_spend` holds the tenants' spend per day, see [Budgets](#budgets). No
+events with it; the golden-set grants are for the same purge, which removes golden cases captured
+from runs past retention and rewrites their sets ([evals.md](evals.md#retention)); `DELETE` on `node_audit` empties the audit outbox once the control plane has it; `node_spend` holds the tenants' spend per day, see [Budgets](#budgets). No
 sequence grants are needed: `node_step.seq` is an identity column. Workers write nothing else
 but the indexing state of retrieval documents ([rag.md](rag.md)): usage goes to the control plane
 over HTTP, and tools reach them in the snapshot. The test `postgres_worker_grants_are_enough` runs
@@ -672,6 +684,10 @@ root node: the run pays for them). `GET /api/v1/usage` takes `node` and `run_id`
 per node version) next to `totals`. `charged_usd`
 is what the customer is charged (the billed `caliban/auto` price, discounted on cache hits; the
 model's cost otherwise): over a run's events it equals the run's `cost_usd`.
+
+**Erasure.** `DELETE /api/v1/tenants/{t}/runs/{id}` erases a finished run before its retention,
+with the golden cases captured from it and the eval content and runs made with its content
+([evals.md](evals.md#cases-from-runs)).
 
 **Retention of finished runs.** Every worker (and a standalone process) deletes runs that finished
 more than `CALIBAN_NODE_RUN_RETENTION_DAYS` ago (default 30; 0 keeps them), with their steps and

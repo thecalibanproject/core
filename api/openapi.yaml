@@ -78,6 +78,7 @@ paths:
             x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] }, description: '`hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request.' }
             x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
+            x-caliban-pii-override: { schema: { type: string }, description: 'Present when the request''s `caliban.pii` was ignored: `ignored;requested=<mode>;applied=<mode>` when it was weaker than the tenant''s policy (its mode raised to any `pii_floor`; a per-request mode only makes the policy stricter), `ignored;requested=<mode>;applied=node` on a node answer (a node run''s policy is the tenant''s mode and the version''s `guardrails.pii`). Also recorded on the usage event (`pii_override_ignored`).' }
             x-caliban-cost-usd: { schema: { type: string }, description: 'Cost of this request in USD (non-streaming only; absent when the model has no price).' }
             x-caliban-billed-usd: { schema: { type: string }, description: 'What the request is billed in USD (non-streaming only): the flat `caliban/auto` price (discounted on a cache hit) or the model''s cost; for a node answer, the run''s `cost_usd`.' }
             x-caliban-route: { schema: { type: string }, description: 'The path taken: `node/<name>@v<N>` (a node answered), or `model:<id>` (a `caliban/auto` answer by a model, for a tenant that maps intents to nodes).' }
@@ -132,6 +133,7 @@ paths:
             x-caliban-cache: { schema: { type: string, enum: [hit, miss, bypass] }, description: '`hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request.' }
             x-caliban-cache-tier: { schema: { type: string, enum: [exact, semantic] }, description: 'Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters.' }
             x-caliban-pii-entities: { schema: { type: integer } }
+            x-caliban-pii-override: { schema: { type: string }, description: 'Present when the request''s `caliban.pii` was ignored: `ignored;requested=<mode>;applied=<mode>` when it was weaker than the tenant''s policy (its mode raised to any `pii_floor`; a per-request mode only makes the policy stricter), `ignored;requested=<mode>;applied=node` on a node answer (a node run''s policy is the tenant''s mode and the version''s `guardrails.pii`). Also recorded on the usage event (`pii_override_ignored`).' }
             x-caliban-cost-usd: { schema: { type: string }, description: 'Cost of this request in USD (non-streaming only; absent when the model has no price).' }
             x-caliban-billed-usd: { schema: { type: string }, description: 'What the request is billed in USD (non-streaming only): the flat `caliban/auto` price (discounted on a cache hit) or the model''s cost; for a node answer, the run''s `cost_usd`.' }
             x-caliban-route: { schema: { type: string }, description: 'The path taken: `node/<name>@v<N>` (a node answered), or `model:<id>` (a `caliban/auto` answer by a model, for a tenant that maps intents to nodes).' }
@@ -808,6 +810,47 @@ paths:
         '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [nodes]
+      summary: Erase a finished run and everything derived from it
+      description: |
+        For a data subject's erasure request, or any reason to purge a run's data before its
+        retention. In order: the golden cases captured from the run leave every golden set that
+        holds them (a copy carried to another version by a `PUT` included; each set is rewritten,
+        resealed and audited as `node.golden_set.scrub` with `reason: erasure`); the evals of the
+        node whose sealed plan carries the run's content (a golden plan holding its case, an
+        injection plan whose input is the run's input) lose that content (plan and trial details;
+        summaries and verdicts stay, the eval shows `content_purged: true`); then the run, its
+        steps and events, and the eval runs made with its content are deleted, audited as
+        `node.run.erase` (ids and counts, never content). Caliban keeps no index of data
+        subjects: erase each run that holds the subject's data. Needs `runs.data` and
+        `nodes.write` (it rewrites golden sets). See core/docs/evals.md ("Retention").
+      responses:
+        '200':
+          description: Erased
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, run_id, node, version, golden_cases, cases_removed, evals_cleared, runs_deleted]
+                properties:
+                  object: { type: string, enum: [node.run.erasure] }
+                  run_id: { type: string }
+                  node: { type: string }
+                  version: { type: integer }
+                  golden_cases:
+                    type: array
+                    description: 'The captured cases that named the run'
+                    items:
+                      type: object
+                      properties: { node: { type: string }, version: { type: integer }, case_id: { type: string } }
+                  cases_removed: { type: integer, description: 'Cases that left a golden set' }
+                  evals_cleared: { type: array, items: { type: string }, description: 'Evals whose sealed content was cleared' }
+                  runs_deleted: { type: integer, description: 'The run and the eval runs made with its content' }
+        '403': { description: 'Missing `runs.data` or `nodes.write` on the tenant', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: 'No such run in this tenant', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: 'The run, an eval using its content, or a run made with its content has not finished (cancel it or wait, then erase again; erasing again is safe)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { $ref: '#/components/responses/Error' }
 
   /api/v1/tenants/{tenantId}/runs/{runId}/input:
     parameters:
@@ -888,7 +931,9 @@ paths:
         write tool it called; for `bad`, an `llm_judge` check whose rubric is the `note`. The case
         id is the run id. The set gets a new hash like an edit (a compare-and-set on the hash read,
         so concurrent edits are not lost). A `mast_label` is stored on the run. Needs `nodes.write`
-        (what editing a golden set needs); the `case` is returned with `runs.data`. Audited as
+        (what editing a golden set needs) and `runs.data` (the case copies the run's content: its
+        input, answers and output); a caller without either gets a `403` naming the missing
+        permission, before the run is looked up. The `case` is returned. Audited as
         `node.golden_set.capture` (ids, verdict, label, counts and hashes; never the note or
         content). See docs/evals.md ("Cases from runs").
       requestBody:
@@ -902,7 +947,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CapturedGoldenCase' }
-        '403': { $ref: '#/components/responses/Error' }
+        '403': { description: 'Missing `nodes.write` or `runs.data` on the tenant', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '404': { description: 'No such run in this tenant (another tenant''s run included), or no such version', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '409': { description: 'The run has not finished, it is already in that golden set, or the set kept changing', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '422': { description: '`good` on a run that did not succeed, `bad` without a note, a label on `good`, an unknown label, an injection-suite run, or a case that does not fit the set (problems of kind `golden_set`)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
@@ -1251,7 +1296,9 @@ paths:
         At most 200 cases, unique ids, at least one check each; inputs are checked against the
         version's `prompt.input_schema` (422 listing every problem, kind `golden_set`). Sealed under
         the tenant's data key. Needs `nodes.write`; audited as `node.golden_set.update` (counts and
-        hashes, never cases).
+        hashes, never cases). A case that keeps the id of a case captured from a run, or a case
+        tagged `captured` whose id is a finished run of the node, keeps following that run's
+        retention and erasure (see `DELETE .../runs/{runId}`).
       requestBody:
         required: true
         content:
@@ -1316,9 +1363,11 @@ paths:
         and managed by the control plane, see `GET .../eval-key`), or as the API key `api_key_id`
         when one is named (it must be active and allowed to run the node). The key's quotas apply and
         its usage is metered. Trial runs (origin `eval:<eval>:<case>`) never reach a real write
-        tool: every call to a tool with effect `write` goes to the eval sandbox, which answers the
-        case's `tool_results` or a synthetic result marked `"sandbox": true`; reads call the real
-        tools unless scripted.
+        tool, and by default no MCP tool at all: every call to an `mcp://` tool goes to the eval
+        sandbox, which answers the case's `tool_results` or a synthetic result marked
+        `"sandbox": true`. A read tool the version's spec declares with `eval_live: true` calls the
+        real tool (unless the case scripts it); built-in tools (`builtin://datasource_query`,
+        `builtin://rag_search`) call the real tool unless scripted.
         `injection`: the built-in injection suite against sandboxed tools (`k` default 1); the run
         input is `input`, else the input of `input_case` (or the golden set's first case), whose
         checks then measure utility under attack. Needs `nodes.run`; audited as `node.eval.start`.
@@ -2756,7 +2805,7 @@ paths:
         (`node.run.answer`, `node.write.approve`, `node.write.deny`, `node.run.cancel`,
         `node.eval.finish`) at least once; each event id is recorded once in the hash-chained audit
         log, so a retry appends nothing. Every other action, including the control plane's own
-        (`rag.*`, `node.golden_set.*`, `node.eval_policy.update`, `node.eval.start`,
+        (`rag.*`, `node.golden_set.*` (`scrub` included), `node.run.erase`, `node.eval_policy.update`, `node.eval.start`,
         `node.eval.cancel`), is counted as `rejected` and not recorded.
       requestBody:
         required: true
@@ -3003,7 +3052,7 @@ components:
       type: object
       description: Caliban-specific request options. Unknown to OpenAI clients; safe to omit.
       properties:
-        pii: { type: string, enum: [off, mask, reversible], default: reversible }
+        pii: { type: string, enum: [off, mask, reversible], description: 'This request''s mode. It can only make the policy stricter (ordered off < reversible < mask): the request gets the stricter of this and the tenant''s mode (raised to `pii_floor`). A weaker value (`off` on a tenant that masks) is ignored, not refused, and reported in `x-caliban-pii-override` and on the usage event (`pii_override_ignored`). Not applied to node runs (`model: node/<name>`, `caliban/auto` handing to a node): their policy is the tenant''s mode and the version''s `guardrails.pii`. Default: the tenant''s mode.' }
         pii_floor: { type: string, enum: [off, mask, reversible], description: 'A minimum protection applied to every model class, sovereign and attested models included (a node''s `guardrails.pii` sets it on its calls). Only strengthens: the request gets the stricter of this and `pii` (or the tenant''s mode), ordered off < reversible < mask.' }
         cache: { type: string, enum: [off, exact, semantic], default: exact, description: '`off`: no cache. `exact`: exact cache only. `semantic`: exact, then the semantic cache when the tenant has it on, whatever the temperature (without it, the semantic cache applies only up to `[cache.semantic] max_temperature`). Unset: exact, plus semantic within the temperature limit when the tenant has it on.' }
         datasources: { type: array, items: { type: string } }
@@ -3507,7 +3556,7 @@ components:
         tool_results:
           type: object
           additionalProperties: true
-          description: 'Scripted tool results, by tool name (the manifest''s, e.g. `refund`) or reference. A trial never calls a write tool (effect `write`): the eval sandbox answers this script, else a synthetic result marked `"sandbox": true` (valid against the tool''s output schema when it declares one). A read tool named here answers the script too; other reads call the real tool.'
+          description: 'Scripted tool results, by tool name (the manifest''s, e.g. `refund`) or reference. A trial never calls a write tool (effect `write`), nor an `mcp://` read tool the version does not declare with `eval_live: true`: the eval sandbox answers this script, else a synthetic result marked `"sandbox": true` (valid against the tool''s output schema when it declares one). An opted-in read or a built-in tool named here answers the script too; other opted-in reads and built-in tools call the real tool.'
         tags: { type: array, items: { type: string }, description: 'Free labels. A case captured from a run has `captured`, its verdict and `mast:<id>`.' }
     EvalCheck:
       description: 'A check of the run output. Text checks see the output as text (a string as is, other JSON compact).'
@@ -3745,6 +3794,10 @@ components:
               attacked: { type: [boolean, 'null'] }
               defenses: { type: [array, 'null'], items: { type: string } }
               run_id: { type: [string, 'null'] }
+    PendingVerdict:
+      type: object
+      maxProperties: 0
+      description: 'The verdict of a trial whose run has been created and not scored yet (`status: running`): an empty object. Every other verdict has required fields, so `{}` matches this variant only.'
     GoldenVerdict:
       type: object
       required: [run_status, checks]
@@ -3818,8 +3871,9 @@ components:
               latency_ms: { type: integer }
               tokens: { type: integer }
               verdict:
-                description: 'Metadata, never content. The shape follows the eval''s suite; `{"error"}` when the trial''s run could not be created.'
+                description: 'Metadata, never content. The shape follows the eval''s suite; `{"error"}` when the trial''s run could not be created; `{}` (PendingVerdict) while the trial is `running`.'
                 oneOf:
+                  - $ref: '#/components/schemas/PendingVerdict'
                   - $ref: '#/components/schemas/GoldenVerdict'
                   - $ref: '#/components/schemas/InjectionVerdict'
                   - type: object
@@ -4126,6 +4180,7 @@ components:
         route: { type: string, description: 'In transit only (never in reports): the path a caliban/auto request took' }
         route_fallback: { type: string, description: 'In transit only (never in reports): why a model answered rather than a node; counted in `by_route`' }
         purpose: { type: string, enum: [rag.ingest, rag.search], description: 'Work Caliban did on the tenant''s behalf: `rag.ingest` (embedding a collection''s documents), `rag.search` (a node''s retrieval query, its embedding and reranking). Absent for client calls and node model calls. Kept in reports (billing-class, not content-class).' }
+        pii_override_ignored: { type: string, enum: [off, reversible], description: 'The request''s `caliban.pii` when it asked for weaker personal-data protection than the tenant''s policy and was ignored (migration 0038). Policy-class: what the caller asked for, never content. Absent otherwise.' }
         timings: { $ref: '#/components/schemas/UsageTimings' }
     UsageTimings:
       type: object

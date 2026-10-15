@@ -64,6 +64,28 @@ pub(crate) struct Outcome {
     pub purpose: Option<&'static str>,
     /// Per-stage durations (`Server-Timing`, the usage event's `timings`).
     pub timings: Timings,
+    /// The request asked for a weaker PII mode (`caliban.pii`) than its policy: the mode it asked
+    /// for (ignored) and the mode it got (`x-caliban-pii-override`, the usage event's
+    /// `pii_override_ignored`).
+    pub pii_ignored: Option<IgnoredPii>,
+}
+
+/// A request's `caliban.pii` weaker than the tenant's mode (raised to any floor): ignored, since a
+/// per-request setting only ever makes the policy stricter ([`PiiMode::with_request`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IgnoredPii {
+    pub requested: PiiMode,
+    pub applied: PiiMode,
+}
+
+/// The response header that reports an ignored `caliban.pii`.
+pub const PII_OVERRIDE_HEADER: &str = "x-caliban-pii-override";
+
+impl IgnoredPii {
+    /// `ignored;requested=<mode>;applied=<mode>`.
+    pub fn header(&self) -> String {
+        format!("ignored;requested={};applied={}", self.requested.as_str(), self.applied.as_str())
+    }
 }
 
 /// Entry point for both chat dialects.
@@ -134,9 +156,20 @@ async fn run(
         anthropic_beta: header_str(headers, "anthropic-beta"),
     };
     let ext = req.ext();
-    // The request's mode (or the tenant's), raised to the floor a node's `guardrails.pii` (or the
-    // caller) sets. Which candidates get the protected copy is decided per model below.
-    let pii_mode = ext.pii.unwrap_or_else(|| snap.pii_mode_for(&tenant)).at_least(ext.pii_floor);
+    // The policy is the tenant's mode raised to the floor a node's `guardrails.pii` (or the caller)
+    // sets. The request's own `caliban.pii` only ever makes it stricter: a weaker one (`off` on a
+    // tenant that masks) is ignored and recorded (research note 05, section 4: the policy engine,
+    // not the caller, decides what leaves the boundary). Which candidates get the protected copy
+    // is decided per model below.
+    let requested_pii = snap.pii_mode_for(&tenant).at_least(ext.pii_floor).with_request(ext.pii);
+    let pii_mode = requested_pii.mode;
+    let pii_ignored = requested_pii.ignored.map(|requested| IgnoredPii { requested, applied: pii_mode });
+    if let Some(i) = pii_ignored {
+        span.record("caliban.pii.override_ignored", i.requested.as_str());
+        tracing::info!(target: "caliban::audit", request_id = %request_id, tenant = %tenant.id,
+            requested = i.requested.as_str(), applied = i.applied.as_str(),
+            "caliban.pii asked for weaker protection than the tenant's policy: ignored");
+    }
 
     let (decision, escalation) = {
         let s = telemetry::child("route");
@@ -359,6 +392,7 @@ async fn run(
             auto_fallback,
             purpose: internal.and_then(|i| i.purpose),
             timings: timings.clone(),
+            pii_ignored,
         };
 
         if let Some(k) = &key {
@@ -499,11 +533,7 @@ async fn run(
 }
 
 fn pii_mode_str(m: PiiMode) -> &'static str {
-    match m {
-        PiiMode::Off => "off",
-        PiiMode::Mask => "mask",
-        PiiMode::Reversible => "reversible",
-    }
+    m.as_str()
 }
 
 fn set_model(v: &mut Value, model: &ModelEntry) {
@@ -664,6 +694,9 @@ pub(crate) fn caliban_headers(h: &mut HeaderMap, o: &Outcome) {
         set("x-caliban-cache-tier", t.as_str().to_owned());
     }
     set("x-caliban-pii-entities", o.pii_entities.to_string());
+    if let Some(i) = &o.pii_ignored {
+        set(PII_OVERRIDE_HEADER, i.header());
+    }
     if let Some(reason) = o.auto_fallback {
         set(crate::node_chat::ROUTE_HEADER, format!("model:{}", o.model.id));
         set(crate::node_chat::ROUTE_FALLBACK_HEADER, reason.to_owned());
@@ -790,6 +823,7 @@ pub(crate) async fn record(gw: &Gateway, o: &Outcome, m: Metered, tokens_saved: 
         route_fallback: o.auto_fallback.map(str::to_owned),
         purpose: o.purpose.map(str::to_owned),
         timings: Some(o.timings.usage(o.started)),
+        pii_override_ignored: o.pii_ignored.map(|i| i.requested.as_str().to_owned()),
     };
     let billed = if auto.is_some() { event.billed_usd } else { cost };
     gw.usage.record(event).await;

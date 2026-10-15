@@ -1806,8 +1806,9 @@ mod evals {
 
     /// A golden trial never reaches a real write tool (fintech demo, 2026-10-13: a golden trial
     /// issued a real refund). Writes go to the eval sandbox, which answers the case's scripted
-    /// result or a synthetic one; reads still call the real tool; every call is recorded in the
-    /// trial detail, and `tool_call` checks assert what was (or must not be) called.
+    /// result or a synthetic one; a read the spec opts in with `eval_live` calls the real tool;
+    /// every call is recorded in the trial detail, and `tool_call` checks assert what was (or must
+    /// not be) called.
     #[tokio::test]
     async fn a_golden_eval_sandboxes_writes_and_checks_tool_calls() {
         for j in journals().await {
@@ -1822,7 +1823,7 @@ mod evals {
                 "refunds",
                 1,
                 json!({"kind": "agent", "model_policy": {}, "budgets": budgets(10, 100_000),
-                "tools": [{"ref": read, "effect": "read"}, {"ref": write, "effect": "write"}]}),
+                "tools": [{"ref": read, "effect": "read", "eval_live": true}, {"ref": write, "effect": "write"}]}),
             );
             // Refunds the transaction and looks it up in one turn (the refund first, so its arguments
             // carry no tool output and need no approval), then answers with what the refund said.
@@ -1893,6 +1894,87 @@ mod evals {
             assert_eq!(calls.iter().find(|c| c["name"] == "lookup").unwrap()["sandboxed"], false);
             assert!(detail["checks"][1]["reason"].as_str().unwrap().contains("must not"), "{detail}");
         }
+    }
+
+    /// Golden trials sandbox every `mcp://` tool by default, reads included (2026-10-15): a read
+    /// without `eval_live` never reaches its server, answers the case's script or a synthetic
+    /// result, and is recorded as sandboxed. The same tool opted in by one reachable version but
+    /// not by another stays sandboxed (fail-safe), and a write never runs live.
+    #[tokio::test]
+    async fn a_golden_eval_sandboxes_mcp_reads_unless_the_spec_opts_in() {
+        for j in journals().await {
+            let lookup = Recorder::new("lookup", false, json!({"tx": "TX-30015", "amount": 20}));
+            let read = format!("mcp://bank/lookup#{PIN}");
+            let tools = StaticTools::new().with(read.clone(), Arc::clone(&lookup) as Arc<dyn Tool>);
+            let h = Harness::new(Arc::clone(&j)).with_tools(tools);
+            h.nodes.add(
+                "lookups",
+                1,
+                json!({"kind": "agent", "model_policy": {}, "budgets": budgets(10, 100_000),
+                       "tools": [{"ref": read, "effect": "read"}]}),
+            );
+            // Looks the transaction up, then answers with what the tool said.
+            let model = FakeModel::new(|body| {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                match msgs.iter().find(|m| m["role"] == "tool") {
+                    Some(m) => text(&format!("Found: {}", m["content"].as_str().unwrap_or_default())),
+                    None => json!({"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "c0", "type": "function", "function": {"name": "lookup", "arguments": "{\"tx\": \"TX-30015\"}"}}]}),
+                }
+            });
+            let ex = h.executor(&model, "w1");
+            let case = |v: Value| serde_json::from_value::<GoldenCase>(v).unwrap();
+            let cases = vec![
+                // No script: a synthetic, marked result; the server is never called.
+                case(json!({"id": "synthetic", "input": "find TX-30015",
+                    "checks": [{"type": "contains", "value": "sandbox"},
+                               {"type": "tool_call", "tool": "lookup", "args": {"tx": "TX-30015"}}]})),
+                // Scripted: the read answers the script.
+                case(json!({"id": "scripted", "input": "find TX-30015",
+                    "tool_results": {"lookup": {"tx": "TX-30015", "amount": 99}},
+                    "checks": [{"type": "contains", "value": "99"}]})),
+            ];
+            let plan = Plan::Golden { golden_hash: crate::eval::golden_hash(&cases), cases, judge_model: None };
+            let e = start_eval(&h, "lookups", Suite::Golden, 1, &plan).await;
+            assert!(EvalRunner::new(Arc::clone(&ex), opts()).run_once().await);
+            let e = j.get_eval("acme", &e.id).await.unwrap().unwrap();
+            assert_eq!(e.status, EvalStatus::Succeeded, "{e:?}");
+            assert!(lookup.seen.lock().is_empty(), "a golden trial reached a read tool not opted in");
+            let trials = j.trials(&e.id).await.unwrap();
+            for t in &trials {
+                assert_eq!(t.status, TrialStatus::Passed, "{t:?}");
+                assert_eq!(
+                    (t.verdict["tool_calls"].as_u64(), t.verdict["sandboxed_calls"].as_u64()),
+                    (Some(1), Some(1)),
+                    "{t:?}"
+                );
+            }
+            let synthetic = trials.iter().find(|t| t.case_id == "synthetic").unwrap();
+            let detail: Value =
+                serde_json::from_str(&h.sealer.open("acme", &e.id, synthetic.detail.as_ref().unwrap()).unwrap())
+                    .unwrap();
+            let call = &detail["tool_calls"][0];
+            assert_eq!((call["sandboxed"].as_bool(), call["write"].as_bool()), (Some(true), Some(false)), "{detail}");
+        }
+    }
+
+    /// `eval_live` is per tool and fail-safe across the versions a run can reach: live only when
+    /// every declaration of the reference opts in and none makes it a write.
+    #[test]
+    fn eval_live_needs_every_reachable_declaration_to_opt_in() {
+        use crate::eval::sandbox::SandboxTools;
+        let read = format!("mcp://bank/lookup#{PIN}");
+        let spec = |live: bool, effect: &str| -> NodeSpec {
+            serde_json::from_value(json!({"kind": "agent", "model_policy": {}, "budgets": budgets(10, 100),
+                "tools": [{"ref": read, "effect": effect, "eval_live": live}]}))
+            .unwrap()
+        };
+        let live = |root: &NodeSpec, children: &[&NodeSpec]| SandboxTools::live_tools(root, children);
+        assert!(live(&spec(true, "read"), &[]).contains(&read));
+        assert!(live(&spec(false, "read"), &[]).is_empty());
+        assert!(live(&spec(true, "read"), &[&spec(false, "read")]).is_empty(), "a child did not opt in");
+        assert!(live(&spec(true, "read"), &[&spec(false, "write")]).is_empty(), "a child declares a write");
+        assert!(live(&spec(true, "read"), &[&spec(true, "read")]).contains(&read));
     }
 
     /// Cancelling a running eval stops it: its run in flight is cancelled and it ends `cancelled`.

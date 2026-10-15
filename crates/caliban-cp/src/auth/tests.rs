@@ -1092,6 +1092,15 @@ fn cases() -> Vec<Case> {
             true,
             "owner admin tenant_admin developer",
         ),
+        // Erasing a run: runs.data and nodes.write (it rewrites golden sets).
+        c(
+            "DELETE",
+            "/tenants/{tenant_id}/runs/{id}",
+            "/api/v1/tenants/{t}/runs/run_nope",
+            None,
+            true,
+            "owner admin tenant_admin developer",
+        ),
         c("GET", "/tenants/{tenant_id}/inbox", "/api/v1/tenants/{t}/inbox", None, true, RUN_READERS),
         c("GET", "/tenants/{tenant_id}/node-spend", "/api/v1/tenants/{t}/node-spend", None, true, EVERYONE),
         c("GET", "/models", "/api/v1/models", None, false, EVERYONE),
@@ -1722,10 +1731,55 @@ async fn run_content_and_answers_follow_the_roles() {
     assert_eq!((r.body["caps"]["monthly_usd"].clone(), r.body["capped"].as_bool()), (Value::Null, Some(false)));
 }
 
-/// Capturing a run into a golden set (`POST .../runs/{id}/golden-case`) needs what editing a
-/// golden set needs (`nodes.write`), stays inside the tenant (another tenant's run is not found,
-/// another tenant's path is forbidden), shows the case only with `runs.data`, and audits metadata
-/// only: never the note or the run's content.
+/// Capturing a run copies its content into a golden set, so it needs `runs.data` on top of what
+/// editing a golden set needs (`nodes.write`): a principal with `nodes.write` alone gets a `403`
+/// that names the missing permission, before the run is even looked up. Every built-in role that
+/// has `nodes.write` has `runs.data` today, so the check is exercised on the permission set
+/// itself; the route test below covers a role with neither.
+#[test]
+fn capturing_a_run_needs_runs_data_as_well_as_nodes_write() {
+    use super::rbac::{Perm, Role};
+    use crate::evals::{CAPTURE_PERMS, may_capture};
+    assert_eq!(CAPTURE_PERMS, [Perm::NodesWrite, Perm::RunsData]);
+    let err = may_capture(|p| p == Perm::NodesWrite).unwrap_err();
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+    assert!(err.1.contains("runs.data"), "{}", err.1);
+    let err = may_capture(|p| p == Perm::RunsData).unwrap_err();
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+    assert!(err.1.contains("missing nodes.write"), "{}", err.1);
+    assert_eq!(may_capture(|_| false).unwrap_err().0, StatusCode::FORBIDDEN);
+    assert!(may_capture(|p| CAPTURE_PERMS.contains(&p)).is_ok());
+    // The roles that capture in practice hold both.
+    for role in [Role::Developer, Role::TenantAdmin, Role::Admin, Role::Owner] {
+        assert!(may_capture(|p| role.grants(p)).is_ok(), "{role:?}");
+    }
+    for role in [Role::Viewer, Role::Auditor, Role::Billing] {
+        assert!(may_capture(|p| role.grants(p)).is_err(), "{role:?}");
+    }
+}
+
+/// Erasing a run (`DELETE .../runs/{id}`) rewrites the golden sets built from it: `runs.data` (the
+/// route) and `nodes.write` (the handler), each refused alone with a 403 naming the other.
+#[test]
+fn erasing_a_run_needs_runs_data_and_nodes_write() {
+    use super::rbac::{Perm, Role};
+    use crate::evals::may_erase;
+    let err = may_erase(|p| p == Perm::RunsData).unwrap_err();
+    assert_eq!((err.0, err.1.contains("missing nodes.write")), (StatusCode::FORBIDDEN, true), "{}", err.1);
+    let err = may_erase(|p| p == Perm::NodesWrite).unwrap_err();
+    assert_eq!((err.0, err.1.contains("missing runs.data")), (StatusCode::FORBIDDEN, true), "{}", err.1);
+    for role in [Role::Developer, Role::TenantAdmin, Role::Admin, Role::Owner] {
+        assert!(may_erase(|p| role.grants(p)).is_ok(), "{role:?}");
+    }
+    for role in [Role::Viewer, Role::Auditor, Role::Billing] {
+        assert!(may_erase(|p| role.grants(p)).is_err(), "{role:?}");
+    }
+}
+
+/// Capturing a run into a golden set (`POST .../runs/{id}/golden-case`) needs `nodes.write` and
+/// `runs.data`, stays inside the tenant (another tenant's run is not found, another tenant's path
+/// is forbidden), returns the case, and audits metadata only: never the note or the run's
+/// content.
 #[tokio::test]
 async fn capturing_a_run_follows_the_roles_and_the_tenant() {
     use caliban_nodes::budget::BudgetState;

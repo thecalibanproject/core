@@ -65,6 +65,12 @@ impl Default for EvalOptions {
 /// under the same judge).
 pub const JUDGE_PROMPT_VERSION: u32 = 1;
 
+/// The verdict of a trial that is still running (its run created, not scored yet): an empty
+/// object, `PendingVerdict` in api/openapi.yaml.
+pub fn pending_verdict() -> Value {
+    json!({})
+}
+
 pub struct EvalRunner {
     ex: Arc<Executor>,
     opts: EvalOptions,
@@ -408,7 +414,7 @@ impl EvalRunner {
             cost_usd: run.map_or(0.0, |r| r.budget.usd),
             latency_ms: run.map_or(0, |r| r.budget.wall_clock_ms_used),
             tokens: run.map_or(0, |r| r.budget.tokens_used),
-            verdict: json!({}),
+            verdict: pending_verdict(),
             detail: None,
             created_at: Utc::now(),
             finished_at: None,

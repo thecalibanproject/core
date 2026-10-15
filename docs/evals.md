@@ -15,8 +15,8 @@ schema, budgets and tenant spend caps apply, and every model call goes through t
 pipeline (PII, caches, routing, quotas, metering, tracing). Usage events carry `node`,
 `node_version` and `run_id` as for any run. The LLM judge's calls go through the same pipeline,
 metered under the node with the eval id as `run_id`, so they never count in a run's cost.
-One exception to the normal path: a trial never reaches a real write tool ([golden trials and
-write tools](#golden-trials-and-write-tools)). They are
+One exception to the normal path: a trial never reaches a real write tool, nor by default any
+MCP tool ([golden trials and tools](#golden-trials-and-tools)). They are
 retried like a run's model calls: a transient failure with the same backoff (50 ms, doubled up to
 2 s, for the executor's model retry window, 60 s by default), a rate limit (`429`) after waiting
 for its `Retry-After` (within 10 ms and 5 minutes), at most 5 times, with one idempotency key for
@@ -76,7 +76,7 @@ the real tool (see below).
 | `errors` | Trials that could not be scored: the run could not be created, a judge call failed, the run's tool calls could not be read, or the run failed for a reason outside the node (`error_kind` on the trial: `quota`, `provider`, `timeout`, see [errors](#errors)). They count as not passed |
 | `golden_hash`, `judge` | Which golden set ran, and the judge configuration (default model, prompt version and hash, temperature), so scores are compared under the same set and judge (swapping a simulated user or judge moves scores by many points: UserProxyBench, arXiv 2609.38043) |
 
-### Golden trials and write tools
+### Golden trials and tools
 
 A golden trial runs the node for real, so before 2026-10-13 it also called its write tools for
 real: in the fintech demo a golden trial issued a real refund (TX-30015) on the bank's refund
@@ -92,10 +92,26 @@ a sandbox" (research note 04, section 7); golden trials now use the same sandbox
   `{"ok": true, "sandbox": true, "synthetic": true, "note": "Caliban eval sandbox: ..."}`. A schema
   the generator cannot satisfy (a `pattern`) gets the marked default. MCP manifests are pinned
   without an output schema today, so for them the marked default is what a trial sees.
-- **Reads behave as before.** A read tool (MCP, `builtin://datasource_query`,
-  `builtin://rag_search`) is called for real, with its real result, unless the case scripts it.
-  A version's reads are expected to be side-effect free; their effect is what the version
-  declares.
+- **MCP reads are sandboxed too, unless the spec opts in** (since 2026-10-15). A declared
+  `effect: read` is the author's claim, not a guarantee: AgentDojo-style tools diverge from their
+  advertised surface (research note 04, section 7), a "read" may still log, bill or rate-limit on
+  the customer's system, and a trial that depends on live data is not repeatable. So every call to
+  an `mcp://` tool goes to the sandbox, which answers the case's `tool_results` entry, else the
+  same marked synthetic result as a write. A read tool the version declares with
+  `"eval_live": true` calls the real server (unless the case scripts it):
+
+  ```json
+  {"ref": "mcp://bank/lookup#sha256:...", "effect": "read", "eval_live": true}
+  ```
+
+  `eval_live` is accepted on `mcp://` tools with `effect: read` only (a version that sets it on a
+  write, a built-in or a `node://` reference is refused, kind `spec`). It is part of the spec, so
+  of its hash, and reviewed at publish like the rest. Across the versions a run reaches (its
+  pinned subnodes), a tool runs live only when every declaration of it opts in and none declares
+  it a write.
+- **Built-in tools run live.** `builtin://datasource_query` and `builtin://rag_search` are
+  Caliban's own read-only tools (the query compiler refuses writes; retrieval only reads the
+  index), so they are called for real unless the case scripts them.
 - **The executor's defenses are unchanged**: taint, approvals (scripted with `answers`; a tainted
   write without one is denied), declared tools only, the PII guard. The sandbox only replaces the
   final call.
@@ -164,14 +180,42 @@ finished (`409`); a run already in that set (`409`, the case id is the run id); 
 did not succeed, a `bad` one without a note, a MAST label on a `good` run, an unknown label, an
 injection-suite run (its input carries an attack) (`422`); a version that does not exist (`404`).
 
+**Who may capture.** `nodes.write` (it edits a golden set) and `runs.data` (the case copies the
+run's content, its input, answers and output, into the set: a caller who may not read a run's
+content must not be able to move it elsewhere). A caller missing either gets a `403` naming it,
+before the run is looked up. The built-in roles that have `nodes.write` (`developer`, `tenant_admin`, `admin`,
+`owner`) all have `runs.data`.
+
 **Response** (`201`): `object: "node.golden_case"`, `run_id`, `node`, `version`, `run_version`,
 `case_id`, `verdict`, `mast_label`, `checks` (their kinds), `previous_hash` (`null` when the set
-was created), `golden_set` (the set's metadata: `hash`, `case_count`, ...), `content_visible`, and
-the `case` itself with `runs.data` (it is the run's content).
+was created), `golden_set` (the set's metadata: `hash`, `case_count`, ...), `content_visible`
+(always `true`), and the `case` itself.
 
-**Retention.** A captured case is golden-set content: sealed, kept with the set, not purged with
-the run (golden sets are not purged). Deleting the case means editing the set (`PUT`) or deleting
-it.
+**Retention and erasure.** A captured case copies the run's content (its input, answers and
+output), so it may not outlive the run (research note 05: retention and erasure cover every copy
+of personal data; note 04, "Risks & failure modes": memory "deletable via a TTL/erasure API", and open question 6, right to erasure across derived data).
+Each captured case gets a provenance row (`node_golden_case_source`, migration 0039: tenant, node,
+version, case id, run id, the run's finish time; ids and times only), written in the transaction
+of the set's write. A `PUT` keeps the row of a case that keeps a captured case's id (editing it
+does not free it from its run), adds one for a case tagged `captured` whose id is a finished run of
+the node (a captured case carried to another version), and drops the rows of cases that left the
+set. Deleting the set deletes its rows.
+
+- **Retention.** The workers' hourly purge (`CALIBAN_NODE_RUN_RETENTION_DAYS`, the run retention)
+  removes a captured case from its set once its run finished longer ago than that: the set is
+  opened, rewritten without it, resealed (a new hash; a compare-and-set like every write) and the
+  change audited as `node.golden_set.scrub` (`reason: retention`, actor `caliban:retention`; node,
+  version, case and run ids, counts and hashes). Hand-written cases have no run and are kept.
+- **Erasure.** `DELETE /api/v1/tenants/{t}/runs/{id}` (`runs.data` and `nodes.write`) erases a
+  finished run at once: its captured cases leave every set (`node.golden_set.scrub`,
+  `reason: erasure`); the evals of the node whose sealed plan carries the run's content (a golden
+  plan holding its case, an injection plan whose input is the run's input) lose that content (plan
+  and trial details; summaries and verdicts stay, `content_purged: true`); then the run, its steps
+  and events, and the eval runs made with its content (`eval:<eval>:<case>`, and every run of such
+  an injection eval) are deleted, audited as `node.run.erase`. A run that has not finished, or an
+  eval using its content that has not, is a `409`; erasing again is safe. Caliban keeps no index
+  of data subjects: a data subject's erasure is the erasure of each run that holds their data.
+  Usage events of the run's model calls are billing-class (no content) and are kept.
 
 ## The injection suite
 
@@ -409,7 +453,8 @@ which is audited.
 | `GET .../nodes/{name}/versions/{v}/golden-set` | `nodes.read` (cases with `runs.data`) | |
 | `PUT .../nodes/{name}/versions/{v}/golden-set` `{"cases": [...]}` | `nodes.write` | `node.golden_set.update` |
 | `DELETE .../nodes/{name}/versions/{v}/golden-set` | `nodes.write` | `node.golden_set.delete` |
-| `POST /api/v1/tenants/{t}/runs/{id}/golden-case` `{"verdict", "note"?, "mast_label"?, "version"?}` ([cases from runs](#cases-from-runs)) | `nodes.write` | `node.golden_set.capture` |
+| `POST /api/v1/tenants/{t}/runs/{id}/golden-case` `{"verdict", "note"?, "mast_label"?, "version"?}` ([cases from runs](#cases-from-runs)) | `nodes.write` and `runs.data` | `node.golden_set.capture` |
+| `DELETE /api/v1/tenants/{t}/runs/{id}` (erase a run and what was derived from it, [retention and erasure](#cases-from-runs)) | `runs.data` and `nodes.write` | `node.golden_set.scrub`, `node.run.erase` |
 | `GET .../nodes/{name}/eval-policy` | `nodes.read` | |
 | `PUT .../nodes/{name}/eval-policy` | `nodes.publish` | `node.eval_policy.update` (old and new bar) |
 | `POST .../nodes/{name}/versions/{v}/evals` `{"suite", "api_key_id"?, "k"?, "concurrency"?, "cases"?, "judge_model"?, "input"?, "input_case"?}` | `nodes.run` | `node.eval.start` |
@@ -457,7 +502,9 @@ content goes with the run retention (`CALIBAN_NODE_RUN_RETENTION_DAYS`, default 
 purge on the workers clears each trial's `detail` (what the scorers said, the output that failed a
 check, the tool calls) and the eval's sealed plan (its golden cases or injection input) once the eval finished
 longer ago than that, in batches with `FOR UPDATE SKIP LOCKED`. The eval then shows
-`content_purged: true`. Golden sets themselves belong to a version and are not purged.
+`content_purged: true`. Golden sets themselves belong to a version and are not purged, but the
+cases captured from runs leave them on the same clock as their runs ([cases from
+runs](#cases-from-runs)), in the same hourly purge.
 
 ## Where evals run
 

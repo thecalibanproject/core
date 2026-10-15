@@ -10,9 +10,9 @@
 //!   executor: every model call goes through the gateway pipeline and is metered (the usage events
 //!   carry the node, version and run id). The judge's calls go through the same pipeline. The
 //!   result is metrics only ([`metrics`]): pass^k, pass@1, cost per success, p50 and p95 latency.
-//!   A trial never reaches a real write tool: its writes go to the eval sandbox ([`sandbox`]),
-//!   which answers the case's scripted `tool_results` or a synthetic result; `tool_call` checks
-//!   assert what the run called.
+//!   A trial never reaches a real write tool, nor an MCP read tool its spec does not opt in with
+//!   `eval_live`: those calls go to the eval sandbox ([`sandbox`]), which answers the case's
+//!   scripted `tool_results` or a synthetic result; `tool_call` checks assert what the run called.
 //! - **Cases from runs** ([`capture`]): a reviewer marks a finished run good or bad (with a MAST
 //!   failure label) and it becomes a golden case.
 //! - **The injection suite** ([`injection`]) runs the version against sandboxed tools that carry
@@ -61,9 +61,10 @@ pub struct GoldenCase {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub answers: BTreeMap<String, Value>,
     /// Scripted tool results, by tool name (the manifest's, e.g. `refund_payment`) or full
-    /// reference. A trial never calls a write tool (effect `write`): it answers this script, else a
-    /// synthetic result marked `"sandbox": true` ([`sandbox::synthetic_result`]). A read tool
-    /// named here answers the script too; the others call the real tool. See [`sandbox`].
+    /// reference. A trial never calls a write tool (effect `write`), nor an `mcp://` read tool the
+    /// spec does not opt in with `eval_live`: it answers this script, else a synthetic result
+    /// marked `"sandbox": true` ([`sandbox::synthetic_result`]). An opted-in read or a built-in
+    /// tool named here answers the script too; the others call the real tool. See [`sandbox`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_results: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

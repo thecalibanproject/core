@@ -59,6 +59,12 @@ pub struct ToolRef {
     /// `datasource`, `caller`, `*`, ...). See `executor::taint`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_tainted: Vec<String>,
+    /// Golden eval trials answer every `mcp://` tool from the eval sandbox by default (the case's
+    /// scripted result, else a synthetic one): a trial must not depend on, or act on, a customer
+    /// system. `true` on an `mcp://` tool with `effect: read` lets trials call it for real; a
+    /// write never leaves the sandbox. Built-in tools (Caliban's own read-only tools) are live.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub eval_live: bool,
 }
 
 /// A parsed tool reference.
@@ -343,7 +349,23 @@ impl NodeSpec {
             return Err(SpecError::BadGuardrails("pii must be off, mask or reversible".into()));
         }
         for t in &self.tools {
-            if let ToolTarget::Builtin { name } = ToolTarget::parse(&t.reference)? {
+            let target = ToolTarget::parse(&t.reference)?;
+            if t.eval_live {
+                if !matches!(target, ToolTarget::Mcp { .. }) {
+                    return Err(SpecError::BadTool(format!(
+                        "{}: eval_live applies to mcp:// tools only (built-in tools always run live in eval \
+                         trials; a subnode's tools follow its own spec)",
+                        t.reference
+                    )));
+                }
+                if t.effect != Effect::Read {
+                    return Err(SpecError::BadTool(format!(
+                        "{}: eval_live is for read tools only (a write tool never leaves the eval sandbox)",
+                        t.reference
+                    )));
+                }
+            }
+            if let ToolTarget::Builtin { name } = target {
                 if t.effect != Effect::Read {
                     return Err(SpecError::BadTool(format!("builtin://{name} is read only: declare it effect: read")));
                 }
@@ -688,6 +710,34 @@ mod tests {
         ));
         assert_eq!(with("builtin://datasource_query", json!(["shop.orders:read", "rag.kb:read"]), "read"), Ok(()));
         assert!(matches!(ToolTarget::parse("builtin://web_search"), Err(SpecError::UnknownToolKind(_))));
+    }
+
+    /// `eval_live` (golden trials call the tool for real) is for `mcp://` read tools only.
+    #[test]
+    fn eval_live_is_for_mcp_read_tools_only() {
+        let pin = format!("sha256:{}", "ab".repeat(32));
+        let with = |tool: String, effect: &str, live: bool| {
+            spec(json!({
+                "kind": "agent", "prompt": {"system": "x"}, "model_policy": {},
+                "tools": [{"ref": tool, "effect": effect, "eval_live": live}],
+                "datasources": {"scopes": ["shop.orders:read"]},
+                "budgets": {"steps": 5, "tokens": 1000, "wall_clock_s": 30}
+            }))
+            .validate()
+        };
+        assert_eq!(with(format!("mcp://crm/lookup#{pin}"), "read", true), Ok(()));
+        assert_eq!(with(format!("mcp://crm/refund#{pin}"), "write", false), Ok(()));
+        let e = with(format!("mcp://crm/refund#{pin}"), "write", true).unwrap_err();
+        assert!(e.to_string().contains("read tools only"), "{e}");
+        let e = with("builtin://datasource_query".into(), "read", true).unwrap_err();
+        assert!(e.to_string().contains("mcp:// tools only"), "{e}");
+        assert!(matches!(with("node://child@v1".into(), "read", true), Err(SpecError::BadTool(_))));
+        // Off by default, and absent from the serialized spec (spec hashes do not change).
+        let s = spec(json!({"kind": "agent", "prompt": {"system": "x"}, "model_policy": {},
+                            "tools": [{"ref": format!("mcp://crm/lookup#{pin}"), "effect": "read"}],
+                            "budgets": {"steps": 5, "tokens": 1000, "wall_clock_s": 30}}));
+        assert!(!s.tools[0].eval_live);
+        assert!(serde_json::to_value(&s.tools[0]).unwrap().get("eval_live").is_none());
     }
 
     #[test]

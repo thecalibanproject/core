@@ -534,6 +534,7 @@ pub const ROUTES: &[RouteRule] = &[
     ),
     r("GET", "/tenants/{tenant_id}/runs", Perm::RunsRead, TenantFrom::Path),
     r("GET", "/tenants/{tenant_id}/runs/{id}", Perm::RunsRead, TenantFrom::Path),
+    r("DELETE", "/tenants/{tenant_id}/runs/{id}", Perm::RunsData, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/runs/{id}/input", Perm::RunsAnswer, TenantFrom::Path),
     r("POST", "/tenants/{tenant_id}/runs/{id}/cancel", Perm::RunsAnswer, TenantFrom::Path),
     // Appends a case built from the run to a golden set: the permission that edits golden sets.
