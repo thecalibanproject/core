@@ -26,7 +26,7 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 
-ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-rustls", "api-24"] }
+ort = { version = "=2.0.0-rc.14", optional = true, default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-rustls", "api-24"] }
 tokenizers = { version = "0.23.2", optional = true, default-features = false, features = ["onig"] }
 
 [lints]
