@@ -43,7 +43,7 @@ caliban-cache.workspace = true
 caliban-route.workspace = true
 caliban-mcp = { workspace = true, features = ["test-server"] }
 # A raw MCP client for the MCP server's Tasks test.
-rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+rmcp = { version = "=3.6.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
 futures.workspace = true
 tower.workspace = true
 # Black-box tests (tests/isolation.rs, tests/usage_accuracy.rs): mock upstream + process harness.
